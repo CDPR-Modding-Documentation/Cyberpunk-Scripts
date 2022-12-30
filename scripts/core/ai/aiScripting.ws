@@ -96,6 +96,18 @@ import class AIbehaviorconditionScript extends AIBehaviorScriptBase
 	public import static function SetUpdateInterval( context : ScriptExecutionContext, interval : Float ) : Bool;
 }
 
+import class AIbehaviorexpressionScript extends AIBehaviorScriptBase
+{
+	public import function MarkDirty( context : ref< ScriptExecutionContext > );
+
+	protected export virtual function OnBehaviorCallback( cbName : CName, context : ScriptExecutionContext ) : Bool
+	{
+		MarkDirty( context );
+		return true;
+	}
+
+}
+
 import class AIbehaviortaskScript extends AIBehaviorScriptBase
 {
 
@@ -112,18 +124,6 @@ import class AIbehaviortaskScript extends AIBehaviorScriptBase
 	protected export virtual function ChildCompleted( context : ScriptExecutionContext, status : AIbehaviorCompletionStatus ) {}
 	public import static function CutSelector( context : ScriptExecutionContext );
 	public import static function SetUpdateInterval( context : ScriptExecutionContext, interval : Float ) : Bool;
-}
-
-import class AIbehaviorexpressionScript extends AIBehaviorScriptBase
-{
-	public import function MarkDirty( context : ref< ScriptExecutionContext > );
-
-	protected export virtual function OnBehaviorCallback( cbName : CName, context : ScriptExecutionContext ) : Bool
-	{
-		MarkDirty( context );
-		return true;
-	}
-
 }
 
 importonly struct ScriptExecutionContext
