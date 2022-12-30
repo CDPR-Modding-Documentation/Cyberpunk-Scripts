@@ -1,0 +1,1070 @@
+import class MinigameGenerationRule extends IScriptable
+{
+	import var minigameController : weak< HackingMinigameGameController >;
+	var m_blackboardSystem : BlackboardSystem;
+	var m_entity : weak< Entity >;
+	var m_player : weak< PlayerPuppet >;
+	var m_minigameRecord : weak< Minigame_Def_Record >;
+	var m_bufferSize : Int32;
+	var m_isItemBreach : Bool;
+
+	protected virtual function OnProcessRule( size : Uint32, out grid : array< array< GridCell > > ) : Bool
+	{
+		return true;
+	}
+
+	public function SetBlackboard( b : BlackboardSystem )
+	{
+		m_blackboardSystem = b;
+	}
+
+	public function SetEntity( entity : Entity )
+	{
+		m_entity = entity;
+	}
+
+	public function SetPlayer( player : PlayerPuppet )
+	{
+		m_player = player;
+	}
+
+	public function SetRecord( rec : Minigame_Def_Record )
+	{
+		m_minigameRecord = rec;
+	}
+
+	public function SetBufferSize( buffer : Int32 )
+	{
+		m_bufferSize = buffer;
+	}
+
+	public function SetIsItemBreach( itemBreach : Bool )
+	{
+		m_isItemBreach = itemBreach;
+	}
+
+	public function IntToTrap( i : Int32 ) : MiniGame_Trap_Record
+	{
+		switch( i )
+		{
+			case 0:
+				return TweakDBInterface.GetMiniGame_TrapRecord( T"MinigameTraps.NONE" );
+			case 1:
+				return TweakDBInterface.GetMiniGame_TrapRecord( T"MinigameTraps.VisionReset" );
+			case 2:
+				return TweakDBInterface.GetMiniGame_TrapRecord( T"MinigameTraps.BrokenVision" );
+			case 3:
+				return TweakDBInterface.GetMiniGame_TrapRecord( T"MinigameTraps.MaterialsBonus" );
+			default:
+				return TweakDBInterface.GetMiniGame_TrapRecord( T"MinigameTraps.NONE" );
+		}
+	}
+
+}
+
+importonly struct MinigameProgramData
+{
+	import persistent var actionID : TweakDBID;
+	import persistent var programName : CName;
+}
+
+importonly struct MinigameData
+{
+	import var timeLimit : Float;
+	import var gridSize : Uint32;
+	import var bufferSize : Uint32;
+	import var timerWaitsForInteraction : Bool;
+	import var rules : array< MinigameGenerationRule >;
+	import var acceptableTraps : array< MiniGame_Trap_Record >;
+	import var symbolsToUse : MiniGame_AllSymbols_Record;
+}
+
+importonly struct CharactersChain
+{
+	import var rarities : array< Uint32 >;
+	import var matchedValues : Uint32;
+	import var ownerId : Int32;
+	import var isFulfilled : Bool;
+	import var isPossible : Bool;
+}
+
+importonly struct UnlockableProgram
+{
+	import var name : CName;
+	import var note : CName;
+	import var isFulfilled : Bool;
+	import var programTweakID : TweakDBID;
+	import var iconTweakID : TweakDBID;
+	import var hidden : Bool;
+}
+
+importonly struct GridCell
+{
+	import var rarityValue : Int32;
+	import var currentTrap : MiniGame_Trap_Record;
+}
+
+struct Overlap
+{
+	var instructionNumber : Int32;
+	var otherInstruction : Int32;
+	var atStart : Bool;
+	var rarity : Int32;
+}
+
+class MinigameTooltipShowRequest extends Event
+{
+	var data : MessageTooltipData;
+}
+
+class MinigameTooltipHideRequest extends Event
+{
+}
+
+import class TrapTooltipDisplayer extends inkLogicController
+{
+	import var trap : weak< MiniGame_Trap_Record >;
+	private editable var m_delayDuration : Float;
+	private var m_animationProxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		var delayAnim : inkAnimDef;
+		var delayInterpolator : inkAnimTranslation;
+		if( trap )
+		{
+			delayAnim = new inkAnimDef;
+			delayInterpolator = new inkAnimTranslation;
+			delayInterpolator.SetDuration( m_delayDuration );
+			delayAnim.AddInterpolator( delayInterpolator );
+			m_animationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_animationProxy = GetRootWidget().PlayAnimation( delayAnim );
+			m_animationProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnDelayedTooltipRequest' );
+		}
+	}
+
+	protected event OnDelayedTooltipRequest( e : inkAnimProxy )
+	{
+		var evt : MinigameTooltipShowRequest;
+		evt = new MinigameTooltipShowRequest;
+		evt.data = new MessageTooltipData;
+		evt.data.Title = LocKeyToString( trap.TrapName() );
+		evt.data.Description = LocKeyToString( trap.TrapDescription() );
+		QueueEvent( evt );
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		var evt : MinigameTooltipHideRequest;
+		evt = new MinigameTooltipHideRequest;
+		m_animationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		QueueEvent( evt );
+	}
+
+}
+
+import class HackingMinigameGameController extends inkGameController
+{
+	private var m_miniGameRecord : weak< Minigame_Def_Record >;
+	private var m_dimension : Int32;
+	private var m_isTutorialActive : Bool;
+	var m_isOfficerBreach : Bool;
+	var m_isRemoteBreach : Bool;
+	var m_isItemBreach : Bool;
+	var m_numberAttempts : Int32;
+	private editable var m_tooltipsManagerRef : inkWidgetRef;
+	private var m_TooltipsManager : weak< gameuiTooltipsManager >;
+	private var m_uiSystem : UISystem;
+	private var m_contextHelpOverlay : Bool;
+	private var m_bbMinigame : weak< IBlackboard >;
+	private var m_bbMinigameStateListener : CallbackHandle;
+	private var m_bbUiData : weak< IBlackboard >;
+	private var m_bbControllerStateListener : CallbackHandle;
+
+	public import function GetProgramsChains() : array< CharactersChain >;
+	public import function GetUnlockablePrograms() : array< UnlockableProgram >;
+	public import function GetRarity( rarityValue : Float ) : Int32;
+	public import function GetTrapByProbability( probabilityValue : Float ) : MiniGame_Trap_Record;
+	public import function GetPlayerPrograms() : array< MinigameProgramData >;
+	public import function SetTrapIconAtCell( cellCoordinates : Vector2, trap : CName );
+	public import function AddUnlockableProgram( program : UnlockableProgram, instruction : array< Uint32 > );
+	public import function PauseTheTimer();
+	public import function ResumeTheTimer();
+	public import function EnableWhitelist( enable : Bool );
+	public import function IsWhitelistEnabled() : Bool;
+	public import function WhitelistPosition( position : Vector2 );
+	public import function RemoveWhitelistedPosition( position : Vector2 );
+
+	protected event OnInitialize()
+	{
+		var bbNetwork : IBlackboard;
+		var minigameData : MinigameData;
+		var entity : Entity;
+		var networkID : TweakDBID;
+		var characterRecord : Character_Record;
+		var itemRecord : Item_Record;
+		var minigameRules : array< MinigameGenerationRule >;
+		var gridSymbols : array< weak< RowSymbols_Record > >;
+		var gridTraps : array< weak< RowTraps_Record > >;
+		var overrideProgramList : array< weak< Program_Record > >;
+		var predefBoardTrapsRule : MinigameGenerationRulePredefinedBoardWithTraps;
+		var predefBoardRule : MinigameGenerationRulePredefinedBoard;
+		var overrideProgramsRule : MinigameGenerationRuleOverridePrograms;
+		var scalingProgramsRule : MinigameGenerationRuleScalingPrograms;
+		var player : weak< PlayerPuppet >;
+		var ownerObject : GameObject;
+		var trapProb : Float;
+		var powerLevel : Float;
+		var bufferSize : Float;
+		var minigameDef : TweakDBID;
+		var extraDifficulty : Float;
+		var symbolsToUse : MiniGame_AllSymbols_Record;
+		PrepareTooltips();
+		m_bbMinigame = GetBlackboardSystem().Get( GetAllBlackboardDefs().HackingMinigame );
+		bbNetwork = GetBlackboardSystem().Get( GetAllBlackboardDefs().NetworkBlackboard );
+		m_bbMinigameStateListener = m_bbMinigame.RegisterDelayedListenerInt( GetAllBlackboardDefs().HackingMinigame.State, this, 'OnGameStateChanged' );
+		m_bbUiData = GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData );
+		m_bbControllerStateListener = m_bbUiData.RegisterListenerBool( GetAllBlackboardDefs().UIGameData.Controller_Disconnected, this, 'OnDisconnectController' );
+		ownerObject = GetPlayerControlledObject();
+		player = ( ( PlayerPuppet )( ownerObject ) );
+		entity = GameInstance.FindEntityByID( ownerObject.GetGame(), bbNetwork.GetEntityID( GetAllBlackboardDefs().NetworkBlackboard.DeviceID ) );
+		networkID = ( ( TweakDBID )( bbNetwork.GetVariant( GetAllBlackboardDefs().NetworkBlackboard.NetworkTDBID ) ) );
+		m_isRemoteBreach = bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.RemoteBreach );
+		m_isItemBreach = bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.ItemBreach );
+		m_uiSystem = GameInstance.GetUISystem( player.GetGame() );
+		powerLevel = GameInstance.GetStatsSystem( ( ( GameObject )( entity ) ).GetGame() ).GetStatValue( entity.GetEntityID(), gamedataStatType.PowerLevel );
+		m_numberAttempts = bbNetwork.GetInt( GetAllBlackboardDefs().NetworkBlackboard.Attempt );
+		extraDifficulty = m_miniGameRecord.ExtraDifficulty();
+		m_isOfficerBreach = bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.OfficerBreach );
+		if( bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.ItemBreach ) )
+		{
+			itemRecord = TweakDBInterface.GetItemRecord( networkID );
+			m_miniGameRecord = itemRecord.MinigameInstance();
+		}
+		else if( bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.SuicideBreach ) )
+		{
+			m_miniGameRecord = TweakDBInterface.GetMinigame_DefRecord( T"minigame_v2.SuicideMinigame" );
+		}
+		else if( m_isOfficerBreach )
+		{
+			characterRecord = TweakDBInterface.GetCharacterRecord( ( ( ScriptedPuppet )( entity ) ).GetRecordID() );
+			m_miniGameRecord = characterRecord.MinigameInstance();
+		}
+		else
+		{
+			minigameDef = ( ( TweakDBID )( bbNetwork.GetVariant( GetAllBlackboardDefs().NetworkBlackboard.MinigameDef ) ) );
+			if( TDBID.IsValid( minigameDef ) )
+			{
+				m_miniGameRecord = TweakDBInterface.GetMinigame_DefRecord( minigameDef );
+			}
+			else
+			{
+				m_miniGameRecord = TweakDBInterface.GetMinigame_DefRecord( T"minigame_v2.DefaultMinigame" );
+			}
+		}
+		if( m_miniGameRecord.GetID() == T"minigame_v2.VrTutorialMinigame" )
+		{
+			EnableWhitelist( true );
+			WhitelistPosition( Vector2( 0.0, 0.0 ) );
+		}
+		m_miniGameRecord.GridSymbols( gridSymbols );
+		m_miniGameRecord.GridTraps( gridTraps );
+		minigameData.timerWaitsForInteraction = true;
+		if( m_miniGameRecord.GridSize() != 0 )
+		{
+			m_dimension = m_miniGameRecord.GridSize();
+			minigameData.gridSize = ( ( Uint32 )( m_dimension ) );
+		}
+		else
+		{
+			ScaleBoard( entity, m_dimension, powerLevel + extraDifficulty, symbolsToUse );
+			minigameData.gridSize = ( ( Uint32 )( m_dimension ) );
+		}
+		minigameData.symbolsToUse = symbolsToUse;
+		if( m_miniGameRecord.TimeLimit() > 0.0 )
+		{
+			minigameData.timeLimit = ( ( Float )( m_miniGameRecord.TimeLimit() ) );
+			ScaleTimer( player, entity, minigameData.timeLimit, powerLevel + extraDifficulty, minigameData.timerWaitsForInteraction );
+		}
+		if( m_miniGameRecord.BufferSize() != 0 )
+		{
+			minigameData.bufferSize = ( ( Uint32 )( m_miniGameRecord.BufferSize() ) );
+		}
+		else
+		{
+			ScaleBuffer( entity, bufferSize, powerLevel + extraDifficulty, player );
+			minigameData.bufferSize = ( ( Uint32 )( bufferSize ) );
+		}
+		if( gridSymbols.Size() > 0 )
+		{
+			if( gridTraps.Size() > 0 )
+			{
+				predefBoardTrapsRule = new MinigameGenerationRulePredefinedBoardWithTraps;
+				predefBoardTrapsRule.SetBlackboard( GetBlackboardSystem() );
+				predefBoardTrapsRule.SetRecord( m_miniGameRecord );
+				minigameRules.PushBack( predefBoardTrapsRule );
+			}
+			else
+			{
+				predefBoardRule = new MinigameGenerationRulePredefinedBoard;
+				predefBoardRule.SetRecord( m_miniGameRecord );
+				minigameRules.PushBack( predefBoardRule );
+				if( !( m_miniGameRecord.NoTraps() ) )
+				{
+					ScaleTraps( entity, player, trapProb, powerLevel + extraDifficulty );
+					minigameRules.PushBack( new TrapsGenRule );
+				}
+			}
+		}
+		else
+		{
+			minigameRules.PushBack( new GridNoiseGenRule );
+			if( !( m_miniGameRecord.NoTraps() ) )
+			{
+				ScaleTraps( entity, player, trapProb, powerLevel + extraDifficulty );
+				minigameRules.PushBack( new TrapsGenRule );
+			}
+		}
+		m_miniGameRecord.OverrideProgramsList( overrideProgramList );
+		if( overrideProgramList.Size() > 0 )
+		{
+			overrideProgramsRule = new MinigameGenerationRuleOverridePrograms;
+			overrideProgramsRule.SetRecord( m_miniGameRecord );
+			overrideProgramsRule.SetIsItemBreach( m_isItemBreach );
+			minigameRules.PushBack( overrideProgramsRule );
+		}
+		else
+		{
+			scalingProgramsRule = new MinigameGenerationRuleScalingPrograms;
+			scalingProgramsRule.SetBlackboard( GetBlackboardSystem() );
+			scalingProgramsRule.SetEntity( entity );
+			scalingProgramsRule.SetPlayer( player );
+			scalingProgramsRule.SetBufferSize( ( ( Int32 )( minigameData.bufferSize ) ) );
+			minigameRules.PushBack( scalingProgramsRule );
+		}
+		if( gridSymbols.Size() <= 0 )
+		{
+			minigameRules.PushBack( new ProgramsGridGenRule );
+		}
+		if( minigameRules.Size() > 0 )
+		{
+			minigameData.rules = minigameRules;
+		}
+		m_bbMinigame.SetVariant( GetAllBlackboardDefs().HackingMinigame.MinigameDefaults, minigameData );
+		if( ProcessMinigameTutorialFact( player ) )
+		{
+			m_isTutorialActive = true;
+		}
+		else
+		{
+			m_isTutorialActive = false;
+		}
+		bbNetwork.SetVariant( GetAllBlackboardDefs().NetworkBlackboard.SelectedMinigameDef, m_miniGameRecord.GetID() );
+		bbNetwork.SignalVariant( GetAllBlackboardDefs().NetworkBlackboard.SelectedMinigameDef );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnHandleInput' );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_bbMinigame.UnregisterDelayedListener( GetAllBlackboardDefs().HackingMinigame.State, m_bbMinigameStateListener );
+		m_bbUiData.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.Controller_Disconnected, m_bbControllerStateListener );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnHandleInput' );
+		if( m_contextHelpOverlay )
+		{
+			ToggleTutorialOverlay( false );
+		}
+	}
+
+	protected event OnGameStateChanged( value : Int32 )
+	{
+		var state : HackingMinigameState;
+		state = ( ( HackingMinigameState )( value ) );
+		if( state != HackingMinigameState.InProgress && m_contextHelpOverlay )
+		{
+			ToggleTutorialOverlay( false );
+		}
+	}
+
+	protected event OnHandleInput( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'context_help' ) || ( ( ( evt.IsAction( 'click' ) || evt.IsAction( 'select' ) ) || evt.IsAction( 'cancel' ) ) && m_contextHelpOverlay ) )
+		{
+			ToggleTutorialOverlay( !( m_contextHelpOverlay ) );
+			m_contextHelpOverlay = !( m_contextHelpOverlay );
+		}
+	}
+
+	protected event OnDisconnectController( isDisconnected : Bool )
+	{
+		if( isDisconnected )
+		{
+			PauseTheTimer();
+		}
+		else
+		{
+			ResumeTheTimer();
+		}
+	}
+
+	protected event OnPositionSelected( position : Vector2 )
+	{
+		var step1, step2, step3, step4 : Vector2;
+		step1 = Vector2( 0.0, 0.0 );
+		step2 = Vector2( 4.0, 0.0 );
+		step3 = Vector2( 4.0, 1.0 );
+		step4 = Vector2( 2.0, 1.0 );
+		if( position == step1 )
+		{
+			RemoveWhitelistedPosition( step1 );
+			WhitelistPosition( step2 );
+		}
+		else if( position == step2 )
+		{
+			RemoveWhitelistedPosition( step2 );
+			WhitelistPosition( step3 );
+		}
+		else if( position == step3 )
+		{
+			RemoveWhitelistedPosition( step3 );
+			WhitelistPosition( step4 );
+		}
+	}
+
+	private function ToggleTutorialOverlay( value : Bool )
+	{
+		var data : TutorialOverlayData;
+		data.itemName = 'Root';
+		data.widgetLibraryResource = R"base\gameplay\gui\widgets\tutorial\vr_minigame_tutorial.inkwidget";
+		if( value )
+		{
+			m_uiSystem.ShowTutorialOverlay( data );
+		}
+		else
+		{
+			m_uiSystem.HideTutorialOverlay( data );
+		}
+	}
+
+	private function PrepareTooltips()
+	{
+		m_TooltipsManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_tooltipsManagerRef, 'gameuiTooltipsManager' ) ) );
+		m_TooltipsManager.Setup( ETooltipsStyle.Menus );
+	}
+
+	protected event OnShowTooltipRequest( request : MinigameTooltipShowRequest )
+	{
+		m_TooltipsManager.ShowTooltip( 0, request.data, inkMargin( 60.0, -60.0, 0.0, 0.0 ) );
+	}
+
+	protected event OnHideTooltipRequest( request : MinigameTooltipHideRequest )
+	{
+		m_TooltipsManager.HideTooltips();
+	}
+
+	protected event OnGridCellPressed( wasHorizontalyActive : Bool )
+	{
+		m_TooltipsManager.HideTooltips();
+		if( m_isTutorialActive )
+		{
+			ProcessMinigameGridClickTutorialFacts( !( wasHorizontalyActive ) );
+		}
+	}
+
+	private function ProcessMinigameGridClickTutorialFacts( horizontal : Bool )
+	{
+		var player : weak< PlayerPuppet >;
+		var ownerObject : GameObject;
+		var questSys : QuestsSystem;
+		ownerObject = GetPlayerControlledObject();
+		player = ( ( PlayerPuppet )( ownerObject ) );
+		questSys = GameInstance.GetQuestsSystem( player.GetGame() );
+		if( horizontal )
+		{
+			if( questSys.GetFact( 'minigame_horizontal_input' ) == 0 )
+			{
+				questSys.SetFact( 'minigame_horizontal_input', 1 );
+			}
+			else
+			{
+				ResumeTheTimer();
+			}
+		}
+		else
+		{
+			if( questSys.GetFact( 'minigame_vertical_input' ) == 0 )
+			{
+				questSys.SetFact( 'minigame_vertical_input', 1 );
+			}
+			else
+			{
+				m_isTutorialActive = false;
+			}
+		}
+	}
+
+	private function ProcessMinigameTutorialFact( player : PlayerPuppet ) : Bool
+	{
+		var questSys : QuestsSystem;
+		questSys = GameInstance.GetQuestsSystem( player.GetGame() );
+		if( ( questSys.GetFact( 'minigame_tutorial' ) == 0 ) && ( questSys.GetFact( 'disable_tutorials' ) == 0 ) )
+		{
+			questSys.SetFact( 'minigame_tutorial', 1 );
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public function ScaleBoard( entity : Entity, out size : Int32, powerLevel : Float, out symbolsToUse : MiniGame_AllSymbols_Record )
+	{
+		var difficulty : EGameplayChallengeLevel;
+		var maxLevel : Float;
+		maxLevel = TweakDBInterface.GetStatRecord( T"BaseStats.PowerLevel" ).Max();
+		difficulty = ( ( Device )( entity ) ).GetDevicePS().GetBackdoorAccessPoint().GetSkillCheckContainer().GetHackingSlot().GetDifficulty();
+		switch( difficulty )
+		{
+			case EGameplayChallengeLevel.NONE:
+				powerLevel -= 10.0;
+			break;
+			case EGameplayChallengeLevel.EASY:
+				powerLevel -= 0.0;
+			break;
+			case EGameplayChallengeLevel.HARD:
+				powerLevel += 10.0;
+			break;
+			case EGameplayChallengeLevel.IMPOSSIBLE:
+				powerLevel += 20.0;
+			break;
+			default:
+				break;
+		}
+		if( powerLevel < ( maxLevel / 4.0 ) )
+		{
+			size = 5;
+			symbolsToUse = TweakDBInterface.GetMiniGame_AllSymbolsRecord( T"minigame_v2.DefaultMinigameSymbols" );
+		}
+		else if( powerLevel < ( maxLevel * 0.60000002 ) )
+		{
+			size = 6;
+			symbolsToUse = TweakDBInterface.GetMiniGame_AllSymbolsRecord( T"minigame_v2.DefaultMinigameSymbols2" );
+		}
+		else
+		{
+			size = 7;
+			symbolsToUse = TweakDBInterface.GetMiniGame_AllSymbolsRecord( T"minigame_v2.DefaultMinigameSymbols3" );
+		}
+	}
+
+	public function ScaleTraps( entity : Entity, player : PlayerPuppet, out prob : Float, powerLevel : Float )
+	{
+		var difficulty : EGameplayChallengeLevel;
+		difficulty = ( ( Device )( entity ) ).GetDevicePS().GetBackdoorAccessPoint().GetSkillCheckContainer().GetHackingSlot().GetDifficulty();
+		powerLevel -= GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.PowerLevel );
+		switch( difficulty )
+		{
+			case EGameplayChallengeLevel.NONE:
+				powerLevel -= 10.0;
+			break;
+			case EGameplayChallengeLevel.EASY:
+				powerLevel -= 0.0;
+			break;
+			case EGameplayChallengeLevel.HARD:
+				powerLevel += 10.0;
+			break;
+			case EGameplayChallengeLevel.IMPOSSIBLE:
+				powerLevel += 20.0;
+			break;
+			default:
+				break;
+		}
+		if( powerLevel != 0.0 )
+		{
+			prob *= ( 1.0 + ( powerLevel / 100.0 ) );
+		}
+	}
+
+	public function ScaleTimer( player : PlayerPuppet, entity : Entity, out time : Float, powerLevel : Float, out waitInteraction : Bool )
+	{
+		var difficulty : EGameplayChallengeLevel;
+		var statValue : Float;
+		var timerNotRemoteMultiplier : Float;
+		var tempMultiplier : Float;
+		timerNotRemoteMultiplier = 1.5;
+		difficulty = ( ( Device )( entity ) ).GetDevicePS().GetBackdoorAccessPoint().GetSkillCheckContainer().GetHackingSlot().GetDifficulty();
+		switch( difficulty )
+		{
+			case EGameplayChallengeLevel.NONE:
+				powerLevel -= 20.0;
+			break;
+			case EGameplayChallengeLevel.EASY:
+				powerLevel -= 0.0;
+			break;
+			case EGameplayChallengeLevel.HARD:
+				powerLevel += 10.0;
+			break;
+			case EGameplayChallengeLevel.IMPOSSIBLE:
+				powerLevel += 20.0;
+			break;
+			default:
+				break;
+		}
+		statValue = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.MinigameTimeLimitExtension );
+		if( statValue != 0.0 )
+		{
+			time *= statValue;
+		}
+		if( !( m_isRemoteBreach ) && m_isOfficerBreach )
+		{
+			time *= timerNotRemoteMultiplier;
+		}
+		if( m_numberAttempts > 1 )
+		{
+			tempMultiplier = 1.0 / ( ( ( Float )( ( m_numberAttempts - 1 ) ) ) * 1.33000004 );
+			if( tempMultiplier < 0.2 )
+			{
+				tempMultiplier = 0.2;
+			}
+			time *= tempMultiplier;
+		}
+	}
+
+	public function FilterTraps( out trapList : array< MiniGame_Trap_Record > )
+	{
+		var i : Int32;
+		for( i = trapList.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_isOfficerBreach && trapList[ i ].TrapType().EnumName() == 'Device' )
+			{
+				trapList.Remove( trapList[ i ] );
+			}
+			else if( !( m_isOfficerBreach ) && trapList[ i ].TrapType().EnumName() == 'NPC' )
+			{
+				trapList.Remove( trapList[ i ] );
+			}
+		}
+	}
+
+	public function ScaleBuffer( entity : Entity, out size : Float, powerLevel : Float, player : PlayerPuppet )
+	{
+		var difficulty : EGameplayChallengeLevel;
+		var baseStatValue : Float;
+		var statValue, statValue2 : Float;
+		difficulty = ( ( Device )( entity ) ).GetDevicePS().GetBackdoorAccessPoint().GetSkillCheckContainer().GetHackingSlot().GetDifficulty();
+		baseStatValue = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.BufferSize );
+		size = baseStatValue;
+		statValue += ( ( Float )( player.GetBufferModifier() ) );
+		statValue2 = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.MinigameBufferExtension );
+		player.SetBufferModifier( 0 );
+		size += statValue;
+		size += statValue2;
+		switch( difficulty )
+		{
+			case EGameplayChallengeLevel.NONE:
+				size += 0.0;
+			break;
+			case EGameplayChallengeLevel.EASY:
+				size += 0.0;
+			break;
+			case EGameplayChallengeLevel.HARD:
+				size -= 1.0;
+			break;
+			case EGameplayChallengeLevel.IMPOSSIBLE:
+				size -= 2.0;
+			break;
+			default:
+				break;
+		}
+		if( size < 4.0 )
+		{
+			size = 4.0;
+		}
+	}
+
+}
+
+class MinigameGenerationRuleOverridePrograms extends MinigameGenerationRule
+{
+
+	protected override function OnProcessRule( size : Uint32, out grid : array< array< GridCell > > ) : Bool
+	{
+		var program : UnlockableProgram;
+		var overrideProgramList : array< weak< Program_Record > >;
+		var programRecord : Program_Record;
+		var minigameRecord : MinigameAction_Record;
+		var i, j : Int32;
+		var obj : ObjectAction_Record;
+		var programChain : array< Int32 >;
+		var finalChain : array< Uint32 >;
+		var rand : Float;
+		m_minigameRecord.OverrideProgramsList( overrideProgramList );
+		for( i = 0; i < overrideProgramList.Size(); i += 1 )
+		{
+			programRecord = overrideProgramList[ i ];
+			obj = programRecord.Program();
+			program.programTweakID = obj.GetID();
+			minigameRecord = TweakDBInterface.GetMinigameActionRecord( program.programTweakID );
+			program.name = StringToName( LocKeyToString( minigameRecord.ObjectActionUI().Caption() ) );
+			program.note = minigameRecord.ObjectActionUI().Description();
+			program.iconTweakID = minigameRecord.ObjectActionUI().CaptionIcon().TexturePartID().GetID();
+			if( ( !( m_isItemBreach ) && ( i == 0 ) ) && ( GameInstance.GetStatsSystem( m_player.GetGame() ).GetStatValue( m_player.GetEntityID(), gamedataStatType.AutomaticUploadPerk ) >= 1.0 ) )
+			{
+				program.isFulfilled = true;
+			}
+			else
+			{
+				program.isFulfilled = false;
+			}
+			programChain = programRecord.CharactersChain();
+			for( j = 0; j < programChain.Size(); j += 1 )
+			{
+				if( programChain[ j ] == -1 )
+				{
+					rand = RandRangeF( 0.0, 1.0 );
+					finalChain.PushBack( ( ( Uint32 )( minigameController.GetRarity( rand ) ) ) );
+				}
+				else
+				{
+					finalChain.PushBack( ( ( Uint32 )( programChain[ j ] ) ) );
+				}
+			}
+			minigameController.AddUnlockableProgram( program, finalChain );
+			finalChain.Clear();
+		}
+		return true;
+	}
+
+	public function ConvertToUint( arr : array< Int32 > ) : array< Uint32 >
+	{
+		var arr2 : array< Uint32 >;
+		var i : Int32;
+		for( i = 0; i < arr.Size(); i += 1 )
+		{
+			arr2.PushBack( ( ( Uint32 )( arr[ i ] ) ) );
+		}
+		return arr2;
+	}
+
+}
+
+class MinigameGenerationRuleScalingPrograms extends MinigameGenerationRule
+{
+	var m_bbNetwork : weak< IBlackboard >;
+	var m_isOfficerBreach : Bool;
+	var m_isRemoteBreach : Bool;
+	var m_isFirstAttempt : Bool;
+
+	protected override function OnProcessRule( size : Uint32, out grid : array< array< GridCell > > ) : Bool
+	{
+		var powerLevel : Float;
+		var programComplexity : Float;
+		var combinedPowerLevel : Float;
+		var length, i, x : Int32;
+		var playerPrograms : array< MinigameProgramData >;
+		var program : UnlockableProgram;
+		var rand : Float;
+		var overlapProbability : Float;
+		var atStart : Bool;
+		var overlappingPrograms : array< Overlap >;
+		var overlapInstance : Overlap;
+		var miniGameRecord : weak< Minigame_Def_Record >;
+		var miniGameActionRecord : weak< MinigameAction_Record >;
+		var tempPrograms : array< TweakDBID >;
+		var isItemBreach : Bool;
+		var extraDifficulty : Float;
+		m_bbNetwork = m_blackboardSystem.Get( GetAllBlackboardDefs().NetworkBlackboard );
+		m_isOfficerBreach = m_bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.OfficerBreach );
+		m_isRemoteBreach = m_bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.RemoteBreach );
+		m_isFirstAttempt = m_bbNetwork.GetInt( GetAllBlackboardDefs().NetworkBlackboard.Attempt ) == 1;
+		isItemBreach = m_bbNetwork.GetBool( GetAllBlackboardDefs().NetworkBlackboard.ItemBreach );
+		playerPrograms = minigameController.GetPlayerPrograms();
+		FilterPlayerPrograms( playerPrograms );
+		miniGameRecord = TweakDBInterface.GetMinigame_DefRecord( T"minigame_v2.DefaultMinigame" );
+		powerLevel = GameInstance.GetStatsSystem( ( ( GameObject )( m_entity ) ).GetGame() ).GetStatValue( m_entity.GetEntityID(), gamedataStatType.PowerLevel );
+		extraDifficulty = miniGameRecord.ExtraDifficulty();
+		overlapProbability = miniGameRecord.OverlapProbability();
+		RandomMode( atStart );
+		if( playerPrograms.Size() > 0 )
+		{
+			for( i = 0; i < ( playerPrograms.Size() + 1 ); i += 1 )
+			{
+				rand = RandRangeF( 0.0, 1.0 );
+				if( rand < overlapProbability )
+				{
+					overlapInstance.instructionNumber = i;
+					x = RandDifferent( i, playerPrograms.Size() + 1 );
+					rand = RandRangeF( 0.0, 1.0 );
+					overlapInstance.otherInstruction = x;
+					overlapInstance.atStart = atStart;
+					overlapInstance.rarity = minigameController.GetRarity( rand );
+					overlappingPrograms.PushBack( overlapInstance );
+					RandomMode( atStart );
+				}
+			}
+		}
+		tempPrograms.Clear();
+		for( i = 0; i < playerPrograms.Size(); i += 1 )
+		{
+			miniGameActionRecord = TweakDBInterface.GetMinigameActionRecord( playerPrograms[ i ].actionID );
+			programComplexity = miniGameActionRecord.Complexity();
+			combinedPowerLevel = ( programComplexity + powerLevel ) + extraDifficulty;
+			length = DefineLength( combinedPowerLevel, m_bufferSize, playerPrograms.Size() );
+			program.name = StringToName( LocKeyToString( miniGameActionRecord.ObjectActionUI().Caption() ) );
+			program.note = miniGameActionRecord.ObjectActionUI().Description();
+			program.programTweakID = playerPrograms[ i ].actionID;
+			program.iconTweakID = miniGameActionRecord.ObjectActionUI().CaptionIcon().TexturePartID().GetID();
+			if( ( !( isItemBreach ) && ( i == 0 ) ) && ( GameInstance.GetStatsSystem( m_player.GetGame() ).GetStatValue( m_player.GetEntityID(), gamedataStatType.AutomaticUploadPerk ) >= 1.0 ) )
+			{
+				program.isFulfilled = true;
+			}
+			else
+			{
+				program.isFulfilled = false;
+			}
+			if( !( tempPrograms.Contains( program.programTweakID ) ) )
+			{
+				tempPrograms.PushBack( program.programTweakID );
+				minigameController.AddUnlockableProgram( program, GenerateRarities( length, overlappingPrograms, i + 1 ) );
+			}
+		}
+		return true;
+	}
+
+	public function FilterPlayerPrograms( out programs : array< MinigameProgramData > )
+	{
+		var i : Int32;
+		var miniGameActionRecord : weak< MinigameAction_Record >;
+		var data : ConnectedClassTypes;
+		if( ( ( GameObject )( m_entity ) ).IsPuppet() )
+		{
+			data = ( ( ScriptedPuppet )( m_entity ) ).GetMasterConnectedClassTypes();
+		}
+		else
+		{
+			data = ( ( Device )( m_entity ) ).GetDevicePS().CheckMasterConnectedClassTypes();
+		}
+		for( i = programs.Size() - 1; i >= 0; i -= 1 )
+		{
+			miniGameActionRecord = TweakDBInterface.GetMinigameActionRecord( programs[ i ].actionID );
+			if( !( IsNameValid( programs[ i ].programName ) ) || programs[ i ].programName == 'None' )
+			{
+				programs.Erase( i );
+				continue;
+			}
+			if( !( m_isRemoteBreach ) && miniGameActionRecord.Type().EnumName() != 'AccessPoint' )
+			{
+				programs.Erase( i );
+				continue;
+			}
+			if( m_isRemoteBreach && miniGameActionRecord.Type().EnumName() == 'AccessPoint' )
+			{
+				programs.Erase( i );
+				continue;
+			}
+			if( miniGameActionRecord.Category().EnumName() == 'Camera Access' && !( data.surveillanceCamera ) )
+			{
+				programs.Erase( i );
+				continue;
+			}
+			else if( miniGameActionRecord.Category().EnumName() == 'Turret Access' && !( data.securityTurret ) )
+			{
+				programs.Erase( i );
+				continue;
+			}
+			else if( miniGameActionRecord.Type().EnumName() == 'NPC' && !( data.puppet ) )
+			{
+				programs.Erase( i );
+				continue;
+			}
+		}
+	}
+
+	public function GenerateRarities( length : Int32, overlap : array< Overlap >, id : Int32 ) : array< Uint32 >
+	{
+		var rarities : array< Uint32 >;
+		var rand : Float;
+		var i : Int32;
+		for( i = 0; i < length; i += 1 )
+		{
+			rand = RandRangeF( 0.0, 1.0 );
+			rarities.PushBack( ( ( Uint32 )( minigameController.GetRarity( rand ) ) ) );
+		}
+		for( i = 0; i < overlap.Size(); i += 1 )
+		{
+			if( overlap[ i ].instructionNumber == id )
+			{
+				if( overlap[ i ].atStart )
+				{
+					rarities[ 0 ] = ( ( Uint32 )( overlap[ i ].rarity ) );
+				}
+				else
+				{
+					rarities[ rarities.Size() - 1 ] = ( ( Uint32 )( overlap[ i ].rarity ) );
+				}
+			}
+			if( overlap[ i ].otherInstruction == id )
+			{
+				if( overlap[ i ].atStart )
+				{
+					rarities[ rarities.Size() - 1 ] = ( ( Uint32 )( overlap[ i ].rarity ) );
+				}
+				else
+				{
+					rarities[ 0 ] = ( ( Uint32 )( overlap[ i ].rarity ) );
+				}
+			}
+		}
+		return rarities;
+	}
+
+	public function DefineLength( combinedPowerLevel : Float, bufferSize : Int32, numPrograms : Int32 ) : Int32
+	{
+		var normalizedLevel, residual, rand, modifier, perkModifierLevel : Float;
+		var min, max : Float;
+		var length : Int32;
+		min = 1.0;
+		max = 120.0;
+		if( numPrograms > 0 )
+		{
+			combinedPowerLevel = combinedPowerLevel - ( ( ( 3.0 * combinedPowerLevel ) * ( ( Float )( numPrograms ) ) ) / max );
+		}
+		normalizedLevel = 2.0 + ( ( ( combinedPowerLevel - min ) * ( 5.0 - 2.0 ) ) / ( max - min ) );
+		length = ( ( Int32 )( normalizedLevel ) );
+		residual = normalizedLevel - ( ( Float )( length ) );
+		rand = RandRangeF( 0.0, 1.0 );
+		if( rand < residual )
+		{
+			length += 1;
+		}
+		perkModifierLevel = GameInstance.GetStatsSystem( m_player.GetGame() ).GetStatValue( m_player.GetEntityID(), gamedataStatType.ShorterChains );
+		modifier = perkModifierLevel;
+		if( ( modifier > 0.0 ) && ( length > 2 ) )
+		{
+			length -= 1;
+		}
+		if( length < 2 )
+		{
+			length = 2;
+		}
+		if( length > 5 )
+		{
+			length = 5;
+		}
+		if( length > bufferSize )
+		{
+			return bufferSize;
+		}
+		return length;
+	}
+
+	public function SwapMode( out b : Bool )
+	{
+		if( b )
+		{
+			b = false;
+		}
+		else
+		{
+			b = true;
+		}
+	}
+
+	public function RandomMode( out b : Bool )
+	{
+		var rand : Float;
+		rand = RandRangeF( 0.0, 1.0 );
+		if( rand >= 0.5 )
+		{
+			b = true;
+		}
+		else
+		{
+			b = false;
+		}
+	}
+
+}
+
+class MinigameGenerationRulePredefinedBoardWithTraps extends MinigameGenerationRule
+{
+
+	protected override function OnProcessRule( size : Uint32, out grid : array< array< GridCell > > ) : Bool
+	{
+		var i, j : Int32;
+		var tempCell : GridCell;
+		var tempArray : array< GridCell >;
+		var recordGrid : array< weak< RowSymbols_Record > >;
+		var recordTrapsGrid : array< weak< RowTraps_Record > >;
+		var row : array< Int32 >;
+		var rowTraps : array< Int32 >;
+		var recordRow : RowSymbols_Record;
+		var recordTrapsRow : RowTraps_Record;
+		m_minigameRecord.GridSymbols( recordGrid );
+		m_minigameRecord.GridTraps( recordTrapsGrid );
+		for( i = 0; i < ( ( Int32 )( size ) ); i += 1 )
+		{
+			for( j = 0; j < ( ( Int32 )( size ) ); j += 1 )
+			{
+				recordRow = recordGrid[ i ];
+				row = recordRow.Symbols();
+				tempCell.rarityValue = row[ j ];
+				recordTrapsRow = recordTrapsGrid[ i ];
+				rowTraps = recordTrapsRow.Traps();
+				tempCell.currentTrap = IntToTrap( rowTraps[ j ] );
+				tempArray.PushBack( tempCell );
+			}
+			grid.PushBack( tempArray );
+			tempArray.Clear();
+		}
+		return true;
+	}
+
+}
+
+class MinigameGenerationRulePredefinedBoard extends MinigameGenerationRule
+{
+
+	protected override function OnProcessRule( size : Uint32, out grid : array< array< GridCell > > ) : Bool
+	{
+		var i, j : Int32;
+		var tempCell : GridCell;
+		var tempArray : array< GridCell >;
+		var trapRecord : weak< MiniGame_Trap_Record >;
+		var recordGrid : array< weak< RowSymbols_Record > >;
+		var row : array< Int32 >;
+		var recordRow : RowSymbols_Record;
+		trapRecord = TweakDBInterface.GetMiniGame_TrapRecord( T"MinigameTraps.NONE" );
+		m_minigameRecord.GridSymbols( recordGrid );
+		for( i = 0; i < ( ( Int32 )( size ) ); i += 1 )
+		{
+			for( j = 0; j < ( ( Int32 )( size ) ); j += 1 )
+			{
+				recordRow = recordGrid[ i ];
+				row = recordRow.Symbols();
+				tempCell.rarityValue = row[ j ];
+				tempCell.currentTrap = trapRecord;
+				tempArray.PushBack( tempCell );
+			}
+			grid.PushBack( tempArray );
+			tempArray.Clear();
+		}
+		return true;
+	}
+
+}
+
+enum MinigameActionType
+{
+	Device = 0,
+	NPC = 1,
+	Both = 2,
+	AccessPoint = 3,
+}
+

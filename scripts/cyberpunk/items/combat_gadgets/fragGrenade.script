@@ -1,0 +1,2072 @@
+struct BeamData
+{
+	var startDirection : Vector4;
+	var endDirection : Vector4;
+	var effect : EffectInstance;
+	var target : weak< GameObject >;
+}
+
+class GrenadeMappinData extends MappinScriptData
+{
+	var m_grenadeType : EGrenadeType;
+	var m_iconID : TweakDBID;
+}
+
+import class WeaponGrenade extends ItemObject
+{
+	protected import var deliveryMethod : gamedataGrenadeDeliveryMethodType;
+	protected import var lastHitNormal : Vector4;
+
+	public import function OnExplosion();
+}
+
+class BaseGrenade extends WeaponGrenade
+{
+	protected var m_projectileComponent : ProjectileComponent;
+	protected var m_user : weak< GameObject >;
+	protected var m_projectileSpawnPoint : Vector4;
+	protected var m_shootCollision : SimpleColliderComponent;
+	protected var m_visualComponent : IComponent;
+	protected var m_stickyMeshComponent : IComponent;
+	protected var m_decalsStickyComponent : IComponent;
+	protected var m_homingMeshComponent : IComponent;
+	protected var m_targetingComponent : TargetingComponent;
+	protected var m_resourceLibraryComponent : ResourceLibraryComponent;
+	protected var m_mappinID : NewMappinID;
+	protected var m_timeSinceLaunch : Float;
+	protected var m_detonationTimer : Float;
+	protected var m_stickyTrackerTimeout : Float;
+	protected var m_timeOfFreezing : Float;
+	protected var m_spawnBlinkEffectDelayID : DelayID;
+	protected var m_detonateRequestDelayID : DelayID;
+	protected var m_releaseRequestDelayID : DelayID;
+	protected var m_delayToDetonate : Float;
+	protected var m_detonationTimerActive : Bool;
+	protected var m_isAlive : Bool;
+	default m_isAlive = true;
+	protected var m_isSinking : Bool;
+	default m_isSinking = false;
+	protected var m_landedOnGround : Bool;
+	default m_landedOnGround = false;
+	protected var m_isStuck : Bool;
+	protected var m_isTracking : Bool;
+	protected var m_isLockingOn : Bool;
+	protected var m_isLockedOn : Bool;
+	protected var m_readyToTrack : Bool;
+	protected var m_lockOnFailed : Bool;
+	protected var m_canBeShot : Bool;
+	protected var m_shotDownByThePlayer : Bool;
+	protected var m_forceExplosion : Bool;
+	protected var m_hasClearedIgnoredObject : Bool;
+	protected var m_detonateOnImpact : Bool;
+	protected var m_setStickyTracker : Bool;
+	protected var m_isContinuousEffect : Bool;
+	protected var m_additionalAttackOnDetonate : Bool;
+	protected var m_additionalAttackOnCollision : Bool;
+	protected var m_targetAcquired : Bool;
+	default m_targetAcquired = false;
+	protected var m_collidedWithNPC : Bool;
+	protected var m_isBroadcastingStim : Bool;
+	protected var m_playingFastBeep : Bool;
+	protected var m_targetTracker : EffectInstance;
+	protected var m_potentialHomingTargets : array< GrenadePotentialHomingTarget >;
+	protected var m_homingGrenadeTarget : GrenadePotentialHomingTarget;
+	protected var m_cuttingGrenadePotentialTargets : array< CuttingGrenadePotentialTarget >;
+	protected var m_drillTargetPosition : Vector4;
+	protected var m_attacksSpawned : array< EffectInstance >;
+	protected var m_tweakRecord : Grenade_Record;
+	private editable var m_additionalEffect : FxResource;
+	protected var m_landedCooldownActive : Bool;
+	protected var m_landedCooldownTimer : Float;
+	protected var m_hasHitWater : Bool;
+	protected var m_waterHeight : Float;
+	protected var m_cpoTimeBeforeRelease : Float;
+	default m_cpoTimeBeforeRelease = 3.0f;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'projectileComponent', 'ProjectileComponent', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'StimBroadcaster', 'StimBroadcasterComponent', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ShootCollision', 'SimpleColliderComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'GrenadeBody', 'IComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'homing_mesh', 'IComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'sticky_mesh', 'IComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'sticky_decals', 'IComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'targetingComponent', 'TargetingComponent', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ResourceLibrary', 'ResourceLibraryComponent', true );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_projectileComponent = ( ( ProjectileComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'projectileComponent' ) ) );
+		m_shootCollision = ( ( SimpleColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ShootCollision' ) ) );
+		m_visualComponent = EntityResolveComponentsInterface.GetComponent( ri, 'GrenadeBody' );
+		m_stickyMeshComponent = EntityResolveComponentsInterface.GetComponent( ri, 'sticky_mesh' );
+		m_decalsStickyComponent = EntityResolveComponentsInterface.GetComponent( ri, 'sticky_decals' );
+		m_homingMeshComponent = EntityResolveComponentsInterface.GetComponent( ri, 'homing_mesh' );
+		m_targetingComponent = ( ( TargetingComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'targetingComponent' ) ) );
+		m_resourceLibraryComponent = ( ( ResourceLibraryComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ResourceLibrary' ) ) );
+	}
+
+	protected function PreloadAttackResources()
+	{
+		var effectSystem : EffectSystem;
+		effectSystem = GameInstance.GetGameEffectSystem( GetGame() );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.Attack() ) ), effectSystem );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.AdditionalAttack() ) ), effectSystem );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.EnemyAttack() ) ), effectSystem );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.NpcHitReactionAttack() ) ), effectSystem );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.ShallowWaterAttack() ) ), effectSystem );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.DeepWaterAttack() ) ), effectSystem );
+		PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( TweakDBInterface.GetAttackRecord( T"Attacks.ReconGrenadeBeams" ) ) ), effectSystem );
+	}
+
+	protected function ReleaseAttackResources()
+	{
+		var effectSystem : EffectSystem;
+		effectSystem = GameInstance.GetGameEffectSystem( GetGame() );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.Attack() ) ), effectSystem );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.AdditionalAttack() ) ), effectSystem );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.EnemyAttack() ) ), effectSystem );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.NpcHitReactionAttack() ) ), effectSystem );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.ShallowWaterAttack() ) ), effectSystem );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( m_tweakRecord.DeepWaterAttack() ) ), effectSystem );
+		ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( TweakDBInterface.GetAttackRecord( T"Attacks.ReconGrenadeBeams" ) ) ), effectSystem );
+	}
+
+	protected event OnVisualSpawnAttached()
+	{
+		super.OnVisualSpawnAttached();
+		if( IsConnectedWithDrop() )
+		{
+			SetThrowableAnimFeatureOnGrenade( 3, this );
+		}
+	}
+
+	protected event OnProjectileInitialize( eventData : gameprojectileSetUpEvent )
+	{
+		m_user = eventData.owner;
+		m_tweakRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) );
+		deliveryMethod = m_tweakRecord.DeliveryMethod().Type().Type();
+		Reset();
+		SetupDeliveryMethodMesh();
+		m_projectileComponent.SetEnergyLossFactor( m_tweakRecord.DeliveryMethod().Bounciness(), 0.11 );
+		if( ( ( Bool )GameInstance.GetStatsSystem( m_user.GetGame() ).GetStatValue( m_user.GetEntityID(), gamedataStatType.CanSeeGrenadeRadius ) ) )
+		{
+			m_projectileComponent.SetExplosionVisualRadius( GetAttackRadius() );
+		}
+		m_projectileComponent.SetCollisionEvaluator( new GrenadeCollisionEvaluator );
+		m_projectileComponent.SetDeactivationDepth( m_tweakRecord.SinkingDepth() );
+		PreloadAttackResources();
+	}
+
+	protected virtual function Reset()
+	{
+		var delaySystem : DelaySystem;
+		var invalidDelayID : DelayID;
+		var invalidHomingTarget : GrenadePotentialHomingTarget;
+		delaySystem = GameInstance.GetDelaySystem( GetGame() );
+		invalidDelayID = GetInvalidDelayID();
+		m_isAlive = true;
+		m_isSinking = false;
+		m_landedOnGround = false;
+		m_isStuck = false;
+		m_isTracking = false;
+		m_timeSinceLaunch = 0.0;
+		m_timeOfFreezing = 999999.0;
+		m_hasClearedIgnoredObject = false;
+		m_isLockingOn = false;
+		m_isLockedOn = false;
+		m_readyToTrack = false;
+		m_lockOnFailed = false;
+		m_shotDownByThePlayer = false;
+		m_forceExplosion = false;
+		m_detonateOnImpact = false;
+		m_targetAcquired = false;
+		m_collidedWithNPC = false;
+		m_isBroadcastingStim = false;
+		m_playingFastBeep = false;
+		m_homingGrenadeTarget = invalidHomingTarget;
+		m_potentialHomingTargets.Clear();
+		m_cuttingGrenadePotentialTargets.Clear();
+		m_attacksSpawned.Clear();
+		m_drillTargetPosition = Vector4.EmptyVector();
+		lastHitNormal = Vector4.EmptyVector();
+		m_landedCooldownActive = false;
+		m_landedCooldownTimer = 0.0;
+		m_hasHitWater = false;
+		m_waterHeight = 0.0;
+		m_isContinuousEffect = TDB.GetBool( ItemID.GetTDBID( GetItemID() ) + T".isContinuousEffect", false );
+		m_delayToDetonate = TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".delayToDetonate", 0.1 );
+		m_setStickyTracker = TDB.GetBool( ItemID.GetTDBID( GetItemID() ) + T".setStickyTracker", false );
+		m_stickyTrackerTimeout = TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".stickyTrackerTimeout", 10.0 );
+		m_additionalAttackOnDetonate = TDB.GetBool( ItemID.GetTDBID( GetItemID() ) + T".additionalAttackOnDetonate", false );
+		m_additionalAttackOnCollision = TDB.GetBool( ItemID.GetTDBID( GetItemID() ) + T".additionalAttackOnCollision", false );
+		if( m_spawnBlinkEffectDelayID != invalidDelayID )
+		{
+			delaySystem.CancelDelay( m_spawnBlinkEffectDelayID );
+			m_spawnBlinkEffectDelayID = invalidDelayID;
+		}
+		if( m_detonateRequestDelayID != invalidDelayID )
+		{
+			delaySystem.CancelDelay( m_detonateRequestDelayID );
+			m_detonateRequestDelayID = invalidDelayID;
+		}
+		if( m_releaseRequestDelayID != invalidDelayID )
+		{
+			delaySystem.CancelDelay( m_releaseRequestDelayID );
+			m_releaseRequestDelayID = invalidDelayID;
+		}
+		SetCanBeShot( false );
+		if( m_targetingComponent && ( ( NPCPuppet )( m_user ) ) )
+		{
+			m_targetingComponent.Toggle( true );
+		}
+		if( m_visualComponent )
+		{
+			m_visualComponent.Toggle( true );
+		}
+		m_detonationTimer = 0.0;
+		m_detonationTimerActive = false;
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Regular )
+		{
+			m_detonationTimerActive = true;
+		}
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+		{
+			m_detonationTimerActive = true;
+			m_projectileComponent.SetOnCollisionAction( gameprojectileOnCollisionAction.StopAndStick );
+		}
+		if( IsGrenadeOfType( EGrenadeType.Piercing ) )
+		{
+			m_projectileComponent.SetOnCollisionAction( gameprojectileOnCollisionAction.StopAndStickPerpendicular );
+		}
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing )
+		{
+			m_timeOfFreezing = ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).FreezeDelay();
+		}
+		InitializeRotation();
+	}
+
+	protected function SetupDeliveryMethodMesh()
+	{
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+		{
+			m_stickyMeshComponent.Toggle( true );
+			m_decalsStickyComponent.Toggle( true );
+		}
+		else if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing )
+		{
+			m_homingMeshComponent.Toggle( true );
+		}
+	}
+
+	private function GetAttackRadius() : Float
+	{
+		var value : Float;
+		var data : weak< gameItemData >;
+		data = GetItemData();
+		value = data.GetStatValueByType( gamedataStatType.Range );
+		return value;
+	}
+
+	public function GetInitialVelocity( isQuickThrow : Bool ) : Float
+	{
+		var initialVelocity : Float;
+		var tweakRecord : Grenade_Record;
+		tweakRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) );
+		if( !( isQuickThrow ) )
+		{
+			initialVelocity = tweakRecord.DeliveryMethod().InitialVelocity();
+		}
+		else
+		{
+			initialVelocity = tweakRecord.DeliveryMethod().InitialQuickThrowVelocity();
+		}
+		return initialVelocity;
+	}
+
+	public function GetAccelerationZ() : Float
+	{
+		var tweakRecord : Grenade_Record;
+		tweakRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) );
+		return tweakRecord.DeliveryMethod().AccelerationZ();
+	}
+
+	public function SetCanBeShot( canBeShot : Bool )
+	{
+		m_canBeShot = canBeShot;
+		if( m_shootCollision != NULL )
+		{
+			if( m_canBeShot )
+			{
+				m_shootCollision.Resize( GetShootCollisionSize(), 0 );
+			}
+			m_shootCollision.Toggle( m_canBeShot );
+		}
+	}
+
+	protected event OnShoot( eventData : gameprojectileShootEvent )
+	{
+		var mappinSystem : MappinSystem;
+		var grenadeMappinData : MappinData;
+		var spawnBlinkEffectRequest : CuttingGrenadeSpawnBlinkEffectEvent;
+		var grenadeData : GrenadeMappinData;
+		var grenadeType : EGrenadeType;
+		m_projectileSpawnPoint = eventData.startPoint;
+		GameObject.PlayVoiceOver( eventData.owner, 'grenade_throw', 'Scripts:Grenade_OnShoot' );
+		Reset();
+		if( ( m_user != NULL ) && ( m_mappinID.value == ( ( Uint64 )( 0 ) ) ) )
+		{
+			grenadeType = GetGrenadeType();
+			grenadeData = new GrenadeMappinData;
+			grenadeData.m_grenadeType = grenadeType;
+			grenadeData.m_iconID = GetMappinIconIDForGrenadeType( grenadeType );
+			mappinSystem = GameInstance.GetMappinSystem( m_user.GetGame() );
+			grenadeMappinData.mappinType = T"Mappins.InteractionMappinDefinition";
+			grenadeMappinData.variant = gamedataMappinVariant.GrenadeVariant;
+			grenadeMappinData.active = true;
+			grenadeMappinData.scriptData = grenadeData;
+			m_mappinID = mappinSystem.RegisterGrenadeMappin( grenadeMappinData, ( ( GameObject )( this ) ) );
+		}
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Regular && !( m_isContinuousEffect ) )
+		{
+			SetTracking( true );
+			if( m_tweakRecord.DeliveryMethod().TrackingRadius() > 0.0 )
+			{
+				GameObject.StartReplicatedEffectEvent( this, 'fx_regular_scanning', true, false );
+			}
+		}
+		if( m_isContinuousEffect )
+		{
+			spawnBlinkEffectRequest = new CuttingGrenadeSpawnBlinkEffectEvent;
+			m_spawnBlinkEffectDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, spawnBlinkEffectRequest, m_delayToDetonate - 0.40000001, true );
+			RequestGrenadeDetonation( m_delayToDetonate );
+		}
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+		{
+			PlayStickyGrenadeLongBeepSound();
+		}
+		PlayNPCGrenadeBeepSound();
+	}
+
+	protected event OnShootTarget( eventData : gameprojectileShootTargetEvent )
+	{
+		OnShoot( eventData );
+	}
+
+	protected event OnCollision( eventData : gameprojectileHitEvent )
+	{
+		var puppetTarget : ScriptedPuppet;
+		var impactSpeed : Float;
+		var tags : array< CName >;
+		var hitInstance : gameprojectileHitInstance;
+		var i : Int32;
+		if( !( m_isAlive ) || m_isSinking )
+		{
+			return false;
+		}
+		for( i = 0; i < eventData.hitInstances.Size(); i += 1 )
+		{
+			hitInstance = eventData.hitInstances[ i ];
+			if( hitInstance.isWaterSurfaceImpact )
+			{
+				if( !( hitInstance.hitThroughWaterSurface ) )
+				{
+					m_hasHitWater = true;
+					m_waterHeight = hitInstance.position.Z;
+					if( !( GameObject.IsCooldownActive( this, 'grenade_water_impact_effects' ) ) )
+					{
+						SpawnEffectFromLibrary( 'splash_effect' );
+						GameObject.PlaySound( this, 'w_bul_hit_water_heavy' );
+						RenderingSystem.AddWaterImpulse( hitInstance.position, m_tweakRecord.WaterSurfaceImpactImpulseRadius(), m_tweakRecord.WaterSurfaceImpactImpulseStrength() );
+						GameObject.StartCooldown( this, 'grenade_water_impact_effects', 0.2 );
+					}
+				}
+				continue;
+			}
+			else if( m_hasHitWater && ( ( hitInstance.position.Z - m_waterHeight ) <= m_tweakRecord.SinkingDepth() ) )
+			{
+				break;
+			}
+			puppetTarget = ( ( ScriptedPuppet )( hitInstance.hitObject ) );
+			lastHitNormal = ( ( Vector4 )( hitInstance.traceResult.normal ) );
+			if( !( m_landedOnGround ) && ( Vector4.GetAngleBetween( lastHitNormal, Vector4( 0.0, 0.0, 1.0, 0.0 ) ) < 35.0 ) )
+			{
+				m_landedOnGround = true;
+			}
+			if( !( GameObject.IsCooldownActive( this, 'grenade_impact_sound' ) ) )
+			{
+				impactSpeed = Vector4.Length( hitInstance.velocity );
+				GameObject.SetAudioParameter( this, 'ph_impact_velocity', impactSpeed );
+				tags = m_tweakRecord.Tags();
+				if( tags.Contains( 'Ozob' ) )
+				{
+					GameObject.PlaySound( this, 'gre_impact_solid_ozob' );
+				}
+				else
+				{
+					GameObject.PlaySound( this, 'gre_impact_solid' );
+				}
+				GameObject.StartCooldown( this, 'grenade_impact_sound', 0.2 );
+			}
+			if( IsGrenadeOfType( EGrenadeType.Piercing ) && ( deliveryMethod != gamedataGrenadeDeliveryMethodType.Homing || m_targetAcquired ) )
+			{
+				if( m_additionalAttackOnCollision && puppetTarget )
+				{
+					SpawnOnPuppetCollisionAttack( m_tweakRecord.AdditionalAttack(), puppetTarget );
+				}
+				else
+				{
+					GameObject.StartReplicatedEffectEvent( this, 'fx_drill', true, true );
+				}
+				DrillThrough( hitInstance );
+			}
+			else if( m_additionalAttackOnCollision && m_targetAcquired )
+			{
+				if( puppetTarget )
+				{
+					SpawnOnPuppetCollisionAttack( m_tweakRecord.AdditionalAttack(), puppetTarget );
+				}
+				Detonate( lastHitNormal );
+			}
+			else if( m_detonateOnImpact )
+			{
+				Detonate( lastHitNormal );
+			}
+			else
+			{
+				if( !( m_isBroadcastingStim ) )
+				{
+					TriggerGrenadeLandedStimuli( true );
+				}
+				if( ( !( m_collidedWithNPC ) && puppetTarget ) && ( m_tweakRecord.DeliveryMethod().TrackingRadius() == 0.0 ) )
+				{
+					m_collidedWithNPC = true;
+					SpawnAttack( m_tweakRecord.NpcHitReactionAttack() );
+				}
+				if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+				{
+					GameObject.StartReplicatedEffectEvent( this, 'fx_sticky', true, true );
+					GameObject.PlaySound( this, 'grenade_stick' );
+					m_isStuck = true;
+				}
+				if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing && !( m_isTracking ) )
+				{
+					m_timeOfFreezing = m_timeSinceLaunch + ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).FreezeDelayAfterBounce();
+				}
+				else if( ( IsGrenadeOfType( EGrenadeType.Cutting ) && !( m_isTracking ) ) && ( ( ( m_delayToDetonate + m_tweakRecord.AttackDuration() ) - m_timeSinceLaunch ) > 0.5 ) )
+				{
+					m_timeOfFreezing = m_timeSinceLaunch + TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".freezeDelayAfterBounce", 0.1 );
+				}
+			}
+			break;
+		}
+	}
+
+	protected event OnForceActivation( evt : gameprojectileForceActivationEvent )
+	{
+		m_forceExplosion = true;
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		var instigatorIsPlayer : Bool;
+		if( m_isAlive )
+		{
+			instigatorIsPlayer = evt.attackData.GetInstigator() == GetPlayer( GetGame() );
+			if( instigatorIsPlayer && m_canBeShot )
+			{
+				m_shotDownByThePlayer = true;
+				CheckForGunslingerAchievement( evt.attackData );
+				Detonate();
+			}
+			else if( m_isStuck && evt.attackData.HasFlag( hitFlag.DetonateGrenades ) )
+			{
+				RequestGrenadeDetonation( Vector4.Distance( GetWorldPosition(), evt.attackData.GetAttackPosition() ) / 5.0 );
+			}
+		}
+	}
+
+	protected function CheckForGunslingerAchievement( attackData : AttackData )
+	{
+		var dataTrackingSystem : DataTrackingSystem;
+		var achievementRequest : AddAchievementRequest;
+		var achievement : gamedataAchievement;
+		achievement = gamedataAchievement.Gunslinger;
+		if( m_isSinking )
+		{
+			return;
+		}
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( GetGame() ).Get( 'DataTrackingSystem' ) ) );
+		if( dataTrackingSystem.IsAchievementUnlocked( achievement ) )
+		{
+			return;
+		}
+		if( WeaponObject.GetWeaponType( attackData.GetWeapon().GetItemID() ) == gamedataItemType.Wea_Revolver )
+		{
+			if( GameObject.GetAttitudeTowards( m_user, GetPlayer( GetGame() ) ) == EAIAttitude.AIA_Hostile )
+			{
+				if( !( m_landedOnGround ) )
+				{
+					achievementRequest = new AddAchievementRequest;
+					achievementRequest.achievement = achievement;
+					dataTrackingSystem.QueueRequest( achievementRequest );
+				}
+			}
+		}
+	}
+
+	protected event OnTick( eventData : gameprojectileTickEvent )
+	{
+		var isUnderwater : Bool;
+		if( m_detonationTimerActive )
+		{
+			m_detonationTimer += eventData.deltaTime;
+		}
+		if( m_landedCooldownActive )
+		{
+			m_landedCooldownTimer += eventData.deltaTime;
+			if( m_landedCooldownTimer >= 1.0 )
+			{
+				m_landedCooldownActive = false;
+				m_landedCooldownTimer = 0.0;
+			}
+		}
+		m_timeSinceLaunch += eventData.deltaTime;
+		isUnderwater = IsUnderwater();
+		if( isUnderwater && !( m_isSinking ) )
+		{
+			TryToSinkAndRequestDetonation();
+		}
+		if( m_isSinking )
+		{
+			return false;
+		}
+		if( m_isAlive && !( m_isContinuousEffect ) )
+		{
+			if( m_forceExplosion )
+			{
+				Detonate();
+			}
+			else if( m_detonationTimerActive && ( m_detonationTimer >= m_tweakRecord.DeliveryMethod().DetonationTimer() ) )
+			{
+				Detonate( lastHitNormal );
+			}
+			else if( !( m_hasClearedIgnoredObject ) && ( m_timeSinceLaunch >= 0.15000001 ) )
+			{
+				m_hasClearedIgnoredObject = true;
+				m_projectileComponent.ClearIgnoredEntities();
+			}
+			else if( ( ( ( m_tweakRecord.ShootCollisionEnableDelay() >= 0.0 ) && ( m_shootCollision != NULL ) ) && ( m_timeSinceLaunch >= m_tweakRecord.ShootCollisionEnableDelay() ) ) && m_canBeShot == false )
+			{
+				SetCanBeShot( true );
+			}
+			if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+			{
+				if( ( ( m_tweakRecord.DeliveryMethod().DetonationTimer() - m_detonationTimer ) <= 0.80000001 ) && !( m_playingFastBeep ) )
+				{
+					m_playingFastBeep = true;
+					PlayStickyGrenadeShortBeepSound();
+				}
+			}
+			else if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing )
+			{
+				if( ( ( !( isUnderwater ) && ( m_timeSinceLaunch >= m_timeOfFreezing ) ) && !( m_isLockingOn ) ) && !( m_lockOnFailed ) )
+				{
+					DelayTargetTrackingStateChange( true, 1.0 );
+					Freeze();
+					FloatToLockOnAltitude();
+					if( !( m_isBroadcastingStim ) )
+					{
+						TriggerGrenadeLandedStimuli( true );
+					}
+					GameObject.StartReplicatedEffectEvent( this, 'homing_thrust', true, false );
+					m_isLockingOn = true;
+					m_timeOfFreezing += 1.0;
+				}
+				else if( ( m_isLockingOn && ( ( m_timeSinceLaunch - m_timeOfFreezing ) >= ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).LockOnDelay() ) ) && !( m_readyToTrack ) )
+				{
+					m_readyToTrack = true;
+					if( m_targetAcquired )
+					{
+						QueueSmartTrajectory( ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).LockOnDelay() );
+					}
+				}
+				else if( ( m_isLockingOn && ( ( m_timeSinceLaunch - m_timeOfFreezing ) >= ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).FreezeDuration() ) ) && !( m_targetAcquired ) )
+				{
+					DropToFloor();
+					SetTracking( false );
+					RequestGrenadeDetonation( ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).LockOnFailDetonationDelay() );
+					GameObject.BreakReplicatedEffectLoopEvent( this, 'fx_homing_freeze' );
+					GameObject.StopReplicatedEffectEvent( this, 'homing_thrust' );
+					m_isLockingOn = false;
+					m_lockOnFailed = true;
+				}
+			}
+		}
+		if( !( isUnderwater ) )
+		{
+			if( ( ( ( m_isAlive && IsGrenadeOfType( EGrenadeType.Cutting ) ) && ( m_timeOfFreezing > 0.0 ) ) && ( m_timeSinceLaunch > m_timeOfFreezing ) ) && !( m_isLockingOn ) )
+			{
+				FloatCuttingGrenadeUp();
+				GameObject.StartReplicatedEffectEvent( this, 'homing_thrust', true, false );
+				if( !( m_isBroadcastingStim ) )
+				{
+					TriggerGrenadeLandedStimuli( true );
+				}
+				m_isLockingOn = true;
+			}
+			if( m_isContinuousEffect && ( m_timeSinceLaunch >= m_tweakRecord.AttackDuration() ) )
+			{
+				if( IsGrenadeOfType( EGrenadeType.Cutting ) && !( m_lockOnFailed ) )
+				{
+					StopCuttingGrenadeAttack();
+				}
+				else if( !( IsGrenadeOfType( EGrenadeType.Cutting ) ) )
+				{
+					Release( true );
+				}
+			}
+		}
+		OnServerTick( eventData );
+	}
+
+	protected function OnServerTick( eventData : gameprojectileTickEvent )
+	{
+		if( GameInstance.GetRuntimeInfo( GetGame() ).IsServer() )
+		{
+			if( !( m_isAlive ) && ( m_timeSinceLaunch >= m_cpoTimeBeforeRelease ) )
+			{
+				Release();
+			}
+		}
+	}
+
+	protected virtual function Detonate( optional hitNormal : Vector4 )
+	{
+		var effect : EffectInstance;
+		var additionalEffect : EffectInstance;
+		var currentPosition : Vector4;
+		var vfxOffset : Vector4;
+		var detonationLocation : Vector4;
+		var detonationSoundName : CName;
+		var detonationRumbleName : String;
+		var detonationStimRadius : Float;
+		var attackRadius : Float;
+		var attackDuration : Float;
+		var attack : weak< Attack_Record >;
+		var minDetonationDelay : Float;
+		var isUnderwater : Bool;
+		var isDeepUnderwater : Bool;
+		isUnderwater = false;
+		isDeepUnderwater = false;
+		if( m_detonateRequestDelayID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_detonateRequestDelayID );
+			m_detonateRequestDelayID = GetInvalidDelayID();
+		}
+		currentPosition = GetWorldPosition();
+		isUnderwater = IsUnderwater();
+		if( isUnderwater )
+		{
+			isDeepUnderwater = ( currentPosition.Z - m_waterHeight ) <= m_tweakRecord.DeepWaterDepth();
+		}
+		if( m_isContinuousEffect && isUnderwater )
+		{
+			minDetonationDelay = m_delayToDetonate + m_tweakRecord.SinkingDetonationDelay();
+			if( m_timeSinceLaunch < minDetonationDelay )
+			{
+				RequestGrenadeDetonation( minDetonationDelay - m_timeSinceLaunch );
+				return;
+			}
+		}
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing )
+		{
+			GameObject.StopReplicatedEffectEvent( this, 'fx_homing_freeze' );
+			GameObject.StopReplicatedEffectEvent( this, 'homing_thrust' );
+			if( m_homingGrenadeTarget.entity )
+			{
+				GameObject.SendForceRevealObjectEvent( m_homingGrenadeTarget.entity, false, 'HomingGrenade' );
+			}
+		}
+		else if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+		{
+			StopStickyGrenadeSounds();
+			if( m_tweakRecord.RemoveMeshOnDetonation() )
+			{
+				GameObject.StopReplicatedEffectEvent( this, 'fx_sticky' );
+			}
+		}
+		SetCanBeShot( false );
+		StopNPCGrenadeBeepSound();
+		RemoveGrenadeLandedStimuli();
+		attackDuration = m_tweakRecord.AttackDuration();
+		if( isUnderwater )
+		{
+			attack = ( ( isDeepUnderwater ) ? ( m_tweakRecord.DeepWaterAttack() ) : ( m_tweakRecord.ShallowWaterAttack() ) );
+			attackRadius = attack.Range();
+			if( m_tweakRecord.SpawnFxAtWaterSurface() )
+			{
+				vfxOffset = Vector4( 0.0, 0.0, m_waterHeight - currentPosition.Z, 0.0 );
+			}
+			effect = SpawnAttack( attack, attackRadius, attackDuration, hitNormal, currentPosition, vfxOffset );
+			effect.AttachToEntity( this, GetAllBlackboardDefs().EffectSharedData.position );
+			AddWaterImpulsesOnDetonation( currentPosition, attackRadius, 4 );
+			detonationRumbleName = m_tweakRecord.UnderwaterDetonationRumbleName();
+			detonationStimRadius = m_tweakRecord.UnderwaterDetonationStimRadius();
+		}
+		else
+		{
+			attack = m_tweakRecord.Attack();
+			attackRadius = GetAttackRadius();
+			if( IsGrenadeOfType( EGrenadeType.Cutting ) )
+			{
+				SpawnLaserAttack( attack, 21, attackRadius, attackDuration, false, 0.04 );
+			}
+			else
+			{
+				effect = SpawnAttack( attack, attackRadius, attackDuration, hitNormal );
+				effect.AttachToEntity( this, GetAllBlackboardDefs().EffectSharedData.position );
+				if( IsGrenadeOfType( EGrenadeType.Recon ) )
+				{
+					SpawnLaserAttack( TweakDBInterface.GetAttackRecord( T"Attacks.ReconGrenadeBeams" ), 7, attackRadius, attackDuration, true );
+					additionalEffect = SpawnAttack( m_tweakRecord.AdditionalAttack(), attackRadius * 0.5, attackDuration, hitNormal );
+					additionalEffect.AttachToEntity( this, GetAllBlackboardDefs().EffectSharedData.position );
+				}
+			}
+			if( m_additionalAttackOnDetonate )
+			{
+				attack = m_tweakRecord.AdditionalAttack();
+				additionalEffect = SpawnAttack( attack, attack.Range(), 0.0, hitNormal );
+				additionalEffect.AttachToEntity( this, GetAllBlackboardDefs().EffectSharedData.position );
+			}
+			SpawnVisualEffectsOnDetonation();
+			detonationSoundName = StringToName( m_tweakRecord.DetonationSound() );
+			GameObject.PlayMetadataEvent( this, detonationSoundName );
+			GameInstance.GetAudioSystem( GetGame() ).PlayShockwave( detonationSoundName, detonationLocation );
+			detonationRumbleName = m_tweakRecord.DetonationRumbleName();
+			detonationStimRadius = m_tweakRecord.DetonationStimRadius();
+		}
+		GameObject.PlaySound( this, TDB.GetCName( TDBID.Create( "rumble.world." + detonationRumbleName ) ) );
+		TriggerStimuli( detonationStimRadius );
+		if( !( IsGrenadeOfType( EGrenadeType.Recon ) ) && !( IsGrenadeOfType( EGrenadeType.Cutting ) ) )
+		{
+			SendCombatGadgetIsAliveFeature();
+		}
+		if( m_tweakRecord.RemoveMeshOnDetonation() || isUnderwater )
+		{
+			if( m_visualComponent )
+			{
+				m_visualComponent.Toggle( false );
+			}
+			if( m_stickyMeshComponent )
+			{
+				m_stickyMeshComponent.Toggle( false );
+				m_decalsStickyComponent.Toggle( false );
+			}
+			if( m_homingMeshComponent )
+			{
+				m_homingMeshComponent.Toggle( false );
+			}
+		}
+		OnExplosion();
+		if( m_tweakRecord.ReleaseOnDetonation() || isUnderwater )
+		{
+			Release( isUnderwater );
+		}
+	}
+
+	protected function SendCombatGadgetIsAliveFeature()
+	{
+		var animFeature : AnimFeature_CombatGadget;
+		animFeature = new AnimFeature_CombatGadget;
+		animFeature.isDetonated = true;
+		AnimationControllerComponent.ApplyFeature( this, 'Grenade', animFeature );
+	}
+
+	protected function SetThrowableAnimFeatureOnGrenade( newState : Int32, target : weak< GameObject > )
+	{
+		var feature : AnimFeature_Throwable;
+		feature = new AnimFeature_Throwable;
+		feature.state = newState;
+		AnimationControllerComponent.ApplyFeature( this, 'CombatGadget', feature );
+	}
+
+	protected virtual function SpawnVisualEffectsOnDetonation()
+	{
+		if( IsGrenadeOfType( EGrenadeType.Incendiary ) )
+		{
+			SpawnEffectOnGround( m_resourceLibraryComponent.GetResource( 'incendiary_ground_effect' ) );
+		}
+		else if( IsGrenadeOfType( EGrenadeType.Piercing ) )
+		{
+			SpawnPiercingExplosion();
+		}
+	}
+
+	protected function AddWaterImpulsesOnDetonation( position : Vector4, attackRadius : Float, numImpulses : Int32 )
+	{
+		var impulseRadius : Float;
+		var impulseStrength : Float;
+		var i : Int32;
+		impulseRadius = ( attackRadius * m_tweakRecord.WaterDetonationImpulseRadiusCoef() ) * RandRangeF( 0.80000001, 1.20000005 );
+		impulseStrength = m_tweakRecord.WaterDetonationImpulseStrength() * RandRangeF( 0.1, 1.20000005 );
+		RenderingSystem.AddWaterImpulse( position, impulseRadius, impulseStrength );
+		for( i = 0; i < ( numImpulses - 1 ); i += 1 )
+		{
+			RenderingSystem.AddWaterImpulse( position + Vector4.RandRing( impulseRadius * 0.25, impulseRadius * 0.89999998 ), impulseRadius * RandRangeF( 0.40000001, 0.80000001 ), impulseStrength );
+		}
+	}
+
+	protected event OnCuttingGrenadeSpawnBlinkEffectEvent( evt : CuttingGrenadeSpawnBlinkEffectEvent )
+	{
+		GameObject.StartReplicatedEffectEvent( this, 'fx_diode', true, false );
+	}
+
+	protected event OnCuttingGrenadeDespawnEffectsEvent( evt : CuttingGrenadeDespawnEffectsEvent )
+	{
+		GameObjectEffectHelper.BreakEffectLoopEvent( this, 'fx_laser' );
+	}
+
+	public static function SendGrenadeAnimFeatureChangeEvent( owner : weak< GameObject >, itemID : ItemID )
+	{
+		var evt : GrenadeAnimFeatureChangeEvent;
+		var item : weak< ItemObject >;
+		if( !( owner ) )
+		{
+			return;
+		}
+		item = GameInstance.GetTransactionSystem( owner.GetGame() ).GetItemInSlotByItemID( owner, itemID );
+		if( !( item ) )
+		{
+			return;
+		}
+		evt = new GrenadeAnimFeatureChangeEvent;
+		evt.newState = 1;
+		item = GameInstance.GetTransactionSystem( owner.GetGame() ).GetItemInSlotByItemID( owner, itemID );
+		item.QueueEvent( evt );
+	}
+
+	protected event OnGrenadeAnimFeatureChange( evt : GrenadeAnimFeatureChangeEvent )
+	{
+		SetThrowableAnimFeatureOnGrenade( evt.newState, this );
+	}
+
+	protected function SpawnEffectFromLibrary( key : CName )
+	{
+		var transform : WorldTransform;
+		var effect : FxResource;
+		effect = m_resourceLibraryComponent.GetResource( key );
+		if( FxResource.IsValid( effect ) )
+		{
+			WorldTransform.SetPosition( transform, GetWorldPosition() );
+			WorldTransform.SetOrientationFromDir( transform, Quaternion.GetForward( GetWorldOrientation() ) );
+			GameInstance.GetFxSystem( GetGame() ).SpawnEffect( effect, transform );
+		}
+	}
+
+	protected virtual function SpawnEffectOnGround( groundEffect : FxResource )
+	{
+		var transform : WorldTransform;
+		var ground : Vector4;
+		if( FxResource.IsValid( groundEffect ) && m_user )
+		{
+			WorldTransform.SetPosition( transform, GetWorldPosition() );
+			ground = m_user.GetWorldForward();
+			ground.Z = 0.0;
+			WorldTransform.SetOrientationFromDir( transform, ground );
+			GameInstance.GetFxSystem( GetGame() ).SpawnEffectOnGround( groundEffect, transform, 2.5 );
+		}
+	}
+
+	protected virtual function SpawnPiercingExplosion()
+	{
+		var transform : WorldTransform;
+		if( FxResource.IsValid( m_additionalEffect ) && m_user )
+		{
+			if( !( Vector4.IsZero( m_drillTargetPosition ) ) )
+			{
+				WorldTransform.SetPosition( transform, m_drillTargetPosition );
+			}
+			else
+			{
+				WorldTransform.SetPosition( transform, GetWorldPosition() );
+			}
+			GameInstance.GetFxSystem( GetGame() ).SpawnEffect( m_additionalEffect, transform );
+		}
+	}
+
+	protected virtual function IsGrenadeOfType( compareType : EGrenadeType ) : Bool
+	{
+		var tags : array< CName >;
+		tags = m_tweakRecord.Tags();
+		switch( compareType )
+		{
+			case EGrenadeType.Frag:
+				return tags.Contains( 'FragGrenade' );
+			case EGrenadeType.Flash:
+				return tags.Contains( 'FlashGrenade' );
+			case EGrenadeType.Piercing:
+				return tags.Contains( 'PiercingGrenade' );
+			case EGrenadeType.EMP:
+				return tags.Contains( 'EMPGrenade' );
+			case EGrenadeType.Biohazard:
+				return tags.Contains( 'BiohazardGrenade' );
+			case EGrenadeType.Incendiary:
+				return tags.Contains( 'IncendiaryGrenade' );
+			case EGrenadeType.Recon:
+				return tags.Contains( 'ReconGrenade' );
+			case EGrenadeType.Cutting:
+				return tags.Contains( 'CuttingGrenade' );
+			case EGrenadeType.Sonic:
+				return tags.Contains( 'SonicGrenade' );
+			default:
+				return false;
+		}
+	}
+
+	protected function GetGrenadeType() : EGrenadeType
+	{
+		var tags : array< CName >;
+		var returnValue : EGrenadeType;
+		tags = m_tweakRecord.Tags();
+		if( tags.Contains( 'FragGrenade' ) )
+		{
+			returnValue = EGrenadeType.Frag;
+		}
+		else if( tags.Contains( 'FlashGrenade' ) )
+		{
+			returnValue = EGrenadeType.Flash;
+		}
+		else if( tags.Contains( 'PiercingGrenade' ) )
+		{
+			returnValue = EGrenadeType.Piercing;
+		}
+		else if( tags.Contains( 'EMPGrenade' ) )
+		{
+			returnValue = EGrenadeType.EMP;
+		}
+		else if( tags.Contains( 'BiohazardGrenade' ) )
+		{
+			returnValue = EGrenadeType.Biohazard;
+		}
+		else if( tags.Contains( 'IncendiaryGrenade' ) )
+		{
+			returnValue = EGrenadeType.Incendiary;
+		}
+		else if( tags.Contains( 'ReconGrenade' ) )
+		{
+			returnValue = EGrenadeType.Recon;
+		}
+		else if( tags.Contains( 'CuttingGrenade' ) )
+		{
+			returnValue = EGrenadeType.Cutting;
+		}
+		else if( tags.Contains( 'SonicGrenade' ) )
+		{
+			returnValue = EGrenadeType.Sonic;
+		}
+		return returnValue;
+	}
+
+	protected function GetMappinIconIDForGrenadeType( type : EGrenadeType ) : TweakDBID
+	{
+		var iconID : TweakDBID;
+		switch( type )
+		{
+			case EGrenadeType.Frag:
+				iconID = T"MappinIcons.GrenadeMappin";
+			break;
+			case EGrenadeType.Flash:
+				iconID = T"MappinIcons.FlashbangGrenadeMappin";
+			break;
+			case EGrenadeType.Piercing:
+				iconID = T"MappinIcons.GrenadeMappin";
+			break;
+			case EGrenadeType.EMP:
+				iconID = T"MappinIcons.EMPGrenadeMappin";
+			break;
+			case EGrenadeType.Biohazard:
+				iconID = T"MappinIcons.BiohazardGrenadeMappin";
+			break;
+			case EGrenadeType.Incendiary:
+				iconID = T"MappinIcons.IncendiaryGrenadeMappin";
+			break;
+			case EGrenadeType.Recon:
+				iconID = T"MappinIcons.ReconGrenadeMappin";
+			break;
+			case EGrenadeType.Cutting:
+				iconID = T"MappinIcons.CuttingGrenadeMappin";
+			break;
+			case EGrenadeType.Sonic:
+				iconID = T"MappinIcons.GrenadeMappin";
+			break;
+			default:
+				iconID = T"MappinIcons.GrenadeMappin";
+			break;
+		}
+		return iconID;
+	}
+
+	protected function ShouldUsePlayerAttack() : Bool
+	{
+		var player : weak< GameObject >;
+		player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject();
+		if( ( m_user == player ) || GameObject.GetAttitudeTowards( m_user, player ) == EAIAttitude.AIA_Friendly )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected event OnFollowSuccess( eventData : gameprojectileFollowEvent )
+	{
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing )
+		{
+			if( m_isLockedOn )
+			{
+				Detonate();
+			}
+			else
+			{
+				m_projectileComponent.ClearTrajectories();
+			}
+		}
+	}
+
+	protected function TriggerStimuli( radius : Float )
+	{
+		var investigateData : stimInvestigateData;
+		var broadcaster : StimBroadcasterComponent;
+		if( radius > 0.0 )
+		{
+			broadcaster = GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				investigateData.attackInstigator = ( ( Entity )( GetUser() ) );
+				investigateData.attackInstigatorPosition = GetUser().GetWorldPosition();
+				investigateData.revealsInstigatorPosition = true;
+				broadcaster.TriggerSingleBroadcast( this, m_tweakRecord.DetonationStimType().Type(), radius, investigateData );
+			}
+		}
+	}
+
+	protected function TriggerGrenadeLandedStimuli( hasLifeTime : Bool )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		var investigateData : stimInvestigateData;
+		RemoveGrenadeLandedStimuli();
+		if( hasLifeTime && ( ( m_tweakRecord.DeliveryMethod().DetonationTimer() - m_detonationTimer ) <= 0.5 ) )
+		{
+			hasLifeTime = false;
+		}
+		broadcaster = GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky || IsGrenadeOfType( EGrenadeType.Recon ) )
+			{
+				if( !( m_landedCooldownActive ) )
+				{
+					investigateData.attackInstigator = ( ( Entity )( GetUser() ) );
+					broadcaster.TriggerSingleBroadcast( this, gamedataStimType.ProjectileDistraction, 1.5, investigateData );
+					m_landedCooldownActive = true;
+				}
+			}
+			else if( hasLifeTime )
+			{
+				broadcaster.AddActiveStimuli( this, gamedataStimType.GrenadeLanded, ( m_tweakRecord.DeliveryMethod().DetonationTimer() - m_detonationTimer ) - 0.15000001, GetAttackRadius() + 2.0 );
+				m_isBroadcastingStim = true;
+			}
+			else
+			{
+				broadcaster.TriggerSingleBroadcast( this, gamedataStimType.GrenadeLanded, GetAttackRadius() + 2.0 );
+			}
+		}
+	}
+
+	protected function RemoveGrenadeLandedStimuli()
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.RemoveActiveStimuliByName( this, gamedataStimType.GrenadeLanded );
+		}
+	}
+
+	protected function DetermineLandedStimType() : gamedataStimType
+	{
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky || IsGrenadeOfType( EGrenadeType.Recon ) )
+		{
+			return gamedataStimType.ProjectileDistraction;
+		}
+		else
+		{
+			return gamedataStimType.GrenadeLanded;
+		}
+	}
+
+	protected function SpawnAttack( attackRecord : Attack_Record, optional range : Float, optional duration : Float, optional hitNormal : Vector4, optional position : Vector4, optional vfxOffset : Vector4 ) : EffectInstance
+	{
+		var attack : Attack_GameEffect;
+		var effect : EffectInstance;
+		var attackContext : AttackInitContext;
+		var statMods : array< gameStatModifierData >;
+		var flag : SHitFlag;
+		var hitFlags : array< SHitFlag >;
+		var hitCooldown : Float;
+		attackContext.record = attackRecord;
+		attackContext.instigator = m_user;
+		attackContext.source = this;
+		attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		attack.GetStatModList( statMods );
+		effect = attack.PrepareAttack( m_user );
+		if( !( m_shotDownByThePlayer ) )
+		{
+			flag.flag = hitFlag.CanDamageSelf;
+			flag.source = 'GrenadeDetonation';
+			hitFlags.PushBack( flag );
+			EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.flags, hitFlags );
+		}
+		if( range > 0.0 )
+		{
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.range, range );
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, range );
+		}
+		if( !( Vector4.IsZero( position ) ) )
+		{
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position );
+		}
+		else
+		{
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, GetWorldPosition() );
+		}
+		if( duration > 0.0 )
+		{
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.duration, duration );
+		}
+		hitCooldown = TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".effectCooldown", 0.0 );
+		if( hitCooldown > 0.0 )
+		{
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.hitCooldown, hitCooldown );
+		}
+		if( !( Vector4.IsZero( hitNormal ) ) )
+		{
+			EffectData.SetQuat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.rotation, Quaternion.BuildFromDirectionVector( hitNormal, Vector4( 0.0, 0.0, 1.0, 0.0 ) ) );
+		}
+		if( !( Vector4.IsZero( vfxOffset ) ) )
+		{
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.vfxOffset, vfxOffset );
+		}
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+		attack.StartAttack();
+		return effect;
+	}
+
+	protected function SpawnLaserAttack( attackRecord : Attack_Record, numberOfLasers : Int32, optional range : Float, optional duration : Float, playSlotAnimation : Bool, optional delayPerLaser : Float )
+	{
+		var i : Int32;
+		var spawnLaserEvent : SpawnLaserAttackEvent;
+		for( i = 0; i < numberOfLasers; i += 1 )
+		{
+			if( delayPerLaser <= 0.0 )
+			{
+				SpawnLaserAttackSingle( attackRecord, range, duration, i, playSlotAnimation );
+			}
+			else
+			{
+				spawnLaserEvent = new SpawnLaserAttackEvent;
+				spawnLaserEvent.attackRecord = attackRecord;
+				spawnLaserEvent.range = range;
+				spawnLaserEvent.duration = duration;
+				spawnLaserEvent.index = i;
+				spawnLaserEvent.playSlotAnimation = playSlotAnimation;
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, spawnLaserEvent, delayPerLaser * ( ( Float )( i ) ), true );
+			}
+		}
+	}
+
+	protected event OnSpawnLaserAttackEvent( evt : SpawnLaserAttackEvent )
+	{
+		if( !( IsUnderwater() ) )
+		{
+			SpawnLaserAttackSingle( evt.attackRecord, evt.range, evt.duration, evt.index, evt.playSlotAnimation );
+		}
+	}
+
+	protected function SpawnLaserAttackSingle( attackRecord : Attack_Record, range : Float, duration : Float, index : Int32, playSlotAnimation : Bool )
+	{
+		var effect : EffectInstance;
+		effect = SpawnAttack( attackRecord, range, duration );
+		effect.AttachToSlot( this, StringToName( "beam_" + index ), GetAllBlackboardDefs().EffectSharedData.position, GetAllBlackboardDefs().EffectSharedData.forward );
+		if( playSlotAnimation )
+		{
+			PlayLaserSlotAnimation( index );
+		}
+		m_attacksSpawned.PushBack( effect );
+	}
+
+	protected function TerminateCuttingGrenadeAttack()
+	{
+		var i : Int32;
+		for( i = m_attacksSpawned.Size(); i >= 0; i -= 1 )
+		{
+			m_attacksSpawned[ i ].Terminate();
+		}
+	}
+
+	protected function PlayLaserSlotAnimation( index : Int32 )
+	{
+		var transformAnimationPlayEvent : gameTransformAnimationPlayEvent;
+		transformAnimationPlayEvent = new gameTransformAnimationPlayEvent;
+		transformAnimationPlayEvent.animationName = StringToName( ( "beam_" + index ) + "_animation" );
+		transformAnimationPlayEvent.looping = true;
+		transformAnimationPlayEvent.timeScale = 1.0;
+		GetOwner().QueueEvent( transformAnimationPlayEvent );
+	}
+
+	protected virtual function GetShootCollisionSize() : Vector4
+	{
+		return Vector4( 0.30000001, 0.30000001, 0.30000001, 0.0 );
+	}
+
+	protected function RequestGrenadeRelease( delay : Float )
+	{
+		var releaseRequestEvent : GrenadeReleaseRequestEvent;
+		if( m_releaseRequestDelayID == GetInvalidDelayID() )
+		{
+			releaseRequestEvent = new GrenadeReleaseRequestEvent;
+			m_releaseRequestDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, releaseRequestEvent, delay, true );
+		}
+	}
+
+	protected event OnReleaseRequestEvent( evt : GrenadeReleaseRequestEvent )
+	{
+		Release( true );
+	}
+
+	protected final function Release( optional isInstant : Bool )
+	{
+		var despawnRequest : GrenadeDespawnRequestEvent;
+		var delay : Float;
+		if( !( m_isAlive ) )
+		{
+			return;
+		}
+		if( ( m_mappinID.value != ( ( Uint64 )( 0 ) ) ) && ( m_user != NULL ) )
+		{
+			GameInstance.GetMappinSystem( m_user.GetGame() ).UnregisterMappin( m_mappinID );
+			m_mappinID.value = 0;
+		}
+		SetTracking( false );
+		m_projectileComponent.ClearTrajectories();
+		if( !( GameInstance.GetRuntimeInfo( GetGame() ).IsMultiplayer() ) || MultiplayerCanRelease() )
+		{
+			despawnRequest = new GrenadeDespawnRequestEvent;
+			delay = ( ( m_tweakRecord.AttackDuration() > 0.0 ) ? ( m_tweakRecord.AttackDuration() ) : ( 1.5 ) );
+			if( isInstant )
+			{
+				delay = 0.01;
+			}
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, despawnRequest, delay, false );
+			m_isAlive = false;
+		}
+		ReleaseAttackResources();
+		if( m_releaseRequestDelayID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_releaseRequestDelayID );
+		}
+		if( m_detonateRequestDelayID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_detonateRequestDelayID );
+		}
+	}
+
+	protected function MultiplayerCanRelease() : Bool
+	{
+		return GameInstance.GetRuntimeInfo( GetGame() ).IsServer() && ( m_timeSinceLaunch >= m_cpoTimeBeforeRelease );
+	}
+
+	protected event OnDespawnRequest( evt : GrenadeDespawnRequestEvent )
+	{
+		var transactionSystem : TransactionSystem;
+		var animFeature : AnimFeature_CombatGadget;
+		animFeature = new AnimFeature_CombatGadget;
+		if( !( m_tweakRecord.RemoveMeshOnDetonation() ) )
+		{
+			GameObject.StopReplicatedEffectEvent( this, 'fx_sticky' );
+			if( !( IsUnderwater() ) )
+			{
+				SpawnEffectFromLibrary( 'despawn_effect' );
+			}
+		}
+		transactionSystem = GameInstance.GetTransactionSystem( GetGame() );
+		transactionSystem.ReleaseItem( GetOwner(), this );
+		SetThrowableAnimFeatureOnGrenade( 0, this );
+		animFeature.isDetonated = false;
+		AnimationControllerComponent.ApplyFeature( this, 'Grenade', animFeature );
+	}
+
+	private function InitializeRotation()
+	{
+		var rotationAxesX : array< Float >;
+		var rotationAxesY : array< Float >;
+		var rotationAxesZ : array< Float >;
+		var rotationAxesSpeeds : array< Float >;
+		var randomRotationAxes : Int32;
+		var rotationSpeedMin : Float;
+		var rotationSpeedMax : Float;
+		var useSeed : Bool;
+		var seed : Int32;
+		var i : Int32;
+		var x : Float;
+		var y : Float;
+		var z : Float;
+		var timeSystem : TimeSystem;
+		var axis : Vector4;
+		m_projectileComponent.ToggleAxisRotation( true );
+		timeSystem = GameInstance.GetTimeSystem( GetGame() );
+		rotationAxesX = m_tweakRecord.RotationAxesX();
+		rotationAxesY = m_tweakRecord.RotationAxesY();
+		rotationAxesZ = m_tweakRecord.RotationAxesZ();
+		rotationAxesSpeeds = m_tweakRecord.RotationAxesSpeeds();
+		randomRotationAxes = m_tweakRecord.RandomRotationAxes();
+		rotationSpeedMin = m_tweakRecord.RotationSpeedMin();
+		rotationSpeedMax = m_tweakRecord.RotationSpeedMax();
+		useSeed = m_tweakRecord.UseSeed();
+		seed = m_tweakRecord.Seed();
+		if( !( useSeed ) )
+		{
+			seed = ( ( Int32 )( timeSystem.GetGameTimeStamp() ) );
+		}
+		for( i = 0; i < rotationAxesX.Size(); i += 1 )
+		{
+			axis = Vector4( rotationAxesX[ i ], rotationAxesY[ i ], rotationAxesZ[ i ], 0.0 );
+			m_projectileComponent.AddAxisRotation( axis, rotationAxesSpeeds[ i ] );
+		}
+		for( i = 0; i < randomRotationAxes; i += 1 )
+		{
+			x = RandNoiseF( seed, 1.0, -1.0 );
+			y = RandNoiseF( seed, 1.0, -1.0 );
+			z = RandNoiseF( seed, 1.0, -1.0 );
+			axis = Vector4( x, y, z, 0.0 );
+			m_projectileComponent.AddAxisRotation( axis, RandNoiseF( seed, rotationSpeedMax, rotationSpeedMin ) );
+		}
+	}
+
+	protected function Freeze()
+	{
+		m_projectileComponent.ClearTrajectories();
+		GameObject.StartReplicatedEffectEvent( this, 'fx_homing_freeze', true, false );
+	}
+
+	protected function DrillThrough( collisionEventData : gameprojectileHitInstance )
+	{
+		var drillDuration : Float;
+		var stopDrillingRequest : GrenadeStopDrillingRequestEvent;
+		stopDrillingRequest = new GrenadeStopDrillingRequestEvent;
+		m_projectileComponent.ClearTrajectories();
+		m_visualComponent.Toggle( false );
+		m_shootCollision.Toggle( false );
+		m_drillTargetPosition = GetDrillTargetPosition( collisionEventData.position, ( ( Vector4 )( collisionEventData.traceResult.normal ) ) );
+		if( ( ( ScriptedPuppet )( collisionEventData.hitObject ) ) )
+		{
+			m_drillTargetPosition = GetWorldPosition() + ( ( m_drillTargetPosition - GetWorldPosition() ) / 2.0 );
+		}
+		drillDuration = Vector4.Length( GetWorldPosition() - m_drillTargetPosition );
+		RequestGrenadeDetonation( drillDuration + 2.5 );
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, stopDrillingRequest, drillDuration, true );
+		m_detonationTimerActive = false;
+	}
+
+	protected function SpawnOnPuppetCollisionAttack( attackRecord : Attack_Record, optional targetEntity : ScriptedPuppet ) : EffectInstance
+	{
+		var attack : Attack_GameEffect;
+		var effect : EffectInstance;
+		var attackContext : AttackInitContext;
+		var statMods : array< gameStatModifierData >;
+		attackContext.record = attackRecord;
+		attackContext.instigator = m_user;
+		attackContext.source = this;
+		attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		attack.GetStatModList( statMods );
+		effect = attack.PrepareAttack( m_user );
+		if( targetEntity )
+		{
+			EffectData.SetEntity( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.entity, targetEntity );
+		}
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+		effect.AttachToEntity( this, GetAllBlackboardDefs().EffectSharedData.position );
+		attack.StartAttack();
+		return effect;
+	}
+
+	protected function GetDrillTargetPosition( currentPosition : Vector4, hitNormal : Vector4 ) : Vector4
+	{
+		var geometryDescription : GeometryDescriptionQuery;
+		var staticQueryFilter : QueryFilter;
+		var geometryDescriptionResult : GeometryDescriptionResult;
+		var targetPosition : Vector4;
+		QueryFilter.AddGroup( staticQueryFilter, 'Static' );
+		QueryFilter.AddGroup( staticQueryFilter, 'AI' );
+		geometryDescription = new GeometryDescriptionQuery;
+		geometryDescription.refPosition = currentPosition + ( Vector4.Normalize( hitNormal ) * 0.1 );
+		geometryDescription.refDirection = -( hitNormal );
+		geometryDescription.filter = staticQueryFilter;
+		geometryDescription.primitiveDimension = Vector4( 0.1, 0.1, 0.1, 0.0 );
+		geometryDescription.maxDistance = 5.0;
+		geometryDescription.maxExtent = 5.0;
+		geometryDescription.probingPrecision = 0.05;
+		geometryDescription.probingMaxDistanceDiff = 5.0;
+		geometryDescription.AddFlag( worldgeometryDescriptionQueryFlags.ObstacleDepth );
+		geometryDescriptionResult = GameInstance.GetSpatialQueriesSystem( GetGame() ).GetGeometryDescriptionSystem().QueryExtents( geometryDescription );
+		if( geometryDescriptionResult.queryStatus == worldgeometryDescriptionQueryStatus.OK && geometryDescriptionResult.obstacleDepthStatus == worldgeometryProbingStatus.None )
+		{
+			targetPosition = currentPosition - ( Vector4.Normalize( hitNormal ) * ( geometryDescriptionResult.obstacleDepth + 0.1 ) );
+		}
+		else
+		{
+			targetPosition = currentPosition;
+		}
+		return targetPosition;
+	}
+
+	protected function RequestGrenadeDetonation( delay : Float )
+	{
+		var detonateRequestEvent : GrenadeDetonateRequestEvent;
+		if( m_detonateRequestDelayID == GetInvalidDelayID() )
+		{
+			detonateRequestEvent = new GrenadeDetonateRequestEvent;
+			m_detonateRequestDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, detonateRequestEvent, delay, true );
+		}
+	}
+
+	protected event OnDetonateRequest( evt : GrenadeDetonateRequestEvent )
+	{
+		Detonate();
+	}
+
+	protected event OnStopDrillingRequest( evt : GrenadeStopDrillingRequestEvent )
+	{
+		GameObject.BreakReplicatedEffectLoopEvent( this, 'fx_drill' );
+	}
+
+	protected function FloatCuttingGrenadeUp()
+	{
+		var accelerateTowardsTrajectoryParams : AccelerateTowardsTrajectoryParams;
+		var accelerateTowardsParameters : weak< AccelerateTowardsParameters_Record >;
+		var addAxisRotationEvent : CuttingGrenadeAddAxisRotationEvent;
+		var targetPosition : Vector4;
+		var minimumDistanceFromFloor : Float;
+		var currentDistanceFromFloor : Float;
+		var distanceToFloat : Float;
+		var freezingDuration : Float;
+		var currentVelocityNormalized : Vector4;
+		var currentSpeed : Float;
+		accelerateTowardsTrajectoryParams = new AccelerateTowardsTrajectoryParams;
+		addAxisRotationEvent = new CuttingGrenadeAddAxisRotationEvent;
+		freezingDuration = TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".freezingDuration", 1.0 );
+		minimumDistanceFromFloor = TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".minimumDistanceFromFloor", 2.0 );
+		currentDistanceFromFloor = GetDistanceFromFloor();
+		currentSpeed = Vector4.Length( m_projectileComponent.GetPrintVelocity() );
+		if( ( currentDistanceFromFloor < 0.0 ) || ( currentDistanceFromFloor > minimumDistanceFromFloor ) )
+		{
+			currentVelocityNormalized = Vector4.Normalize( m_projectileComponent.GetPrintVelocity() );
+			targetPosition = GetWorldPosition() + ( currentVelocityNormalized * ( currentSpeed * freezingDuration ) );
+			targetPosition = GetWorldPosition() + ( Vector4.Normalize( lastHitNormal ) * ( currentSpeed * freezingDuration ) );
+		}
+		else
+		{
+			currentVelocityNormalized = Vector4.Normalize( m_projectileComponent.GetPrintVelocity() * Vector4( 1.0, 1.0, 0.0, 1.0 ) );
+			distanceToFloat = minimumDistanceFromFloor - currentDistanceFromFloor;
+			targetPosition = ( GetWorldPosition() + ( currentVelocityNormalized * ( currentSpeed * freezingDuration ) ) ) + Vector4( 0.0, 0.0, distanceToFloat, 0.0 );
+		}
+		m_projectileComponent.ClearTrajectories();
+		accelerateTowardsParameters = TweakDBInterface.GetAccelerateTowardsParametersRecord( T"AccelerateTowardsParameters.cuttingGrenadeFreezeParameters" );
+		accelerateTowardsTrajectoryParams.targetPosition = targetPosition;
+		accelerateTowardsTrajectoryParams.accuracy = accelerateTowardsParameters.Accuracy();
+		accelerateTowardsTrajectoryParams.maxSpeed = currentSpeed * accelerateTowardsParameters.MaxSpeed();
+		accelerateTowardsTrajectoryParams.decelerateTowardsTargetPositionDistance = accelerateTowardsParameters.DecelerateTowardsTargetPositionDistance();
+		accelerateTowardsTrajectoryParams.maxRotationSpeed = accelerateTowardsParameters.MaxRotationSpeed();
+		accelerateTowardsTrajectoryParams.minRotationSpeed = accelerateTowardsParameters.MinRotationSpeed();
+		m_projectileComponent.AddAccelerateTowards( accelerateTowardsTrajectoryParams );
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, addAxisRotationEvent, 0.1, true );
+	}
+
+	protected event OnAddAxisRotationEvent( evt : CuttingGrenadeAddAxisRotationEvent )
+	{
+		var axis : Vector4;
+		var addAxisRotationEvent : CuttingGrenadeAddAxisRotationEvent;
+		addAxisRotationEvent = new CuttingGrenadeAddAxisRotationEvent;
+		if( m_projectileComponent.IsTrajectoryEmpty() )
+		{
+			return NULL;
+		}
+		axis = Vector4( RandRangeF( 0.0, 1.0 ), RandRangeF( 0.0, 1.0 ), RandRangeF( 0.0, 1.0 ), 0.0 );
+		m_projectileComponent.AddAxisRotation( axis, RandRangeF( TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".addAxisRotationSpeedMin", 20.0 ), TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".addAxisRotationSpeedMax", 45.0 ) ) );
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, addAxisRotationEvent, TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".addAxisRotationDelay", 0.69999999 ), true );
+	}
+
+	protected function FloatToLockOnAltitude()
+	{
+		var accelerateTowardsTrajectoryParams : AccelerateTowardsTrajectoryParams;
+		var homingParameters : weak< AccelerateTowardsParameters_Record >;
+		var targetOffset : Vector4;
+		var targetPosition : Vector4;
+		var distanceToFloat : Float;
+		var currentVelocityNormalized : Vector4;
+		var forwardOffsetValue : Float;
+		accelerateTowardsTrajectoryParams = new AccelerateTowardsTrajectoryParams;
+		forwardOffsetValue = 0.30000001;
+		distanceToFloat = GetDistanceToFloat();
+		if( distanceToFloat <= 0.0 )
+		{
+			return;
+		}
+		homingParameters = ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).FlyUpParameters();
+		currentVelocityNormalized = Vector4.Normalize( m_projectileComponent.GetPrintVelocity() * Vector4( 1.0, 1.0, 0.0, 1.0 ) );
+		targetOffset = currentVelocityNormalized * forwardOffsetValue;
+		m_projectileComponent.ClearTrajectories();
+		targetPosition = ( GetWorldPosition() + Vector4( 0.0, 0.0, distanceToFloat, 0.0 ) ) + targetOffset;
+		accelerateTowardsTrajectoryParams.targetPosition = targetPosition;
+		accelerateTowardsTrajectoryParams.accuracy = homingParameters.Accuracy();
+		accelerateTowardsTrajectoryParams.decelerateTowardsTargetPositionDistance = homingParameters.DecelerateTowardsTargetPositionDistance();
+		accelerateTowardsTrajectoryParams.maxRotationSpeed = homingParameters.MaxRotationSpeed();
+		accelerateTowardsTrajectoryParams.minRotationSpeed = homingParameters.MinRotationSpeed();
+		m_projectileComponent.AddAccelerateTowards( accelerateTowardsTrajectoryParams );
+	}
+
+	protected function GetDistanceFromFloor() : Float
+	{
+		var geometryDescription : GeometryDescriptionQuery;
+		var staticQueryFilter : QueryFilter;
+		var geometryDescriptionResult : GeometryDescriptionResult;
+		var currentPosition : Vector4;
+		var distanceFromFloor : Float;
+		QueryFilter.AddGroup( staticQueryFilter, 'Static' );
+		currentPosition = GetWorldPosition();
+		geometryDescription = new GeometryDescriptionQuery;
+		geometryDescription.refPosition = currentPosition;
+		geometryDescription.refDirection = Vector4( 0.0, 0.0, -1.0, 0.0 );
+		geometryDescription.filter = staticQueryFilter;
+		geometryDescription.primitiveDimension = Vector4( 0.1, 0.1, 0.2, 0.0 );
+		geometryDescriptionResult = GameInstance.GetSpatialQueriesSystem( GetGame() ).GetGeometryDescriptionSystem().QueryExtents( geometryDescription );
+		if( geometryDescriptionResult.queryStatus != worldgeometryDescriptionQueryStatus.OK )
+		{
+			return -1.0;
+		}
+		distanceFromFloor = AbsF( geometryDescriptionResult.distanceVector.Z );
+		return distanceFromFloor;
+	}
+
+	protected function GetDistanceToFloat() : Float
+	{
+		var lockOnAltitude : Float;
+		var distanceFromFloor : Float;
+		lockOnAltitude = ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).LockOnAltitude();
+		distanceFromFloor = GetDistanceFromFloor();
+		if( distanceFromFloor < 0.0 )
+		{
+			return 0.0;
+		}
+		return lockOnAltitude - distanceFromFloor;
+	}
+
+	protected function QueueSmartTrajectory( delay : Float )
+	{
+		var triggerSmartTrajectoryEvent : GrenadeTriggerSmartTrajectoryEvent;
+		m_homingGrenadeTarget = ChooseSmartTrajectoryTarget();
+		GameObject.SendForceRevealObjectEvent( m_homingGrenadeTarget.entity, true, 'HomingGrenade' );
+		m_projectileComponent.SetWasTrajectoryStopped( true );
+		triggerSmartTrajectoryEvent = new GrenadeTriggerSmartTrajectoryEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, triggerSmartTrajectoryEvent, delay, true );
+	}
+
+	protected function ChooseSmartTrajectoryTarget() : GrenadePotentialHomingTarget
+	{
+		var i : Int32;
+		var puppet : NPCPuppet;
+		var affiliation : gamedataAffiliation;
+		var topPickIndex : Int32;
+		var topPickScore : Float;
+		var score : Float;
+		for( i = 0; i < m_potentialHomingTargets.Size(); i += 1 )
+		{
+			puppet = ( ( NPCPuppet )( m_potentialHomingTargets[ i ].entity ) );
+			if( !( puppet ) )
+			{
+				continue;
+			}
+			score = 0.0;
+			score += ( 1.0 / Vector4.Distance( GetWorldPosition(), puppet.GetWorldPosition() ) );
+			affiliation = TweakDBInterface.GetCharacterRecord( puppet.GetRecordID() ).Affiliation().Type();
+			score *= ( ( affiliation == gamedataAffiliation.NCPD ) ? ( 0.25 ) : ( 1.0 ) );
+			if( score > topPickScore )
+			{
+				topPickIndex = i;
+				topPickScore = score;
+			}
+		}
+		return m_potentialHomingTargets[ topPickIndex ];
+	}
+
+	protected event OnTriggerSmartTrajectory( evt : GrenadeTriggerSmartTrajectoryEvent )
+	{
+		SetTracking( false );
+		ActivateSmartTrajectory();
+	}
+
+	protected function StopCuttingGrenadeAttack()
+	{
+		var stopAttackEvent : CuttingGrenadeStopAttackEvent;
+		TerminateCuttingGrenadeAttack();
+		GameObject.BreakReplicatedEffectLoopEvent( this, 'homing_thrust' );
+		m_lockOnFailed = true;
+		stopAttackEvent = new CuttingGrenadeStopAttackEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, stopAttackEvent, TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".stopAttackDelay", 1.0 ), true );
+	}
+
+	protected event OnCuttingGrenadeStopAttackEvent( evt : CuttingGrenadeStopAttackEvent )
+	{
+		DropToFloor();
+		GameObject.PlaySound( this, 'grenade_laser_stop' );
+		RequestGrenadeRelease( 2.5 );
+	}
+
+	protected function DropToFloor()
+	{
+		var parabolicTrajectoryParams : ParabolicTrajectoryParams;
+		parabolicTrajectoryParams = ParabolicTrajectoryParams.GetAccelVelParabolicParams( Vector4( 0.0, 0.0, -9.81000042, 0.0 ), 0.0001, 20.0 );
+		m_projectileComponent.ClearTrajectories();
+		m_projectileComponent.SetEnergyLossFactor( 0.30000001, 0.11 );
+		m_projectileComponent.AddParabolic( parabolicTrajectoryParams );
+	}
+
+	protected function IsUnderwater() : Bool
+	{
+		var currentPosition : Vector4;
+		var isUnderwater : Bool;
+		isUnderwater = false;
+		if( m_hasHitWater )
+		{
+			currentPosition = GetWorldPosition();
+			isUnderwater = ( currentPosition.Z - m_waterHeight ) <= m_tweakRecord.ShallowWaterDepth();
+		}
+		return isUnderwater;
+	}
+
+	protected function TryToSinkAndRequestDetonation()
+	{
+		var currentPosition : Vector4;
+		var parabolicTrajectoryParams : ParabolicTrajectoryParams;
+		var delaySystem : DelaySystem;
+		var invalidDelayID : DelayID;
+		if( ( !( m_isAlive ) || m_isSinking ) || !( m_hasHitWater ) )
+		{
+			return;
+		}
+		currentPosition = GetWorldPosition();
+		if( ( currentPosition.Z - m_waterHeight ) > m_tweakRecord.SinkingDepth() )
+		{
+			return;
+		}
+		m_isSinking = true;
+		RequestGrenadeDetonation( m_tweakRecord.SinkingDetonationDelay() );
+		if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing )
+		{
+			GameObject.StopReplicatedEffectEvent( this, 'fx_homing_freeze' );
+			GameObject.StopReplicatedEffectEvent( this, 'homing_thrust' );
+		}
+		else if( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky )
+		{
+			StopStickyGrenadeSounds();
+		}
+		if( m_isContinuousEffect )
+		{
+			if( IsGrenadeOfType( EGrenadeType.Cutting ) && !( m_lockOnFailed ) )
+			{
+				TerminateCuttingGrenadeAttack();
+				GameObject.StopReplicatedEffectEvent( this, 'homing_thrust' );
+				GameObject.PlaySound( this, 'grenade_laser_stop' );
+			}
+			delaySystem = GameInstance.GetDelaySystem( GetGame() );
+			invalidDelayID = GetInvalidDelayID();
+			if( m_spawnBlinkEffectDelayID != invalidDelayID )
+			{
+				delaySystem.CancelDelay( m_spawnBlinkEffectDelayID );
+				m_spawnBlinkEffectDelayID = invalidDelayID;
+			}
+			if( m_releaseRequestDelayID != invalidDelayID )
+			{
+				delaySystem.CancelDelay( m_releaseRequestDelayID );
+				m_releaseRequestDelayID = invalidDelayID;
+			}
+		}
+		StopNPCGrenadeBeepSound();
+		RemoveGrenadeLandedStimuli();
+		parabolicTrajectoryParams = ParabolicTrajectoryParams.GetAccelVelParabolicParams( Vector4( 0.0, 0.0, -0.30000001, 0.0 ), 0.40000001, 0.40000001 );
+		m_projectileComponent.ClearTrajectories();
+		m_projectileComponent.SetEnergyLossFactor( 0.05, 0.05 );
+		m_projectileComponent.AddParabolic( parabolicTrajectoryParams );
+	}
+
+	protected function ActivateSmartTrajectory()
+	{
+		var accelerateTowardsTrajectoryParams : AccelerateTowardsTrajectoryParams;
+		var homingParameters : weak< AccelerateTowardsParameters_Record >;
+		var slotTransform : WorldTransform;
+		var slotComponent : SlotComponent;
+		var offset : Vector4;
+		accelerateTowardsTrajectoryParams = new AccelerateTowardsTrajectoryParams;
+		GameObject.BreakReplicatedEffectLoopEvent( this, 'fx_homing_freeze' );
+		if( m_potentialHomingTargets.Size() < 1 )
+		{
+			return;
+		}
+		homingParameters = ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).FlyToTargetParameters();
+		m_isLockedOn = true;
+		m_detonateOnImpact = true;
+		m_projectileComponent.ClearTrajectories();
+		slotComponent = m_homingGrenadeTarget.entity.GetHitRepresantationSlotComponent();
+		if( m_homingGrenadeTarget.targetSlot != '' && slotComponent.GetSlotTransform( m_homingGrenadeTarget.targetSlot, slotTransform ) )
+		{
+			offset = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( slotTransform ) ) - Matrix.GetTranslation( slotComponent.GetLocalToWorld() );
+		}
+		else if( slotComponent.GetSlotTransform( 'Chest', slotTransform ) || slotComponent.GetSlotTransform( 'Center', slotTransform ) )
+		{
+			offset = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( slotTransform ) ) - Matrix.GetTranslation( slotComponent.GetLocalToWorld() );
+		}
+		accelerateTowardsTrajectoryParams.targetComponent = slotComponent;
+		accelerateTowardsTrajectoryParams.targetOffset = offset;
+		accelerateTowardsTrajectoryParams.accelerationSpeed = homingParameters.AccelerationSpeed();
+		accelerateTowardsTrajectoryParams.maxSpeed = homingParameters.MaxSpeed();
+		accelerateTowardsTrajectoryParams.maxRotationSpeed = homingParameters.MaxRotationSpeed();
+		accelerateTowardsTrajectoryParams.minRotationSpeed = homingParameters.MinRotationSpeed();
+		accelerateTowardsTrajectoryParams.accuracy = homingParameters.Accuracy();
+		m_projectileComponent.AddAccelerateTowards( accelerateTowardsTrajectoryParams );
+		m_projectileComponent.SetOnCollisionAction( gameprojectileOnCollisionAction.Stop );
+	}
+
+	protected function SetTracking( state : Bool )
+	{
+		var attackRecordPath : TweakDBID;
+		var attackRecord : Attack_Record;
+		if( m_isTracking == state )
+		{
+			return;
+		}
+		if( !( m_isTracking ) )
+		{
+			if( m_shootCollision && m_canBeShot )
+			{
+				m_shootCollision.Resize( Vector4( 0.05, 0.06, 0.05, 0.0 ), 0 );
+			}
+			attackRecordPath = T"Attacks.GrenadeTargetTracker";
+			attackRecord = TweakDBInterface.GetAttack_GameEffectRecord( attackRecordPath );
+			m_targetTracker = SpawnAttack( attackRecord, m_tweakRecord.DeliveryMethod().TrackingRadius() );
+			m_targetTracker.AttachToEntity( this, GetAllBlackboardDefs().EffectSharedData.position );
+			m_isTracking = true;
+		}
+		else
+		{
+			m_targetTracker.Terminate();
+			m_targetTracker.AttachToEntity( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject(), GetAllBlackboardDefs().EffectSharedData.position );
+			m_targetTracker = NULL;
+			m_isTracking = false;
+			GameObject.BreakReplicatedEffectLoopEvent( this, 'fx_regular_scanning' );
+			if( m_shootCollision && m_canBeShot )
+			{
+				m_shootCollision.Resize( GetShootCollisionSize(), 0 );
+			}
+		}
+	}
+
+	protected function ProcessProximityTargets() : Bool
+	{
+		var i : Int32;
+		if( ( m_potentialHomingTargets.Size() == 0 ) || ( m_timeSinceLaunch < 0.1 ) )
+		{
+			return false;
+		}
+		for( i = 0; i < m_potentialHomingTargets.Size(); i += 1 )
+		{
+			if( m_potentialHomingTargets[ i ].entity == GetPlayer( GetGame() ) )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	protected function CheckRegularDeliveryMethodConditions() : Bool
+	{
+		return deliveryMethod == gamedataGrenadeDeliveryMethodType.Regular && ProcessProximityTargets();
+	}
+
+	protected function CheckStickyDeliveryMethodConditions() : Bool
+	{
+		return ( deliveryMethod == gamedataGrenadeDeliveryMethodType.Sticky && m_isStuck ) && ProcessProximityTargets();
+	}
+
+	protected function PlayNPCGrenadeBeepSound()
+	{
+		if( ( ( NPCPuppet )( m_user ) ) )
+		{
+			GameObject.PlaySound( this, StringToName( "gre_npc_beep_lp" ) );
+		}
+	}
+
+	protected function StopNPCGrenadeBeepSound()
+	{
+		if( ( ( NPCPuppet )( m_user ) ) )
+		{
+			GameObject.StopSound( this, StringToName( "grenade_charge_start" ) );
+			GameObject.PlaySound( this, StringToName( "gre_npc_beep_lp_stop" ) );
+		}
+	}
+
+	protected function PlayStickyGrenadeLongBeepSound()
+	{
+		GameObject.PlaySound( this, 'grenade_charge_start' );
+	}
+
+	protected function PlayStickyGrenadeShortBeepSound()
+	{
+		GameObject.PlaySound( this, 'grenade_charge_1s' );
+	}
+
+	protected function StopStickyGrenadeSounds()
+	{
+		GameObject.StopSound( this, 'grenade_charge_start' );
+		GameObject.StopSound( this, 'grenade_charge_1s' );
+	}
+
+	protected event OnTargetAcquired( evt : GrenadeTrackerTargetAcquiredEvent )
+	{
+		var i : Int32;
+		var newPotentialTarget : GrenadePotentialHomingTarget;
+		if( IsGrenadeOfType( EGrenadeType.Cutting ) )
+		{
+			NewCuttingGrenadeHit( evt );
+		}
+		else
+		{
+			for( i = 0; i < m_potentialHomingTargets.Size(); i += 1 )
+			{
+				if( m_potentialHomingTargets[ i ].entity == evt.target )
+				{
+					return NULL;
+				}
+			}
+			newPotentialTarget.entity = evt.target;
+			newPotentialTarget.targetSlot = evt.targetSlot;
+			m_potentialHomingTargets.PushBack( newPotentialTarget );
+			if( CheckRegularDeliveryMethodConditions() || CheckStickyDeliveryMethodConditions() )
+			{
+				SetTracking( false );
+				Detonate();
+			}
+			if( ( deliveryMethod == gamedataGrenadeDeliveryMethodType.Homing && !( m_targetAcquired ) ) && m_readyToTrack )
+			{
+				QueueSmartTrajectory( ( ( HomingGDM_Record )( m_tweakRecord.DeliveryMethod() ) ).LockOnDelay() );
+			}
+			m_targetAcquired = true;
+		}
+	}
+
+	protected function NewCuttingGrenadeHit( evt : GrenadeTrackerTargetAcquiredEvent )
+	{
+		var newPotentialTarget : CuttingGrenadePotentialTarget;
+		var i : Int32;
+		var isExistingTarget : Bool;
+		var hitsDoneToTarget : Int32;
+		var hitsNeededForAdditionalAttack : Int32;
+		hitsNeededForAdditionalAttack = TDB.GetInt( ItemID.GetTDBID( GetItemID() ) + T".numberOfHitsForAdditionalAttack", 3 );
+		for( i = 0; i < m_cuttingGrenadePotentialTargets.Size(); i += 1 )
+		{
+			if( m_cuttingGrenadePotentialTargets[ i ].entity == evt.target )
+			{
+				m_cuttingGrenadePotentialTargets[ i ].hits += 1;
+				isExistingTarget = true;
+				hitsDoneToTarget = m_cuttingGrenadePotentialTargets[ i ].hits;
+				if( hitsDoneToTarget > hitsNeededForAdditionalAttack )
+				{
+					return;
+				}
+			}
+		}
+		if( !( isExistingTarget ) )
+		{
+			newPotentialTarget.entity = evt.target;
+			newPotentialTarget.hits = 1;
+			m_cuttingGrenadePotentialTargets.PushBack( newPotentialTarget );
+			hitsDoneToTarget = 1;
+		}
+		if( hitsDoneToTarget == hitsNeededForAdditionalAttack )
+		{
+			SpawnAttack( m_tweakRecord.AdditionalAttack(), m_tweakRecord.AdditionalAttack().Range(), , , evt.target.GetWorldPosition() );
+		}
+	}
+
+	protected event OnTargetLost( evt : GrenadeTrackerTargetLostEvent )
+	{
+		var i : Int32;
+		for( i = m_potentialHomingTargets.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_potentialHomingTargets[ i ].entity == evt.target )
+			{
+				m_potentialHomingTargets.EraseFast( i );
+				if( m_potentialHomingTargets.Size() == 0 )
+				{
+					m_targetAcquired = false;
+				}
+				break;
+			}
+		}
+	}
+
+	protected function DelayTargetTrackingStateChange( newState : Bool, delay : Float )
+	{
+		var changeStateEvent : GrenadeSetTargetTrackerStateEvent;
+		changeStateEvent = new GrenadeSetTargetTrackerStateEvent;
+		changeStateEvent.state = newState;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, changeStateEvent, delay, true );
+	}
+
+	protected event OnTargetTrackerStateSet( evt : GrenadeSetTargetTrackerStateEvent )
+	{
+		SetTracking( evt.state );
+	}
+
+	public function GetUser() : weak< GameObject >
+	{
+		return m_user;
+	}
+
+	public function GetLastHitNormal() : Vector4
+	{
+		return lastHitNormal;
+	}
+
+	public function GetDeliveryMethod() : gamedataGrenadeDeliveryMethodType
+	{
+		return deliveryMethod;
+	}
+
+}
+
+class GrenadeCollisionEvaluator extends gameprojectileScriptCollisionEvaluator
+{
+
+	protected export override function EvaluateCollision( defaultOnCollisionAction : gameprojectileOnCollisionAction, params : CollisionEvaluatorParams ) : gameprojectileOnCollisionAction
+	{
+		return ( ( params.isWaterSurface ) ? ( gameprojectileOnCollisionAction.Pierce ) : ( defaultOnCollisionAction ) );
+	}
+
+}
+
+struct GrenadePotentialHomingTarget
+{
+	var entity : weak< ScriptedPuppet >;
+	var targetSlot : CName;
+}
+
+struct CuttingGrenadePotentialTarget
+{
+	var entity : weak< ScriptedPuppet >;
+	var hits : Int32;
+}
+
+class GrenadeProximitySensorTargetAcquiredEvent extends Event
+{
+}
+
+class GrenadeTrackerTargetAcquiredEvent extends Event
+{
+	var target : weak< ScriptedPuppet >;
+	var targetSlot : CName;
+}
+
+class GrenadeTrackerTargetLostEvent extends Event
+{
+	var target : weak< ScriptedPuppet >;
+}
+
+class GrenadeSetTargetTrackerStateEvent extends Event
+{
+	var state : Bool;
+}
+
+class GrenadeTriggerSmartTrajectoryEvent extends Event
+{
+}
+
+class GrenadeDetonateRequestEvent extends Event
+{
+}
+
+class GrenadeDespawnRequestEvent extends Event
+{
+}
+
+class GrenadeReleaseRequestEvent extends Event
+{
+}
+
+class GrenadeStopDrillingRequestEvent extends Event
+{
+}
+
+class CuttingGrenadeDespawnEffectsEvent extends Event
+{
+}
+
+class CuttingGrenadeSpawnBlinkEffectEvent extends Event
+{
+}
+
+class CuttingGrenadeStopAttackEvent extends Event
+{
+}
+
+class CuttingGrenadeAddAxisRotationEvent extends Event
+{
+}
+
+class GrenadeAnimFeatureChangeEvent extends Event
+{
+	var newState : Int32;
+}
+
+class SpawnLaserAttackEvent extends Event
+{
+	var attackRecord : Attack_Record;
+	var range : Float;
+	var duration : Float;
+	var index : Int32;
+	var playSlotAnimation : Bool;
+}
+
+enum EBeamStyle
+{
+	None = 0,
+	Sweeping = 1,
+	HeadSlicer = 2,
+}
+
+enum EGrenadeType
+{
+	Frag = 0,
+	Flash = 1,
+	Piercing = 2,
+	EMP = 3,
+	Biohazard = 4,
+	Incendiary = 5,
+	Recon = 6,
+	Cutting = 7,
+	Sonic = 8,
+}
+

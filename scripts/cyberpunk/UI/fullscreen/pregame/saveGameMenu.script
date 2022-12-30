@@ -1,0 +1,370 @@
+class SaveGameMenuGameController extends gameuiSaveHandlingController
+{
+	private editable var m_list : inkCompoundRef;
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_gogButtonWidgetRef : inkWidgetRef;
+	private editable var m_gogContainer : inkWidgetRef;
+	private editable var m_scrollbar : inkWidgetRef;
+	private var m_eventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_handler : weak< inkISystemRequestsHandler >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_saveInfo : SaveMetadataInfo;
+	private var m_saves : array< String >;
+	private var m_pendingRegistration : Bool;
+	private var m_hasEmptySlot : Bool;
+	private var m_saveInProgress : Bool;
+	private var m_loadComplete : Bool;
+	private var m_saveFilesReady : Bool;
+	private var m_cloudSynced : Bool;
+
+	protected event OnInitialize()
+	{
+		m_handler = GetSystemRequestsHandler();
+		m_handler.RegisterToCallback( 'OnSavesForSaveReady', this, 'OnSavesForSaveReady' );
+		m_handler.RegisterToCallback( 'OnSaveMetadataReady', this, 'OnSaveMetadataReady' );
+		m_handler.RegisterToCallback( 'OnSaveDeleted', this, 'OnSaveDeleted' );
+		m_handler.RegisterToCallback( 'OnGogLoginStatusChanged', this, 'OnGogLoginStatusChanged' );
+		m_handler.RegisterToCallback( 'OnSavingComplete', this, 'OnSavingComplete' );
+		m_handler.RegisterToCallback( 'OnCloudSavesQueryStatusChanged', this, 'OnCloudSavesQueryStatusChanged' );
+		m_handler.RegisterToCallback( 'OnCloudSaveUploadFinish', this, 'OnCloudSaveUploadFinish' );
+		m_handler.RequestSavesForSave();
+		inkCompoundRef.RemoveAllChildren( m_list );
+		m_hasEmptySlot = false;
+		PlayLibraryAnimation( 'intro' );
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		m_buttonHintsController.AddButtonHint( 'delete_save', GetLocalizedText( "UI-Menus-DeleteSave" ) );
+		m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-UserActions-Select" ) );
+		if( IsTransferSavedExportSupported() )
+		{
+			m_buttonHintsController.AddButtonHint( 'transfer_save', GetLocalizedText( "UI-Menus-ExportSave" ) );
+		}
+		InitCrossProgression();
+		PlayLoadingAnimation();
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_handler.CancelSavesRequest();
+		m_handler.CancelSavedGameScreenshotRequests();
+		if( GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ) )
+		{
+			inkWidgetRef.UnregisterFromCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+		}
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+	}
+
+	protected event OnButtonRelease( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'next_menu' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			GogLogin();
+			evt.Handle();
+		}
+	}
+
+	protected event OnRefreshGOGState( evt : RefreshGOGState )
+	{
+		if( evt.status == GOGRewardsSystemStatus.RegistrationPending )
+		{
+			m_pendingRegistration = true;
+		}
+		else if( m_pendingRegistration && evt.status == GOGRewardsSystemStatus.Registered )
+		{
+			m_pendingRegistration = false;
+			m_saveFilesReady = false;
+			m_cloudSynced = false;
+			PlayLoadingAnimation();
+			m_handler.RequestSavesForLoad();
+		}
+	}
+
+	private function InitCrossProgression()
+	{
+		var hudGroup : ConfigGroup;
+		var settingsVar : ConfigVarBool;
+		var gameInst : GameInstance;
+		gameInst = GetPlayerControlledObject().GetGame();
+		hudGroup = GameInstance.GetSettingsSystem( gameInst ).GetGroup( '/gameplay/misc' );
+		settingsVar = ( ( ConfigVarBool )( hudGroup.GetVar( 'EnableCloudSaves' ) ) );
+		if( ( GameInstance.GetOnlineSystem( gameInst ) && settingsVar.GetValue() ) && settingsVar.IsVisible() )
+		{
+			inkWidgetRef.RegisterToCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, true );
+			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, false );
+			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, false );
+		}
+	}
+
+	private function TryToCreateEmptySlot()
+	{
+		var currButton : weak< inkCompoundWidget >;
+		var currLogic : weak< LoadListItem >;
+		if( m_hasEmptySlot )
+		{
+			return;
+		}
+		if( !( m_handler.HasFreeSaveSlot( "ManualSave-" ) ) )
+		{
+			return;
+		}
+		currButton = ( ( inkCompoundWidget )( SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListItem' ) ) );
+		currButton.RegisterToCallback( 'OnRelease', this, 'OnSaveFile' );
+		inkCompoundRef.ReorderChild( m_list, currButton, 0 );
+		currLogic = ( ( LoadListItem )( currButton.GetController() ) );
+		currLogic.SetData( -1, true );
+		m_hasEmptySlot = true;
+	}
+
+	private function SetupLoadItems( saves : array< String > )
+	{
+		var i : Int32;
+		for( i = 0; i < saves.Size(); i += 1 )
+		{
+			CreateLoadItem( i );
+		}
+	}
+
+	private function CreateLoadItem( index : Int32 )
+	{
+		var currButton : weak< inkCompoundWidget >;
+		var currLogic : weak< LoadListItem >;
+		currButton = ( ( inkCompoundWidget )( SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListItem' ) ) );
+		currButton.RegisterToCallback( 'OnRelease', this, 'OnSaveFile' );
+		currLogic = ( ( LoadListItem )( currButton.GetController() ) );
+		currLogic.SetData( index );
+		GetSystemRequestsHandler().RequestSavedGameScreenshot( index, currLogic.GetPreviewImageWidget() );
+	}
+
+	protected event OnSaveFile( e : inkPointerEvent )
+	{
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		var transferSaveData : TransferSaveData;
+		if( ( ( !( m_loadComplete ) || m_saveInProgress ) || IsSaveFailedNotificationActive() ) || IsGameSavedNotificationActive() )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			return false;
+		}
+		button = ( ( inkWidget )( e.GetCurrentTarget() ) );
+		controller = ( ( LoadListItem )( button.GetController() ) );
+		if( e.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			if( controller.EmptySlot() )
+			{
+				m_saveInProgress = true;
+				GetSystemRequestsHandler().ManualSave( "ManualSave-" );
+			}
+			else
+			{
+				OverrideSavedGame( controller.Index() );
+			}
+			return true;
+		}
+		if( e.IsAction( 'transfer_save' ) && IsTransferSavedExportSupported() )
+		{
+			if( !( controller.EmptySlot() ) )
+			{
+				transferSaveData = new TransferSaveData;
+				transferSaveData.saveIndex = controller.Index();
+				transferSaveData.action = TransferSaveAction.Export;
+				TransferSavedGame( transferSaveData );
+			}
+		}
+		if( e.IsAction( 'delete_save' ) )
+		{
+			if( !( controller.EmptySlot() ) )
+			{
+				PlaySound( 'SaveDeleteButton', 'OnPress' );
+				if( controller.IsCloud() )
+				{
+					m_handler.RequestSystemNotificationGeneric( 'UI-CrossProgression-Title', 'UI-CrossProgression-DeleteSaveRestriction' );
+				}
+				else
+				{
+					DeleteSavedGame( controller.Index() );
+				}
+			}
+			else
+			{
+				PlaySound( 'SaveDeleteButton', 'OnPress' );
+			}
+			return true;
+		}
+	}
+
+	private function GogLogin()
+	{
+		var container : weak< inkCompoundWidget >;
+		var gogPopupWidget : inkWidget;
+		var gogPopupController : weak< GOGProfileLogicController >;
+		container = ( ( inkCompoundWidget )( inkWidgetRef.Get( m_gogContainer ) ) );
+		if( container.GetNumChildren() )
+		{
+			container.RemoveAllChildren();
+		}
+		else
+		{
+			gogPopupWidget = SpawnFromExternal( container, R"base\gameplay\gui\fullscreen\main_menu\gog_popup.inkwidget", 'Root' );
+			if( gogPopupWidget != NULL )
+			{
+				gogPopupController = ( ( GOGProfileLogicController )( gogPopupWidget.GetController() ) );
+				if( gogPopupController != NULL )
+				{
+					gogPopupController.SetMenuState( EGOGMenuState.LoadGame );
+				}
+			}
+		}
+	}
+
+	protected event OnSaveDeleted( result : Bool, idx : Int32 )
+	{
+		var i : Int32;
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		if( result )
+		{
+			for( i = 0; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+			{
+				button = inkCompoundRef.GetWidgetByIndex( m_list, i );
+				controller = ( ( LoadListItem )( button.GetController() ) );
+				if( controller.Index() == idx )
+				{
+					inkCompoundRef.RemoveChild( m_list, button );
+					break;
+				}
+			}
+			TryToCreateEmptySlot();
+		}
+	}
+
+	protected event OnGogLoginStatusChanged( bIsSignedIn : Bool )
+	{
+		var handler : weak< inkISystemRequestsHandler >;
+		handler = GetSystemRequestsHandler();
+		if( bIsSignedIn )
+		{
+			handler.CancelSavesRequest();
+			handler.RequestSavesForLoad();
+		}
+	}
+
+	protected event OnOverrideSaveAccepted()
+	{
+		m_saveInProgress = true;
+	}
+
+	protected event OnSavingComplete( success : Bool, locks : array< gameSaveLock > )
+	{
+		if( success )
+		{
+			m_handler.CancelSavedGameScreenshotRequests();
+			m_handler.RequestSavesForSave();
+			RequestGameSavedNotification();
+		}
+		else
+		{
+			ShowSavingLockedNotification( locks );
+			RequestSaveFailedNotification();
+		}
+		m_saveInProgress = false;
+	}
+
+	protected event OnSavesForSaveReady( saves : array< String > )
+	{
+		m_saves = saves;
+		m_saveFilesReady = true;
+		UpdateSavesList();
+	}
+
+	protected event OnCloudSavesQueryStatusChanged( status : CloudSavesQueryStatus )
+	{
+		m_cloudSynced = true;
+		UpdateSavesList();
+	}
+
+	protected event OnCloudSaveUploadFinish( success : Bool )
+	{
+		m_handler.CancelSavedGameScreenshotRequests();
+		m_handler.RequestSavesForSave();
+	}
+
+	private function UpdateSavesList()
+	{
+		if( m_saveFilesReady && m_cloudSynced )
+		{
+			m_saveFilesReady = false;
+			m_cloudSynced = false;
+			inkCompoundRef.RemoveAllChildren( m_list );
+			m_hasEmptySlot = false;
+			TryToCreateEmptySlot();
+			SetupLoadItems( m_saves );
+			m_loadComplete = true;
+			StopLoadingAnimation();
+		}
+	}
+
+	protected event OnSaveMetadataReady( info : SaveMetadataInfo )
+	{
+		var i : Int32;
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		for( i = 0; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+		{
+			button = inkCompoundRef.GetWidgetByIndex( m_list, i );
+			controller = ( ( LoadListItem )( button.GetController() ) );
+			if( controller.Index() == info.saveIndex )
+			{
+				if( info.isValid )
+				{
+					controller.SetMetadata( info );
+				}
+				else
+				{
+					controller.SetInvalid( info.internalName );
+				}
+				break;
+			}
+		}
+	}
+
+	protected event OnGogPressed( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			GogLogin();
+			evt.Handle();
+		}
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		m_eventDispatcher = menuEventDispatcher;
+	}
+
+	private function PlayLoadingAnimation()
+	{
+		var i : Int32;
+		inkCompoundRef.RemoveAllChildren( m_list );
+		for( i = 0; i < 7; i += 1 )
+		{
+			SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListItemPlaceholder' );
+		}
+		inkWidgetRef.SetVisible( m_scrollbar, false );
+	}
+
+	private function StopLoadingAnimation()
+	{
+		inkWidgetRef.SetVisible( m_scrollbar, true );
+	}
+
+}
+

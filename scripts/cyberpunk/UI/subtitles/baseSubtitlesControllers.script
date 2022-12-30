@@ -1,0 +1,704 @@
+class BaseSubtitlesGameController extends inkProjectedHUDGameController
+{
+	protected var m_lineMap : array< subtitleLineMapEntry >;
+	protected var m_pendingShowLines : array< CRUID >;
+	protected var m_pendingHideLines : array< CRUID >;
+	protected var m_settings : UserSettings;
+	protected var m_settingsListener : SubtitlesSettingsListener;
+	protected var m_groupPath : CName;
+	default m_groupPath = '/audio/subtitles';
+	private var m_gameInstance : GameInstance;
+	private var m_uiBlackboard : weak< IBlackboard >;
+	private var m_bbCbShowDialogLine : CallbackHandle;
+	private var m_bbCbHideDialogLine : CallbackHandle;
+	private var m_bbCbHideDialogLineByData : CallbackHandle;
+	private var m_bbCbShowBackground : CallbackHandle;
+	private var m_showBackgroud : Bool;
+	default m_showBackgroud = false;
+	private var m_isCreoleUnlocked : Bool;
+	default m_isCreoleUnlocked = false;
+	private var m_isPlayerJohnny : Bool;
+	private var m_disabledBySettings : Bool;
+	private var m_forceForeignLines : Bool;
+	private var m_isRadioSubtitleEnabled : Bool;
+	private var m_backgroundOpacity : Float;
+	private var m_fontSize : Int32;
+	private var m_factlistenerId : Uint32;
+
+	protected event OnInitialize()
+	{
+		m_uiBlackboard = GetUIBlackboard();
+		RegisterToDialogBlackboard( true );
+		m_bbCbShowBackground = m_uiBlackboard.RegisterDelayedListenerBool( GetAllBlackboardDefs().UIGameData.ShowSubtitlesBackground, this, 'OnShowBackground' );
+		if( GetPlayerControlledObject() )
+		{
+			m_gameInstance = GetPlayerControlledObject().GetGame();
+			m_factlistenerId = GameInstance.GetQuestsSystem( m_gameInstance ).RegisterListener( 'creole_translator_unlocked', this, 'OnCreoleFactChanged' );
+			m_isCreoleUnlocked = GameInstance.GetQuestsSystem( m_gameInstance ).GetFact( 'creole_translator_unlocked' ) > 0;
+		}
+		CalculateVisibility();
+		m_settings = new UserSettings;
+		m_settingsListener = new SubtitlesSettingsListener;
+		m_settingsListener.RegisterController( this );
+		m_settingsListener.Register( m_groupPath );
+		UpdateSubsVisibilitySetting();
+		UpdateRadioSubsVisibilitySetting();
+		UpdateChattersVisibilitySetting();
+		UpdateSizeSettings();
+		UpdateBackgroundOpacitySettings();
+		m_forceForeignLines = true;
+		ShowPendingSubtitles();
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		var controlledPuppetRecordID : TweakDBID;
+		var controlledPuppet : weak< gamePuppetBase >;
+		controlledPuppet = ( ( gamePuppetBase )( GetPlayer( m_gameInstance ) ) );
+		if( controlledPuppet != NULL )
+		{
+			controlledPuppetRecordID = controlledPuppet.GetRecordID();
+			if( controlledPuppetRecordID == T"Character.johnny_replacer" )
+			{
+				m_isPlayerJohnny = true;
+			}
+			else
+			{
+				m_isPlayerJohnny = false;
+			}
+		}
+		else
+		{
+			m_isPlayerJohnny = false;
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		GameInstance.GetQuestsSystem( m_gameInstance ).UnregisterListener( 'creole_translator_unlocked', m_factlistenerId );
+		GameInstance.GetSubtitleHandlerSystem( GetGame() ).UnregisterSubtitleController( this );
+		RegisterToDialogBlackboard( false );
+		m_uiBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.ShowSubtitlesBackground, m_bbCbShowBackground );
+	}
+
+	protected export event OnCreoleFactChanged( value : Int32 )
+	{
+		m_isCreoleUnlocked = value > 0;
+	}
+
+	private function RegisterToDialogBlackboard( value : Bool )
+	{
+		if( value )
+		{
+			m_bbCbShowDialogLine = m_uiBlackboard.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UIGameData.ShowDialogLine, this, 'OnShowDialogLine' );
+			m_bbCbHideDialogLine = m_uiBlackboard.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UIGameData.HideDialogLine, this, 'OnHideDialogLine' );
+			m_bbCbHideDialogLineByData = m_uiBlackboard.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UIGameData.HideDialogLineByData, this, 'OnHideDialogLineByData' );
+		}
+		else
+		{
+			m_uiBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.ShowDialogLine, m_bbCbShowDialogLine );
+			m_uiBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.HideDialogLine, m_bbCbHideDialogLine );
+			m_uiBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.HideDialogLineByData, m_bbCbHideDialogLineByData );
+		}
+	}
+
+	protected event OnWorldAttached( evt : inkWorldAttachedEvt )
+	{
+		RegisterToDialogBlackboard( false );
+		m_uiBlackboard = GetUIBlackboard();
+		RegisterToDialogBlackboard( true );
+	}
+
+	protected function DisableBySettings( value : Bool )
+	{
+		if( m_disabledBySettings != value )
+		{
+			m_disabledBySettings = value;
+			Cleanup();
+		}
+		RefreshSettings();
+	}
+
+	protected function ForceForeignLinesBySettings( value : Bool )
+	{
+		if( m_forceForeignLines != value )
+		{
+			m_forceForeignLines = value;
+			Cleanup();
+		}
+	}
+
+	protected function EnableRadioSubtilesBySettings( value : Bool )
+	{
+		if( m_isRadioSubtitleEnabled != value )
+		{
+			m_isRadioSubtitleEnabled = value;
+			Cleanup();
+		}
+	}
+
+	protected function IsKiroshiEnabled( lineData : scnDialogLineData ) : Bool
+	{
+		var lineLangIsCreole : Bool;
+		var lineText : scnDialogDisplayString;
+		lineText = scnDialogLineData.GetDisplayText( lineData );
+		lineLangIsCreole = lineText.language == scnDialogLineLanguage.Creole;
+		return !( lineLangIsCreole ) || m_isCreoleUnlocked;
+	}
+
+	protected virtual function ShouldDisplayLine( lineData : scnDialogLineData ) : Bool
+	{
+		return false;
+	}
+
+	protected virtual function CreateLine( lineSpawnData : LineSpawnData ) {}
+
+	protected virtual function SetupLine( lineWidget : inkWidget, lineSpawnData : LineSpawnData ) {}
+
+	protected virtual function OnHideLine( lineData : subtitleLineMapEntry )
+	{
+		m_pendingHideLines.Remove( lineData.id );
+	}
+
+	protected virtual function OnHideLineByData( lineData : subtitleLineMapEntry )
+	{
+		m_pendingHideLines.Remove( lineData.id );
+	}
+
+	protected event OnShowDialogLine( value : Variant )
+	{
+		var linesToShow : array< scnDialogLineData >;
+		linesToShow = ( ( array< scnDialogLineData > )value );
+		ShowDialogLines( linesToShow );
+	}
+
+	public function ShowDialogLines( linesToShow : array< scnDialogLineData > )
+	{
+		var currLine : scnDialogLineData;
+		var i, count : Int32;
+		count = linesToShow.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currLine = linesToShow[ i ];
+			if( m_disabledBySettings && currLine.type != scnDialogLineType.Radio )
+			{
+				if( scnDialogLineData.HasKiroshiTag( currLine ) )
+				{
+					if( !( m_forceForeignLines ) )
+					{
+						continue;
+					}
+				}
+				else
+				{
+					continue;
+				}
+			}
+			if( !( ShouldDisplayLine( currLine ) ) || m_pendingShowLines.Contains( currLine.id ) )
+			{
+				continue;
+			}
+			if( currLine.type == scnDialogLineType.Radio && !( m_isRadioSubtitleEnabled ) )
+			{
+				continue;
+			}
+			m_pendingShowLines.PushBack( currLine.id );
+			SpawnDialogLine( currLine );
+		}
+		CalculateVisibility();
+	}
+
+	protected event OnHideDialogLineByData( value : Variant )
+	{
+		var linesToHide : array< scnDialogLineData >;
+		linesToHide = ( ( array< scnDialogLineData > )value );
+		HideDialogLinesByData( linesToHide );
+		TryRemovePendingHideLines();
+	}
+
+	public function HideDialogLinesByData( linesToHide : array< scnDialogLineData > )
+	{
+		var currLine : scnDialogLineData;
+		var i, count : Int32;
+		count = linesToHide.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currLine = linesToHide[ i ];
+			ResolveShowHidePendingLines( currLine.id );
+			RemoveLineByData( currLine );
+		}
+		CalculateVisibility();
+	}
+
+	protected event OnHideDialogLine( value : Variant )
+	{
+		var linesToHide : array< CRUID >;
+		linesToHide = ( ( array< CRUID > )value );
+		HideDialogLine( linesToHide );
+		TryRemovePendingHideLines();
+	}
+
+	public function HideDialogLine( linesToHide : array< CRUID > )
+	{
+		var currLine : CRUID;
+		var i, count : Int32;
+		count = linesToHide.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currLine = linesToHide[ i ];
+			ResolveShowHidePendingLines( currLine );
+			RemoveLine( currLine );
+		}
+		CalculateVisibility();
+	}
+
+	protected event OnShowBackground( value : Bool )
+	{
+		var i, count : Int32;
+		var currLine : BaseSubtitleLineLogicController;
+		m_showBackgroud = value;
+		count = m_lineMap.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currLine = ( ( BaseSubtitleLineLogicController )( m_lineMap[ i ].widget.GetController() ) );
+			if( currLine )
+			{
+				currLine.ShowBackground( m_showBackgroud );
+			}
+		}
+	}
+
+	public function OnVarModified( groupPath : CName, varName : CName, varType : ConfigVarType, reason : ConfigChangeReason )
+	{
+		switch( varName )
+		{
+			case 'Cinematic':
+				UpdateSubsVisibilitySetting();
+			break;
+			case 'Radio':
+				UpdateRadioSubsVisibilitySetting();
+			ForceSettingsUpdate();
+			break;
+			case 'CinematicForceKiroshiTexts':
+				UpdateSubsForeignVisibilitySettings();
+			break;
+			case 'Overheads':
+				UpdateChattersVisibilitySetting();
+			break;
+			case 'OverheadsForceKiroshiTexts':
+				UpdateChattersForeignVisibilitySettings();
+			break;
+			case 'ChattersTextSize':
+			case 'TextSize':
+				UpdateSizeSettings();
+			ForceSettingsUpdate();
+			break;
+			case 'BackgroundOpacity':
+				UpdateBackgroundOpacitySettings();
+			ForceSettingsUpdate();
+			break;
+			default:
+				break;
+		}
+	}
+
+	private function ForceSettingsUpdate()
+	{
+		var i, count : Int32;
+		var currLine : BaseSubtitleLineLogicController;
+		count = m_lineMap.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currLine = ( ( BaseSubtitleLineLogicController )( m_lineMap[ i ].widget.GetController() ) );
+			if( currLine )
+			{
+				currLine.SetupSettings( m_fontSize, m_backgroundOpacity );
+			}
+		}
+	}
+
+	private function UpdateSubsVisibilitySetting()
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'Cinematic' ) ) );
+		SetSubsVisibilitySetting( configVar.GetValue() );
+	}
+
+	private function UpdateRadioSubsVisibilitySetting()
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'Radio' ) ) );
+		SetRadioSubsVisibilitySetting( configVar.GetValue() );
+	}
+
+	private function UpdateSubsForeignVisibilitySettings()
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'CinematicForceKiroshiTexts' ) ) );
+		SetSubsForeignLinesVisibilitySetting( configVar.GetValue() );
+	}
+
+	private function UpdateChattersVisibilitySetting()
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'Overheads' ) ) );
+		SetChattersVisibilitySetting( configVar.GetValue() );
+	}
+
+	private function UpdateChattersForeignVisibilitySettings()
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'OverheadsForceKiroshiTexts' ) ) );
+		SetChattersForeignLinesVisibilitySetting( configVar.GetValue() );
+	}
+
+	private function UpdateSizeSettings()
+	{
+		var configVar : ConfigVarListInt;
+		configVar = ( ( ConfigVarListInt )( m_settings.GetVar( m_groupPath, GetTextSizeSettigId() ) ) );
+		SetSizeSettings( configVar.GetValue() );
+	}
+
+	private function UpdateBackgroundOpacitySettings()
+	{
+		var configVar : ConfigVarFloat;
+		configVar = ( ( ConfigVarFloat )( m_settings.GetVar( m_groupPath, 'BackgroundOpacity' ) ) );
+		SetBackgroundOpacitySettings( configVar.GetValue() );
+	}
+
+	private function ShowPendingSubtitles()
+	{
+		var pendingSubtitles : gamePendingSubtitles;
+		pendingSubtitles = GameInstance.GetSubtitleHandlerSystem( GetGame() ).RegisterSubtitleController( this );
+		ShowDialogLines( pendingSubtitles.pendingSubtitles );
+	}
+
+	protected virtual function GetTextSizeSettigId() : CName
+	{
+		return 'TextSize';
+	}
+
+	protected virtual function SetSubsVisibilitySetting( value : Bool ) {}
+
+	protected virtual function SetRadioSubsVisibilitySetting( value : Bool ) {}
+
+	protected virtual function SetChattersVisibilitySetting( value : Bool ) {}
+
+	protected virtual function ShowKiroshiSettings( value : Bool ) {}
+
+	protected virtual function SetSubsForeignLinesVisibilitySetting( value : Bool ) {}
+
+	protected virtual function SetChattersForeignLinesVisibilitySetting( value : Bool ) {}
+
+	protected virtual function SetSizeSettings( value : Int32 )
+	{
+		m_fontSize = value;
+	}
+
+	protected virtual function SetBackgroundOpacitySettings( value : Float )
+	{
+		m_backgroundOpacity = value;
+	}
+
+	private function FindLineWidget( lineID : CRUID ) : weak< inkWidget >
+	{
+		var i : Int32;
+		var currLine : subtitleLineMapEntry;
+		for( i = 0; i < m_lineMap.Size(); i += 1 )
+		{
+			currLine = m_lineMap[ i ];
+			if( currLine.id == lineID )
+			{
+				return currLine.widget;
+			}
+		}
+		return NULL;
+	}
+
+	private function FindLineController( lineID : CRUID ) : weak< BaseSubtitleLineLogicController >
+	{
+		var widget : weak< inkWidget >;
+		widget = FindLineWidget( lineID );
+		if( widget )
+		{
+			return ( ( BaseSubtitleLineLogicController )( widget.GetController() ) );
+		}
+		return NULL;
+	}
+
+	private function SpawnDialogLine( lineData : scnDialogLineData )
+	{
+		var controller : weak< BaseSubtitleLineLogicController >;
+		var lineSpawnData : LineSpawnData;
+		if( lineData.type != scnDialogLineType.GlobalTV )
+		{
+			controller = FindLineController( lineData.id );
+		}
+		if( controller == NULL )
+		{
+			lineSpawnData = new LineSpawnData;
+			lineSpawnData.Initialize( lineData );
+			CreateLine( lineSpawnData );
+		}
+		else
+		{
+			OnSubCreated( controller );
+			controller.SetKiroshiStatus( IsKiroshiEnabled( lineData ) );
+			controller.SetLineData( lineData );
+			controller.ShowBackground( m_showBackgroud );
+		}
+	}
+
+	protected event OnLineSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var lineSpawnData : LineSpawnData;
+		var controller : weak< BaseSubtitleLineLogicController >;
+		var newLineEntry : subtitleLineMapEntry;
+		lineSpawnData = ( ( LineSpawnData )( userData ) );
+		if( widget )
+		{
+			SetupLine( widget, lineSpawnData );
+			controller = ( ( BaseSubtitleLineLogicController )( widget.GetController() ) );
+			newLineEntry.id = lineSpawnData.m_lineData.id;
+			newLineEntry.widget = widget;
+			newLineEntry.owner = lineSpawnData.m_lineData.speaker;
+			m_lineMap.PushBack( newLineEntry );
+			OnSubCreated( controller );
+			controller.SetKiroshiStatus( IsKiroshiEnabled( lineSpawnData.m_lineData ) );
+			controller.SetLineData( lineSpawnData.m_lineData );
+			controller.ShowBackground( m_showBackgroud );
+		}
+		TryRemovePendingHideLines();
+	}
+
+	protected virtual function OnSubCreated( controller : weak< BaseSubtitleLineLogicController > )
+	{
+		controller.SetupSettings( m_fontSize, m_backgroundOpacity );
+	}
+
+	protected virtual function OnRemovalFailure( lineId : CRUID );
+
+	private function RemoveLineByData( line : scnDialogLineData ) : Bool
+	{
+		var i : Int32;
+		var currLine : subtitleLineMapEntry;
+		var result : Bool;
+		result = false;
+		for( i = 0; i < m_lineMap.Size(); i += 1 )
+		{
+			currLine = m_lineMap[ i ];
+			if( !( currLine.owner ) || ( line.speaker && currLine.owner.GetPersistentID() == line.speaker.GetPersistentID() ) )
+			{
+				OnHideLineByData( currLine );
+				m_lineMap.Erase( i );
+				result = true;
+				i -= 1;
+			}
+		}
+		if( !( result ) )
+		{
+			OnRemovalFailure( line.id );
+		}
+		return result;
+	}
+
+	private function TryRemovePendingHideLines()
+	{
+		var currLine : CRUID;
+		var i, count : Int32;
+		count = m_pendingHideLines.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currLine = m_pendingHideLines[ i ];
+			RemoveLine( currLine );
+		}
+		CalculateVisibility();
+	}
+
+	private function RemoveLine( lineID : CRUID ) : Bool
+	{
+		var i : Int32;
+		var currLine : subtitleLineMapEntry;
+		var result : Bool;
+		result = false;
+		for( i = 0; i < m_lineMap.Size(); i += 1 )
+		{
+			currLine = m_lineMap[ i ];
+			if( currLine.id == lineID )
+			{
+				OnHideLine( currLine );
+				m_lineMap.Erase( i );
+				result = true;
+				break;
+			}
+		}
+		if( !( result ) )
+		{
+			OnRemovalFailure( lineID );
+		}
+		return result;
+	}
+
+	private function Cleanup()
+	{
+		var currLine : subtitleLineMapEntry;
+		var i : Int32;
+		for( i = 0; i < m_lineMap.Size(); i += 1 )
+		{
+			currLine = m_lineMap[ i ];
+			OnHideLine( currLine );
+			m_lineMap.Erase( i );
+		}
+		for( i = 0; i < m_pendingShowLines.Size(); i += 1 )
+		{
+			m_pendingShowLines.Erase( i );
+		}
+		for( i = 0; i < m_pendingHideLines.Size(); i += 1 )
+		{
+			m_pendingHideLines.Erase( i );
+		}
+	}
+
+	private function ResolveShowHidePendingLines( currLine : CRUID )
+	{
+		if( m_pendingShowLines.Contains( currLine ) && !( m_pendingHideLines.Contains( currLine ) ) )
+		{
+			m_pendingShowLines.Remove( currLine );
+			m_pendingHideLines.PushBack( currLine );
+		}
+	}
+
+	protected virtual function CalculateVisibility()
+	{
+		GetRootWidget().SetVisible( m_lineMap.Size() > 0 );
+	}
+
+	protected function IsMainDialogLine( lineData : scnDialogLineData ) : Bool
+	{
+		var playerVehicle : weak< VehicleObject >;
+		var player : weak< PlayerPuppet >;
+		var speakerVehicle : weak< VehicleObject >;
+		speakerVehicle = ( ( VehicleObject )( lineData.speaker ) );
+		if( ( speakerVehicle != NULL ) && lineData.type == scnDialogLineType.Radio )
+		{
+			player = ( ( PlayerPuppet )( GetPlayerControlledObject() ) );
+			VehicleComponent.GetVehicle( player.GetGame(), player.GetEntityID(), playerVehicle );
+			return playerVehicle == speakerVehicle;
+		}
+		return ( ( ( ( ( ( lineData.speaker != NULL ) && lineData.type != scnDialogLineType.Radio ) && lineData.type != scnDialogLineType.OverHead ) && lineData.type != scnDialogLineType.OverHeadAlwaysVisible ) && lineData.type != scnDialogLineType.GlobalTV ) && lineData.type != scnDialogLineType.Invisible ) || lineData.type == scnDialogLineType.OwnerlessRegular;
+	}
+
+	protected function GetGame() : GameInstance
+	{
+		return m_gameInstance;
+	}
+
+}
+
+class BaseSubtitleLineLogicController extends inkLogicController
+{
+	private var m_root : weak< inkWidget >;
+	private var m_isKiroshiEnabled : Bool;
+	private var c_tier1_duration : Float;
+	default c_tier1_duration = 0.5;
+	private var c_tier2_duration : Float;
+	default c_tier2_duration = 5;
+
+	public virtual function SetupSettings( textSize : Int32, backgroundOpacity : Float ) {}
+
+	protected function SetupAnimation( duration : Float, animCtrl : weak< inkTextKiroshiAnimController > )
+	{
+		if( duration < c_tier1_duration )
+		{
+			animCtrl.SetDuration( 0.2 );
+			animCtrl.SetDelay( 0.2 );
+			animCtrl.SetStart( 0.0 );
+		}
+		else if( duration < c_tier2_duration )
+		{
+			animCtrl.SetDuration( 0.5 + ( duration * 0.1 ) );
+			animCtrl.SetDelay( 0.25 );
+			animCtrl.SetStart( 0.0 );
+		}
+		else
+		{
+			animCtrl.SetDuration( 0.5 + ( duration * 0.1 ) );
+			animCtrl.SetDelay( 0.0 );
+			animCtrl.SetStart( 0.05 );
+		}
+	}
+
+	protected function SetupAnimation( duration : Float, animCtrl : weak< inkTextReplaceController > )
+	{
+		if( duration < c_tier1_duration )
+		{
+			animCtrl.SetDuration( 0.2 );
+			animCtrl.SetDelay( 0.2 );
+			animCtrl.SetStart( 0.0 );
+		}
+		else if( duration < c_tier2_duration )
+		{
+			animCtrl.SetDuration( 0.5 + ( duration * 0.1 ) );
+			animCtrl.SetDelay( 0.25 );
+			animCtrl.SetStart( 0.0 );
+		}
+		else
+		{
+			animCtrl.SetDuration( 0.5 + ( duration * 0.1 ) );
+			animCtrl.SetDelay( 0.0 );
+			animCtrl.SetStart( 0.05 );
+		}
+	}
+
+	public virtual function SetLineData( lineData : scnDialogLineData )
+	{
+		GetRootWidget().SetOpacity( ( ( lineData.isPersistent ) ? ( 1.0 ) : ( 0.5 ) ) );
+	}
+
+	public function SetKiroshiStatus( kiroshiStatus : Bool )
+	{
+		m_isKiroshiEnabled = kiroshiStatus;
+	}
+
+	public function IsKiroshiEnabled() : Bool
+	{
+		return m_isKiroshiEnabled;
+	}
+
+	public virtual function ShowBackground( value : Bool ) {}
+}
+
+class LineSpawnData
+{
+	var m_lineData : scnDialogLineData;
+
+	public function Initialize( lineData : scnDialogLineData )
+	{
+		m_lineData = lineData;
+	}
+
+}
+
+struct subtitleLineMapEntry
+{
+	var id : CRUID;
+	var widget : weak< inkWidget >;
+	var owner : weak< GameObject >;
+}
+
+class SubtitlesSettingsListener extends ConfigVarListener
+{
+	private var m_ctrl : weak< BaseSubtitlesGameController >;
+
+	public function RegisterController( ctrl : BaseSubtitlesGameController )
+	{
+		m_ctrl = ctrl;
+	}
+
+	public export override function OnVarModified( groupPath : CName, varName : CName, varType : ConfigVarType, reason : ConfigChangeReason )
+	{
+		m_ctrl.OnVarModified( groupPath, varName, varType, reason );
+	}
+
+}
+

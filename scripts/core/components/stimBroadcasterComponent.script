@@ -1,0 +1,941 @@
+class BlockStimProcessingCooldownEvent extends Event
+{
+	var stimData : StimIdentificationData;
+}
+
+struct StimIdentificationData
+{
+	var sourceID : EntityID;
+	var stimType : gamedataStimType;
+	var stimName : CName;
+	var delayID : DelayID;
+}
+
+class BroadcastEvent extends Event
+{
+	var broadcastType : EBroadcasteingType;
+	var shouldOverride : Bool;
+	var lifetime : Float;
+	var stimType : gamedataStimType;
+	var stimData : stimInvestigateData;
+	var radius : Float;
+	var propagationChange : Bool;
+	var directTarget : weak< Entity >;
+	var delay : Float;
+}
+
+class RecurrentStimuliEvent extends Event
+{
+	var requestID : StimRequestID;
+}
+
+struct StimRequestID
+{
+	var ID : Uint32;
+	var isValid : Bool;
+
+	public static function IsValid( self : StimRequestID ) : Bool
+	{
+		return self.isValid;
+	}
+
+	public static function GetID( self : StimRequestID ) : Uint32
+	{
+		return self.ID;
+	}
+
+}
+
+import struct stimInvestigateData
+{
+	import var investigationSpots : array< Vector4 >;
+	import var investigateController : Bool;
+	import var controllerEntity : weak< Entity >;
+	import var mainDeviceEntity : weak< Entity >;
+	import var distrationPoint : Vector4;
+	import var attackInstigator : weak< Entity >;
+	import var attackInstigatorPosition : Vector4;
+	import var revealsInstigatorPosition : Bool;
+	import var illegalAction : Bool;
+	import var fearPhase : Int32;
+	import var skipReactionDelay : Bool;
+	import var skipInitialAnimation : Bool;
+	import var victimEntity : weak< Entity >;
+}
+
+class StimRequest
+{
+	var stimuli : StimuliEvent;
+	var hasExpirationDate : Bool;
+	var duration : Float;
+	var requestID : StimRequestID;
+}
+
+struct StimTargetData
+{
+	editable var spawnerRef : NodeRef;
+	editable var entryID : CName;
+
+	public static function IsValid( self : StimTargetData ) : Bool
+	{
+		return GlobalNodeRef.IsDefined( ResolveNodeRef( self.spawnerRef, GlobalNodeID.GetRoot() ) ) && IsNameValid( self.entryID );
+	}
+
+}
+
+class StimTargetsEvent extends Event
+{
+	mutable editable var targets : array< StimTargetData >;
+	editable var restore : Bool;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Stim Targets";
+	}
+
+}
+
+class StimBroadcasterComponent extends ScriptableComponent
+{
+	var m_activeRequests : array< StimRequest >;
+	var m_currentID : Uint32;
+	default m_currentID = 0;
+	var m_shouldBroadcast : Bool;
+	var m_targets : array< NPCstubData >;
+	private var m_blockedStims : array< StimIdentificationData >;
+	var m_fallbackInterval : Float;
+	default m_fallbackInterval = 1.0f;
+
+	public const function IsStimProcessingBlocked( sourceID : EntityID, stimType : gamedataStimType, optional stimName : CName ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_blockedStims.Size(); i += 1 )
+		{
+			if( ( ( m_blockedStims[ i ].sourceID == sourceID ) && m_blockedStims[ i ].stimType == stimType ) && m_blockedStims[ i ].stimName == stimName )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function ResolveStimProcessingCooldown( sourceID : EntityID, stimType : gamedataStimType, optional stimName : CName, cooldown : Float ) : Bool
+	{
+		var cooldownEvent : BlockStimProcessingCooldownEvent;
+		var stimData : StimIdentificationData;
+		stimData.sourceID = sourceID;
+		stimData.stimType = stimType;
+		stimData.stimName = stimName;
+		if( IsStimBlocked( stimData ) )
+		{
+			return false;
+		}
+		if( cooldown > 0.0 )
+		{
+			cooldownEvent = new BlockStimProcessingCooldownEvent;
+			stimData.delayID = GameInstance.GetDelaySystem( GetOwner().GetGame() ).DelayEvent( GetOwner(), cooldownEvent, cooldown, false );
+			cooldownEvent.stimData = stimData;
+		}
+		AddBlockedStim( stimData );
+		return true;
+	}
+
+	protected event OnBlockStimProcessingCooldownEvent( evt : BlockStimProcessingCooldownEvent )
+	{
+		RemoveBlockedStim( evt.stimData.delayID );
+	}
+
+	private function IsStimBlocked( data : ref< StimIdentificationData > ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_blockedStims.Size(); i += 1 )
+		{
+			if( ( ( m_blockedStims[ i ].sourceID == data.sourceID ) && m_blockedStims[ i ].stimType == data.stimType ) && m_blockedStims[ i ].stimName == data.stimName )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function AddBlockedStim( data : ref< StimIdentificationData > )
+	{
+		m_blockedStims.PushBack( data );
+	}
+
+	private function RemoveBlockedStim( data : ref< StimIdentificationData > )
+	{
+		var i : Int32;
+		for( i = 0; i < m_blockedStims.Size(); i += 1 )
+		{
+			if( ( ( m_blockedStims[ i ].sourceID == data.sourceID ) && m_blockedStims[ i ].stimType == data.stimType ) && m_blockedStims[ i ].stimName == data.stimName )
+			{
+				m_blockedStims.EraseFast( i );
+				return;
+			}
+		}
+	}
+
+	private function RemoveBlockedStim( delayID : DelayID )
+	{
+		var i : Int32;
+		if( delayID == GetInvalidDelayID() )
+		{
+			return;
+		}
+		for( i = 0; i < m_blockedStims.Size(); i += 1 )
+		{
+			if( m_blockedStims[ i ].delayID == delayID )
+			{
+				m_blockedStims.EraseFast( i );
+				return;
+			}
+		}
+	}
+
+	public static function BroadcastStim( sender : weak< GameObject >, gdStimType : gamedataStimType, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		if( !( sender ) )
+		{
+			return;
+		}
+		broadcaster = sender.GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.TriggerSingleBroadcast( sender, gdStimType, radius, investigateData, propagationChange );
+		}
+	}
+
+	public static function BroadcastActiveStim( sender : weak< GameObject >, gdStimType : gamedataStimType, optional lifetime : Float, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		if( !( sender ) )
+		{
+			return;
+		}
+		broadcaster = sender.GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.SetSingleActiveStimuli( sender, gdStimType, lifetime, radius, investigateData, propagationChange );
+		}
+	}
+
+	public static function SendStimDirectly( sender : weak< GameObject >, gdStimType : gamedataStimType, target : GameObject, optional investigateData : stimInvestigateData, optional delay : Float )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		if( !( sender ) )
+		{
+			return;
+		}
+		broadcaster = sender.GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.SendDrirectStimuliToTarget( sender, gdStimType, target, investigateData, delay );
+		}
+	}
+
+	public function TriggerSingleBroadcast( contextOwner : weak< GameObject >, gdStimType : gamedataStimType, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool )
+	{
+		var stimuliEvent : StimuliEvent;
+		var broadcastEvent : BroadcastEvent;
+		var owner : GameObject;
+		owner = GetOwner();
+		if( contextOwner == owner )
+		{
+			stimuliEvent = StimBroadcasterComponentHelper.CreateStimEvent( owner, gdStimType, radius, investigateData, propagationChange );
+			StimBroadcasterComponentHelper.ProcessSingleStimuliBroadcast( owner, stimuliEvent, ( ( ScriptedPuppet )( owner ) ).IsCrowd(), ( ( Bool )( ( ( SurveillanceCamera )( owner ) ) ) ), stimuliEvent.GetStimType() == gamedataStimType.Distract && !( ( stimuliEvent.sourceObject && stimuliEvent.sourceObject.CanBeInvestigated() ) ), m_targets );
+		}
+		else
+		{
+			broadcastEvent = new BroadcastEvent;
+			broadcastEvent.broadcastType = EBroadcasteingType.Single;
+			broadcastEvent.stimType = gdStimType;
+			broadcastEvent.radius = radius;
+			broadcastEvent.stimData = investigateData;
+			broadcastEvent.propagationChange = propagationChange;
+			GetOwner().QueueEvent( broadcastEvent );
+		}
+	}
+
+	public function AddActiveStimuli( contextOwner : weak< GameObject >, gdStimType : gamedataStimType, optional lifetime : Float, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool, optional shouldOverride : Bool )
+	{
+		var broadcastEvent : BroadcastEvent;
+		if( contextOwner == GetOwner() )
+		{
+			AddActiveStimulus( gdStimType, lifetime, shouldOverride, radius, investigateData, propagationChange );
+		}
+		else
+		{
+			broadcastEvent = new BroadcastEvent;
+			broadcastEvent.broadcastType = EBroadcasteingType.Active;
+			broadcastEvent.stimType = gdStimType;
+			broadcastEvent.lifetime = lifetime;
+			broadcastEvent.radius = radius;
+			broadcastEvent.stimData = investigateData;
+			broadcastEvent.propagationChange = propagationChange;
+			broadcastEvent.shouldOverride = shouldOverride;
+			GetOwner().QueueEvent( broadcastEvent );
+		}
+	}
+
+	public function SetSingleActiveStimuli( contextOwner : weak< GameObject >, gdStimType : gamedataStimType, optional lifetime : Float, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool )
+	{
+		var broadcastEvent : BroadcastEvent;
+		if( contextOwner == GetOwner() )
+		{
+			ClearRequests();
+			AddActiveStimulus( gdStimType, lifetime, false, radius, investigateData, propagationChange );
+		}
+		else
+		{
+			broadcastEvent = new BroadcastEvent;
+			broadcastEvent.broadcastType = EBroadcasteingType.SingleActive;
+			broadcastEvent.stimType = gdStimType;
+			broadcastEvent.lifetime = lifetime;
+			broadcastEvent.radius = radius;
+			broadcastEvent.stimData = investigateData;
+			broadcastEvent.propagationChange = propagationChange;
+			GetOwner().QueueEvent( broadcastEvent );
+		}
+	}
+
+	public function RemoveActiveStimuliByName( contextOwner : weak< GameObject >, gdStimType : gamedataStimType )
+	{
+		var broadcastEvent : BroadcastEvent;
+		if( contextOwner == GetOwner() )
+		{
+			ProcessStopRequest( gdStimType );
+		}
+		else
+		{
+			broadcastEvent = new BroadcastEvent;
+			broadcastEvent.broadcastType = EBroadcasteingType.Remove;
+			broadcastEvent.stimType = gdStimType;
+			GetOwner().QueueEvent( broadcastEvent );
+		}
+	}
+
+	public function SendDrirectStimuliToTarget( contextOwner : weak< GameObject >, gdStimType : gamedataStimType, target : GameObject, optional investigateData : stimInvestigateData, optional delay : Float )
+	{
+		var newStim : StimuliEvent;
+		var broadcastEvent : BroadcastEvent;
+		if( contextOwner == GetOwner() )
+		{
+			newStim = StimBroadcasterComponentHelper.CreateStimEvent( GetOwner(), gdStimType, , investigateData );
+			if( delay > 0.0 )
+			{
+				GameInstance.GetDelaySystem( target.GetGame() ).DelayEvent( target, newStim, delay );
+			}
+			else
+			{
+				target.QueueEvent( newStim );
+			}
+		}
+		else
+		{
+			broadcastEvent = new BroadcastEvent;
+			broadcastEvent.broadcastType = EBroadcasteingType.Direct;
+			broadcastEvent.stimType = gdStimType;
+			broadcastEvent.directTarget = ( ( Entity )( target ) );
+			broadcastEvent.delay = delay;
+			broadcastEvent.stimData = investigateData;
+			GetOwner().QueueEvent( broadcastEvent );
+		}
+	}
+
+	protected event OnBroadcastEvent( evt : BroadcastEvent )
+	{
+		var stimuliEvent : StimuliEvent;
+		var owner : GameObject;
+		owner = GetOwner();
+		switch( evt.broadcastType )
+		{
+			case EBroadcasteingType.Single:
+				stimuliEvent = StimBroadcasterComponentHelper.CreateStimEvent( owner, evt.stimType, evt.radius, evt.stimData, evt.propagationChange );
+			StimBroadcasterComponentHelper.ProcessSingleStimuliBroadcast( owner, stimuliEvent, ( ( ScriptedPuppet )( owner ) ).IsCrowd(), ( ( Bool )( ( ( SurveillanceCamera )( owner ) ) ) ), stimuliEvent.GetStimType() == gamedataStimType.Distract && !( ( stimuliEvent.sourceObject && stimuliEvent.sourceObject.CanBeInvestigated() ) ), m_targets );
+			break;
+			case EBroadcasteingType.Direct:
+				stimuliEvent = StimBroadcasterComponentHelper.CreateStimEvent( owner, evt.stimType, , evt.stimData );
+			if( evt.delay > 0.0 )
+			{
+				GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( evt.directTarget, stimuliEvent, evt.delay );
+			}
+			else
+			{
+				evt.directTarget.QueueEvent( stimuliEvent );
+			}
+			break;
+			case EBroadcasteingType.Active:
+				AddActiveStimulus( evt.stimType, evt.lifetime, evt.shouldOverride, evt.radius, evt.stimData, evt.propagationChange );
+			break;
+			case EBroadcasteingType.SingleActive:
+				ClearRequests();
+			AddActiveStimulus( evt.stimType, evt.lifetime, evt.shouldOverride, evt.radius, evt.stimData, evt.propagationChange );
+			break;
+			case EBroadcasteingType.Remove:
+				ProcessStopRequest( evt.stimType );
+			break;
+		}
+	}
+
+	protected export function OnGameDetach()
+	{
+		ClearRequests();
+	}
+
+	protected event OnStimTargetsUpdate( evt : StimTargetsEvent )
+	{
+		var i : Int32;
+		if( evt.restore )
+		{
+			ClearStimTargets();
+			return false;
+		}
+		for( i = 0; i < evt.targets.Size(); i += 1 )
+		{
+			if( !( StimTargetData.IsValid( evt.targets[ i ] ) ) )
+			{
+				continue;
+			}
+			if( !( HasStimTarget( evt.targets[ i ] ) ) )
+			{
+				AddStimmTarget( evt.targets[ i ] );
+			}
+		}
+	}
+
+	private function ClearStimTargets()
+	{
+		m_targets.Clear();
+	}
+
+	private function HasStimTarget( data : StimTargetData ) : Bool
+	{
+		var spawnerID : EntityID;
+		var i : Int32;
+		spawnerID = ( ( EntityID )( ResolveNodeRef( data.spawnerRef, GlobalNodeID.GetRoot() ) ) );
+		for( i = 0; i < m_targets.Size(); i += 1 )
+		{
+			if( ( m_targets[ i ].spawnerID == spawnerID ) && m_targets[ i ].entryID == data.entryID )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function AddStimmTarget( data : StimTargetData )
+	{
+		var stubData : NPCstubData;
+		stubData.spawnerID = ( ( EntityID )( ResolveNodeRef( data.spawnerRef, GlobalNodeID.GetRoot() ) ) );
+		stubData.entryID = data.entryID;
+		m_targets.PushBack( stubData );
+	}
+
+	public const function HasStimTargets() : Bool
+	{
+		return m_targets.Size() > 0;
+	}
+
+	private function AddActiveStimulus( gdStimType : gamedataStimType, lifetime : Float, optional shouldOverride : Bool, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool )
+	{
+		var index : Int32;
+		var owner : GameObject;
+		var lootContainer : gameLootContainerBase;
+		var deviceBase : DeviceBase;
+		owner = GetOwner();
+		lootContainer = ( ( gameLootContainerBase )( owner ) );
+		deviceBase = ( ( DeviceBase )( owner ) );
+		if( ( deviceBase && !( deviceBase.IsLogicReady() ) ) || ( lootContainer && !( lootContainer.IsLogicReady() ) ) )
+		{
+			return;
+		}
+		if( lifetime == 0.0 )
+		{
+			return;
+		}
+		if( shouldOverride )
+		{
+			index = FindRequestIndexByName( gdStimType );
+			RemoveRequest( index );
+		}
+		ProcessStartRequest( gdStimType, lifetime, radius, investigateData, propagationChange );
+	}
+
+	private function RemoveActiveStimByID( id : StimRequestID )
+	{
+		var index : Int32;
+		index = FindRequestIndexByID( id );
+		RemoveRequest( index );
+	}
+
+	private function ProcessStartRequest( gdStimType : gamedataStimType, lifetime : Float, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool ) : StimRequestID
+	{
+		var newStimRequest : StimRequest;
+		var owner : GameObject;
+		owner = GetOwner();
+		if( IsRequestDuplicated( gdStimType ) )
+		{
+			LogAI( "Stim already registered" );
+			return GenerateRequestID( 0, false );
+		}
+		newStimRequest = CreateStimRequest( gdStimType, lifetime, radius, investigateData, propagationChange );
+		m_activeRequests.PushBack( newStimRequest );
+		m_shouldBroadcast = true;
+		AddNewDelayEvent();
+		StimBroadcasterComponentHelper.ProcessSingleStimuliBroadcast( owner, newStimRequest.stimuli, ( ( ScriptedPuppet )( owner ) ).IsCrowd(), ( ( Bool )( ( ( SurveillanceCamera )( owner ) ) ) ), newStimRequest.stimuli.GetStimType() == gamedataStimType.Distract && !( ( newStimRequest.stimuli.sourceObject && newStimRequest.stimuli.sourceObject.CanBeInvestigated() ) ), m_targets );
+		return newStimRequest.requestID;
+	}
+
+	private function ProcessStopRequest( gdStimType : gamedataStimType )
+	{
+		var indexRequest : Int32;
+		indexRequest = FindRequestIndexByName( gdStimType );
+		RemoveRequest( indexRequest );
+	}
+
+	private function RemoveRequest( index : Int32 )
+	{
+		if( index >= 0 )
+		{
+			m_activeRequests.Erase( index );
+		}
+		else
+		{
+			LogAI( "Invalid index. Index to be >= 0" );
+		}
+		if( m_activeRequests.Size() == 0 )
+		{
+			StopTriggeringStims();
+		}
+	}
+
+	private function RemoveRequest( request : StimRequest )
+	{
+		RemoveRequest( FindRequestIndex( request ) );
+	}
+
+	private function ClearRequests()
+	{
+		m_activeRequests.Clear();
+		m_currentID = 0;
+		m_shouldBroadcast = false;
+	}
+
+	private function AddNewDelayEvent()
+	{
+		var index : Int32;
+		var interval : Float;
+		var evt : RecurrentStimuliEvent;
+		evt = new RecurrentStimuliEvent;
+		index = m_activeRequests.Size() - 1;
+		interval = m_activeRequests[ index ].stimuli.GetStimInterval();
+		evt.requestID = m_activeRequests[ index ].requestID;
+		GameInstance.GetDelaySystem( GetOwner().GetGame() ).DelayEvent( GetOwner(), evt, interval );
+	}
+
+	protected event OnRecurrentStimuliEvent( evt : RecurrentStimuliEvent )
+	{
+		var owner : GameObject;
+		var lootContainer : gameLootContainerBase;
+		var deviceBase : DeviceBase;
+		owner = GetOwner();
+		lootContainer = ( ( gameLootContainerBase )( owner ) );
+		deviceBase = ( ( DeviceBase )( owner ) );
+		if( ( !( m_shouldBroadcast ) || ( deviceBase && !( deviceBase.IsLogicReady() ) ) ) || ( lootContainer && !( lootContainer.IsLogicReady() ) ) )
+		{
+			return false;
+		}
+		RebroadcastStimuli( evt );
+	}
+
+	private function RebroadcastStimuli( evt : RecurrentStimuliEvent ) : Bool
+	{
+		var requestID : StimRequestID;
+		var requestIndex : Int32;
+		var request : StimRequest;
+		var owner : GameObject;
+		owner = GetOwner();
+		requestID = evt.requestID;
+		requestIndex = FindRequestIndexByID( requestID );
+		request = GetRequestByID( requestID );
+		if( !( request ) )
+		{
+			LogAI( ( "Request with ID: " + IntToString( ( ( Int32 )( StimRequestID.GetID( requestID ) ) ) ) ) + " does not exist anymore" );
+			return false;
+		}
+		if( !( request.hasExpirationDate ) )
+		{
+			GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( owner, evt, request.stimuli.GetStimInterval() );
+			return StimBroadcasterComponentHelper.ProcessSingleStimuliBroadcast( owner, request.stimuli, ( ( ScriptedPuppet )( owner ) ).IsCrowd(), ( ( Bool )( ( ( SurveillanceCamera )( owner ) ) ) ), request.stimuli.GetStimType() == gamedataStimType.Distract && !( ( request.stimuli.sourceObject && request.stimuli.sourceObject.CanBeInvestigated() ) ), m_targets );
+		}
+		request.duration -= request.stimuli.GetStimInterval();
+		if( request.duration < 0.0 )
+		{
+			RemoveRequest( requestIndex );
+			return false;
+		}
+		else
+		{
+			GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( owner, evt, request.stimuli.GetStimInterval() );
+			return StimBroadcasterComponentHelper.ProcessSingleStimuliBroadcast( owner, request.stimuli, ( ( ScriptedPuppet )( owner ) ).IsCrowd(), ( ( Bool )( ( ( SurveillanceCamera )( owner ) ) ) ), request.stimuli.GetStimType() == gamedataStimType.Distract && !( ( request.stimuli.sourceObject && request.stimuli.sourceObject.CanBeInvestigated() ) ), m_targets );
+		}
+	}
+
+	private function StopTriggeringStims()
+	{
+		m_shouldBroadcast = false;
+	}
+
+	private function CreateStimRequest( gdStimType : gamedataStimType, optional duration : Float, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool ) : StimRequest
+	{
+		var newStimRequest : StimRequest;
+		newStimRequest = new StimRequest;
+		newStimRequest.stimuli = StimBroadcasterComponentHelper.CreateStimEvent( GetOwner(), gdStimType, radius, investigateData, propagationChange );
+		if( duration > 0.0 )
+		{
+			newStimRequest.hasExpirationDate = true;
+		}
+		newStimRequest.duration = duration;
+		newStimRequest.requestID = AssignNextValidUniqueID();
+		return newStimRequest;
+	}
+
+	private function IsEqual( stim : StimuliEvent, gdStimType : gamedataStimType ) : Bool
+	{
+		if( stim.name == EnumValueToName( 'gamedataStimType', ( ( Int32 )( gdStimType ) ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function IsRequestDuplicated( gdStimType : gamedataStimType ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRequests.Size(); i += 1 )
+		{
+			if( IsEqual( m_activeRequests[ i ].stimuli, gdStimType ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function GetRequestByID( id : StimRequestID ) : StimRequest
+	{
+		var index : Int32;
+		index = FindRequestIndexByID( id );
+		return GetRequestByArrayIndex( index );
+	}
+
+	private function GetRequestByName( gdStimType : gamedataStimType ) : StimRequest
+	{
+		var index : Int32;
+		index = FindRequestIndexByName( gdStimType );
+		return GetRequestByArrayIndex( index );
+	}
+
+	private function GetRequestByArrayIndex( index : Int32 ) : StimRequest
+	{
+		if( index >= 0 )
+		{
+			return m_activeRequests[ index ];
+		}
+		LogAI( "StimBroadcaster / Invalid Index. Request not found. Returning NULL" );
+		return NULL;
+	}
+
+	private function FindRequestIndexByName( gdStimType : gamedataStimType ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRequests.Size(); i += 1 )
+		{
+			if( IsEqual( m_activeRequests[ i ].stimuli, gdStimType ) )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private function FindRequestIndexByID( id : StimRequestID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRequests.Size(); i += 1 )
+		{
+			if( m_activeRequests[ i ].requestID == id )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private function FindRequestIndex( request : StimRequest ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRequests.Size(); i += 1 )
+		{
+			if( m_activeRequests[ i ] == request )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private function AssignNextValidUniqueID() : StimRequestID
+	{
+		var requestID : StimRequestID;
+		m_currentID += ( ( Uint32 )( 1 ) );
+		if( m_currentID == ( ( Uint32 )( 0 ) ) )
+		{
+			m_currentID += ( ( Uint32 )( 1 ) );
+		}
+		requestID = GenerateRequestID( m_currentID, true );
+		return requestID;
+	}
+
+	private function GenerateRequestID( id : Uint32, valid : Bool ) : StimRequestID
+	{
+		var newID : StimRequestID;
+		newID.ID = id;
+		newID.isValid = valid;
+		return newID;
+	}
+
+	private function DetermineHowManyRepeats( request : StimRequest ) : Int32
+	{
+		var duration : Float;
+		var interval : Float;
+		var repeats : Int32;
+		duration = request.duration;
+		interval = request.stimuli.GetStimInterval();
+		repeats = ( ( Int32 )( duration / interval ) );
+		return repeats;
+	}
+
+	protected event OnStatusEffectApplied( evt : ApplyStatusEffectEvent )
+	{
+		var stimData : stimInvestigateData;
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetOwner(), 'SpreadFear' ) )
+		{
+			stimData.fearPhase = 3;
+			TriggerSingleBroadcast( GetOwner(), gamedataStimType.SpreadFear, TweakDBInterface.GetFloat( T"AIGeneralSettings.spreadFearEffectStimuliRange", 5.0 ), stimData );
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetOwner(), 'GreaterSpreadFear' ) )
+		{
+			stimData.fearPhase = 3;
+			TriggerSingleBroadcast( GetOwner(), gamedataStimType.SpreadFear, TweakDBInterface.GetFloat( T"AIGeneralSettings.greaterSpreadFearEffectStimuliRange", 15.0 ), stimData );
+		}
+	}
+
+	private function LogStimuliBroadcast( stim : StimuliEvent, optional request : StimRequest, optional context : String )
+	{
+		var requestPresent : Bool;
+		var requestType : String;
+		var hasExpirationDate : Bool;
+		var isNextDepartureScheduled : Bool;
+		if( request )
+		{
+			requestPresent = true;
+			requestType = "Active Request";
+			hasExpirationDate = request.hasExpirationDate;
+			if( !( hasExpirationDate ) || ( request.duration >= stim.GetStimInterval() ) )
+			{
+				isNextDepartureScheduled = true;
+			}
+		}
+		else
+		{
+			requestPresent = false;
+			requestType = "Single Event";
+		}
+		LogAI( "//////////////////////////////////////////////////////////////////////////////////" );
+		LogAI( "STIM BROADCAST LOG" );
+		LogAI( "OPERATION TYPE:						" + "SENDING" );
+		LogAI( "Stim name:							" + NameToString( stim.name ) );
+		LogAI( "Request Type:						" + requestType );
+		LogAI( "DATA - Radius:						" + FloatToString( stim.radius ) );
+		LogAI( "DATA - Time of departure:					" + FloatToString( GetTimeSystem().GetGameTimeStamp() ) );
+		if( isNextDepartureScheduled )
+		{
+			LogAI( "DATA - Next departure estimated at:				" + FloatToString( GetTimeSystem().GetGameTimeStamp() + stim.GetStimInterval() ) );
+		}
+		else
+		{
+			LogAI( "DATA - Next departure estimated at:			" + "Not planned. Last Reoccurence" );
+		}
+		if( requestPresent )
+		{
+			LogAI( "DATA - Has expiration date					" + BoolToString( request.hasExpirationDate ) );
+			if( hasExpirationDate )
+			{
+				LogAI( "DATA - Duration remaining:					" + FloatToString( request.duration ) );
+			}
+			else
+			{
+				LogAI( "DATA - Duration remaining:			" + "Undefined" );
+			}
+			LogAI( "DATA - RequestID						" + IntToString( ( ( Int32 )( request.requestID.ID ) ) ) );
+		}
+		LogAI( "DATA - Stim sender:						" + stim.sourceObject.GetDisplayName() );
+		LogAI( "//////////////////////////////////////////////////////////////////////////////////" );
+	}
+
+	private function LogStimuliRemoval( stim : StimuliEvent, optional request : StimRequest )
+	{
+		LogAI( "//////////////////////////////////////////////////////////////////////////////////" );
+		LogAI( "STIM BROADCAST LOG" );
+		LogAI( "OPERATION TYPE:						" + "REMOVING" );
+		LogAI( "Stim name:							" + NameToString( stim.name ) );
+		LogAI( "DATA - RequestID						" + IntToString( ( ( Int32 )( request.requestID.ID ) ) ) );
+		LogAI( "DATA - Stim sender:						" + stim.sourceObject.GetDisplayName() );
+		LogAI( "DATA - Active Stims left:				" + IntToString( m_activeRequests.Size() - 1 ) );
+	}
+
+	public static function nameToStimEnum( stimName : CName, out stimType : gamedataStimType )
+	{
+		switch( stimName )
+		{
+			case 'DeadBody':
+				stimType = gamedataStimType.DeadBody;
+			break;
+			case 'FootStepRegular':
+				stimType = gamedataStimType.FootStepRegular;
+			break;
+			case 'Distract':
+				stimType = gamedataStimType.Distract;
+			break;
+			case 'VisualDistract':
+				stimType = gamedataStimType.VisualDistract;
+			break;
+			case 'Gunshot':
+				stimType = gamedataStimType.Gunshot;
+			break;
+			case 'Reprimand':
+				stimType = gamedataStimType.Reprimand;
+			break;
+			case 'Alarm':
+				stimType = gamedataStimType.Alarm;
+			break;
+			case 'GrenadeLanded':
+				stimType = gamedataStimType.GrenadeLanded;
+			break;
+			case 'IllegalAction':
+				stimType = gamedataStimType.IllegalAction;
+			break;
+			case 'CarAlarm':
+				stimType = gamedataStimType.CarAlarm;
+			break;
+			case 'ProjectileDistraction':
+				stimType = gamedataStimType.ProjectileDistraction;
+			break;
+			case 'SoundDistraction':
+				stimType = gamedataStimType.SoundDistraction;
+			break;
+			case 'OpeningDoor':
+				stimType = gamedataStimType.OpeningDoor;
+			break;
+			case 'AreaEffec':
+				stimType = gamedataStimType.AreaEffect;
+			break;
+			case 'Scream':
+				stimType = gamedataStimType.Scream;
+			break;
+			case 'Attention':
+				stimType = gamedataStimType.Attention;
+			break;
+			case 'Explosion':
+				stimType = gamedataStimType.Explosion;
+			break;
+			case 'IllegalInteraction':
+				stimType = gamedataStimType.IllegalInteraction;
+			break;
+			case 'Combat':
+				stimType = gamedataStimType.Combat;
+			break;
+			case 'Bullet':
+				stimType = gamedataStimType.Bullet;
+			break;
+			case 'CarryBody':
+				stimType = gamedataStimType.CarryBody;
+			break;
+			case 'MeleeHit':
+				stimType = gamedataStimType.MeleeHit;
+			break;
+			case 'VehicleHit':
+				stimType = gamedataStimType.VehicleHit;
+			break;
+			case 'LandingVeryHard':
+				stimType = gamedataStimType.LandingVeryHard;
+			break;
+			case 'Bump':
+				stimType = gamedataStimType.Bump;
+			break;
+			case 'Police':
+				stimType = gamedataStimType.CrimeWitness;
+			break;
+			case 'EnvironmentalHazard':
+				stimType = gamedataStimType.EnvironmentalHazard;
+			break;
+			case 'VehicleHorn':
+				stimType = gamedataStimType.VehicleHorn;
+			break;
+			default:
+				stimType = gamedataStimType.Invalid;
+			break;
+		}
+	}
+
+	public function TriggerNoiseStim( owner : weak< GameObject >, takedownActionType : ETakedownActionType )
+	{
+		if( owner )
+		{
+			if( ( takedownActionType == ETakedownActionType.Takedown || takedownActionType == ETakedownActionType.AerialTakedown ) || takedownActionType == ETakedownActionType.DisposalTakedown )
+			{
+				TriggerSingleBroadcast( owner, gamedataStimType.SoundDistraction, TweakDBInterface.GetFloat( T"AIGeneralSettings.takedownNoiseRange", 3.0 ) );
+			}
+			else if( takedownActionType == ETakedownActionType.TakedownNonLethal || takedownActionType == ETakedownActionType.DisposalTakedownNonLethal )
+			{
+				TriggerSingleBroadcast( owner, gamedataStimType.SoundDistraction, TweakDBInterface.GetFloat( T"AIGeneralSettings.takedownLessNoiseRange", 3.0 ) );
+			}
+			else if( takedownActionType == ETakedownActionType.Grapple || takedownActionType == ETakedownActionType.GrappleFailed )
+			{
+				TriggerSingleBroadcast( owner, gamedataStimType.SoundDistraction, TweakDBInterface.GetFloat( T"AIGeneralSettings.grappleNoiseRange", 3.0 ) );
+			}
+		}
+	}
+
+}
+
+importonly final class StimBroadcasterComponentHelper extends IScriptable
+{
+	public import static function CreateStimEvent( owner : GameObject, stimType : gamedataStimType, optional radius : Float, optional investigateData : stimInvestigateData, optional propagationChange : Bool ) : StimuliEvent;
+	public import static function ProcessSingleStimuliBroadcast( owner : GameObject, stimuli : StimuliEvent, isCrowd : Bool, isSurveillanceCamera : Bool, invalidDistraction : Bool, targets : array< NPCstubData > ) : Bool;
+}
+
+exec function CreateDebugStimuli( gameInstance : GameInstance, stimType : String, activeStim : String )
+{
+	var player : PlayerPuppet;
+	var debugStim : gamedataStimType;
+	var broadcaster : StimBroadcasterComponent;
+	StimBroadcasterComponent.nameToStimEnum( StringToName( stimType ), debugStim );
+	player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( gameInstance ).GetLocalPlayerMainGameObject() ) );
+	broadcaster = player.GetStimBroadcasterComponent();
+	if( broadcaster )
+	{
+		if( activeStim == "true" )
+		{
+			broadcaster.AddActiveStimuli( player, debugStim, 15.0 );
+		}
+		else
+		{
+			broadcaster.TriggerSingleBroadcast( player, debugStim );
+		}
+	}
+}
+

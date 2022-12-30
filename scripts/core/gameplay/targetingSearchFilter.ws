@@ -1,0 +1,109 @@
+importonly struct TargetSearchFilter
+{
+}
+
+importonly struct TargetSearchQuery
+{
+	import var testedSet : TargetingSet;
+	import var searchFilter : TargetSearchFilter;
+	import var includeSecondaryTargets : Bool;
+	import var ignoreInstigator : Bool;
+	import var maxDistance : Float;
+	import var queryTarget : EntityID;
+
+	public import static function SetComponentFilter( self : TargetSearchQuery, componentFilter : TargetComponentFilterType );
+}
+
+import enum TargetComponentFilterType
+{
+	Melee,
+	Shooting,
+	Scanning,
+	QuickHack,
+	ShootingLimbCyber,
+	HeadTarget,
+	LegTarget,
+	MechanicalTarget,
+}
+
+import enum TSFMV
+{
+	Obj_Player,
+	Obj_Puppet,
+	Obj_Sensor,
+	Obj_Device,
+	Obj_Other,
+	Att_Friendly,
+	Att_Hostile,
+	Att_Neutral,
+	Sp_AimAssistEnabled,
+	Sp_Aggressive,
+	St_Alive,
+	St_Dead,
+	St_NotDefeated,
+	St_Defeated,
+	St_Conscious,
+	St_Unconscious,
+	St_TurnedOn,
+	St_TurnedOff,
+	St_QuickHackable,
+	St_AliveAndActive,
+}
+
+import enum TargetingSet
+{
+	Visible,
+	Frustum,
+	Complete,
+	None,
+}
+
+import operator|( a : TSFMV, b : TSFMV ) : TSFMV;
+import operator&( a : TSFMV, b : TSFMV ) : TSFMV;
+import function TSF_Any( mask : TSFMV ) : TargetSearchFilter;
+import function TSF_All( mask : TSFMV ) : TargetSearchFilter;
+import function TSF_Not( mask : TSFMV ) : TargetSearchFilter;
+import function TSF_And( tsf1, tsf2 : TargetSearchFilter, optional tsf3, tsf4 : TargetSearchFilter ) : TargetSearchFilter;
+import function TSF_Or( tsf1, tsf2 : TargetSearchFilter, optional tsf3, tsf4 : TargetSearchFilter ) : TargetSearchFilter;
+
+function TSF_NPC() : TargetSearchFilter
+{
+	var tsf : TargetSearchFilter;
+	tsf = TSF_And( TSF_All( TSFMV.Obj_Puppet | TSFMV.St_Alive ), TSF_Not( TSFMV.Obj_Player ) );
+	return tsf;
+}
+
+function TSF_EnemyNPC() : TargetSearchFilter
+{
+	var tsf : TargetSearchFilter;
+	tsf = TSF_And( TSF_All( ( TSFMV.Obj_Puppet | TSFMV.Att_Hostile ) | TSFMV.St_Alive ), TSF_Not( TSFMV.Obj_Player ) );
+	return tsf;
+}
+
+function TSF_Quickhackable() : TargetSearchFilter
+{
+	var tsf : TargetSearchFilter;
+	tsf = TSF_And( TSF_All( TSFMV.St_QuickHackable ), TSF_Not( TSFMV.Obj_Player ), TSF_Not( TSFMV.Att_Friendly ), TSF_Any( TSFMV.Sp_Aggressive | TSFMV.Obj_Device ) );
+	return tsf;
+}
+
+function TSQ_ALL() : TargetSearchQuery
+{
+	var tsq : TargetSearchQuery;
+	return tsq;
+}
+
+function TSQ_NPC() : TargetSearchQuery
+{
+	var tsq : TargetSearchQuery;
+	tsq.searchFilter = TSF_NPC();
+	return tsq;
+}
+
+function TSQ_EnemyNPC() : TargetSearchQuery
+{
+	var tsq : TargetSearchQuery;
+	tsq.searchFilter = TSF_EnemyNPC();
+	return tsq;
+}
+

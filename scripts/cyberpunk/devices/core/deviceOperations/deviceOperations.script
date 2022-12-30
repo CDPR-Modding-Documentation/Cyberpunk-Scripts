@@ -1,0 +1,1364 @@
+class PlayBinkEvent extends Event
+{
+	var data : SBinkperationData;
+}
+
+class ToggleComponentsEvent extends Event
+{
+	var componentsData : array< SComponentOperationData >;
+}
+
+struct SToggleDeviceOperationData
+{
+	instanceeditable var operationName : CName;
+	instanceeditable var enable : Bool;
+}
+
+abstract class DeviceOperationBase extends IScriptable
+{
+	[ category = "Base Data" ]
+	instanceeditable var operationName : CName;
+	[ category = "Base Data" ]
+	instanceeditable var executeOnce : Bool;
+	[ category = "Base Data" ]
+	protected instanceeditable persistent var isEnabled : Bool;
+	default isEnabled = true;
+	[ category = "Base Data" ]
+	const instanceeditable var toggleOperations : array< SToggleDeviceOperationData >;
+	[ category = "Base Data" ]
+	instanceeditable var disableDevice : Bool;
+
+	public virtual function Execute( owner : weak< GameObject > )
+	{
+		ResolveDisable( disableDevice, owner );
+		if( executeOnce )
+		{
+			isEnabled = false;
+		}
+	}
+
+	public function SetIsEnabled( enabled : Bool )
+	{
+		isEnabled = enabled;
+	}
+
+	public const function IsEnabled() : Bool
+	{
+		return isEnabled;
+	}
+
+	public virtual function Restore( owner : weak< GameObject > ) {}
+
+	private function ResolveDisable( disable : Bool, owner : weak< GameObject > )
+	{
+		var device : Device;
+		if( disable )
+		{
+			device = ( ( Device )( owner ) );
+			if( device == NULL )
+			{
+				return;
+			}
+			device.GetDevicePS().ForceDisableDevice();
+		}
+	}
+
+}
+
+class GenericDeviceOperation extends DeviceOperationBase
+{
+	private var m_fxInstances : array< SVfxInstanceData >;
+	const instanceeditable var transformAnimations : array< STransformAnimationData >;
+	const instanceeditable var VFXs : array< SVFXOperationData >;
+	const instanceeditable var SFXs : array< SSFXOperationData >;
+	const instanceeditable var facts : array< SFactOperationData >;
+	const instanceeditable var components : array< SComponentOperationData >;
+	const instanceeditable var stims : array< SStimOperationData >;
+	const instanceeditable var statusEffects : array< SStatusEffectOperationData >;
+	const instanceeditable var damages : array< SDamageOperationData >;
+	const instanceeditable var items : array< SInventoryOperationData >;
+	instanceeditable var teleport : STeleportOperationData;
+	instanceeditable var meshesAppearence : CName;
+	instanceeditable var playerWorkspot : SWorkspotData;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveVFXs( VFXs, owner );
+		ResolveSFXs( SFXs, owner );
+		ResolveFacts( facts, owner );
+		ResolveComponents( components, owner );
+		ResolveMeshesAppearence( meshesAppearence, owner );
+		ResolveTransformAnimations( transformAnimations, owner );
+		ResolveWorkspots( playerWorkspot, owner );
+		ResolveStims( stims, owner );
+		ResolveStatusEffects( statusEffects, owner );
+		ResolveDamages( damages, owner );
+		ResolveItems( items, owner );
+		ResolveTeleport( teleport, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveVFXs( VFXs, owner );
+		ResolveSFXs( SFXs, owner );
+		ResolveComponents( components, owner );
+		ResolveMeshesAppearence( meshesAppearence, owner );
+		ResolveTransformAnimations( transformAnimations, owner );
+		ResolveStims( stims, owner );
+		ResolveStatusEffects( statusEffects, owner );
+		ResolveFacts( facts, owner, true );
+	}
+
+	private function ResolveTeleport( teleportArg : STeleportOperationData, owner : weak< GameObject > )
+	{
+		var puppet : GameObject;
+		if( owner == NULL )
+		{
+			return;
+		}
+		puppet = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		if( puppet == NULL )
+		{
+			return;
+		}
+		GameInstance.GetTeleportationFacility( owner.GetGame() ).TeleportToNode( puppet, teleportArg.nodeRef );
+	}
+
+	private function ResolveItems( itemsArg : array< SInventoryOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var transactionSystem : TransactionSystem;
+		var puppet : GameObject;
+		if( owner == NULL )
+		{
+			return;
+		}
+		puppet = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		if( puppet == NULL )
+		{
+			return;
+		}
+		transactionSystem = GameInstance.GetTransactionSystem( owner.GetGame() );
+		for( i = 0; i < itemsArg.Size(); i += 1 )
+		{
+			if( itemsArg[ i ].operationType == EItemOperationType.ADD )
+			{
+				transactionSystem.GiveItem( puppet, ItemID.FromTDBID( itemsArg[ i ].itemName ), itemsArg[ i ].quantity );
+			}
+			else if( itemsArg[ i ].operationType == EItemOperationType.REMOVE )
+			{
+				transactionSystem.RemoveItem( puppet, ItemID.FromTDBID( itemsArg[ i ].itemName ), itemsArg[ i ].quantity );
+			}
+		}
+	}
+
+	private function ResolveVFXs( VFXsArg : array< SVFXOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var effectBlackboard : worldEffectBlackboard;
+		var targetID : EntityID;
+		var target : GameEntity;
+		var fxInstance : FxInstance;
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < VFXsArg.Size(); i += 1 )
+		{
+			targetID = ( ( EntityID )( ResolveNodeRefWithEntityID( VFXsArg[ i ].nodeRef, owner.GetEntityID() ) ) );
+			target = ( ( GameEntity )( GameInstance.FindEntityByID( owner.GetGame(), targetID ) ) );
+			if( target == NULL )
+			{
+				target = owner;
+			}
+			if( target == NULL )
+			{
+				continue;
+			}
+			if( VFXsArg[ i ].operationType == EEffectOperationType.START )
+			{
+				if( FxResource.IsValid( VFXsArg[ i ].vfxResource ) )
+				{
+					if( !( IsNameValid( VFXsArg[ i ].vfxName ) ) )
+					{
+						VFXsArg[ i ].vfxName = StringToName( IntToString( i ) );
+					}
+					fxInstance = GetFxInstance( VFXsArg[ i ].vfxName );
+					if( fxInstance != NULL )
+					{
+						RemoveFxInstance( VFXsArg[ i ].vfxName );
+						fxInstance.Kill();
+					}
+					WorldPosition.SetVector4( position, target.GetWorldPosition() );
+					WorldTransform.SetWorldPosition( transform, position );
+					fxInstance = CreateFxInstance( owner, VFXsArg[ i ].vfxName, VFXsArg[ i ].vfxResource, transform );
+					fxInstance.SetBlackboardValue( 'change_size', VFXsArg[ i ].size );
+					StoreFxInstance( VFXsArg[ i ].vfxName, fxInstance );
+				}
+				else
+				{
+					effectBlackboard = new worldEffectBlackboard;
+					effectBlackboard.SetValue( 'change_size', VFXsArg[ i ].size );
+					GameObjectEffectHelper.StartEffectEvent( ( ( GameObject )( target ) ), VFXsArg[ i ].vfxName, VFXsArg[ i ].shouldPersist, effectBlackboard );
+				}
+			}
+			else if( VFXsArg[ i ].operationType == EEffectOperationType.STOP )
+			{
+				fxInstance = GetFxInstance( VFXsArg[ i ].vfxName );
+				if( fxInstance == NULL )
+				{
+					GameObjectEffectHelper.StopEffectEvent( ( ( GameObject )( target ) ), VFXsArg[ i ].vfxName );
+				}
+				else
+				{
+					RemoveFxInstance( VFXsArg[ i ].vfxName );
+					fxInstance.Kill();
+				}
+			}
+			else if( VFXsArg[ i ].operationType == EEffectOperationType.BRAKE_LOOP )
+			{
+				fxInstance = GetFxInstance( VFXsArg[ i ].vfxName );
+				if( fxInstance == NULL )
+				{
+					GameObjectEffectHelper.BreakEffectLoopEvent( ( ( GameObject )( target ) ), VFXsArg[ i ].vfxName );
+				}
+				else
+				{
+					fxInstance.BreakLoop();
+				}
+			}
+		}
+	}
+
+	private function ResolveSFXs( SFXsArg : array< SSFXOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < SFXsArg.Size(); i += 1 )
+		{
+			GameObject.PlaySoundEvent( owner, SFXsArg[ i ].sfxName );
+		}
+	}
+
+	private function ResolveFacts( factsArg : array< SFactOperationData >, owner : weak< GameObject >, optional restore : Bool )
+	{
+		var i : Int32;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < factsArg.Size(); i += 1 )
+		{
+			if( IsNameValid( factsArg[ i ].factName ) )
+			{
+				if( factsArg[ i ].operationType == EMathOperationType.Add )
+				{
+					if( !( restore ) || ( GetFact( owner.GetGame(), factsArg[ i ].factName ) < factsArg[ i ].factValue ) )
+					{
+						AddFact( owner.GetGame(), factsArg[ i ].factName, factsArg[ i ].factValue );
+					}
+				}
+				else
+				{
+					SetFactValue( owner.GetGame(), factsArg[ i ].factName, factsArg[ i ].factValue );
+				}
+			}
+		}
+	}
+
+	private function ResolveComponents( componentsData : array< SComponentOperationData >, owner : weak< GameObject > )
+	{
+		var evt : ToggleComponentsEvent;
+		evt = new ToggleComponentsEvent;
+		evt.componentsData = componentsData;
+		owner.QueueEvent( evt );
+	}
+
+	private function ResolveMeshesAppearence( appearanceName : CName, owner : weak< GameObject > )
+	{
+		if( owner == NULL )
+		{
+			return;
+		}
+		if( IsNameValid( appearanceName ) )
+		{
+			GameObject.SetMeshAppearanceEvent( owner, appearanceName );
+		}
+	}
+
+	private function ResolveTransformAnimations( animations : array< STransformAnimationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var playEvent : gameTransformAnimationPlayEvent;
+		var pauseEvent : gameTransformAnimationPauseEvent;
+		var resetEvent : gameTransformAnimationResetEvent;
+		var skipEvent : gameTransformAnimationSkipEvent;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < animations.Size(); i += 1 )
+		{
+			if( animations[ i ].operationType == ETransformAnimationOperationType.PLAY )
+			{
+				playEvent = new gameTransformAnimationPlayEvent;
+				playEvent.animationName = animations[ i ].animationName;
+				playEvent.timeScale = animations[ i ].playData.timeScale;
+				playEvent.looping = animations[ i ].playData.looping;
+				playEvent.timesPlayed = animations[ i ].playData.timesPlayed;
+				owner.QueueEvent( playEvent );
+				return;
+			}
+			else if( animations[ i ].operationType == ETransformAnimationOperationType.PAUSE )
+			{
+				pauseEvent = new gameTransformAnimationPauseEvent;
+				pauseEvent.animationName = animations[ i ].animationName;
+				owner.QueueEvent( pauseEvent );
+				return;
+			}
+			else if( animations[ i ].operationType == ETransformAnimationOperationType.RESET )
+			{
+				resetEvent = new gameTransformAnimationResetEvent;
+				resetEvent.animationName = animations[ i ].animationName;
+				owner.QueueEvent( resetEvent );
+				return;
+			}
+			else if( animations[ i ].operationType == ETransformAnimationOperationType.SKIP )
+			{
+				skipEvent = new gameTransformAnimationSkipEvent;
+				skipEvent.animationName = animations[ i ].animationName;
+				skipEvent.time = animations[ i ].skipData.time;
+				skipEvent.skipToEnd = animations[ i ].skipData.skipToEnd;
+				owner.QueueEvent( skipEvent );
+				return;
+			}
+		}
+	}
+
+	private function ResolveWorkspots( workspot : SWorkspotData, owner : weak< GameObject > )
+	{
+		var device : Device;
+		var player : GameObject;
+		device = ( ( Device )( owner ) );
+		if( device == NULL )
+		{
+			return;
+		}
+		player = GameInstance.GetPlayerSystem( device.GetGame() ).GetLocalPlayerMainGameObject();
+		if( player == NULL )
+		{
+			return;
+		}
+		if( workspot.operationType == EWorkspotOperationType.ENTER )
+		{
+			if( IsNameValid( workspot.componentName ) )
+			{
+				EnterWorkspot( device, player, workspot.freeCamera, workspot.componentName );
+			}
+		}
+		else if( workspot.operationType == EWorkspotOperationType.LEAVE )
+		{
+			LeaveWorkspot( player );
+		}
+	}
+
+	private function ResolveStims( stimsArg : array< SStimOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var broadcaster : StimBroadcasterComponent;
+		var target : GameObject;
+		var targetID : EntityID;
+		var stimType : gamedataStimType;
+		for( i = 0; i < stimsArg.Size(); i += 1 )
+		{
+			stimType = Device.MapStimType( stimsArg[ i ].stimType );
+			targetID = ( ( EntityID )( ResolveNodeRefWithEntityID( stimsArg[ i ].nodeRef, owner.GetEntityID() ) ) );
+			target = ( ( GameObject )( GameInstance.FindEntityByID( owner.GetGame(), targetID ) ) );
+			if( target == NULL )
+			{
+				target = owner;
+			}
+			if( target == NULL )
+			{
+				continue;
+			}
+			if( stimType == gamedataStimType.Invalid )
+			{
+				continue;
+			}
+			broadcaster = target.GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				if( stimsArg[ i ].operationType == EEffectOperationType.START )
+				{
+					broadcaster.SetSingleActiveStimuli( owner, stimType, stimsArg[ i ].lifeTime, stimsArg[ i ].radius );
+				}
+				else
+				{
+					broadcaster.RemoveActiveStimuliByName( owner, stimType );
+				}
+			}
+		}
+	}
+
+	private function ResolveStatusEffects( statusEffectsArg : array< SStatusEffectOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var effect : EffectInstance;
+		var position : Vector4;
+		if( owner == NULL )
+		{
+			return;
+		}
+		position = owner.GetWorldPosition();
+		for( i = 0; i < statusEffectsArg.Size(); i += 1 )
+		{
+			if( statusEffectsArg[ i ].range > 0.0 )
+			{
+				effect = GameInstance.GetGameEffectSystem( owner.GetGame() ).CreateEffectStatic( 'applyStatusEffect', 'inRange', owner );
+				EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position + statusEffectsArg[ i ].offset );
+				EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, statusEffectsArg[ i ].range );
+				EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.duration, statusEffectsArg[ i ].duration );
+				EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.statusEffect, statusEffectsArg[ i ].effect.statusEffect );
+				effect.Run();
+			}
+		}
+	}
+
+	private function ResolveDamages( damagesArg : array< SDamageOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var damageEffect : EffectInstance;
+		var explosionAttack : Attack_GameEffect;
+		var attackContext : AttackInitContext;
+		var statMods : array< gameStatModifierData >;
+		var player : GameObject;
+		var position : Vector4;
+		if( owner == NULL )
+		{
+			return;
+		}
+		player = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		position = owner.GetWorldPosition();
+		attackContext.instigator = player;
+		attackContext.source = owner;
+		for( i = 0; i < damagesArg.Size(); i += 1 )
+		{
+			if( damagesArg[ i ].range > 0.0 )
+			{
+				attackContext.record = TweakDBInterface.GetAttackRecord( damagesArg[ i ].damageType );
+				explosionAttack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+				damageEffect = explosionAttack.PrepareAttack( owner );
+				explosionAttack.GetStatModList( statMods );
+				EffectData.SetFloat( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, damagesArg[ i ].range );
+				EffectData.SetVector( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position + damagesArg[ i ].offset );
+				EffectData.SetVariant( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( explosionAttack ) ) );
+				EffectData.SetVariant( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attackStatModList, statMods );
+				explosionAttack.StartAttack();
+			}
+		}
+	}
+
+	protected virtual function EnterWorkspot( target : Device, activator : GameObject, optional freeCamera : Bool, optional componentName : CName )
+	{
+		var workspotSystem : WorkspotGameSystem;
+		workspotSystem = GameInstance.GetWorkspotSystem( activator.GetGame() );
+		workspotSystem.PlayInDeviceSimple( target, activator, freeCamera, componentName );
+	}
+
+	protected virtual function LeaveWorkspot( activator : GameObject )
+	{
+		var orientation : Quaternion;
+		var direction : Vector4;
+		var workspotSystem : WorkspotGameSystem;
+		Quaternion.SetIdentity( orientation );
+		direction = Vector4( 0.0, 0.0, 0.0, 1.0 );
+		workspotSystem = GameInstance.GetWorkspotSystem( activator.GetGame() );
+		workspotSystem.StopInDevice( activator, direction, orientation );
+	}
+
+	private function GetFxInstance( id : CName ) : FxInstance
+	{
+		var i : Int32;
+		var fx : FxInstance;
+		for( i = 0; i < m_fxInstances.Size(); i += 1 )
+		{
+			if( m_fxInstances[ i ].id == id )
+			{
+				fx = m_fxInstances[ i ].fx;
+				if( fx == NULL )
+				{
+					m_fxInstances.EraseFast( i );
+				}
+				break;
+			}
+		}
+		return fx;
+	}
+
+	private function RemoveFxInstance( id : CName )
+	{
+		var i : Int32;
+		for( i = 0; i < m_fxInstances.Size(); i += 1 )
+		{
+			if( m_fxInstances[ i ].id == id )
+			{
+				m_fxInstances.EraseFast( i );
+				break;
+			}
+		}
+	}
+
+	private function CreateFxInstance( owner : weak< GameObject >, id : CName, resource : FxResource, transform : WorldTransform ) : FxInstance
+	{
+		var fx : FxInstance;
+		var fxSystem : FxSystem;
+		fxSystem = GameInstance.GetFxSystem( owner.GetGame() );
+		fx = fxSystem.SpawnEffect( resource, transform );
+		return fx;
+	}
+
+	private function StoreFxInstance( id : CName, fx : FxInstance )
+	{
+		var fxInstanceData : SVfxInstanceData;
+		fxInstanceData.id = id;
+		fxInstanceData.fx = fx;
+		m_fxInstances.PushBack( fxInstanceData );
+	}
+
+}
+
+class SetMessageDeviceOperation extends DeviceOperationBase
+{
+	private instanceeditable var targetRef : NodeRef;
+	[ customEditor = "TweakDBGroupInheritance;ScreenMessageData" ]
+	private instanceeditable editable var messageRecordID : TweakDBID;
+	private instanceeditable editable var replaceTextWithCustomNumber : Bool;
+	private instanceeditable editable var customNumber : Int32;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		if( owner )
+		{
+			SendEvent( owner );
+		}
+	}
+
+	private function SendEvent( owner : weak< GameObject > )
+	{
+		var evt : SetMessageRecordEvent;
+		var targetID : EntityID;
+		var targetPSID : PersistentID;
+		targetID = ( ( EntityID )( ResolveNodeRefWithEntityID( targetRef, owner.GetEntityID() ) ) );
+		if( EntityID.IsDefined( targetID ) )
+		{
+			targetPSID = CreatePersistentID( targetID, 'LcdScreenController' );
+			if( PersistentID.IsDefined( targetPSID ) )
+			{
+				evt = new SetMessageRecordEvent;
+				evt.m_messageRecordID = messageRecordID;
+				evt.m_replaceTextWithCustomNumber = replaceTextWithCustomNumber;
+				evt.m_customNumber = customNumber;
+				GameInstance.GetPersistencySystem( owner.GetGame() ).QueuePSEvent( targetPSID, 'LcdScreenControllerPS', evt );
+			}
+		}
+	}
+
+}
+
+class RequestCLSStateChangeDeviceOperation extends DeviceOperationBase
+{
+	private instanceeditable var state : ECLSForcedState;
+	private instanceeditable var sourceName : CName;
+	private instanceeditable var priority : EPriority;
+	default priority = EPriority.Medium;
+	private instanceeditable var removePreviousRequests : Bool;
+	default removePreviousRequests = true;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		if( owner )
+		{
+			SendRequest( owner.GetGame() );
+		}
+	}
+
+	private function SendRequest( game : GameInstance )
+	{
+		var request : ForceCLSStateRequest;
+		if( GameInstance.IsValid( game ) )
+		{
+			request = new ForceCLSStateRequest;
+			request.state = state;
+			request.sourceName = sourceName;
+			request.priority = priority;
+			request.removePreviousRequests = removePreviousRequests;
+			request.savable = true;
+			GameInstance.QueueScriptableSystemRequest( game, 'CityLightSystem', request );
+		}
+	}
+
+}
+
+class ToggleComponentsDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var components : array< SComponentOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveComponents( components, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveComponents( components, owner );
+	}
+
+	private function ResolveComponents( componentsData : array< SComponentOperationData >, owner : weak< GameObject > )
+	{
+		var evt : ToggleComponentsEvent;
+		evt = new ToggleComponentsEvent;
+		evt.componentsData = componentsData;
+		owner.QueueEvent( evt );
+	}
+
+}
+
+class PlayTransformAnimationDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var transformAnimations : array< STransformAnimationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveTransformAnimations( transformAnimations, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveTransformAnimations( transformAnimations, owner );
+	}
+
+	private function ResolveTransformAnimations( animations : array< STransformAnimationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var playEvent : gameTransformAnimationPlayEvent;
+		var pauseEvent : gameTransformAnimationPauseEvent;
+		var resetEvent : gameTransformAnimationResetEvent;
+		var skipEvent : gameTransformAnimationSkipEvent;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < animations.Size(); i += 1 )
+		{
+			if( animations[ i ].operationType == ETransformAnimationOperationType.PLAY )
+			{
+				playEvent = new gameTransformAnimationPlayEvent;
+				playEvent.animationName = animations[ i ].animationName;
+				playEvent.timeScale = animations[ i ].playData.timeScale;
+				playEvent.looping = animations[ i ].playData.looping;
+				playEvent.timesPlayed = animations[ i ].playData.timesPlayed;
+				owner.QueueEvent( playEvent );
+				return;
+			}
+			else if( animations[ i ].operationType == ETransformAnimationOperationType.PAUSE )
+			{
+				pauseEvent = new gameTransformAnimationPauseEvent;
+				pauseEvent.animationName = animations[ i ].animationName;
+				owner.QueueEvent( pauseEvent );
+				return;
+			}
+			else if( animations[ i ].operationType == ETransformAnimationOperationType.RESET )
+			{
+				resetEvent = new gameTransformAnimationResetEvent;
+				resetEvent.animationName = animations[ i ].animationName;
+				owner.QueueEvent( resetEvent );
+				return;
+			}
+			else if( animations[ i ].operationType == ETransformAnimationOperationType.SKIP )
+			{
+				skipEvent = new gameTransformAnimationSkipEvent;
+				skipEvent.animationName = animations[ i ].animationName;
+				skipEvent.time = animations[ i ].skipData.time;
+				skipEvent.skipToEnd = animations[ i ].skipData.skipToEnd;
+				owner.QueueEvent( skipEvent );
+				return;
+			}
+		}
+	}
+
+}
+
+class FactsDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var facts : array< SFactOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveFacts( facts, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveFacts( facts, owner, true );
+	}
+
+	private function ResolveFacts( factsArg : array< SFactOperationData >, owner : weak< GameObject >, optional restore : Bool )
+	{
+		var i : Int32;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < factsArg.Size(); i += 1 )
+		{
+			if( IsNameValid( factsArg[ i ].factName ) )
+			{
+				if( factsArg[ i ].operationType == EMathOperationType.Add )
+				{
+					if( !( restore ) || ( GetFact( owner.GetGame(), factsArg[ i ].factName ) < factsArg[ i ].factValue ) )
+					{
+						AddFact( owner.GetGame(), factsArg[ i ].factName, factsArg[ i ].factValue );
+					}
+				}
+				else
+				{
+					SetFactValue( owner.GetGame(), factsArg[ i ].factName, factsArg[ i ].factValue );
+				}
+			}
+		}
+	}
+
+}
+
+class PlayEffectDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var VFXs : array< SVFXOperationData >;
+	private var m_fxInstances : array< SVfxInstanceData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveVFXs( VFXs, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveVFXs( VFXs, owner );
+	}
+
+	private function ResolveVFXs( VFXsArg : array< SVFXOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var effectBlackboard : worldEffectBlackboard;
+		var targetID : EntityID;
+		var target : GameEntity;
+		var fxInstance : FxInstance;
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < VFXsArg.Size(); i += 1 )
+		{
+			targetID = ( ( EntityID )( ResolveNodeRefWithEntityID( VFXsArg[ i ].nodeRef, owner.GetEntityID() ) ) );
+			target = ( ( GameEntity )( GameInstance.FindEntityByID( owner.GetGame(), targetID ) ) );
+			if( target == NULL )
+			{
+				target = owner;
+			}
+			if( target == NULL )
+			{
+				continue;
+			}
+			if( VFXsArg[ i ].operationType == EEffectOperationType.START )
+			{
+				if( FxResource.IsValid( VFXsArg[ i ].vfxResource ) )
+				{
+					if( !( IsNameValid( VFXsArg[ i ].vfxName ) ) )
+					{
+						VFXsArg[ i ].vfxName = StringToName( IntToString( i ) );
+					}
+					fxInstance = GetFxInstance( VFXsArg[ i ].vfxName );
+					if( fxInstance != NULL )
+					{
+						RemoveFxInstance( VFXsArg[ i ].vfxName );
+						fxInstance.Kill();
+					}
+					WorldPosition.SetVector4( position, target.GetWorldPosition() );
+					WorldTransform.SetWorldPosition( transform, position );
+					fxInstance = CreateFxInstance( owner, VFXsArg[ i ].vfxName, VFXsArg[ i ].vfxResource, transform );
+					fxInstance.SetBlackboardValue( 'change_size', VFXsArg[ i ].size );
+					StoreFxInstance( VFXsArg[ i ].vfxName, fxInstance );
+				}
+				else
+				{
+					effectBlackboard = new worldEffectBlackboard;
+					effectBlackboard.SetValue( 'change_size', VFXsArg[ i ].size );
+					GameObjectEffectHelper.StartEffectEvent( ( ( GameObject )( target ) ), VFXsArg[ i ].vfxName, VFXsArg[ i ].shouldPersist, effectBlackboard );
+				}
+			}
+			else if( VFXsArg[ i ].operationType == EEffectOperationType.STOP )
+			{
+				fxInstance = GetFxInstance( VFXsArg[ i ].vfxName );
+				if( fxInstance == NULL )
+				{
+					GameObjectEffectHelper.StopEffectEvent( ( ( GameObject )( target ) ), VFXsArg[ i ].vfxName );
+				}
+				else
+				{
+					RemoveFxInstance( VFXsArg[ i ].vfxName );
+					fxInstance.Kill();
+				}
+			}
+			else if( VFXsArg[ i ].operationType == EEffectOperationType.BRAKE_LOOP )
+			{
+				fxInstance = GetFxInstance( VFXsArg[ i ].vfxName );
+				if( fxInstance == NULL )
+				{
+					GameObjectEffectHelper.BreakEffectLoopEvent( ( ( GameObject )( target ) ), VFXsArg[ i ].vfxName );
+				}
+				else
+				{
+					fxInstance.BreakLoop();
+				}
+			}
+		}
+	}
+
+	private function GetFxInstance( id : CName ) : FxInstance
+	{
+		var i : Int32;
+		var fx : FxInstance;
+		for( i = 0; i < m_fxInstances.Size(); i += 1 )
+		{
+			if( m_fxInstances[ i ].id == id )
+			{
+				fx = m_fxInstances[ i ].fx;
+				if( fx == NULL )
+				{
+					m_fxInstances.EraseFast( i );
+				}
+				break;
+			}
+		}
+		return fx;
+	}
+
+	private function RemoveFxInstance( id : CName )
+	{
+		var i : Int32;
+		for( i = 0; i < m_fxInstances.Size(); i += 1 )
+		{
+			if( m_fxInstances[ i ].id == id )
+			{
+				m_fxInstances.EraseFast( i );
+				break;
+			}
+		}
+	}
+
+	private function CreateFxInstance( owner : weak< GameObject >, id : CName, resource : FxResource, transform : WorldTransform ) : FxInstance
+	{
+		var fx : FxInstance;
+		var fxSystem : FxSystem;
+		fxSystem = GameInstance.GetFxSystem( owner.GetGame() );
+		fx = fxSystem.SpawnEffect( resource, transform );
+		return fx;
+	}
+
+	private function StoreFxInstance( id : CName, fx : FxInstance )
+	{
+		var fxInstanceData : SVfxInstanceData;
+		fxInstanceData.id = id;
+		fxInstanceData.fx = fx;
+		m_fxInstances.PushBack( fxInstanceData );
+	}
+
+}
+
+class StimDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var stims : array< SStimOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		ResolveStims( stims, owner );
+		if( executeOnce )
+		{
+			isEnabled = false;
+		}
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveStims( stims, owner );
+	}
+
+	private function ResolveStims( stimsArg : array< SStimOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var broadcaster : StimBroadcasterComponent;
+		var target : GameObject;
+		var targetID : EntityID;
+		var stimType : gamedataStimType;
+		for( i = 0; i < stimsArg.Size(); i += 1 )
+		{
+			stimType = Device.MapStimType( stimsArg[ i ].stimType );
+			targetID = ( ( EntityID )( ResolveNodeRefWithEntityID( stimsArg[ i ].nodeRef, owner.GetEntityID() ) ) );
+			target = ( ( GameObject )( GameInstance.FindEntityByID( owner.GetGame(), targetID ) ) );
+			if( target == NULL )
+			{
+				target = owner;
+			}
+			if( target == NULL )
+			{
+				continue;
+			}
+			if( stimType == gamedataStimType.Invalid )
+			{
+				continue;
+			}
+			broadcaster = target.GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				if( stimsArg[ i ].operationType == EEffectOperationType.START )
+				{
+					broadcaster.SetSingleActiveStimuli( owner, stimType, stimsArg[ i ].lifeTime, stimsArg[ i ].radius );
+				}
+				else
+				{
+					broadcaster.RemoveActiveStimuliByName( owner, stimType );
+				}
+			}
+		}
+	}
+
+}
+
+class PlaySoundDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var SFXs : array< SSFXOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveSFXs( SFXs, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveSFXs( SFXs, owner );
+	}
+
+	private function ResolveSFXs( SFXsArg : array< SSFXOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		if( owner == NULL )
+		{
+			return;
+		}
+		for( i = 0; i < SFXsArg.Size(); i += 1 )
+		{
+			if( SFXsArg[ i ].operationType == EEffectOperationType.START )
+			{
+				GameObject.PlaySound( owner, SFXsArg[ i ].sfxName );
+			}
+			else if( SFXsArg[ i ].operationType == EEffectOperationType.STOP )
+			{
+				GameObject.StopSound( owner, SFXsArg[ i ].sfxName );
+			}
+		}
+	}
+
+}
+
+class ApplyStatusEffectDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var statusEffects : array< SStatusEffectOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveStatusEffects( statusEffects, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveStatusEffects( statusEffects, owner );
+	}
+
+	private function ResolveStatusEffects( statusEffectsArg : array< SStatusEffectOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var effect : EffectInstance;
+		var position : Vector4;
+		if( owner == NULL )
+		{
+			return;
+		}
+		position = owner.GetWorldPosition();
+		for( i = 0; i < statusEffectsArg.Size(); i += 1 )
+		{
+			if( statusEffectsArg[ i ].range > 0.0 )
+			{
+				effect = GameInstance.GetGameEffectSystem( owner.GetGame() ).CreateEffectStatic( 'applyStatusEffect', 'inRange', owner );
+				EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position + statusEffectsArg[ i ].offset );
+				EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, statusEffectsArg[ i ].range );
+				EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.duration, statusEffectsArg[ i ].duration );
+				EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.statusEffect, statusEffectsArg[ i ].effect.statusEffect );
+				effect.Run();
+			}
+		}
+	}
+
+}
+
+class ApplyDamageDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var damages : array< SDamageOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveDamages( damages, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveDamages( damages, owner );
+	}
+
+	private function ResolveDamages( damagesArg : array< SDamageOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var damageEffect : EffectInstance;
+		var explosionAttack : Attack_GameEffect;
+		var attackContext : AttackInitContext;
+		var statMods : array< gameStatModifierData >;
+		var player : GameObject;
+		var attackRecord : Attack_Record;
+		var range : Float;
+		var position : Vector4;
+		if( owner == NULL )
+		{
+			return;
+		}
+		player = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		position = owner.GetWorldPosition();
+		attackContext.instigator = player;
+		attackContext.source = owner;
+		for( i = 0; i < damagesArg.Size(); i += 1 )
+		{
+			attackRecord = TweakDBInterface.GetAttackRecord( damagesArg[ i ].damageType );
+			if( attackRecord == NULL )
+			{
+				continue;
+			}
+			if( damagesArg[ i ].range <= 0.0 )
+			{
+				range = attackRecord.Range();
+			}
+			else
+			{
+				range = damagesArg[ i ].range;
+			}
+			if( range > 0.0 )
+			{
+				attackContext.record = attackRecord;
+				explosionAttack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+				damageEffect = explosionAttack.PrepareAttack( owner );
+				explosionAttack.GetStatModList( statMods );
+				EffectData.SetFloat( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, range );
+				EffectData.SetVector( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position + damagesArg[ i ].offset );
+				EffectData.SetVariant( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( explosionAttack ) ) );
+				EffectData.SetVariant( damageEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attackStatModList, statMods );
+				explosionAttack.StartAttack();
+			}
+		}
+	}
+
+}
+
+class ItemsDeviceOperation extends DeviceOperationBase
+{
+	const instanceeditable var items : array< SInventoryOperationData >;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveItems( items, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveItems( items, owner );
+	}
+
+	private function ResolveItems( itemsArg : array< SInventoryOperationData >, owner : weak< GameObject > )
+	{
+		var i : Int32;
+		var transactionSystem : TransactionSystem;
+		var puppet : GameObject;
+		if( owner == NULL )
+		{
+			return;
+		}
+		puppet = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		if( puppet == NULL )
+		{
+			return;
+		}
+		transactionSystem = GameInstance.GetTransactionSystem( owner.GetGame() );
+		for( i = 0; i < itemsArg.Size(); i += 1 )
+		{
+			if( itemsArg[ i ].operationType == EItemOperationType.ADD )
+			{
+				transactionSystem.GiveItem( puppet, ItemID.FromTDBID( itemsArg[ i ].itemName ), itemsArg[ i ].quantity );
+			}
+			else if( itemsArg[ i ].operationType == EItemOperationType.REMOVE )
+			{
+				transactionSystem.RemoveItem( puppet, ItemID.FromTDBID( itemsArg[ i ].itemName ), itemsArg[ i ].quantity );
+			}
+		}
+	}
+
+}
+
+class TeleportDeviceOperation extends DeviceOperationBase
+{
+	instanceeditable var teleport : STeleportOperationData;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveTeleport( teleport, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveTeleport( teleport, owner );
+	}
+
+	private function ResolveTeleport( teleportArg : STeleportOperationData, owner : weak< GameObject > )
+	{
+		var puppet : GameObject;
+		if( owner == NULL )
+		{
+			return;
+		}
+		puppet = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		if( puppet == NULL )
+		{
+			return;
+		}
+		GameInstance.GetTeleportationFacility( owner.GetGame() ).TeleportToNode( puppet, teleportArg.nodeRef );
+	}
+
+}
+
+class MeshAppearanceDeviceOperation extends DeviceOperationBase
+{
+	instanceeditable var meshesAppearence : CName;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveMeshesAppearence( meshesAppearence, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveMeshesAppearence( meshesAppearence, owner );
+	}
+
+	private function ResolveMeshesAppearence( appearanceName : CName, owner : weak< GameObject > )
+	{
+		if( owner == NULL )
+		{
+			return;
+		}
+		if( IsNameValid( appearanceName ) )
+		{
+			GameObject.SetMeshAppearanceEvent( owner, appearanceName );
+		}
+	}
+
+}
+
+class PlayerWokrspotDeviceOperation extends DeviceOperationBase
+{
+	instanceeditable var playerWorkspot : SWorkspotData;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveWorkspots( playerWorkspot, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > ) {}
+
+	private function ResolveWorkspots( workspot : SWorkspotData, owner : weak< GameObject > )
+	{
+		var device : Device;
+		var player : GameObject;
+		device = ( ( Device )( owner ) );
+		if( device == NULL )
+		{
+			return;
+		}
+		player = GameInstance.GetPlayerSystem( device.GetGame() ).GetLocalPlayerMainGameObject();
+		if( player == NULL )
+		{
+			return;
+		}
+		if( workspot.operationType == EWorkspotOperationType.ENTER )
+		{
+			if( IsNameValid( workspot.componentName ) )
+			{
+				EnterWorkspot( device, player, workspot.freeCamera, workspot.componentName );
+			}
+		}
+		else if( workspot.operationType == EWorkspotOperationType.LEAVE )
+		{
+			LeaveWorkspot( player );
+		}
+	}
+
+	protected virtual function EnterWorkspot( target : Device, activator : GameObject, optional freeCamera : Bool, optional componentName : CName )
+	{
+		var workspotSystem : WorkspotGameSystem;
+		workspotSystem = GameInstance.GetWorkspotSystem( activator.GetGame() );
+		workspotSystem.PlayInDeviceSimple( target, activator, freeCamera, componentName );
+	}
+
+	protected virtual function LeaveWorkspot( activator : GameObject )
+	{
+		var orientation : Quaternion;
+		var direction : Vector4;
+		var workspotSystem : WorkspotGameSystem;
+		Quaternion.SetIdentity( orientation );
+		direction = Vector4( 0.0, 0.0, 0.0, 1.0 );
+		workspotSystem = GameInstance.GetWorkspotSystem( activator.GetGame() );
+		workspotSystem.StopInDevice( activator, direction, orientation );
+	}
+
+}
+
+class PlayBinkDeviceOperation extends DeviceOperationBase
+{
+	instanceeditable var bink : SBinkperationData;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveBink( bink, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveBink( bink, owner );
+	}
+
+	private function ResolveBink( binkData : SBinkperationData, owner : weak< GameObject > )
+	{
+		var evt : PlayBinkEvent;
+		if( owner == NULL )
+		{
+			return;
+		}
+		evt = new PlayBinkEvent;
+		evt.data = binkData;
+		owner.QueueEvent( evt );
+	}
+
+}
+
+class ToggleCustomActionDeviceOperation extends DeviceOperationBase
+{
+	instanceeditable var customActionID : CName;
+	instanceeditable var enabled : Bool;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveCustomActionState( customActionID, enabled, owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveCustomActionState( customActionID, enabled, owner );
+	}
+
+	private function ResolveCustomActionState( actionID : CName, state : Bool, owner : weak< GameObject > )
+	{
+		var device : Device;
+		var evt : ToggleCustomActionEvent;
+		if( owner == NULL )
+		{
+			return;
+		}
+		device = ( ( Device )( owner ) );
+		if( device == NULL )
+		{
+			return;
+		}
+		if( !( IsNameValid( actionID ) ) )
+		{
+			return;
+		}
+		evt = new ToggleCustomActionEvent;
+		evt.enabled = state;
+		evt.actionID = actionID;
+		GameInstance.GetPersistencySystem( device.GetGame() ).QueuePSEvent( device.GetDevicePS().GetID(), device.GetDevicePS().GetClassName(), evt );
+	}
+
+}
+
+class ToggleOffMeshConnectionsDeviceOperation extends DeviceOperationBase
+{
+	instanceeditable var enable : Bool;
+	instanceeditable var affectsPlayer : Bool;
+	instanceeditable var affectsNPCs : Bool;
+
+	public override function Execute( owner : weak< GameObject > )
+	{
+		super.Execute( owner );
+		ResolveOffMeshConnections( owner );
+	}
+
+	public override function Restore( owner : weak< GameObject > )
+	{
+		ResolveOffMeshConnections( owner );
+	}
+
+	private function ResolveOffMeshConnections( owner : weak< GameObject > )
+	{
+		var device : Device;
+		var evt : ToggleOffMeshConnections;
+		if( owner == NULL )
+		{
+			return;
+		}
+		evt = new ToggleOffMeshConnections;
+		evt.enable = enable;
+		evt.affectsPlayer = affectsPlayer;
+		evt.affectsNPCs = affectsNPCs;
+		device.QueueEvent( evt );
+	}
+
+}
+

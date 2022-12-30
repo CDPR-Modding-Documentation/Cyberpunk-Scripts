@@ -1,0 +1,1171 @@
+class RegisterTimeListeners extends Event
+{
+}
+
+class ManageAreaComponent extends Event
+{
+	var enable : Bool;
+}
+
+class SecurityAreaTypeChangedNotification extends Event
+{
+	var previousType : ESecurityAreaType;
+	var currentType : ESecurityAreaType;
+	var area : weak< SecurityAreaControllerPS >;
+	var wasScheduled : Bool;
+}
+
+class SecurityAreaEvent extends ActionBool
+{
+	private var m_securityAreaData : SecurityAreaData;
+	private var m_whoBreached : weak< GameObject >;
+
+	public const function GetWhoBreached() : GameObject
+	{
+		return m_whoBreached;
+	}
+
+	protected function SetWhoBreached( whoBreached : GameObject )
+	{
+		m_whoBreached = whoBreached;
+	}
+
+	public function SetAreaData( areaData : SecurityAreaData )
+	{
+		m_securityAreaData = areaData;
+	}
+
+	public function GetSecurityAreaData() : SecurityAreaData
+	{
+		return m_securityAreaData;
+	}
+
+	public function GetSecurityAreaID() : PersistentID
+	{
+		return m_securityAreaData.id;
+	}
+
+	public function ModifyAreaTypeHack( modifiedAreaType : ESecurityAreaType )
+	{
+		m_securityAreaData.securityAreaType = modifiedAreaType;
+	}
+
+}
+
+class SecurityAreaCrossingPerimeter extends SecurityAreaEvent
+{
+	private var m_entered : Bool;
+
+	public function SetProperties( whoBreached : GameObject, didEnter : Bool )
+	{
+		SetWhoBreached( whoBreached );
+		m_entered = didEnter;
+	}
+
+	public function GetEnteredState() : Bool
+	{
+		return m_entered;
+	}
+
+}
+
+class TriggerPlayerAreaCheck extends Event
+{
+}
+
+struct AreaEntry
+{
+	persistent var user : EntityID;
+}
+
+struct SecurityAreaData
+{
+	var securityArea : weak< SecurityAreaControllerPS >;
+	var securityAreaType : ESecurityAreaType;
+	var accessLevel : ESecurityAccessLevel;
+	var zoneName : String;
+	var entered : Bool;
+	var id : PersistentID;
+	var incomingFilters : EFilterType;
+	var outgoingFilters : EFilterType;
+}
+
+struct EventsFilters
+{
+	[ toolitp = "DETERMINES UNDER WHAT CIRCUMSTANCES THIS AREA IS ALLOWED TO RECEIVE EVENTS FROM ANOTHER AREAS AND WHICH DID NOT ORIGINATE INSIDE THIS AREA. ALLOW_COMBAT_ONLY EXPLANATION: Only events where SecuritySystem states that it's in COMBAT are accepted. Others are discarded." ]
+	instanceeditable var incomingEventsFilter : EFilterType;
+	default incomingEventsFilter = EFilterType.ALLOW_ALL;
+	[ tooltip = "DETERMINES UNDER WHAT CIRCUMSTANCES THIS AREA IS ALLOWED TO SHARE EVENTS THAT ORIGINATED IN THIS AREA, WITH OTHER AREAS THAT ARE PART OF THE SAME SECURITY SYSTEM. ALLOW_COMBAT_ONLY EXPLANATION: All events that would not change SecuritySystemState to COMBAT are IGNORED." ]
+	instanceeditable var outgoingEventsFilter : EFilterType;
+	default outgoingEventsFilter = EFilterType.ALLOW_ALL;
+}
+
+struct AreaTypeTransition
+{
+	[ tooltip = "Decide to what security type you want this area transition to. DISABLED = SecurityArea no longer receives or broadcasts any events. Does not register enter events." ]
+	instanceeditable persistent var transitionTo : ESecurityAreaType;
+	[ rangeMin = "0" ][ rangeMax = "23" ][ toolitp = "At what hour should transition occur. Works even if area was not streamed in at given time and/or with passing time feature" ]
+	instanceeditable persistent var transitionHour : Int32;
+	[ category = "TransitionConditions" ][ tooltip = "Decides how 'aggressively' transition is supposed to occur.  " ]
+	instanceeditable persistent var transitionMode : ETransitionMode;
+	persistent var listenerID : Uint32;
+	persistent var locked : Bool;
+}
+
+class SecurityAreaController extends MasterController
+{
+
+	public const override function GetPS() : SecurityAreaControllerPS
+	{
+		return ( ( SecurityAreaControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+struct OutputPersistentData
+{
+	persistent var m_currentSecurityState : ESecuritySystemState;
+	persistent var m_breachOrigin : EBreachOrigin;
+	persistent var m_securityStateChanged : Bool;
+	persistent var m_lastKnownPosition : Vector4;
+	persistent var m_type : ESecurityNotificationType;
+	persistent var m_areaType : ESecurityAreaType;
+	persistent var m_objectOfInterest : EntityID;
+	persistent var m_whoBreached : EntityID;
+	persistent var m_reporter : PersistentID;
+	persistent var m_id : Int32;
+
+	public static function IsValid( self : OutputPersistentData ) : Bool
+	{
+		if( EntityID.IsDefined( self.m_whoBreached ) || EntityID.IsDefined( self.m_objectOfInterest ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class SecurityAreaControllerPS extends MasterControllerPS
+{
+	default m_tweakDBRecord = T"Devices.SecurityArea";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.SecurityArea";
+	default m_revealDevicesGrid = false;
+	default m_drawGridLink = false;
+	private var m_system : SecuritySystemControllerPS;
+	private persistent var m_usersInPerimeter : array< AreaEntry >;
+	private persistent var m_isPlayerInside : Bool;
+	[ tooltip = "Utilized during Authorization only. Determines the list of passwords and keycards that are working in this area. Passwords & Keycards are specified in Security System" ]
+	private instanceeditable var m_securityAccessLevel : ESecurityAccessLevel;
+	[ tooltip = "This determines what actions are legal inside this area as well what type of response will be initiated as a countermeasure" ]
+	private instanceeditable persistent var m_securityAreaType : ESecurityAreaType;
+	default m_securityAreaType = ESecurityAreaType.DANGEROUS;
+	[ tooltip = "[ OPTIONAL ] This determines what kind of events can get out of given area or get inside given area and its agents. By default all events are received and broadcasted" ]
+	private instanceeditable var m_eventsFilters : EventsFilters;
+	[ tooltip = "[ OPTIONAL ] If you want your Security Area to change its type regularly (i.e: Store / Alley (day/night) / Arasaka Lobby) here you can control it. TIP: You can perform transitions using SecurityAreaManager Quest Block :) TIP2: UPON TRANSITION, UI PROMPT ABOUT BEING IN AREA X MAY SHOW UP! TIP3: ORDER IS NOT IMPORANT!" ]
+	private const instanceeditable persistent var m_areaTransitions : array< AreaTypeTransition >;
+	private mutable persistent var m_runtimeTransitions : array< AreaTypeTransition >;
+	private persistent var m_pendingDisableRequest : Bool;
+	private persistent var m_lastOutput : OutputPersistentData;
+	private var m_questPlayerHasTriggeredCombat : Bool;
+	private var m_hasThisAreaReceivedCombatNotification : Bool;
+	private var m_pendingNotifyPlayerAboutTransition : Bool;
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+	}
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+	}
+
+	protected override function GameAttached()
+	{
+		CopyAreaTransitions();
+		RegisterTimeSystemListeners( GetOwnerEntityWeak() );
+		if( AreThereAnyValidTransitions() )
+		{
+			ResolveSecurityAreaType();
+		}
+		UpdateMiniMapRepresentation();
+	}
+
+	private function CopyAreaTransitions()
+	{
+		var i : Int32;
+		var k : Int32;
+		var alreadyCopied : Bool;
+		var transitionsToCopy : array< AreaTypeTransition >;
+		if( m_areaTransitions.Size() > 0 )
+		{
+			for( i = 0; i < m_areaTransitions.Size(); i += 1 )
+			{
+				alreadyCopied = false;
+				for( k = 0; k < m_runtimeTransitions.Size(); k += 1 )
+				{
+					if( m_areaTransitions[ i ].transitionHour == m_runtimeTransitions[ k ].transitionHour )
+					{
+						alreadyCopied = true;
+						break;
+					}
+				}
+				if( alreadyCopied )
+				{
+					continue;
+				}
+				transitionsToCopy.PushBack( m_areaTransitions[ i ] );
+			}
+			for( i = 0; i < transitionsToCopy.Size(); i += 1 )
+			{
+				m_runtimeTransitions.PushBack( transitionsToCopy[ i ] );
+			}
+		}
+	}
+
+	public quest const function HasPlayerBeenSpottedAndTriggeredCombat() : Bool
+	{
+		return m_questPlayerHasTriggeredCombat;
+	}
+
+	public quest const function HasThisAreaReceivedCombatNotification() : Bool
+	{
+		return m_hasThisAreaReceivedCombatNotification;
+	}
+
+	public const function GetIncomingFilter() : EFilterType
+	{
+		return m_eventsFilters.incomingEventsFilter;
+	}
+
+	public const function GetOutgoingFilter() : EFilterType
+	{
+		return m_eventsFilters.outgoingEventsFilter;
+	}
+
+	public function RegisterTimeSystemListeners( entity : Entity )
+	{
+		var transitionEvent : Transition;
+		var hour : GameTime;
+		var i : Int32;
+		UnregisterTimeSystemListeners();
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			transitionEvent = new Transition;
+			hour = GameTime.MakeGameTime( 0, m_runtimeTransitions[ i ].transitionHour, 0, 0 );
+			m_runtimeTransitions[ i ].listenerID = GameInstance.GetTimeSystem( GetGameInstance() ).RegisterListener( entity, transitionEvent, hour, -1, true );
+			transitionEvent.listenerID = m_runtimeTransitions[ i ].listenerID;
+		}
+	}
+
+	public function UnregisterTimeSystemListeners()
+	{
+		var i : Int32;
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			GameInstance.GetTimeSystem( GetGameInstance() ).UnregisterListener( m_runtimeTransitions[ i ].listenerID );
+			m_runtimeTransitions[ i ].listenerID = 0;
+		}
+	}
+
+	private function ResolveSecurityAreaType()
+	{
+		var hourOfTheDay : Int32;
+		var i : Int32;
+		var cachedTransitionHour : Int32;
+		var mostRelevantTransition : Uint32;
+		cachedTransitionHour = 25;
+		hourOfTheDay = GameTime.Hours( GameInstance.GetGameTime( GetGameInstance() ) );
+		mostRelevantTransition = 0;
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			if( m_runtimeTransitions[ i ].transitionHour < hourOfTheDay )
+			{
+				if( cachedTransitionHour > m_runtimeTransitions[ i ].transitionHour )
+				{
+					cachedTransitionHour = m_runtimeTransitions[ i ].transitionHour;
+					mostRelevantTransition = m_runtimeTransitions[ i ].listenerID;
+				}
+			}
+		}
+		if( mostRelevantTransition == ( ( Uint32 )( 0 ) ) )
+		{
+			return;
+		}
+		ApplyTransition( mostRelevantTransition );
+	}
+
+	public function ApplyTransition( listenerIndex : Uint32 ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			if( m_runtimeTransitions[ i ].listenerID == listenerIndex )
+			{
+				return ApplyTransition( m_runtimeTransitions[ i ], true );
+			}
+		}
+		return false;
+	}
+
+	private function ApplyTransition( transition : AreaTypeTransition, isScheduled : Bool ) : Bool
+	{
+		var secSys : SecuritySystemControllerPS;
+		var evt : PendingSecuritySystemDisable;
+		var turrets : array< SecurityTurretControllerPS >;
+		var i : Int32;
+		if( m_securityAreaType == transition.transitionTo || transition.locked )
+		{
+			return false;
+		}
+		if( transition.transitionTo == ESecurityAreaType.DISABLED )
+		{
+			if( !( IsDisableAllowed( turrets ) ) )
+			{
+				PostponeAreaDisabling( turrets );
+				return false;
+			}
+		}
+		else
+		{
+			if( m_pendingDisableRequest )
+			{
+				GetTurrets( turrets );
+				for( i = 0; i < turrets.Size(); i += 1 )
+				{
+					evt = new PendingSecuritySystemDisable;
+					evt.isPending = false;
+					QueuePSEvent( turrets[ i ], evt );
+				}
+				m_pendingDisableRequest = false;
+			}
+		}
+		if( transition.transitionMode == ETransitionMode.FORCED )
+		{
+			SetSecurityAreaType( transition.transitionTo );
+			if( IsPlayerInside() )
+			{
+				secSys = GetSecuritySystem();
+				if( !( secSys.IsSystemInCombat() ) && !( secSys.IsHidden() ) )
+				{
+					NotifySystemAboutCrossingPerimeter( GetLocalPlayerControlledGameObject(), true );
+				}
+				else
+				{
+					m_pendingNotifyPlayerAboutTransition = true;
+				}
+			}
+			return true;
+		}
+		else
+		{
+			if( GetSecuritySystem().IsSystemSafe() )
+			{
+				SetSecurityAreaType( transition.transitionTo );
+				if( IsPlayerInside() )
+				{
+					NotifySystemAboutCrossingPerimeter( GetLocalPlayerControlledGameObject(), true );
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function PostponeAreaDisabling( turrets : array< SecurityTurretControllerPS > )
+	{
+		var evt : PendingSecuritySystemDisable;
+		var i : Int32;
+		for( i = 0; i < turrets.Size(); i += 1 )
+		{
+			evt = new PendingSecuritySystemDisable;
+			evt.isPending = true;
+			QueuePSEvent( turrets[ i ], evt );
+		}
+		m_pendingDisableRequest = true;
+	}
+
+	private function OnSecurityTurretOffline( evt : SecurityTurretOffline ) : EntityNotificationType
+	{
+		var turrets : array< SecurityTurretControllerPS >;
+		var transition : AreaTypeTransition;
+		if( m_pendingDisableRequest )
+		{
+			if( IsDisableAllowed( turrets ) )
+			{
+				m_pendingDisableRequest = false;
+				transition.transitionTo = ESecurityAreaType.DISABLED;
+				transition.transitionMode = ETransitionMode.FORCED;
+				ApplyTransition( transition, false );
+			}
+			else
+			{
+				PostponeAreaDisabling( turrets );
+			}
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private const function GetTurrets( turrets : ref< array< SecurityTurretControllerPS > > )
+	{
+		var slaves : array< DeviceComponentPS >;
+		var turret : SecurityTurretControllerPS;
+		var i : Int32;
+		slaves = GetImmediateSlaves();
+		for( i = 0; i < slaves.Size(); i += 1 )
+		{
+			turret = ( ( SecurityTurretControllerPS )( slaves[ i ] ) );
+			if( turret )
+			{
+				turrets.PushBack( turret );
+			}
+		}
+		if( turrets.Size() == 0 )
+		{
+			GetSecuritySystem().GetTurrets( this, turrets );
+		}
+	}
+
+	private const function IsDisableAllowed( turrets : ref< array< SecurityTurretControllerPS > > ) : Bool
+	{
+		var i : Int32;
+		var isAllowed : Bool;
+		isAllowed = true;
+		GetTurrets( turrets );
+		for( i = 0; i < turrets.Size(); i += 1 )
+		{
+			if( turrets[ i ].IsTurretOperationalUnderSecuritySystem() )
+			{
+				isAllowed = false;
+			}
+		}
+		return isAllowed;
+	}
+
+	private function UpdateMiniMapRepresentation()
+	{
+		var secSys : SecuritySystemControllerPS;
+		secSys = GetSecuritySystem();
+		if( secSys && secSys.IsHidden() )
+		{
+			GameInstance.GetMappinSystem( GetGameInstance() ).OnAreaTypeChanged( PersistentID.ExtractEntityID( GetID() ), SecurityAreaTypeEnumToName( ESecurityAreaType.DISABLED ) );
+			return;
+		}
+		if( !( AreThereAnyValidTransitions() ) )
+		{
+			GameInstance.GetMappinSystem( GetGameInstance() ).OnAreaTypeChanged( PersistentID.ExtractEntityID( GetID() ), SecurityAreaTypeEnumToName( m_securityAreaType ) );
+		}
+	}
+
+	public const function AreThereAnyValidTransitions() : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			if( !( m_runtimeTransitions[ i ].locked ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const override function GetDeviceName() : String
+	{
+		if( IsStringValid( m_deviceName ) )
+		{
+			return m_deviceName;
+		}
+		else
+		{
+			return "";
+		}
+	}
+
+	public function AreaEntered( evt : AreaEnteredEvent )
+	{
+		var obj : GameObject;
+		obj = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
+		if( !( IsActive() ) || !( EntityID.IsDefined( obj.GetEntityID() ) ) )
+		{
+			return;
+		}
+		ProcessOnEnterRequest( obj );
+	}
+
+	public function AreaExited( obj : GameObject )
+	{
+		var userIndex : Int32;
+		if( !( EntityID.IsDefined( obj.GetEntityID() ) ) )
+		{
+			return;
+		}
+		userIndex = FindEntryIndex( obj.GetEntityID() );
+		if( ( userIndex == -1 ) && !( IsActive() ) )
+		{
+			return;
+		}
+		m_usersInPerimeter.EraseFast( userIndex );
+		if( obj.IsPlayerControlled() )
+		{
+			m_isPlayerInside = false;
+			m_system = NULL;
+		}
+		NotifySystemAboutCrossingPerimeter( obj, false );
+	}
+
+	private function ProcessOnEnterRequest( objectToProcess : GameObject )
+	{
+		var newEntry : AreaEntry;
+		if( !( objectToProcess ) )
+		{
+			return;
+		}
+		newEntry.user = objectToProcess.GetEntityID();
+		if( IsUserInside( newEntry.user ) )
+		{
+		}
+		else
+		{
+			PushUniqueEntry( newEntry );
+		}
+		if( objectToProcess.IsPlayerControlled() )
+		{
+			m_isPlayerInside = true;
+			if( m_securityAreaType != ESecurityAreaType.DISABLED )
+			{
+				m_system = GetSecuritySystem();
+			}
+			if( m_securityAreaType != ESecurityAreaType.DISABLED )
+			{
+				NotifySystemAboutCrossingPerimeter( objectToProcess, true );
+			}
+		}
+	}
+
+	private function ActionSecurityAreaCrossingPerimeter( whoEntered : GameObject, entered : Bool ) : SecurityAreaCrossingPerimeter
+	{
+		var action : SecurityAreaCrossingPerimeter;
+		action = new SecurityAreaCrossingPerimeter;
+		action.SetUp( this );
+		action.SetProperties( whoEntered, entered );
+		action.AddDeviceName( GetDeviceName() );
+		action.SetAreaData( GetSecurityAreaData() );
+		return action;
+	}
+
+	private function NotifySystemAboutCrossingPerimeter( tresspasser : GameObject, entering : Bool )
+	{
+		var tresspassingEvent : SecurityAreaCrossingPerimeter;
+		if( entering )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, ( "Entity: " + EntityID.ToDebugString( tresspasser.GetEntityID() ) ) + " entered" );
+			}
+		}
+		else
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, ( "Entity: " + EntityID.ToDebugString( tresspasser.GetEntityID() ) ) + " left" );
+			}
+		}
+		if( !( entering ) && tresspasser.IsPlayerControlled() )
+		{
+			m_pendingNotifyPlayerAboutTransition = false;
+		}
+		if( GetSecuritySystem().IsUserAuthorized( tresspasser.GetEntityID(), GetSecurityAccessLevel() ) )
+		{
+			return;
+		}
+		tresspassingEvent = ActionSecurityAreaCrossingPerimeter( tresspasser, entering );
+		SendActionToAllSlaves( tresspassingEvent );
+		NotifySecuritySystem( tresspassingEvent );
+	}
+
+	public function OnQuestAddTransition( evt : QuestAddTransition ) : EntityNotificationType
+	{
+		var registerEvent : RegisterTimeListeners;
+		var i : Int32;
+		var alreadyExisted : Bool;
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			if( m_runtimeTransitions[ i ].transitionHour == evt.transition.transitionHour )
+			{
+				if( !( m_runtimeTransitions[ i ].locked ) )
+				{
+					return EntityNotificationType.DoNotNotifyEntity;
+				}
+				else
+				{
+					m_runtimeTransitions[ i ].locked = false;
+					alreadyExisted = true;
+				}
+			}
+		}
+		if( !( alreadyExisted ) )
+		{
+			m_runtimeTransitions.PushBack( evt.transition );
+		}
+		registerEvent = new RegisterTimeListeners;
+		QueueEntityEvent( GetMyEntityID(), registerEvent );
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, "SECURITY AREA MANAGER: New Transition added" );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function OnQuestRemoveTransition( evt : QuestRemoveTransition ) : EntityNotificationType
+	{
+		var i : Int32;
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			if( m_runtimeTransitions[ i ].transitionHour == evt.removeTransitionFrom )
+			{
+				GameInstance.GetTimeSystem( GetGameInstance() ).UnregisterListener( m_runtimeTransitions[ i ].listenerID );
+				m_runtimeTransitions[ i ].locked = true;
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, "SECURITY AREA MANAGER: Transition removed" );
+				}
+			}
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public export function OnQuestExecuteTransition( evt : QuestExecuteTransition ) : EntityNotificationType
+	{
+		ApplyTransition( evt.transition, false );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function OnPurgeTransitions( evt : PurgeAllTransitions ) : EntityNotificationType
+	{
+		var i : Int32;
+		UnregisterTimeSystemListeners();
+		for( i = 0; i < m_runtimeTransitions.Size(); i += 1 )
+		{
+			m_runtimeTransitions[ i ].locked = true;
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function OnQuestIllegalActionAreaNotification( evt : QuestIllegalActionAreaNotification ) : EntityNotificationType
+	{
+		var actionSecuritySystemInput : SecuritySystemInput;
+		var LKP : Vector4;
+		var playerPup : GameObject;
+		if( evt.revealPlayerSettings.revealPlayer == ERevealPlayerType.REVEAL_ONCE )
+		{
+			playerPup = GetPlayerMainObject();
+			if( playerPup )
+			{
+				LKP = playerPup.GetWorldPosition();
+			}
+		}
+		actionSecuritySystemInput = ActionSecurityBreachNotification( LKP, playerPup, ESecurityNotificationType.ILLEGAL_ACTION );
+		ExecutePSAction( actionSecuritySystemInput, this );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const function OnQuestCombatActionAreaNotification( evt : QuestCombatActionAreaNotification ) : EntityNotificationType
+	{
+		var actionSecuritySystemInput : SecuritySystemInput;
+		var LKP : Vector4;
+		var playerPup : GameObject;
+		if( evt.revealPlayerSettings.revealPlayer == ERevealPlayerType.REVEAL_ONCE )
+		{
+			playerPup = GetLocalPlayerControlledGameObject();
+			if( playerPup )
+			{
+				LKP = playerPup.GetWorldPosition();
+			}
+		}
+		actionSecuritySystemInput = ActionSecurityBreachNotification( LKP, playerPup, ESecurityNotificationType.COMBAT );
+		ExecutePSAction( actionSecuritySystemInput, this );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function OnQuestModifyFilter( evt : QuestModifyFilters ) : EntityNotificationType
+	{
+		if( evt.incomingFilters != EQuestFilterType.DONT_CHANGE )
+		{
+			m_eventsFilters.incomingEventsFilter = ( ( EFilterType )( ( ( Int32 )( evt.incomingFilters ) ) - 1 ) );
+		}
+		if( evt.outgoingFilters != EQuestFilterType.DONT_CHANGE )
+		{
+			m_eventsFilters.outgoingEventsFilter = ( ( EFilterType )( ( ( Int32 )( evt.outgoingFilters ) ) - 1 ) );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function NotifySecuritySystem( tresspassingEvent : SecurityAreaCrossingPerimeter )
+	{
+		QueuePSEvent( GetSecuritySystem(), tresspassingEvent );
+	}
+
+	public const override function GetSecurityAccessLevel() : ESecurityAccessLevel
+	{
+		return m_securityAccessLevel;
+	}
+
+	public const function GetSecurityAreaType() : ESecurityAreaType
+	{
+		return m_securityAreaType;
+	}
+
+	public const override function IsConnectedToSystem() : Bool
+	{
+		return IsPartOfSystem( ESystems.SecuritySystem );
+	}
+
+	public const function GetUsersInPerimeter() : array< AreaEntry >
+	{
+		return m_usersInPerimeter;
+	}
+
+	protected const function IsPlayerInside() : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_usersInPerimeter.Size(); i += 1 )
+		{
+			if( m_usersInPerimeter[ i ].user == GetLocalPlayerControlledGameObject().GetEntityID() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public export const function GetSecurityAreaTypeAsUint32() : Uint32
+	{
+		if( GetSecuritySystem() )
+		{
+			return ( ( GetSecuritySystem().IsHidden() ) ? ( ( ( Uint32 )( 0 ) ) ) : ( ( ( Uint32 )( GetSecurityAreaType() ) ) ) );
+		}
+		return ( ( Uint32 )( 0 ) );
+	}
+
+	public const override function IsConnectedToSecuritySystem( out level : ESecurityAccessLevel ) : Bool
+	{
+		var i : Int32;
+		var parents : array< DeviceComponentPS >;
+		GetParents( parents );
+		level = GetSecurityAccessLevel();
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( SecuritySystemControllerPS )( parents[ i ] ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function SetSecurityAreaType( newType : ESecurityAreaType, optional wasScheduled : Bool )
+	{
+		var notification : SecurityAreaTypeChangedNotification;
+		var manageAreaComponent : ManageAreaComponent;
+		if( m_securityAreaType == newType )
+		{
+			return;
+		}
+		if( newType == ESecurityAreaType.DISABLED )
+		{
+			m_system = NULL;
+			manageAreaComponent = new ManageAreaComponent;
+			manageAreaComponent.enable = false;
+			QueueEntityEvent( GetMyEntityID(), manageAreaComponent );
+			PreventionSystem.PreventionSecurityAreaEnterRequest( GetGameInstance(), false, GetID() );
+		}
+		if( m_securityAreaType == ESecurityAreaType.DISABLED )
+		{
+			m_system = GetSecuritySystem();
+			manageAreaComponent = new ManageAreaComponent;
+			manageAreaComponent.enable = true;
+			QueueEntityEvent( GetMyEntityID(), manageAreaComponent );
+		}
+		notification = new SecurityAreaTypeChangedNotification;
+		notification.area = this;
+		notification.previousType = m_securityAreaType;
+		notification.wasScheduled = wasScheduled;
+		m_securityAreaType = newType;
+		notification.currentType = m_securityAreaType;
+		QueuePSEvent( GetSecuritySystem(), notification );
+		if( GetSecuritySystem().IsHidden() )
+		{
+			GameInstance.GetMappinSystem( GetGameInstance() ).OnAreaTypeChanged( PersistentID.ExtractEntityID( GetID() ), SecurityAreaTypeEnumToName( ESecurityAreaType.DISABLED ) );
+		}
+		else
+		{
+			GameInstance.GetMappinSystem( GetGameInstance() ).OnAreaTypeChanged( PersistentID.ExtractEntityID( GetID() ), SecurityAreaTypeEnumToName( m_securityAreaType ) );
+		}
+	}
+
+	private function ProcessOnExitRequest( entryToProcess : AreaEntry ) {}
+
+	public const function IsActive() : Bool
+	{
+		return m_securityAreaType != ESecurityAreaType.DISABLED;
+	}
+
+	public const function IsUserInside( userToBeChecked : EntityID ) : Bool
+	{
+		var index : Int32;
+		index = FindEntryIndex( userToBeChecked );
+		if( index < 0 )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public quest const function IsAreaCompromised() : Bool
+	{
+		var i : Int32;
+		var secSys : SecuritySystemControllerPS;
+		secSys = GetSecuritySystem();
+		if( !( secSys ) )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "No security system found by security area. This setup is not supported", ELogType.ERROR );
+			}
+			return false;
+		}
+		for( i = 0; i < m_usersInPerimeter.Size(); i += 1 )
+		{
+			if( secSys.IsEntityBlacklisted( m_usersInPerimeter[ i ].user ) || !( secSys.IsUserAuthorized( m_usersInPerimeter[ i ].user, GetSecurityAccessLevel() ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function PushUniqueEntry( entryToPush : AreaEntry )
+	{
+		m_usersInPerimeter.PushBack( entryToPush );
+	}
+
+	private const function FindEntryIndex( userToFind : EntityID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_usersInPerimeter.Size(); i += 1 )
+		{
+			if( m_usersInPerimeter[ i ].user == userToFind )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function ExtractSquadProxies() : array< CommunityProxyPS >
+	{
+		var devices : array< DeviceComponentPS >;
+		var proxies : array< CommunityProxyPS >;
+		var myEntityID : EntityID;
+		var i : Int32;
+		myEntityID = PersistentID.ExtractEntityID( GetID() );
+		GameInstance.GetDeviceSystem( GetGameInstance() ).GetChildren( myEntityID, devices );
+		for( i = 0; i < devices.Size(); i += 1 )
+		{
+			if( ( ( CommunityProxyPS )( devices[ i ] ) ) )
+			{
+				proxies.PushBack( ( ( CommunityProxyPS )( devices[ i ] ) ) );
+			}
+		}
+		return proxies;
+	}
+
+	public const function GetSecurityAreaData() : SecurityAreaData
+	{
+		var data : SecurityAreaData;
+		data.securityArea = this;
+		data.securityAreaType = GetSecurityAreaType();
+		data.accessLevel = GetSecurityAccessLevel();
+		data.zoneName = GetDeviceName();
+		data.id = GetID();
+		data.incomingFilters = m_eventsFilters.incomingEventsFilter;
+		data.outgoingFilters = m_eventsFilters.outgoingEventsFilter;
+		return data;
+	}
+
+	public const function GetSecurityAreaAgents() : array< EntityID >
+	{
+		var agents : array< EntityID >;
+		var npcs : array< EntityID >;
+		var devices : array< EntityID >;
+		var i : Int32;
+		npcs = GetNPCs();
+		devices = GetDevices();
+		for( i = 0; i < npcs.Size(); i += 1 )
+		{
+			agents.PushBack( npcs[ i ] );
+		}
+		for( i = 0; i < devices.Size(); i += 1 )
+		{
+			agents.PushBack( devices[ i ] );
+		}
+		return agents;
+	}
+
+	public const function GetNPCs() : array< EntityID >
+	{
+		var proxies : array< CommunityProxyPS >;
+		var npcs : array< EntityID >;
+		var i : Int32;
+		proxies = ExtractSquadProxies();
+		for( i = 0; i < proxies.Size(); i += 1 )
+		{
+		}
+		return npcs;
+	}
+
+	public const override function GetSecuritySystem() : SecuritySystemControllerPS
+	{
+		if( m_system )
+		{
+			return m_system;
+		}
+		return super.GetSecuritySystem();
+	}
+
+	public const function GetDevices() : array< EntityID >
+	{
+		var slaves : array< DeviceComponentPS >;
+		var devicesIDs : array< EntityID >;
+		var i : Int32;
+		slaves = GetImmediateSlaves();
+		for( i = 0; i < slaves.Size(); i += 1 )
+		{
+			if( ( ( CommunityProxyPS )( slaves[ i ] ) ) )
+			{
+				continue;
+			}
+			devicesIDs.PushBack( PersistentID.ExtractEntityID( slaves[ i ].GetID() ) );
+		}
+		return devicesIDs;
+	}
+
+	public const function GetLastOutput() : SecuritySystemOutput
+	{
+		return RestoreLastOutput();
+	}
+
+	private const function RestoreLastOutput() : SecuritySystemOutput
+	{
+		var recreatedOutput : SecuritySystemOutput;
+		var whoBreached : GameObject;
+		var reporter : GameObject;
+		if( OutputPersistentData.IsValid( m_lastOutput ) )
+		{
+			if( EntityID.IsDefined( m_lastOutput.m_whoBreached ) )
+			{
+				whoBreached = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), m_lastOutput.m_whoBreached ) ) );
+			}
+			else if( EntityID.IsDefined( m_lastOutput.m_objectOfInterest ) )
+			{
+				whoBreached = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), m_lastOutput.m_objectOfInterest ) ) );
+			}
+			reporter = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), PersistentID.ExtractEntityID( m_lastOutput.m_reporter ) ) ) );
+			recreatedOutput = new SecuritySystemOutput;
+			recreatedOutput = GetSecuritySystem().ActionSecuritySystemBreachResponse( ScriptedPuppetPS.ActionSecurityBreachNotificationStatic( m_lastOutput.m_lastKnownPosition, whoBreached, reporter, m_lastOutput.m_type ) );
+			recreatedOutput.SetCachedSecuritySystemState( m_lastOutput.m_currentSecurityState );
+			recreatedOutput.SetBreachOrigin( m_lastOutput.m_breachOrigin );
+			recreatedOutput.SetSecurityStateChanged( m_lastOutput.m_securityStateChanged );
+			recreatedOutput.GetOriginalInputEvent().ModifyNotificationType( m_lastOutput.m_type );
+			recreatedOutput.GetOriginalInputEvent().ModifyAreaTypeHack( m_lastOutput.m_areaType );
+			recreatedOutput.GetOriginalInputEvent().SetID( m_lastOutput.m_id );
+		}
+		return recreatedOutput;
+	}
+
+	public function OnGameEntitySpawnerEvent( evt : gameEntitySpawnerEvent ) : EntityNotificationType
+	{
+		var recreatedOutput : SecuritySystemOutput;
+		recreatedOutput = RestoreLastOutput();
+		if( recreatedOutput )
+		{
+			QueueEntityEvent( evt.spawnedEntityId, recreatedOutput );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public export override function OnSecuritySystemOutput( breachEvent : SecuritySystemOutput ) : EntityNotificationType
+	{
+		var debugMessage : String;
+		var systemState : ESecuritySystemState;
+		systemState = GetSecuritySystem().GetSecurityState();
+		if( m_pendingNotifyPlayerAboutTransition && systemState != ESecuritySystemState.COMBAT )
+		{
+			NotifySystemAboutCrossingPerimeter( GetLocalPlayerControlledGameObject(), true );
+			m_pendingNotifyPlayerAboutTransition = false;
+		}
+		if( !( IsActive() ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		debugMessage = "Input received";
+		if( ( breachEvent.GetOriginalInputEvent() && breachEvent.GetOriginalInputEvent().GetWhoBreached() ) && IsUserInside( breachEvent.GetOriginalInputEvent().GetWhoBreached().GetEntityID() ) )
+		{
+			debugMessage += " User Inside - Breach = LOCAL";
+			breachEvent.SetBreachOrigin( EBreachOrigin.LOCAL );
+			if( systemState == ESecuritySystemState.COMBAT && ( breachEvent.GetOriginalInputEvent().GetWhoBreached() == GetLocalPlayerControlledGameObject() ) )
+			{
+				m_questPlayerHasTriggeredCombat = true;
+				m_hasThisAreaReceivedCombatNotification = true;
+			}
+		}
+		else if( breachEvent.GetOriginalInputEvent().GetNotificationType() == ESecurityNotificationType.ALARM && IsUserInside( breachEvent.GetOriginalInputEvent().GetObjectOfInterest().GetEntityID() ) )
+		{
+			debugMessage += " ALARM ORIGINATED IN THIS AREA - BREACH - LOCAL";
+			breachEvent.SetBreachOrigin( EBreachOrigin.LOCAL );
+		}
+		else
+		{
+			if( m_eventsFilters.incomingEventsFilter == EFilterType.ALLOW_NONE )
+			{
+				debugMessage += " Area does not accept external events. Ignoring Event";
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, breachEvent.GetOriginalInputEvent().GetID(), debugMessage );
+				}
+				return EntityNotificationType.DoNotNotifyEntity;
+			}
+			else if( m_eventsFilters.incomingEventsFilter == EFilterType.ALLOW_COMBAT_ONLY )
+			{
+				if( breachEvent.GetCachedSecurityState() != ESecuritySystemState.COMBAT )
+				{
+					debugMessage += " Area accepts only COMBAT events. Ignoring event.";
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, breachEvent.GetOriginalInputEvent().GetID(), debugMessage );
+					}
+					return EntityNotificationType.DoNotNotifyEntity;
+				}
+				m_hasThisAreaReceivedCombatNotification = true;
+			}
+			debugMessage += " User NOT Inside - Breach = EXTERNAL";
+			breachEvent.SetBreachOrigin( EBreachOrigin.EXTERNAL );
+		}
+		debugMessage += " Forwarding event to slaves";
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, breachEvent.GetOriginalInputEvent().GetID(), debugMessage );
+		}
+		StoreLastOutputPersistentData( breachEvent );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function StoreLastOutputPersistentData( breachEvent : SecuritySystemOutput )
+	{
+		m_lastOutput.m_currentSecurityState = breachEvent.GetCachedSecurityState();
+		m_lastOutput.m_breachOrigin = breachEvent.GetBreachOrigin();
+		m_lastOutput.m_securityStateChanged = breachEvent.GetSecurityStateChanged();
+		m_lastOutput.m_lastKnownPosition = breachEvent.GetOriginalInputEvent().GetLastKnownPosition();
+		m_lastOutput.m_type = breachEvent.GetOriginalInputEvent().GetNotificationType();
+		m_lastOutput.m_areaType = GetSecurityAreaType();
+		if( breachEvent.GetOriginalInputEvent().GetObjectOfInterest() )
+		{
+			m_lastOutput.m_objectOfInterest = breachEvent.GetOriginalInputEvent().GetObjectOfInterest().GetEntityID();
+		}
+		if( breachEvent.GetOriginalInputEvent().GetWhoBreached() )
+		{
+			m_lastOutput.m_whoBreached = breachEvent.GetOriginalInputEvent().GetWhoBreached().GetEntityID();
+		}
+		if( breachEvent.GetOriginalInputEvent().GetNotifierHandle() )
+		{
+			m_lastOutput.m_reporter = breachEvent.GetOriginalInputEvent().GetNotifierHandle().GetID();
+		}
+		m_lastOutput.m_id = breachEvent.GetOriginalInputEvent().GetID();
+	}
+
+	public export override function OnSecuritySystemForceAttitudeChange( evt : SecuritySystemForceAttitudeChange ) : EntityNotificationType
+	{
+		SendActionToAllSlaves( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public override function OnTargetAssessmentRequest( evt : TargetAssessmentRequest ) : EntityNotificationType
+	{
+		SendActionToAllSlaves( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public override function OnFullSystemRestart( evt : FullSystemRestart ) : EntityNotificationType
+	{
+		SendActionToAllSlaves( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public static function SecurityAreaTypeEnumToName( type : ESecurityAreaType ) : CName
+	{
+		switch( type )
+		{
+			case ESecurityAreaType.DISABLED:
+				return 'DISABLED';
+			case ESecurityAreaType.SAFE:
+				return 'SAFE';
+			case ESecurityAreaType.RESTRICTED:
+				return 'RESTRICTED';
+			case ESecurityAreaType.DANGEROUS:
+				return 'DANGEROUS';
+		}
+		return '';
+	}
+
+	public const override function GetDebugTags() : String
+	{
+		var tags : String;
+		tags = super.GetDebugTags();
+		return tags;
+	}
+
+	public override function OnMaraudersMapDeviceDebug( sink : MaraudersMapDevicesSink )
+	{
+		sink.BeginCategory( "securityAreaControllerPS Specific" );
+		sink.PushString( "AREA TYPE", ( ( String )( m_securityAreaType ) ) );
+		sink.PushString( "PLAYER INSIDE: ", BoolToString( m_isPlayerInside ) );
+		sink.PushString( "ACCESS LEVEL", ( ( String )( m_securityAccessLevel ) ) );
+		sink.PushString( "RECEIVED COMBAT OUTPUT: ", BoolToString( m_hasThisAreaReceivedCombatNotification ) );
+		sink.EndCategory();
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceIcon";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceBackground";
+	}
+
+}
+
+enum ESecurityAreaType
+{
+	DISABLED = 0,
+	SAFE = 1,
+	RESTRICTED = 2,
+	DANGEROUS = 3,
+}
+
+enum EFilterType
+{
+	ALLOW_NONE = 0,
+	ALLOW_COMBAT_ONLY = 1,
+	ALLOW_ALL = 2,
+}
+
+enum ETransitionMode
+{
+	GENTLE = 0,
+	FORCED = 1,
+}
+

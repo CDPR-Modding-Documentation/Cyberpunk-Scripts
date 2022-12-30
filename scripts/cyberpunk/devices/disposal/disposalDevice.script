@@ -1,0 +1,618 @@
+class DisposalDevice extends InteractiveDevice
+{
+	default m_controllerTypeName = 'DisposalDeviceController';
+	protected var m_additionalMeshComponent : MeshComponent;
+	protected var m_npcBody : weak< NPCPuppet >;
+	protected var m_playerStateMachineBlackboard : weak< IBlackboard >;
+	protected const editable var m_sideTriggerNames : array< CName >;
+	protected var m_triggerComponents : array< TriggerComponent >;
+	protected var m_currentDisposalSyncName : CName;
+	default m_currentDisposalSyncName = 'disposalSyncSide1';
+	protected var m_currentKillSyncName : CName;
+	default m_currentKillSyncName = 'killSyncSide1';
+	protected var m_isNonlethal : Bool;
+	protected const instanceeditable var m_physicalMeshNames : array< CName >;
+	protected var m_physicalMeshes : array< PhysicalMeshComponent >;
+	protected instanceeditable var m_lethalTakedownKillDelay : Float;
+	default m_lethalTakedownKillDelay = 0.2f;
+	protected const instanceeditable var m_lethalTakedownComponentNames : array< CName >;
+	protected var m_lethalTakedownComponents : array< IPlacedComponent >;
+	protected instanceeditable var m_isReactToHit : Bool;
+	protected instanceeditable var m_distractionSoundName : CName;
+	default m_distractionSoundName = 'v_car_thorton_galena_horn';
+	protected instanceeditable var m_distractionSoundDuration : Float;
+	default m_distractionSoundDuration = 5.0f;
+	protected var m_workspotDuration : Float;
+	default m_workspotDuration = 0.01f;
+	private var m_OnTakedownChangedCallback : CallbackHandle;
+	private var m_OnCarryingChangedCallback : CallbackHandle;
+
+	protected const override function GetController() : DisposalDeviceController
+	{
+		return ( ( DisposalDeviceController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : DisposalDeviceControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		var i : Int32;
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'additionalMesh', 'MeshComponent', false );
+		for( i = 0; i < m_physicalMeshNames.Size(); i += 1 )
+		{
+			EntityRequestComponentsInterface.RequestComponent( ri, m_physicalMeshNames[ i ], 'PhysicalMeshComponent', true );
+		}
+		for( i = 0; i < m_lethalTakedownComponentNames.Size(); i += 1 )
+		{
+			EntityRequestComponentsInterface.RequestComponent( ri, m_lethalTakedownComponentNames[ i ], 'IPlacedComponent', true );
+		}
+		for( i = 0; i < m_sideTriggerNames.Size(); i += 1 )
+		{
+			EntityRequestComponentsInterface.RequestComponent( ri, m_sideTriggerNames[ i ], 'TriggerComponent', true );
+		}
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		var i : Int32;
+		super.OnTakeControl( ri );
+		m_additionalMeshComponent = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'additionalMesh' ) ) );
+		for( i = 0; i < m_physicalMeshNames.Size(); i += 1 )
+		{
+			m_physicalMeshes.PushBack( ( ( PhysicalMeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, m_physicalMeshNames[ i ] ) ) ) );
+		}
+		for( i = 0; i < m_lethalTakedownComponentNames.Size(); i += 1 )
+		{
+			m_lethalTakedownComponents.PushBack( ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, m_lethalTakedownComponentNames[ i ] ) ) ) );
+		}
+		for( i = 0; i < m_sideTriggerNames.Size(); i += 1 )
+		{
+			m_triggerComponents.PushBack( ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, m_sideTriggerNames[ i ] ) ) ) );
+		}
+		m_controller = ( ( DisposalDeviceController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	public override function OnMaraudersMapDeviceDebug( sink : MaraudersMapDevicesSink )
+	{
+		super.OnMaraudersMapDeviceDebug( sink );
+		sink.PushInt32( "Number of uses", ( ( DisposalDeviceControllerPS )( GetDevicePS() ) ).GetNumberOfUses() );
+		sink.PushBool( "Was Activated", ( ( DisposalDeviceControllerPS )( GetDevicePS() ) ).WasActivated() );
+		sink.PushBool( "Has Distract", ( ( DisposalDeviceControllerPS )( GetDevicePS() ) ).HasQuickHackDistraction() );
+		sink.PushFloat( "Distract Range", ( ( DisposalDeviceControllerPS )( GetDevicePS() ) ).GetStimuliRange() );
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		var playerPuppet : PlayerPuppet;
+		super.ResolveGameplayState();
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		m_playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( m_playerStateMachineBlackboard )
+		{
+			m_OnTakedownChangedCallback = m_playerStateMachineBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Takedown, this, 'OnTakedownChanged' );
+			m_OnCarryingChangedCallback = m_playerStateMachineBlackboard.RegisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.Carrying, this, 'OnCarryingChanged' );
+		}
+		if( ( GetDevicePS().GetNumberOfUses() <= 0 ) && !( GetDevicePS().HasQuickHackDistraction() ) )
+		{
+			InitializeAlreadyUsedDevice();
+		}
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		if( GetDevicePS().WasLethalTakedownPerformed() )
+		{
+			EnableLethalTakedownComponents();
+		}
+		UpdateLightAppearance();
+	}
+
+	protected event OnTakedownChanged( value : Int32 )
+	{
+		SendRefreshInteractionEvent();
+	}
+
+	protected event OnCarryingChanged( value : Bool )
+	{
+		SendRefreshInteractionEvent();
+	}
+
+	protected event OnDistraction( evt : Distraction ) {}
+
+	protected event OnSpiderbotDistractionPerformed( evt : SpiderbotDistractionPerformed ) {}
+
+	protected event OnDisposeBody( evt : DisposeBody )
+	{
+		var mountingInfo : MountingInfo;
+		var playerPuppet : PlayerPuppet;
+		var workspotSystem : WorkspotGameSystem;
+		var unmountEvent : UnmountingRequest;
+		var killEvent : NPCKillDelayEvent;
+		unmountEvent = new UnmountingRequest;
+		killEvent = new NPCKillDelayEvent;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		mountingInfo = GameInstance.GetMountingFacility( GetGame() ).GetMountingInfoSingleWithObjects( , playerPuppet );
+		unmountEvent.lowLevelMountingInfo = mountingInfo;
+		m_npcBody = ( ( NPCPuppet )( GameInstance.FindEntityByID( GetGame(), mountingInfo.childId ) ) );
+		m_playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal, true );
+		m_playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, true );
+		m_playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.Dispose ) ) );
+		GameInstance.GetMountingFacility( GetGame() ).Unmount( unmountEvent );
+		workspotSystem = GameInstance.GetWorkspotSystem( GetGame() );
+		CheckCurrentSide();
+		workspotSystem.PlayInDevice( this, playerPuppet, 'lockedCamera', 'playerWorkspot', 'deviceWorkspot', m_currentDisposalSyncName, m_workspotDuration );
+		workspotSystem.PlayNpcInWorkspot( m_npcBody, playerPuppet, this, 'npcWorkspot', m_currentDisposalSyncName, m_workspotDuration );
+		if( m_currentDisposalSyncName == 'disposalSyncSide2' )
+		{
+			workspotSystem.SendJumpToTagCommandEnt( playerPuppet, 'disposalSyncSide2', true, this.GetEntityID() );
+		}
+		killEvent.disableKillReward = true;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, killEvent, 0.1 );
+		SetNpcIsDisposedBlackboard();
+		m_npcBody.GenerateLoot();
+		if( !( RPGManager.IsInventoryEmpty( m_npcBody ) ) )
+		{
+			m_npcBody.DropLootBag();
+		}
+		m_npcBody.GetVisibleObjectComponent().SetVisibleObjectTypeInvalid();
+		GameInstance.GetTelemetrySystem( GetGame() ).LogBodyDisposed();
+	}
+
+	protected event OnTakedownAndDisposeBody( evt : TakedownAndDisposeBody )
+	{
+		m_playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.Lethal ) ) );
+		TakedownAndDispose( false );
+	}
+
+	protected event OnNonlethalTakedownAndDisposeBody( evt : NonlethalTakedownAndDisposeBody )
+	{
+		m_playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.NonLethal ) ) );
+		TakedownAndDispose( true );
+	}
+
+	private function TakedownAndDispose( isNonlethal : Bool )
+	{
+		var mountingInfo : MountingInfo;
+		var playerPuppet : PlayerPuppet;
+		var workspotSystem : WorkspotGameSystem;
+		var unmountEvent : UnmountingRequest;
+		var killEvent : NPCKillDelayEvent;
+		var takedownAction : ETakedownActionType;
+		var broadcaster : StimBroadcasterComponent;
+		var record1HitDamage : Record1DamageInHistoryEvent;
+		unmountEvent = new UnmountingRequest;
+		killEvent = new NPCKillDelayEvent;
+		killEvent.disableKillReward = false;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		mountingInfo = GameInstance.GetMountingFacility( GetGame() ).GetMountingInfoSingleWithObjects( , playerPuppet );
+		m_npcBody = ( ( NPCPuppet )( GameInstance.FindEntityByID( GetGame(), mountingInfo.childId ) ) );
+		m_isNonlethal = isNonlethal;
+		m_playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.Takedown, 5 );
+		m_playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, true );
+		unmountEvent.lowLevelMountingInfo = mountingInfo;
+		GameInstance.GetMountingFacility( GetGame() ).Unmount( unmountEvent );
+		SetNpcIsDisposedBlackboard();
+		workspotSystem = GameInstance.GetWorkspotSystem( GetGame() );
+		CheckCurrentSide();
+		if( isNonlethal )
+		{
+			workspotSystem.PlayInDevice( this, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'lockedCamera', 'playerNonlethalTakedownWorkspot', 'deviceNonlethalTakedownWorkspot', m_currentKillSyncName, m_workspotDuration );
+			workspotSystem.PlayNpcInWorkspot( m_npcBody, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), this, 'npcNonlethalTakedownWorkspot', m_currentKillSyncName, m_workspotDuration, 'deviceNonlethalTakedownWorkspot' );
+		}
+		else
+		{
+			workspotSystem.PlayInDevice( this, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'lockedCamera', 'playerTakedownWorkspot', 'deviceTakedownWorkspot', m_currentKillSyncName, m_workspotDuration );
+			workspotSystem.PlayNpcInWorkspot( m_npcBody, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), this, 'npcTakedownWorkspot', m_currentKillSyncName, m_workspotDuration, 'deviceTakedownWorkspot' );
+		}
+		if( m_currentKillSyncName == 'killSyncSide2' )
+		{
+			workspotSystem.SendJumpToTagCommandEnt( playerPuppet, 'killSyncSide2', true, this.GetEntityID() );
+		}
+		if( m_isNonlethal )
+		{
+			record1HitDamage = new Record1DamageInHistoryEvent;
+			record1HitDamage.source = playerPuppet;
+			m_npcBody.QueueEvent( record1HitDamage );
+			killEvent.isLethalTakedown = false;
+			takedownAction = ETakedownActionType.DisposalTakedownNonLethal;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, killEvent, m_lethalTakedownKillDelay );
+		}
+		else
+		{
+			killEvent.isLethalTakedown = true;
+			takedownAction = ETakedownActionType.DisposalTakedown;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, killEvent, m_lethalTakedownKillDelay );
+		}
+		GameInstance.GetTelemetrySystem( GetGame() ).LogTakedown( EnumValueToName( 'ETakedownActionType', ( ( Int32 )( takedownAction ) ) ), m_npcBody );
+		if( !( GameInstance.GetStatsSystem( playerPuppet.GetGame() ).GetStatBoolValue( playerPuppet.GetEntityID(), gamedataStatType.CanTakedownSilently ) ) )
+		{
+			broadcaster = playerPuppet.GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				broadcaster.TriggerNoiseStim( playerPuppet, takedownAction );
+			}
+		}
+		m_npcBody.GenerateLoot();
+		if( !( RPGManager.IsInventoryEmpty( m_npcBody ) ) )
+		{
+			m_npcBody.DropLootBag();
+		}
+	}
+
+	private function SetNpcIsDisposedBlackboard()
+	{
+		var bb : IBlackboard;
+		bb = m_npcBody.GetPuppetStateBlackboard();
+		bb.SetBool( GetAllBlackboardDefs().PuppetState.IsBodyDisposed, true, true );
+	}
+
+	private function HideNPCPermanently()
+	{
+		var HidePuppetDelayEvt : HidePuppetDelayEvent;
+		HidePuppetDelayEvt = new HidePuppetDelayEvent;
+		HidePuppetDelayEvt.m_target = m_npcBody;
+		m_npcBody.QueueEvent( HidePuppetDelayEvt );
+	}
+
+	protected event OnWorkspotFinished( componentName : CName )
+	{
+		super.OnWorkspotFinished( componentName );
+		m_npcBody.Kill( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), true, true );
+		PlayTransformAnim( 'close' );
+		m_playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal, false );
+		m_playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.Default ) ) );
+		NPCPuppet.SetNPCDisposedFact( m_npcBody );
+		HideNPCPermanently();
+		PlayEffect( 'freeze', 'fridge' );
+		SetTakedownCameraAnimFeature( 0 );
+		GetDevicePS().SetIsPlayerCurrentlyPerformingDisposal( false );
+		UpdateLightAppearance();
+	}
+
+	protected event OnNPCKillDelayEvent( evt : NPCKillDelayEvent )
+	{
+		var toggleRagdollEvent : RagdollToggleDelayEvent;
+		var rewardSettingsEvent : ChangeRewardSettingsEvent;
+		toggleRagdollEvent = new RagdollToggleDelayEvent;
+		toggleRagdollEvent.target = m_npcBody;
+		toggleRagdollEvent.enable = false;
+		m_npcBody.QueueEvent( toggleRagdollEvent );
+		rewardSettingsEvent = new ChangeRewardSettingsEvent;
+		rewardSettingsEvent.forceDefeatReward = !( evt.isLethalTakedown );
+		rewardSettingsEvent.disableKillReward = evt.disableKillReward;
+		m_npcBody.QueueEvent( rewardSettingsEvent );
+		if( evt.isLethalTakedown )
+		{
+			EnableLethalTakedownComponents();
+		}
+	}
+
+	protected function EnableLethalTakedownComponents()
+	{
+		var i : Int32;
+		GetDevicePS().SetWasLethalTakedownPerformed( true );
+		for( i = 0; i < m_lethalTakedownComponents.Size(); i += 1 )
+		{
+			m_lethalTakedownComponents[ i ].Toggle( true );
+		}
+	}
+
+	protected function SetTakedownCameraAnimFeature( value : Int32 )
+	{
+		var animFeature : AnimFeature_AerialTakedown;
+		animFeature = new AnimFeature_AerialTakedown;
+		animFeature.state = value;
+		ApplyAnimFeatureToReplicate( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'AerialTakedown', animFeature );
+	}
+
+	protected function PlayTransformAnim( animationName : CName )
+	{
+		var playEvent : gameTransformAnimationPlayEvent;
+		playEvent = new gameTransformAnimationPlayEvent;
+		playEvent.animationName = animationName;
+		playEvent.looping = false;
+		playEvent.timesPlayed = 1;
+		playEvent.timeScale = 1.0;
+		QueueEvent( playEvent );
+	}
+
+	protected function InitializeAlreadyUsedDevice()
+	{
+		PlayTransformAnim( 'closed_pose' );
+		PlayEffect( 'freeze', 'fridge' );
+	}
+
+	protected function SendRefreshInteractionEvent()
+	{
+		var evt : TimerEvent;
+		evt = new TimerEvent;
+		QueueEvent( evt );
+	}
+
+	protected event OnTimerEvent( evt : TimerEvent )
+	{
+		RefreshInteraction( gamedeviceRequestType.Direct, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
+	}
+
+	protected override function StartGlitching( glitchState : EGlitchState, optional intensity : Float )
+	{
+		PlaySoundEvent( this, m_distractionSoundName );
+		GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.Start, 'hacked' );
+	}
+
+	protected override function StopGlitching()
+	{
+		GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.BreakLoop, 'hacked' );
+	}
+
+	protected event OnToggleActivation( evt : ToggleActivation )
+	{
+		var stopSoundEvt : StopSoundDisposal;
+		stopSoundEvt = new StopSoundDisposal;
+		PlaySoundEvent( this, m_distractionSoundName );
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, stopSoundEvt, m_distractionSoundDuration );
+	}
+
+	protected event OnStopSoundDisposal( evt : StopSoundDisposal )
+	{
+		StopSound( this, m_distractionSoundName );
+	}
+
+	protected function ActivatePhysicalMeshes()
+	{
+		var i : Int32;
+		for( i = 0; i < m_physicalMeshes.Size(); i += 1 )
+		{
+			m_physicalMeshes[ i ].CreatePhysicalBodyInterface().SetIsKinematic( false );
+			m_physicalMeshes[ i ].CreatePhysicalBodyInterface().AddLinearImpulse( Vector4( 0.0, -100.0, 0.0, 0.0 ), false );
+		}
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		var activateAction : ToggleActivation;
+		activateAction = new ToggleActivation;
+		if( m_isReactToHit )
+		{
+			if( !( GetDevicePS().IsDisabled() ) && !( GetDevicePS().WasActivated() ) )
+			{
+				GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( GetDevicePS().GetID(), GetDevicePS().GetClassName(), activateAction );
+			}
+		}
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.HideBody;
+	}
+
+	public const override function DeterminGameplayRoleMappinRange( data : SDeviceMappinData ) : Float
+	{
+		var range : Float;
+		if( data.gameplayRole != EGameplayRole.None )
+		{
+			if( GetDevicePS().HasQuickHackDistraction() )
+			{
+				range = GetDistractionRange( DeviceStimType.Distract );
+			}
+		}
+		return range;
+	}
+
+	public const override function IsBodyDisposalPossible() : Bool
+	{
+		if( GetDevicePS().IsEnemyGrappled() || GetDevicePS().IsPlayerCarrying() )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected event OnSpiderbotExplodeExplosiveDevicePerformed( evt : SpiderbotExplodeExplosiveDevicePerformed )
+	{
+		StartExplosionPipeline( this, 1.0 );
+	}
+
+	protected function StartExplosionPipeline( instigator : weak< GameObject >, optional additionalDelays : Float )
+	{
+		var i : Int32;
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		var evt : ExplosiveDeviceDelayedEvent;
+		var hideEvt : ExplosiveDeviceHideDeviceEvent;
+		var largestDelayTime : Float;
+		dataArray = GetDevicePS().GetExplosionDeinitionArray();
+		for( i = 0; i < dataArray.Size(); i += 1 )
+		{
+			if( ( dataArray[ i ].executionDelay + additionalDelays ) > 0.0 )
+			{
+				evt = new ExplosiveDeviceDelayedEvent;
+				evt.arrayIndex = i;
+				evt.instigator = instigator;
+				if( ( dataArray[ i ].executionDelay + additionalDelays ) > largestDelayTime )
+				{
+					largestDelayTime = dataArray[ i ].executionDelay + additionalDelays;
+				}
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, dataArray[ i ].executionDelay + additionalDelays );
+			}
+			else
+			{
+				Explode( i, instigator );
+			}
+		}
+		if( largestDelayTime > 0.0 )
+		{
+			hideEvt = new ExplosiveDeviceHideDeviceEvent;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, hideEvt, largestDelayTime );
+		}
+	}
+
+	protected event OnExplosiveDeviceDelayedEvent( evt : ExplosiveDeviceDelayedEvent )
+	{
+		Explode( evt.arrayIndex, evt.instigator );
+	}
+
+	private function Explode( index : Int32, instigator : weak< GameObject > )
+	{
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		dataArray = GetDevicePS().GetExplosionDeinitionArray();
+		DoAttack( dataArray[ index ].damageType );
+		SpawnVFXs( dataArray[ index ].vfxResource );
+		Distract( index );
+		m_additionalMeshComponent.Toggle( true );
+	}
+
+	protected event OnOverChargeDevice( evt : OverchargeDevice )
+	{
+		StartExplosionPipeline( this, 1.0 );
+	}
+
+	protected const function GetAttackRange( attackTDBID : TweakDBID ) : Float
+	{
+		return TweakDBInterface.GetAttackRecord( attackTDBID ).Range();
+	}
+
+	private function Distract( index : Int32 )
+	{
+		var i : Int32;
+		var distractionName : CName;
+		distractionName = StringToName( "hardCodeDoNotRemoveExplosion" + index );
+		for( i = 0; i < GetFxResourceMapper().GetAreaEffectDataSize(); i += 1 )
+		{
+			if( GetFxResourceMapper().GetAreaEffectDataByIndex( i ).areaEffectID == distractionName )
+			{
+				TriggerArreaEffectDistraction( GetFxResourceMapper().GetAreaEffectDataByIndex( i ) );
+				break;
+			}
+		}
+	}
+
+	private function DoAttack( damageType : TweakDBID )
+	{
+		var attack : Attack_GameEffect;
+		var hitFlags : array< SHitFlag >;
+		var flag : SHitFlag;
+		flag.flag = hitFlag.FriendlyFire;
+		flag.source = 'DisposalDevice';
+		hitFlags.PushBack( flag );
+		attack = RPGManager.PrepareGameEffectAttack( GetGame(), this, this, damageType, , hitFlags );
+		if( attack )
+		{
+			attack.StartAttack();
+		}
+	}
+
+	private function SpawnVFXs( fx : FxResource )
+	{
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		if( FxResource.IsValid( fx ) )
+		{
+			WorldPosition.SetVector4( position, GetWorldPosition() );
+			WorldTransform.SetWorldPosition( transform, position );
+			CreateFxInstance( fx, transform );
+		}
+	}
+
+	private function CreateFxInstance( resource : FxResource, transform : WorldTransform ) : FxInstance
+	{
+		var fx : FxInstance;
+		var fxSystem : FxSystem;
+		fxSystem = GameInstance.GetFxSystem( GetGame() );
+		fx = fxSystem.SpawnEffect( resource, transform );
+		return fx;
+	}
+
+	protected function CheckCurrentSide()
+	{
+		var finalName : String;
+		var i : Int32;
+		var j : Int32;
+		var overlappingEntities : array< Entity >;
+		for( i = 0; i < m_triggerComponents.Size(); i += 1 )
+		{
+			overlappingEntities = m_triggerComponents[ i ].GetOverlappingEntities();
+			for( j = 0; j < overlappingEntities.Size(); j += 1 )
+			{
+				if( ( ( GameObject )( overlappingEntities[ j ] ) ).IsPlayer() )
+				{
+					finalName = "disposalSyncSide" + ( ( String )( ( i + 1 ) ) );
+					m_currentDisposalSyncName = StringToName( finalName );
+					finalName = "killSyncSide" + ( ( String )( ( i + 1 ) ) );
+					m_currentKillSyncName = StringToName( finalName );
+				}
+			}
+		}
+	}
+
+	public const override function HasImportantInteraction() : Bool
+	{
+		return ( GetDevicePS().GetNumberOfUses() > 0 ) || super.HasImportantInteraction();
+	}
+
+	protected const override function HasAnyDirectInteractionActive() : Bool
+	{
+		if( IsDead() )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	private function UpdateLightAppearance()
+	{
+		var lightSettings : ScriptLightSettings;
+		var evt : ChangeLightEvent;
+		evt = new ChangeLightEvent;
+		if( ( GetDevicePS().GetNumberOfUses() <= 0 ) || GetDevicePS().IsDisabled() )
+		{
+			lightSettings.color = Color( 130, 0, 0, 0 );
+		}
+		else
+		{
+			lightSettings.color = Color( 25, 200, 0, 255 );
+		}
+		lightSettings.strength = 1.0;
+		evt.settings = lightSettings;
+		QueueEvent( evt );
+	}
+
+	public const override function DeterminGameplayRoleMappinVisuaState( data : SDeviceMappinData ) : EMappinVisualState
+	{
+		if( ( IsBodyDisposalPossible() || !( GetDevicePS().HasQuickHackDistraction() ) ) || !( IsQuickHackAble() ) )
+		{
+			if( GetDevicePS().GetNumberOfUses() > 0 )
+			{
+				return EMappinVisualState.Available;
+			}
+			else
+			{
+				return EMappinVisualState.Unavailable;
+			}
+		}
+		return super.DeterminGameplayRoleMappinVisuaState( data );
+	}
+
+}
+
+class StopSoundDisposal extends Event
+{
+}
+
+class NPCKillDelayEvent extends Event
+{
+	var target : weak< GameObject >;
+	var isLethalTakedown : Bool;
+	var disableKillReward : Bool;
+}
+

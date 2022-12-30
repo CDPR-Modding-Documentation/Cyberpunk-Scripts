@@ -1,0 +1,4907 @@
+class PlayerStatsListener extends ScriptStatsListener
+{
+	var m_owner : weak< GameObject >;
+
+	public override function OnStatChanged( ownerID : StatsObjectID, statType : gamedataStatType, diff : Float, total : Float )
+	{
+		m_owner.SetScannerDirty( true );
+	}
+
+}
+
+class PlayerCompanionCacheDataEvent extends Event
+{
+	var m_isPlayerCompanionCached : Bool;
+	var m_isPlayerCompanionCachedTimeStamp : Float;
+}
+
+class DelaySetCoverNPCCurrentlyExposed extends Event
+{
+	var exposed : Bool;
+}
+
+class FinisherEffectorActionOn extends Event
+{
+	var instigator : weak< GameObject >;
+}
+
+import struct NPCstubData
+{
+	import var spawnerID : EntityID;
+	import var entryID : CName;
+}
+
+class NPCGodModeListener extends ScriptStatsListener
+{
+	var m_owner : weak< NPCPuppet >;
+
+	public export override function OnGodModeChanged( ownerID : EntityID, newType : gameGodModeType )
+	{
+		m_owner.OnGodModeChanged();
+	}
+
+}
+
+class NPCDeathListener extends ScriptStatPoolsListener
+{
+	var npc : weak< NPCPuppet >;
+
+	protected event OnStatPoolAdded()
+	{
+		if( npc.IsDefeatMechanicActive() )
+		{
+			GameInstance.GetStatPoolsSystem( npc.GetGame() ).RequestSettingStatPoolValueCustomLimit( npc.GetEntityID(), gamedataStatPoolType.Health, 0.1, NULL );
+		}
+		else
+		{
+			GameInstance.GetStatPoolsSystem( npc.GetGame() ).RequestSettingStatPoolValueCustomLimit( npc.GetEntityID(), gamedataStatPoolType.Health, 0.0, NULL );
+		}
+	}
+
+	protected event OnStatPoolCustomLimitReached( value : Float )
+	{
+		if( StatusEffectSystem.ObjectHasStatusEffect( npc, T"BaseStatusEffect.ForceKill" ) || StatusEffectSystem.ObjectHasStatusEffect( npc, T"WorkspotStatus.Death" ) )
+		{
+			npc.MarkForDeath();
+		}
+		else
+		{
+			npc.MarkForDefeat();
+		}
+		SendPotentialDeathEvent();
+		npc.m_wasJustKilledOrDefeated = true;
+	}
+
+	protected event OnStatPoolMinValueReached( value : Float )
+	{
+		npc.m_wasJustKilledOrDefeated = true;
+		if( npc.GetNPCType() == gamedataNPCType.Drone )
+		{
+			npc.MarkForDeath();
+			SendPotentialDeathEvent();
+		}
+	}
+
+	protected function SendPotentialDeathEvent()
+	{
+		var potentialDeathEvt : gamePotentialDeathEvent;
+		potentialDeathEvt = new gamePotentialDeathEvent;
+		potentialDeathEvt.instigator = npc.GetLastHitInstigator();
+		npc.QueueEvent( potentialDeathEvt );
+	}
+
+}
+
+class NPCPuppet extends ScriptedPuppet
+{
+	private var m_lastHitEvent : gameHitEvent;
+	private var m_totalFrameReactionDamageReceived : Float;
+	private var m_totalFrameWoundsDamageReceived : Float;
+	private var m_totalFrameDismembermentDamageReceived : Float;
+	private var m_hitEventLock : RWLock;
+	private var m_NPCManager : NPCManager;
+	private var m_customDeathDirection : Int32;
+	private var m_deathOverrideState : Bool;
+	private var m_agonyState : Bool;
+	private var m_defensiveState : Bool;
+	private var m_lastSetupWorkspotActionEvent : SetupWorkspotActionEvent;
+	var m_wasJustKilledOrDefeated : Bool;
+	private var m_shouldDie : Bool;
+	private var m_shouldBeDefeated : Bool;
+	private var m_sentDownedEvent : Bool;
+	private var m_isRagdolling : Bool;
+	private var m_hasAnimatedRagdoll : Bool;
+	private var m_disableCollisionRequested : Bool;
+	private var m_ragdollInstigator : weak< GameObject >;
+	private var m_ragdollSplattersSpawned : Int32;
+	private var m_ragdollFloorSplashSpawned : Bool;
+	private var m_ragdollImpactData : RagdollImpactPointData;
+	private var m_ragdollDamageData : RagdollDamagePollData;
+	private var m_ragdollInitialPosition : Vector4;
+	private var m_ragdollActivationTimestamp : Float;
+	private var m_ragdolledEntities : array< weak< Entity > >;
+	private var m_disableRagdollAfterRecovery : Bool;
+	private var m_isNotVisible : Bool;
+	private var m_deathListener : NPCDeathListener;
+	private var m_godModeStatListener : NPCGodModeListener;
+	private var m_npcCollisionComponent : SimpleColliderComponent;
+	private var m_npcRagdollComponent : IComponent;
+	private var m_npcTraceObstacleComponent : SimpleColliderComponent;
+	private var m_npcMountedToPlayerComponents : array< IComponent >;
+	private var m_scavengeComponent : ScavengeComponent;
+	private var m_influenceComponent : InfluenceComponent;
+	private var m_comfortZoneComponent : IComponent;
+	var m_isTargetingPlayer : Bool;
+	private var m_playerStatsListener : ScriptStatsListener;
+	private var m_upperBodyStateCallbackID : CallbackHandle;
+	private var m_leftCyberwareStateCallbackID : CallbackHandle;
+	private var m_meleeStateCallbackID : CallbackHandle;
+	private var m_combatGadgetStateCallbackID : CallbackHandle;
+	private var m_wasAimedAtLast : Bool;
+	private var m_wasCWChargedAtLast : Bool;
+	private var m_wasMeleeChargedAtLast : Bool;
+	private var m_wasChargingGadgetAtLast : Bool;
+	private var m_isLookedAt : Bool;
+	private var m_cachedPlayerID : EntityID;
+	private var m_wasAggressiveCrowd : Bool;
+	private var m_canGoThroughDoors : Bool;
+	private var m_lastStatusEffectSignalSent : weak< StatusEffect_Record >;
+	private var m_cachedStatusEffectAnim : weak< StatusEffect_Record >;
+	private var m_resendStatusEffectSignalDelayID : DelayID;
+	private var m_lastSEAppliedByPlayer : StatusEffect;
+	private var m_pendingSEEvent : ApplyStatusEffectEvent;
+	private var m_bounty : Bounty;
+	private var m_cachedVFXList : array< weak< StatusEffectFX_Record > >;
+	private var m_cachedSFXList : array< weak< StatusEffectFX_Record > >;
+	private var m_isThrowingGrenadeToPlayer : Bool;
+	private var m_throwingGrenadeDelayEventID : DelayID;
+	private var m_myKiller : weak< GameObject >;
+	private var m_primaryThreatCalculationType : EAIThreatCalculationType;
+	private var m_temporaryThreatCalculationType : EAIThreatCalculationType;
+	private var m_isPlayerCompanionCached : Bool;
+	private var m_isPlayerCompanionCachedTimeStamp : Float;
+	private var m_quickHackEffectsApplied : Uint32;
+	private var m_hackingResistanceMod : gameConstantStatModifierData;
+	private var m_delayNonStealthQuickHackVictimEventID : DelayID;
+	private var m_cachedIsPaperdoll : Int32;
+	private var smartDespawnDelayID : DelayID;
+	private var despawnTicks : Uint32;
+
+	public const override function IsNPC() : Bool
+	{
+		return true;
+	}
+
+	public constexpr export const function IsReplicable() : Bool
+	{
+		return true;
+	}
+
+	public constexpr const function GetReplicatedStateClass() : CName
+	{
+		return 'gameNpcPuppetReplicatedState';
+	}
+
+	protected function PrepareVendor()
+	{
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'PrepareVendorTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function PrepareVendorTask( data : ScriptTaskData )
+	{
+		var vendorID : TweakDBID;
+		var request : AttachVendorRequest;
+		var record : Character_Record;
+		record = TweakDBInterface.GetCharacterRecord( GetRecordID() );
+		if( record && record.VendorID() )
+		{
+			vendorID = record.VendorID().GetID();
+		}
+		if( TDBID.IsValid( vendorID ) )
+		{
+			request = new AttachVendorRequest;
+			request.owner = this;
+			request.vendorID = vendorID;
+			MarketSystem.GetInstance( GetGame() ).QueueRequest( request );
+		}
+	}
+
+	protected function InitializeNPCManager()
+	{
+		m_NPCManager = new NPCManager;
+		m_NPCManager.Init( this );
+	}
+
+	protected function IsPaperdoll() : Bool
+	{
+		if( m_cachedIsPaperdoll == 0 )
+		{
+			if( NPCManager.HasTag( GetRecordID(), 'TPP_Player' ) )
+			{
+				m_cachedIsPaperdoll = 1;
+			}
+			else
+			{
+				m_cachedIsPaperdoll = -1;
+			}
+		}
+		return m_cachedIsPaperdoll > 0;
+	}
+
+	public function ResetCompanionRoleCacheTimeStamp()
+	{
+		m_isPlayerCompanionCachedTimeStamp = 0.0;
+	}
+
+	protected event OnPlayerCompanionCacheData( evt : PlayerCompanionCacheDataEvent )
+	{
+		m_isPlayerCompanionCached = evt.m_isPlayerCompanionCached;
+		m_isPlayerCompanionCachedTimeStamp = evt.m_isPlayerCompanionCachedTimeStamp;
+	}
+
+	private const function GetPlayerID() : EntityID
+	{
+		if( EntityID.IsDefined( m_cachedPlayerID ) )
+		{
+			return m_cachedPlayerID;
+		}
+		return GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject().GetEntityID();
+	}
+
+	public const override function IsPlayerCompanion() : Bool
+	{
+		var evt : PlayerCompanionCacheDataEvent;
+		var currTime : Float;
+		var isPlayerCompanionCached : Bool;
+		currTime = EngineTime.ToFloat( GameInstance.GetSimTime( GetGame() ) );
+		if( ( m_isPlayerCompanionCachedTimeStamp == 0.0 ) || ( ( currTime - m_isPlayerCompanionCachedTimeStamp ) > 10.0 ) )
+		{
+			evt = new PlayerCompanionCacheDataEvent;
+			isPlayerCompanionCached = super.IsPlayerCompanion();
+			evt.m_isPlayerCompanionCached = isPlayerCompanionCached;
+			evt.m_isPlayerCompanionCachedTimeStamp = currTime;
+			GameInstance.GetPersistencySystem( GetGame() ).QueueEntityEvent( GetEntityID(), evt );
+		}
+		else
+		{
+			isPlayerCompanionCached = m_isPlayerCompanionCached;
+		}
+		return isPlayerCompanionCached;
+	}
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'scanning', 'gameScanningComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'npcCollision', 'SimpleColliderComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'npcTraceObstacle', 'SimpleColliderComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ethnicity', 'EthnicityComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'VisibleObject', 'VisibleObjectComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ScavengeComponent', 'ScavengeComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'HitPhysicalQueryMesh', 'entColliderComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'HitRepresentation', 'gameHitRepresentationComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'VisualOffset', 'visualOffsetTransformComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'RagdollComponent', 'entRagdollComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'InfluenceComponent', 'gameinfluenceComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ComfortZone', 'entTriggerComponent', false );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_npcCollisionComponent = ( ( SimpleColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'npcCollision' ) ) );
+		m_npcTraceObstacleComponent = ( ( SimpleColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'npcTraceObstacle' ) ) );
+		m_visibleObjectComponent = ( ( VisibleObjectComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'VisibleObject' ) ) );
+		m_scavengeComponent = ( ( ScavengeComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ScavengeComponent' ) ) );
+		m_npcMountedToPlayerComponents.PushBack( ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'HitPhysicalQueryMesh' ) ) ) );
+		m_npcMountedToPlayerComponents.PushBack( ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'HitRepresentation' ) ) ) );
+		m_npcMountedToPlayerComponents.PushBack( ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'VisualOffset' ) ) ) );
+		m_npcRagdollComponent = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'RagdollComponent' ) ) );
+		m_influenceComponent = ( ( InfluenceComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'InfluenceComponent' ) ) );
+		m_comfortZoneComponent = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ComfortZone' ) ) );
+	}
+
+	protected event OnPostInitialize( evt : entPostInitializeEvent )
+	{
+		super.OnPostInitialize( evt );
+		if( m_comfortZoneComponent )
+		{
+			m_comfortZoneComponent.Toggle( false );
+		}
+		if( m_visibleObjectComponent )
+		{
+			m_visibleObjectComponent.Toggle( false );
+		}
+		InitializeNPCManager();
+	}
+
+	protected event OnPreUninitialize( evt : entPreUninitializeEvent )
+	{
+		super.OnPreUninitialize( evt );
+		if( m_NPCManager )
+		{
+			m_NPCManager.UnInit( this );
+		}
+	}
+
+	protected event OnGameAttached()
+	{
+		var setScannerTime : SetScanningTimeEvent;
+		var isCrowd : Bool;
+		var hasCrowdLOD : Bool;
+		super.OnGameAttached();
+		isCrowd = IsCrowd();
+		hasCrowdLOD = HasCrowdStaticLOD();
+		if( hasCrowdLOD )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'crowd', 1.0 );
+		}
+		SetAnimWrapperWeightBasedOnFaction();
+		SetRandomAnimWrappersForLocomotion();
+		AnimationControllerComponent.ApplyFeature( this, 'ProceduralLean', new AnimFeature_ProceduralLean );
+		InitThreatsCurves();
+		if( !( isCrowd ) && !( GetPS().WasAttached() ) )
+		{
+			ApplyRarityMods();
+		}
+		if( !( isCrowd ) )
+		{
+			setScannerTime = new SetScanningTimeEvent;
+			setScannerTime.time = 0.5;
+			QueueEvent( setScannerTime );
+			PrepareVendor();
+		}
+		if( !( m_deathListener ) )
+		{
+			m_deathListener = new NPCDeathListener;
+			m_deathListener.npc = this;
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestRegisteringListener( GetEntityID(), gamedataStatPoolType.Health, m_deathListener );
+		}
+		SetSenseObjectType( gamedataSenseObjectType.Npc );
+		if( GetPS().GetWasIncapacitated() )
+		{
+			if( !( isCrowd ) )
+			{
+				GenerateLoot();
+				EvaluateLootQualityByTask();
+			}
+			SetIsDefeatMechanicActive( false, true );
+		}
+		else
+		{
+			SetIsDefeatMechanicActive( GetNPCType() == gamedataNPCType.Human, true );
+		}
+	}
+
+	protected event OnDetach()
+	{
+		var playerPuppet : weak< ScriptedPuppet >;
+		super.OnDetach();
+		if( !( IsCrowd() ) )
+		{
+			StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.Grappled" );
+			if( IsBoss() )
+			{
+				playerPuppet = ( ( weak< weak< ScriptedPuppet > > )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+				if( playerPuppet )
+				{
+					BossHealthBarGameController.ReevaluateBossHealthBar( this, playerPuppet, true );
+				}
+			}
+		}
+		if( m_deathListener )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( GetEntityID(), gamedataStatPoolType.Health, m_deathListener );
+			m_deathListener = NULL;
+		}
+		if( EntityID.IsDefined( m_cachedPlayerID ) )
+		{
+			UnregisterCallbacksForReactions();
+			m_cachedPlayerID = EntityID();
+		}
+	}
+
+	protected event OnPreloadAnimationsEvent( evt : PreloadAnimationsEvent )
+	{
+		AIActionHelper.PreloadAnimations( this, evt.m_streamingContextName, evt.m_highPriority );
+	}
+
+	protected event OnDeviceLinkRequest( evt : DeviceLinkRequest )
+	{
+		var link : PuppetDeviceLinkPS;
+		if( IsCrowd() || IsCharacterCivilian() )
+		{
+			return false;
+		}
+		link = PuppetDeviceLinkPS.CreateAndAcquirePuppetDeviceLinkPS( GetGame(), GetEntityID() );
+		if( link )
+		{
+			GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( link.GetID(), link.GetClassName(), evt );
+		}
+	}
+
+	protected override function CreateListeners()
+	{
+		var statSys : StatsSystem;
+		var puppetID : EntityID;
+		statSys = GameInstance.GetStatsSystem( GetGameInstance() );
+		puppetID = GetEntityID();
+		if( !( m_godModeStatListener ) )
+		{
+			m_godModeStatListener = new NPCGodModeListener;
+			m_godModeStatListener.m_owner = this;
+			statSys.RegisterListener( puppetID, m_godModeStatListener );
+		}
+		super.CreateListeners();
+	}
+
+	protected override function RemoveListeners()
+	{
+		var statSys : StatsSystem;
+		var puppetID : EntityID;
+		statSys = GameInstance.GetStatsSystem( GetGameInstance() );
+		puppetID = GetEntityID();
+		if( m_godModeStatListener )
+		{
+			statSys.UnregisterListener( puppetID, m_godModeStatListener );
+			m_godModeStatListener = NULL;
+		}
+		super.RemoveListeners();
+	}
+
+	protected event OnDeviceLinkEstablished( evt : DeviceLinkEstablished )
+	{
+		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), evt );
+	}
+
+	private function ApplyRarityMods()
+	{
+		var i : Int32;
+		var mod : gameStatModifierData;
+		var statMods : array< weak< StatModifier_Record > >;
+		var ownerID : EntityID;
+		var puppet : weak< NPCPuppet >;
+		var statSys : StatsSystem;
+		var constMod : weak< ConstantStatModifier_Record >;
+		ownerID = GetEntityID();
+		puppet = this;
+		statSys = GameInstance.GetStatsSystem( GetGameInstance() );
+		puppet.GetPuppetRarity().StatModifiers( statMods );
+		for( i = 0; i < statMods.Size(); i += 1 )
+		{
+			constMod = ( ( ConstantStatModifier_Record )( statMods[ i ] ) );
+			if( constMod )
+			{
+				mod = RPGManager.CreateStatModifier( constMod.StatType().StatType(), ( ( gameStatModifierType )( ( ( Int32 )( EnumValueFromName( 'gameStatModifierType', constMod.ModifierType() ) ) ) ) ), constMod.Value() );
+			}
+			else
+			{
+				mod = RPGManager.CreateCurveModifier( ( ( CurveStatModifier_Record )( statMods[ i ] ) ) );
+			}
+			statSys.AddSavedModifier( ownerID, mod );
+		}
+	}
+
+	protected const override function GetPS() : ScriptedPuppetPS
+	{
+		return ( ( ScriptedPuppetPS )( GetBasePS() ) );
+	}
+
+	public const function GetBounty() : Bounty
+	{
+		return m_bounty;
+	}
+
+	public function SetBountyAwarded( awarded : Bool )
+	{
+		var evt : SetBountyAwardedEvent;
+		evt = new SetBountyAwardedEvent;
+		evt.awarded = awarded;
+		QueueEvent( evt );
+	}
+
+	protected event OnSetBountyAwardedEvent( evt : SetBountyAwardedEvent )
+	{
+		m_bounty.m_awarded = evt.awarded;
+	}
+
+	public static function SetBountyObject( target : GameObject, bounty : Bounty )
+	{
+		var evt : SetBountyObjectEvent;
+		if( target )
+		{
+			evt = new SetBountyObjectEvent;
+			evt.bounty = bounty;
+			target.QueueEvent( evt );
+		}
+	}
+
+	protected event OnSetBountyObjectEvent( evt : SetBountyObjectEvent )
+	{
+		SetBounty( evt.bounty );
+	}
+
+	protected function SetBounty( bounty : Bounty )
+	{
+		m_bounty = bounty;
+		GetPS().StoreBountyData( m_bounty.m_bountID, m_bounty.m_transgressions );
+	}
+
+	protected event OnSetBounty( evt : SetBountyEvent )
+	{
+		BountyManager.SetBountyFromID( evt.bountyID, this );
+	}
+
+	public static function SetNPCDisposedFact( npcBody : weak< NPCPuppet > )
+	{
+		var factName : CName;
+		if( !( npcBody ) )
+		{
+			return;
+		}
+		factName = TweakDBInterface.GetCName( npcBody.GetRecordID() + T".BodyDisposalFact", 'someNpcDisposed' );
+		SetFactValue( npcBody.GetGame(), factName, 1 );
+	}
+
+	protected event OnSecuritySystemAgentTrackingPlayer( evt : SecuritySystemSupport )
+	{
+		var playerPuppet : weak< ScriptedPuppet >;
+		var ttc : TargetTrackerComponent;
+		playerPuppet = ( ( weak< weak< ScriptedPuppet > > )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+		if( !( playerPuppet ) )
+		{
+			return false;
+		}
+		ttc = GetTargetTrackerComponent();
+		if( !( ttc ) )
+		{
+			return false;
+		}
+		if( evt.supportGranted )
+		{
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( this, 'Blind' ) ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( this, 'CommsNoiseJam' ) ) )
+			{
+				SwitchTargetPlayerTrackedAccuracy( true );
+			}
+		}
+		else
+		{
+			SwitchTargetPlayerTrackedAccuracy( false );
+		}
+	}
+
+	protected function SwitchTargetPlayerTrackedAccuracy( freeze : Bool ) : Bool
+	{
+		var playerPuppet : weak< ScriptedPuppet >;
+		var threatPersistenceSource : AIThreatPersistenceSource_Record;
+		var ttc : TargetTrackerComponent;
+		playerPuppet = ( ( weak< weak< ScriptedPuppet > > )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+		if( !( playerPuppet ) )
+		{
+			return false;
+		}
+		ttc = GetTargetTrackerComponent();
+		if( !( ttc ) )
+		{
+			return false;
+		}
+		threatPersistenceSource = TweakDBInterface.GetAIThreatPersistenceSourceRecord( T"AIThreatPersistenceSource.TrackedBySecuritySystemAgent" );
+		if( freeze )
+		{
+			ttc.SetThreatBeliefAccuracy( playerPuppet, 1.0 );
+			ttc.RequestThreatBeliefAccuracyMinValue( playerPuppet, 'TrackedBySecuritySystemAgent', 1.0 );
+			TargetTrackingExtension.SetThreatPersistence( playerPuppet, this, true, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+		}
+		else
+		{
+			ttc.RemoveThreatBeliefAccuracyMinValue( playerPuppet, 'TrackedBySecuritySystemAgent' );
+			TargetTrackingExtension.SetThreatPersistence( playerPuppet, this, false, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+		}
+		return true;
+	}
+
+	protected function SwitchTargetPlayerTrackedAccuracy( ttc : TargetTrackerComponent, freeze : Bool ) : Bool
+	{
+		var playerPuppet : weak< ScriptedPuppet >;
+		var threatPersistenceSource : AIThreatPersistenceSource_Record;
+		if( !( ttc ) )
+		{
+			return false;
+		}
+		playerPuppet = ( ( weak< weak< ScriptedPuppet > > )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+		if( !( playerPuppet ) )
+		{
+			return false;
+		}
+		threatPersistenceSource = TweakDBInterface.GetAIThreatPersistenceSourceRecord( T"AIThreatPersistenceSource.TrackedBySecuritySystemAgent" );
+		if( freeze )
+		{
+			ttc.SetThreatBeliefAccuracy( playerPuppet, 1.0 );
+			ttc.RequestThreatBeliefAccuracyMinValue( playerPuppet, 'TrackedBySecuritySystemAgent', 1.0 );
+			TargetTrackingExtension.SetThreatPersistence( playerPuppet, this, true, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+		}
+		else
+		{
+			ttc.RemoveThreatBeliefAccuracyMinValue( playerPuppet, 'TrackedBySecuritySystemAgent' );
+			TargetTrackingExtension.SetThreatPersistence( playerPuppet, this, false, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+		}
+		return true;
+	}
+
+	protected event OnPlayerDetectionChangedEvent( evt : PlayerDetectionChangedEvent )
+	{
+		SetDetectionPercentage( evt.newDetectionValue );
+	}
+
+	public function SetDetectionPercentage( percent : Float )
+	{
+		var bb : IBlackboard;
+		bb = GetPuppetStateBlackboard();
+		bb.SetFloat( GetAllBlackboardDefs().PuppetState.DetectionPercentage, percent );
+	}
+
+	public function GetDetectionPercentage() : Float
+	{
+		var bb : IBlackboard;
+		bb = GetPuppetStateBlackboard();
+		return bb.GetFloat( GetAllBlackboardDefs().PuppetState.DetectionPercentage );
+	}
+
+	private function InitThreatsCurves()
+	{
+		var targetTrackerComponent : TargetTrackerComponent;
+		targetTrackerComponent = GetTargetTrackerComponent();
+		if( targetTrackerComponent )
+		{
+			targetTrackerComponent.SetThreatPriorityDistCurve( 'ThreatValueDistModifier' );
+			targetTrackerComponent.SetThreatPriorityDmgCurve( 'ThreatValueDmgModifier' );
+			targetTrackerComponent.SetThreatPriorityHisteresisCurve( 'ThreatValueHisteresisModifier' );
+			targetTrackerComponent.SetThreatPriorityAttackersCurve( 'ThreatValueAttackersModifier' );
+		}
+	}
+
+	public override function Kill( optional instigator : weak< GameObject >, optional skipNPCDeathAnim : Bool, optional disableNPCRagdoll : Bool )
+	{
+		if( GameInstance.GetStatsSystem( GetOwner().GetGame() ).GetStatValue( GetOwner().GetEntityID(), gamedataStatType.IsInvulnerable ) > 0.0 )
+		{
+			return;
+		}
+		MarkForDeath();
+		SetIsDefeatMechanicActive( false );
+		if( skipNPCDeathAnim )
+		{
+			SetSkipDeathAnimation( true );
+		}
+		if( disableNPCRagdoll )
+		{
+			SetDisableRagdoll( true );
+		}
+		super.Kill( instigator, skipNPCDeathAnim, disableNPCRagdoll );
+	}
+
+	public const override function IsDead() : Bool
+	{
+		return GameInstance.GetStatPoolsSystem( GetGame() ).HasStatPoolValueReachedMin( GetEntityID(), gamedataStatPoolType.Health );
+	}
+
+	public function MarkForDeath()
+	{
+		m_shouldDie = true;
+	}
+
+	public const function IsAboutToDie() : Bool
+	{
+		return m_shouldDie;
+	}
+
+	public function MarkForDefeat()
+	{
+		m_shouldBeDefeated = true;
+	}
+
+	public const function IsAboutToBeDefeated() : Bool
+	{
+		return m_shouldBeDefeated;
+	}
+
+	public const function IsDefeatMechanicActive() : Bool
+	{
+		if( TweakDBInterface.GetCharacterRecord( GetRecordID() ).DisableDefeatedState() )
+		{
+			return false;
+		}
+		return GetPS().IsDefeatMechanicActive();
+	}
+
+	public function SetIsDefeatMechanicActive( isDefeatMechanicActive : Bool, optional isInitialisation : Bool )
+	{
+		GetPS().SetIsDefeatMechanicActive( isDefeatMechanicActive );
+		if( !( isInitialisation ) )
+		{
+			if( isDefeatMechanicActive )
+			{
+				GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValueCustomLimit( GetEntityID(), gamedataStatPoolType.Health, 0.1, NULL );
+			}
+			else
+			{
+				GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValueCustomLimit( GetEntityID(), gamedataStatPoolType.Health, 0.0, NULL );
+			}
+		}
+	}
+
+	public function GetAffiliation() : String
+	{
+		var affiliation : weak< Affiliation_Record >;
+		affiliation = TweakDBInterface.GetCharacterRecord( GetRecordID() ).Affiliation();
+		if( !( affiliation ) )
+		{
+			return ( ( String )( "Unknown" ) );
+		}
+		return ( ( String )( affiliation.EnumName() ) );
+	}
+
+	public function OnGodModeChanged()
+	{
+		if( CanEnableRagdollComponent() )
+		{
+			if( m_npcRagdollComponent )
+			{
+				m_npcRagdollComponent.Toggle( true );
+			}
+		}
+		else
+		{
+			if( m_npcRagdollComponent )
+			{
+				m_npcRagdollComponent.Toggle( false );
+			}
+		}
+	}
+
+	public const function CanEnableRagdollComponent( optional fromSetDeathParams : Bool ) : Bool
+	{
+		if( GameInstance.GetGodModeSystem( GetGame() ).HasGodMode( GetEntityID(), gameGodModeType.Invulnerable ) )
+		{
+			return false;
+		}
+		if( GameInstance.GetGodModeSystem( GetGame() ).HasGodMode( GetEntityID(), gameGodModeType.Immortal ) )
+		{
+			return false;
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( this, 'DisableRagdoll' ) )
+		{
+			return false;
+		}
+		if( IsBoss() && !( GetPS().GetWasIncapacitated() ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	protected event OnDisableRagdollComponentEvent( evt : DisableRagdollComponentEvent )
+	{
+		if( m_npcRagdollComponent )
+		{
+			m_npcRagdollComponent.Toggle( false );
+		}
+	}
+
+	public function SetDisableRagdoll( disableRagdoll : Bool, optional force : Bool, optional leaveRagdollEnabled : Bool )
+	{
+		if( m_npcRagdollComponent )
+		{
+			if( disableRagdoll )
+			{
+				m_npcRagdollComponent.Toggle( false );
+			}
+			else if( force )
+			{
+				if( !( leaveRagdollEnabled ) && !( m_npcRagdollComponent.IsEnabled() ) )
+				{
+					m_disableRagdollAfterRecovery = true;
+				}
+				m_npcRagdollComponent.Toggle( true );
+			}
+			else if( CanEnableRagdollComponent( true ) )
+			{
+				m_npcRagdollComponent.Toggle( true );
+			}
+		}
+	}
+
+	public static function SendNPCHitDataTrackingRequest( owner : NPCPuppet, telemetryData : ENPCTelemetryData, modifyValue : Int32 )
+	{
+		var request : ModifyNPCTelemetryVariable;
+		request = new ModifyNPCTelemetryVariable;
+		request.dataTrackingFact = telemetryData;
+		request.value = modifyValue;
+		GameInstance.GetScriptableSystemsContainer( owner.GetGame() ).Get( 'DataTrackingSystem' ).QueueRequest( request );
+	}
+
+	public const function CheckStubData( data : NPCstubData ) : Bool
+	{
+		var entityStubPS : gameEntityStubComponentPS;
+		var entityStubPSID : PersistentID;
+		var spawnerID : EntityID;
+		var entryID : CName;
+		entityStubPSID = CreatePersistentID( GetEntityID(), gameEntityStubComponentPS.GetPSComponentName() );
+		entityStubPS = ( ( gameEntityStubComponentPS )( GameInstance.GetPersistencySystem( GetGame() ).GetConstAccessToPSObject( entityStubPSID, 'gameEntityStubComponentPS' ) ) );
+		spawnerID = entityStubPS.GetSpawnerID();
+		entryID = entityStubPS.GetOwnerCommunityEntryName();
+		if( ( spawnerID == data.spawnerID ) && entryID == data.entryID )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected event OnItemAddedToSlot( evt : ItemAddedToSlot )
+	{
+		var equippedItemType : gamedataItemType;
+		var itemRecord : Item_Record;
+		var weaponRecord : WeaponItem_Record;
+		var hasTechWeapon : Bool;
+		hasTechWeapon = false;
+		super.OnItemAddedToSlot( evt );
+		SetAnimWrapperBasedOnEquippedItem( this, evt.GetSlotID(), evt.GetItemID(), 1.0 );
+		SetAnimWrappersOnItem( GameInstance.GetTransactionSystem( GetGame() ).GetItemInSlotByItemID( this, evt.GetItemID() ), evt.GetSlotID() );
+		SetWeaponFx();
+		AIActionHelper.QueuePreloadCoreAnimationsEvent( this );
+		AIActionHelper.QueuePreloadBaseAnimationsEvent( this );
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( evt.GetItemID() ) );
+		equippedItemType = itemRecord.ItemType().Type();
+		if( equippedItemType == gamedataItemType.Cyb_StrongArms )
+		{
+			SpawnStrongArmsFX();
+		}
+		if( !( IsFinal() ) )
+		{
+			( ( PlayerPuppet )( GameInstance.GetPlayerSystem( this.GetGame() ).GetLocalPlayerMainGameObject() ) ).DEBUG_Visualizer.ShowEquipEndText( this, evt.GetSlotID(), evt.GetItemID() );
+		}
+		if( WeaponObject.IsRanged( evt.GetItemID() ) )
+		{
+			weaponRecord = ( ( WeaponItem_Record )( itemRecord ) );
+			if( ( weaponRecord && weaponRecord.Evolution() ) && weaponRecord.Evolution().Type() == gamedataWeaponEvolution.Tech )
+			{
+				hasTechWeapon = true;
+			}
+		}
+		if( GetSensorObjectComponent() )
+		{
+			GetSensorObjectComponent().SetHasPierceableWapon( hasTechWeapon );
+		}
+		if( GetSensesComponent() )
+		{
+			GetSensesComponent().SetHasPierceableWapon( hasTechWeapon );
+		}
+		AIComponent.InvokeBehaviorCallback( this, 'OnItemAddedToSlotConditionEvaluation' );
+	}
+
+	protected event OnItemVisualsAddedToSlot( evt : ItemVisualsAddedToSlot )
+	{
+		var equippedItemType : gamedataItemType;
+		var itemRecord : Item_Record;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( evt.GetItemID() ) );
+		equippedItemType = itemRecord.ItemType().Type();
+		if( equippedItemType == gamedataItemType.Gad_Grenade )
+		{
+			BaseGrenade.SendGrenadeAnimFeatureChangeEvent( this, evt.GetItemID() );
+		}
+	}
+
+	private function SetWeaponFx()
+	{
+		var item : ItemObject;
+		var evt : UpdateMeleeTrailEffectEvent;
+		evt = new UpdateMeleeTrailEffectEvent;
+		evt.instigator = ( ( GameObject )( this ) );
+		item = GameInstance.GetTransactionSystem( this.GetGame() ).GetItemInSlot( this, T"AttachmentSlots.WeaponRight" );
+		if( item )
+		{
+			item.QueueEvent( evt );
+		}
+		item = GameInstance.GetTransactionSystem( this.GetGame() ).GetItemInSlot( this, T"AttachmentSlots.WeaponLeft" );
+		if( item )
+		{
+			item.QueueEvent( evt );
+		}
+	}
+
+	private function SpawnStrongArmsFX()
+	{
+		var cachedThreshold : Float;
+		var statSystem : StatsSystem;
+		var weaponID : StatsObjectID;
+		var damageType : gamedataDamageType;
+		var weapon : weak< WeaponObject >;
+		weapon = ScriptedPuppet.GetWeaponRight( this );
+		if( !( weapon ) )
+		{
+			return;
+		}
+		statSystem = GameInstance.GetStatsSystem( weapon.GetGame() );
+		weaponID = weapon.GetEntityID();
+		cachedThreshold = statSystem.GetStatValue( weaponID, gamedataStatType.PhysicalDamage );
+		damageType = gamedataDamageType.Physical;
+		if( statSystem.GetStatValue( weaponID, gamedataStatType.ThermalDamage ) > cachedThreshold )
+		{
+			cachedThreshold = statSystem.GetStatValue( weaponID, gamedataStatType.ThermalDamage );
+			damageType = gamedataDamageType.Thermal;
+		}
+		if( statSystem.GetStatValue( weaponID, gamedataStatType.ElectricDamage ) > cachedThreshold )
+		{
+			cachedThreshold = statSystem.GetStatValue( weaponID, gamedataStatType.ElectricDamage );
+			damageType = gamedataDamageType.Electric;
+		}
+		if( statSystem.GetStatValue( weaponID, gamedataStatType.ChemicalDamage ) > cachedThreshold )
+		{
+			cachedThreshold = statSystem.GetStatValue( weaponID, gamedataStatType.ChemicalDamage );
+			damageType = gamedataDamageType.Chemical;
+		}
+		if( damageType == gamedataDamageType.Thermal )
+		{
+			StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.StrongArmsThermalActive", GetEntityID() );
+		}
+		else if( damageType == gamedataDamageType.Chemical )
+		{
+			StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.StrongArmsChemicalActive", GetEntityID() );
+		}
+		else if( damageType == gamedataDamageType.Electric )
+		{
+			StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.StrongArmsElecricActive", GetEntityID() );
+		}
+	}
+
+	private function RemoveStrongArmsFX()
+	{
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.StrongArmsThermalActive" );
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.StrongArmsChemicalActive" );
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.StrongArmsElecricActive" );
+	}
+
+	protected event OnItemRemovedFromSlot( evt : ItemRemovedFromSlot )
+	{
+		var weaponTag : CName;
+		var wrapperNameBasedOnID : CName;
+		wrapperNameBasedOnID = AIActionHelper.GetAnimWrapperNameBasedOnItemID( evt.GetItemID() );
+		if( wrapperNameBasedOnID == 'Cyb_StrongArms' )
+		{
+			RemoveStrongArmsFX();
+		}
+		super.OnItemRemovedFromSlot( evt );
+		if( IsPaperdoll() )
+		{
+			SetAnimWrapperBasedOnEquippedItem( this, wrapperNameBasedOnID, evt.GetSlotID(), evt.GetItemID(), 0.0 );
+		}
+		else if( ScriptedPuppet.IsActive( this ) )
+		{
+			weaponTag = AIActionHelper.GetAnimWrapperNameBasedOnItemTag( evt.GetItemID() );
+			if( ( !( AIScriptSquad.HasOrder( this, 'Equip' ) ) || !( IsNameValid( weaponTag ) ) ) || ( IsCrowd() && GetUpperBodyStateFromBlackboard() != gamedataNPCUpperBodyState.Equip ) )
+			{
+				SetAnimWrapperBasedOnEquippedItem( this, wrapperNameBasedOnID, evt.GetSlotID(), evt.GetItemID(), 0.0 );
+			}
+		}
+	}
+
+	private function SetAnimWrapperWeightBasedOnFaction()
+	{
+		var affiliation : weak< Affiliation_Record >;
+		var animWrappers : array< CName >;
+		var i : Int32;
+		affiliation = TweakDBInterface.GetCharacterRecord( GetRecordID() ).Affiliation();
+		if( !( affiliation ) )
+		{
+			return;
+		}
+		animWrappers = affiliation.AnimWrappers();
+		for( i = 0; i < animWrappers.Size(); i += 1 )
+		{
+			if( IsNameValid( animWrappers[ i ] ) )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeight( this, animWrappers[ i ], 1.0 );
+			}
+		}
+	}
+
+	private function SetAnimWrappersOnItem( item : weak< ItemObject >, slotID : TweakDBID )
+	{
+		var affiliation : weak< Affiliation_Record >;
+		var animWrappers : array< CName >;
+		var i : Int32;
+		if( !( item ) )
+		{
+			return;
+		}
+		AnimationControllerComponent.SetAnimWrapperWeight( item, NPCStatesComponent.GetAnimWrapperNameBasedOnStanceState( ( ( gamedataNPCStanceState )( GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.Stance ) ) ) ), 1.0 );
+		AnimationControllerComponent.SetAnimWrapperWeight( item, NPCStatesComponent.GetAnimWrapperNameBasedOnHighLevelState( ( ( gamedataNPCHighLevelState )( GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HighLevel ) ) ) ), 1.0 );
+		affiliation = TweakDBInterface.GetCharacterRecord( GetRecordID() ).Affiliation();
+		if( !( affiliation ) )
+		{
+			return;
+		}
+		animWrappers = affiliation.AnimWrappers();
+		for( i = 0; i < animWrappers.Size(); i += 1 )
+		{
+			if( IsNameValid( animWrappers[ i ] ) )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeight( item, animWrappers[ i ], 1.0 );
+			}
+		}
+	}
+
+	public static function SetAnimWrapperBasedOnEquippedItem( npc : weak< NPCPuppet >, const slotID : TweakDBID, const itemID : ItemID, const value : Float )
+	{
+		var wrapperNameBaseOnID : CName;
+		wrapperNameBaseOnID = AIActionHelper.GetAnimWrapperNameBasedOnItemID( itemID );
+		if( slotID == T"AttachmentSlots.WeaponRight" )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeightOnOwnerAndItems( npc, 'WeaponRight', value );
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, wrapperNameBaseOnID, value );
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, AIActionHelper.GetAnimWrapperNameBasedOnItemTag( itemID ), value );
+			AIActionHelper.SendItemHandling( npc, TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ), 'rightHandItemHandling', ( ( value > 0.0 ) ? ( true ) : ( false ) ) );
+			if( wrapperNameBaseOnID == 'Wea_Fists' )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeight( npc, 'Wea_Hammer', 0.0 );
+			}
+		}
+		else if( slotID == T"AttachmentSlots.WeaponLeft" )
+		{
+			if( wrapperNameBaseOnID != 'Gad_Grenade' )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeightOnOwnerAndItems( npc, 'WeaponLeft', value );
+			}
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, wrapperNameBaseOnID, value );
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, AIActionHelper.GetAnimWrapperNameBasedOnItemTag( itemID ), value );
+			AIActionHelper.SendItemHandling( npc, TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ), 'leftHandItemHandling', ( ( value > 0.0 ) ? ( true ) : ( false ) ) );
+		}
+	}
+
+	public static function SetAnimWrapperBasedOnEquippedItem( npc : weak< NPCPuppet >, const wrapperNameBasedOnID : CName, const slotID : TweakDBID, const itemID : ItemID, const value : Float )
+	{
+		if( slotID == T"AttachmentSlots.WeaponRight" )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeightOnOwnerAndItems( npc, 'WeaponRight', value );
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, wrapperNameBasedOnID, value );
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, AIActionHelper.GetAnimWrapperNameBasedOnItemTag( itemID ), value );
+			AIActionHelper.SendItemHandling( npc, TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ), 'rightHandItemHandling', ( ( value > 0.0 ) ? ( true ) : ( false ) ) );
+			if( wrapperNameBasedOnID == 'Wea_Fists' )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeight( npc, 'Wea_Hammer', 0.0 );
+			}
+		}
+		else if( slotID == T"AttachmentSlots.WeaponLeft" )
+		{
+			if( wrapperNameBasedOnID != 'Gad_Grenade' )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeightOnOwnerAndItems( npc, 'WeaponLeft', value );
+			}
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, wrapperNameBasedOnID, value );
+			AnimationControllerComponent.SetAnimWrapperWeight( npc, AIActionHelper.GetAnimWrapperNameBasedOnItemTag( itemID ), value );
+			AIActionHelper.SendItemHandling( npc, TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ), 'leftHandItemHandling', ( ( value > 0.0 ) ? ( true ) : ( false ) ) );
+		}
+	}
+
+	private function SetRandomAnimWrappersForLocomotion()
+	{
+		switch( RandRange( 1, 15 ) )
+		{
+			case 1:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle01', 1.0 );
+			break;
+			case 2:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle02', 1.0 );
+			break;
+			case 3:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle03', 1.0 );
+			break;
+			case 4:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle04', 1.0 );
+			break;
+			case 5:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle05', 1.0 );
+			break;
+			case 6:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle06', 1.0 );
+			break;
+			case 7:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle07', 1.0 );
+			break;
+			case 8:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle08', 1.0 );
+			break;
+			case 9:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle09', 1.0 );
+			break;
+			case 10:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle10', 1.0 );
+			break;
+			case 11:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle11', 1.0 );
+			break;
+			case 12:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle12', 1.0 );
+			break;
+			case 13:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle13', 1.0 );
+			break;
+			case 14:
+				AnimationControllerComponent.SetAnimWrapperWeight( this, 'LocomotionCycle14', 1.0 );
+			break;
+			default:
+				break;
+		}
+		if( MatchVisualTag( 'anim_Lowlife' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'LowlifeLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_MidCorp' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'MidCorpLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Posh' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'PoshLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_DirtGirl' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'DirtGirlLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Homeless' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'HomelessLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Freak' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'FreakLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Junkie' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'JunkieLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Mallrat' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'MallratLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Worker' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'WorkerLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Borg' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'BorgLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Fam' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'FamLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Cowboy' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'CowboyLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Tomboy' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'TomboyLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Redneck' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'RedneckLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Tennant' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'TennantLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Youngster' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'YoungsterLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_LowCorp' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'LowCorpLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Elder' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'ElderLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Nightlife' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'NightlifeLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'Anim_Monk' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'MonkLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Drunk' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'DrunkLocomotion', 1.0 );
+		}
+		if( MatchVisualTag( 'anim_Beaten' ) )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( this, 'BeatenLocomotion', 1.0 );
+		}
+	}
+
+	protected event OnDelaySetCoverNPCCurrentlyExposed( evt : DelaySetCoverNPCCurrentlyExposed )
+	{
+		AICoverHelper.SetCoverNPCCurrentlyExposed( this, evt.exposed );
+	}
+
+	protected event OnSetPuppetTargetingPlayer( evt : OnBeingTarget )
+	{
+		if( ( ( NPCPuppet )( evt.objectThatTargets ) ) )
+		{
+			SetPuppetTargetingPlayer( true );
+		}
+		else if( ( ( NPCPuppet )( evt.objectThatTargets ) ) && evt.noLongerTarget )
+		{
+			SetPuppetTargetingPlayer( false );
+		}
+	}
+
+	private function SetPuppetTargetingPlayer( isTargeting : Bool )
+	{
+		var i : Int32;
+		m_isTargetingPlayer = isTargeting;
+		for( i = 0; i < m_listeners.Size(); i += 1 )
+		{
+			m_listeners[ i ].OnIsTrackingPlayerChanged( isTargeting );
+		}
+	}
+
+	public const function IsPuppetTargetingPlayer() : Bool
+	{
+		return m_isTargetingPlayer;
+	}
+
+	public static function ChangeHighLevelState( obj : GameObject, newState : gamedataNPCHighLevelState )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		var owner : NPCPuppet;
+		owner = ( ( NPCPuppet )( obj ) );
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( owner.GetHighLevelStateFromBlackboard() == newState )
+		{
+			return;
+		}
+		signalTable = owner.GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_highLevelState = newState;
+		signal.m_highLevelStateValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeUpperBodyState( obj : GameObject, newState : gamedataNPCUpperBodyState )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		var owner : NPCPuppet;
+		owner = ( ( NPCPuppet )( obj ) );
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( owner.GetUpperBodyStateFromBlackboard() == newState )
+		{
+			return;
+		}
+		signalTable = owner.GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_upperBodyState = newState;
+		signal.m_upperBodyStateValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeStanceState( obj : GameObject, newState : gamedataNPCStanceState )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		var owner : NPCPuppet;
+		owner = ( ( NPCPuppet )( obj ) );
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( owner.GetStanceStateFromBlackboard() == newState )
+		{
+			return;
+		}
+		signalTable = owner.GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_stanceState = newState;
+		signal.m_stanceStateValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeHitReactionModeState( obj : GameObject, newState : EHitReactionMode )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		var owner : NPCPuppet;
+		owner = ( ( NPCPuppet )( obj ) );
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( owner.GetHitReactionModeFromBlackboard() == newState )
+		{
+			return;
+		}
+		signalTable = owner.GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_hitReactionModeState = newState;
+		signal.m_hitReactionModeStateValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeDefenseModeState( obj : GameObject, newState : gamedataDefenseMode )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		var owner : NPCPuppet;
+		owner = ( ( NPCPuppet )( obj ) );
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( owner.GetDefenseModeStateFromBlackboard() == newState )
+		{
+			return;
+		}
+		signalTable = owner.GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_defenseMode = newState;
+		signal.m_defenseModeValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeLocomotionMode( obj : GameObject, newState : gamedataLocomotionMode )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		signalTable = ( ( NPCPuppet )( obj ) ).GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_locomotionMode = newState;
+		signal.m_locomotionModeValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeBehaviorState( obj : GameObject, newState : gamedataNPCBehaviorState )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		signalTable = ( ( NPCPuppet )( obj ) ).GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_behaviorState = newState;
+		signal.m_behaviorStateValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangePhaseState( obj : GameObject, newState : ENPCPhaseState )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		signalTable = ( ( NPCPuppet )( obj ) ).GetSignalTable();
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		signal.m_phaseState = newState;
+		signal.m_phaseStateValid = true;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	public static function ChangeForceRagdollOnDeath( obj : GameObject, value : Bool )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : ForcedRagdollDeathSignal;
+		var signalId : Uint16;
+		signalTable = ( ( NPCPuppet )( obj ) ).GetSignalTable();
+		signal = new ForcedRagdollDeathSignal;
+		signalId = signalTable.GetOrCreateSignal( 'ForcedRagdollDeathSignal' );
+		signal.m_value = value;
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+		signalTable.Set( signalId, true );
+	}
+
+	protected event OnStatusEffectApplied( evt : ApplyStatusEffectEvent )
+	{
+		var gmplTags : array< CName >;
+		var si : SquadScriptInterface;
+		var ttc : TargetTrackerComponent;
+		gmplTags = evt.staticData.GameplayTags();
+		if( gmplTags.Contains( 'Quickhack' ) )
+		{
+			OnQuickHackEffectApplied( evt );
+		}
+		if( gmplTags.Contains( 'Blind' ) )
+		{
+			SenseComponent.RequestSecondaryPresetChange( this, T"Senses.Blind" );
+			ttc = GetTargetTrackerComponent();
+			if( ttc )
+			{
+				SwitchTargetPlayerTrackedAccuracy( ttc, false );
+				ttc.SetThreatBeliefAccuracy( this, 0.0 );
+			}
+		}
+		if( gmplTags.Contains( 'ClearThreats' ) )
+		{
+			ttc = GetTargetTrackerComponent();
+			if( ttc )
+			{
+				ttc.ClearThreats();
+			}
+		}
+		if( gmplTags.Contains( 'MemoryWipe' ) )
+		{
+			GetSecuritySystem().TryReleaseFromReprimand( GetEntityID() );
+		}
+		if( gmplTags.Contains( 'ResetSquadSync' ) )
+		{
+			if( AISquadHelper.GetSquadMemberInterface( this, si ) )
+			{
+				si.Leave( this );
+				si.Join( this );
+			}
+		}
+		if( gmplTags.Contains( 'DisableRagdoll' ) )
+		{
+			SetDisableRagdoll( true );
+		}
+		if( gmplTags.Contains( 'Defeated' ) )
+		{
+			SetIsDefeatMechanicActive( false );
+			StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.InvulnerableAfterDefeated" );
+		}
+		switch( evt.staticData.StatusEffectType().Type() )
+		{
+			case gamedataStatusEffectType.DefeatedWithRecover:
+				OnDefeatedWithRecoverStatusEffectApplied();
+			break;
+			default:
+				break;
+		}
+		if( ShouldDelayStatusEffectApplication( evt ) )
+		{
+			DelayStatusEffectApplication( evt );
+		}
+		else
+		{
+			ProcessStatusEffectApplication( evt );
+		}
+	}
+
+	private function ShouldDelayStatusEffectApplication( evt : ApplyStatusEffectEvent ) : Bool
+	{
+		if( TDBID.IsValid( evt.staticData.AIData().GetID() ) )
+		{
+			if( evt.staticData.AIData().ShouldDelayStatusEffectApplication() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function ProcessStatusEffectApplication( evt : ApplyStatusEffectEvent )
+	{
+		var newStatusEffectPrio : Float;
+		var topPrioStatusEffectPrio : Float;
+		var topProEffect : StatusEffect;
+		super.OnStatusEffectApplied( evt );
+		if( ( StatusEffectSystem.ObjectHasStatusEffectWithTag( this, 'Braindance' ) || StatusEffectSystem.ObjectHasStatusEffect( this, T"BaseStatusEffect.Drunk" ) ) && evt.staticData.StatusEffectType().Type() != gamedataStatusEffectType.Defeated )
+		{
+			return;
+		}
+		if( evt.staticData.AIData().ShouldProcessAIDataOnReapplication() && ( evt.staticData.GetID() == m_cachedStatusEffectAnim.GetID() ) )
+		{
+			return;
+		}
+		if( !( evt.isNewApplication ) && !( evt.staticData.AIData().ShouldProcessAIDataOnReapplication() ) )
+		{
+			return;
+		}
+		if( evt.staticData && evt.staticData.AIData() )
+		{
+			newStatusEffectPrio = evt.staticData.AIData().Priority();
+			topProEffect = StatusEffectHelper.GetTopPriorityEffect( this, evt.staticData.StatusEffectType().Type(), true );
+			if( topProEffect )
+			{
+				topPrioStatusEffectPrio = topProEffect.GetRecord().AIData().Priority();
+			}
+		}
+		if( evt.staticData.StatusEffectType().Type() == gamedataStatusEffectType.Defeated )
+		{
+			if( ScriptedPuppet.CanRagdoll( this ) )
+			{
+				QueueEvent( new UncontrolledMovementStartEvent );
+			}
+			TriggerDefeatedBehavior( evt );
+		}
+		else if( evt.staticData.StatusEffectType().Type() == gamedataStatusEffectType.DefeatedWithRecover )
+		{
+			TriggerStatusEffectBehavior( evt, true );
+		}
+		else if( evt.staticData.StatusEffectType().Type() == gamedataStatusEffectType.UncontrolledMovement )
+		{
+			OnUncontrolledMovementStatusEffectAdded( evt );
+		}
+		else if( ( ( newStatusEffectPrio > topPrioStatusEffectPrio ) || ( ( newStatusEffectPrio == topPrioStatusEffectPrio ) && !( m_cachedStatusEffectAnim ) ) ) && StatusEffectHelper.CheckStatusEffectBehaviorPrereqs( this, evt.staticData ) )
+		{
+			if( IsCrowd() && GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Fear )
+			{
+				return;
+			}
+			TriggerStatusEffectBehavior( evt );
+		}
+		CacheStatusEffectAppliedByPlayer( evt );
+	}
+
+	private function OnQuickHackEffectApplied( evt : ApplyStatusEffectEvent )
+	{
+		var value : Float;
+		var gmplTags : array< CName >;
+		var squadMates : array< weak< Entity > >;
+		var squadMate : ScriptedPuppet;
+		var i : Int32;
+		gmplTags = evt.staticData.GameplayTags();
+		m_quickHackEffectsApplied += ( ( Uint32 )( 1 ) );
+		if( m_quickHackEffectsApplied == ( ( Uint32 )( 1 ) ) )
+		{
+			value = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( evt.instigatorEntityID, gamedataStatType.LowerHackingResistanceOnHack );
+			if( value > 0.0 )
+			{
+				m_hackingResistanceMod = new gameConstantStatModifierData;
+				m_hackingResistanceMod.statType = gamedataStatType.HackingResistance;
+				m_hackingResistanceMod.modifierType = gameStatModifierType.Additive;
+				m_hackingResistanceMod.value = value * -1.0;
+				GameInstance.GetStatsSystem( GetGame() ).AddModifier( GetEntityID(), m_hackingResistanceMod );
+			}
+			if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( evt.instigatorEntityID, gamedataStatType.HasMadnessLvl4Passive ) == 1.0 )
+			{
+				StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.DoNotBlockShootingOnFriendlyFire", evt.instigatorEntityID );
+			}
+			if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( evt.instigatorEntityID, gamedataStatType.RemoveSprintOnQuickhack ) == 1.0 )
+			{
+				StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.LocomotionMalfunctionLevel4Passive", evt.instigatorEntityID );
+			}
+			if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( evt.instigatorEntityID, gamedataStatType.CommsNoiseJamOnQuickhack ) == 1.0 )
+			{
+				StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.CommsNoisePassiveEffect", evt.instigatorEntityID );
+			}
+		}
+		if( gmplTags.Contains( 'SquadMemoryWipe' ) )
+		{
+			AISquadHelper.GetSquadmates( this, squadMates );
+			for( i = 0; i < squadMates.Size(); i += 1 )
+			{
+				squadMate = ( ( ScriptedPuppet )( squadMates[ i ] ) );
+				if( !( squadMate ) )
+				{
+					continue;
+				}
+				StatusEffectHelper.ApplyStatusEffect( squadMate, T"BaseStatusEffect.MemoryWipeLevel2", evt.instigatorEntityID );
+			}
+		}
+		if( gmplTags.Contains( 'CommsNoiseJam' ) )
+		{
+			SwitchTargetPlayerTrackedAccuracy( false );
+		}
+		if( ( evt.instigatorEntityID == GetPlayerID() ) && !( gmplTags.Contains( 'Stealth' ) ) )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_delayNonStealthQuickHackVictimEventID );
+			m_delayNonStealthQuickHackVictimEventID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, NonStealthQuickHackVictimEvent.Create( evt.instigatorEntityID ), 0.1 );
+		}
+	}
+
+	protected event OnNonStealthQuickHackVictimEvent( evt : NonStealthQuickHackVictimEvent )
+	{
+		if( !( NPCPuppet.RevealPlayerPositionIfNeeded( this, evt.instigatorID ) ) )
+		{
+			NPCStatesComponent.AlertPuppet( this );
+		}
+	}
+
+	public static function RevealPlayerPositionIfNeeded( ownerPuppet : weak< ScriptedPuppet >, playerID : EntityID ) : Bool
+	{
+		var evt : HackPlayerEvent;
+		var player : weak< PlayerPuppet >;
+		var securitySystem : SecuritySystemControllerPS;
+		var securitySystemState : ESecuritySystemState;
+		if( !( ownerPuppet ) || !( EntityID.IsDefined( playerID ) ) )
+		{
+			return false;
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( ownerPuppet, 'CommsNoiseJam' ) )
+		{
+			return false;
+		}
+		player = ( ( PlayerPuppet )( GameInstance.FindEntityByID( ownerPuppet.GetGame(), playerID ) ) );
+		if( !( player ) || player.IsInCombat() )
+		{
+			return false;
+		}
+		securitySystem = ownerPuppet.GetSecuritySystem();
+		if( !( securitySystem ) || IsBoss( ownerPuppet ) )
+		{
+			if( ownerPuppet.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Alerted )
+			{
+				return false;
+			}
+		}
+		else
+		{
+			securitySystemState = securitySystem.GetSecurityState();
+			if( ( ( securitySystemState != ESecuritySystemState.ALERTED && securitySystemState != ESecuritySystemState.COMBAT ) && ownerPuppet.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Alerted ) && ownerPuppet.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Combat )
+			{
+				return false;
+			}
+		}
+		evt = new HackPlayerEvent;
+		evt.targetID = player.GetEntityID();
+		evt.netrunnerID = ownerPuppet.GetEntityID();
+		evt.objectRecord = TweakDBInterface.GetObjectActionRecord( T"AIQuickHack.HackRevealPosition" );
+		evt.showDirectionalIndicator = false;
+		evt.revealPositionAction = true;
+		if( evt.objectRecord )
+		{
+			player.QueueEvent( evt );
+			return true;
+		}
+		return false;
+	}
+
+	protected function TriggerDefeatedBehavior( evt : ApplyStatusEffectEvent )
+	{
+		var priority : Float;
+		var statusEffectDuration : Float;
+		var tags : array< CName >;
+		var flags : array< EAIGateSignalFlags >;
+		var repeatSignalDelay : Float;
+		var repeatSignalStatModifiers : array< weak< StatModifier_Record > >;
+		priority = evt.staticData.AIData().Priority();
+		statusEffectDuration = StatusEffectHelper.GetStatusEffectByID( this, evt.staticData.GetID() ).GetRemainingDuration();
+		if( statusEffectDuration < 0.0 )
+		{
+			statusEffectDuration = RPGManager.GetStatRecord( gamedataStatType.MaxDuration ).Max();
+		}
+		tags.Resize( 3 );
+		tags[ 0 ] = 'downed';
+		tags[ 1 ] = EnumValueToName( 'gamedataStatusEffectType', ( ( Int32 )( evt.staticData.StatusEffectType().Type() ) ) );
+		flags.Resize( 1 );
+		flags[ 0 ] = ( ( EAIGateSignalFlags )( ( ( Int32 )( EnumValueFromString( "EAIGateSignalFlags", "AIGSF_" + EnumValueToString( "gamedataStatusEffectAIBehaviorFlag", ( ( Int32 )( evt.staticData.AIData().BehaviorEventFlag().Type() ) ) ) ) ) ) ) );
+		evt.staticData.AIData().BehaviorSignalResendDelay( repeatSignalStatModifiers );
+		repeatSignalDelay = RPGManager.CalculateStatModifiers( repeatSignalStatModifiers, GetGame(), this, GetEntityID() );
+		SendStatusEffectSignal( priority, tags, flags, evt.staticData.GetID(), repeatSignalDelay, statusEffectDuration );
+	}
+
+	protected function DelayStatusEffectApplication( evt : ApplyStatusEffectEvent )
+	{
+		var delayStatusEffectTimes : Vector2;
+		var finalDelayTime : Float;
+		var delayedSEReactionEvent : DelayedStatusEffectApplicationEvent;
+		delayStatusEffectTimes = TweakDBInterface.GetVector2( T"AIGeneralSettings.delayStatusEffectApplicationTime", Vector2( 0.1, 0.40000001 ) );
+		finalDelayTime = RandRangeF( delayStatusEffectTimes.X, delayStatusEffectTimes.Y );
+		delayedSEReactionEvent = new DelayedStatusEffectApplicationEvent;
+		delayedSEReactionEvent.statusEffectEvent = evt;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, delayedSEReactionEvent, finalDelayTime );
+	}
+
+	protected function TriggerStatusEffectBehavior( evt : ApplyStatusEffectEvent, optional alwaysTrigger : Bool )
+	{
+		var priority : Float;
+		var statusEffectDuration : Float;
+		var tags : array< CName >;
+		var flags : array< EAIGateSignalFlags >;
+		var repeatSignalDelay : Float;
+		var repeatSignalStatModifiers : array< weak< StatModifier_Record > >;
+		if( !( evt.staticData ) || !( evt.staticData.AIData() ) )
+		{
+			return;
+		}
+		priority = evt.staticData.AIData().Priority();
+		statusEffectDuration = StatusEffectHelper.GetStatusEffectByID( this, evt.staticData.GetID() ).GetRemainingDuration();
+		if( statusEffectDuration < 0.0 )
+		{
+			statusEffectDuration = RPGManager.GetStatRecord( gamedataStatType.MaxDuration ).Max();
+		}
+		tags.Resize( 3 );
+		tags[ 0 ] = 'reactive';
+		tags[ 1 ] = 'statusEffects';
+		tags[ 2 ] = EnumValueToName( 'gamedataStatusEffectType', ( ( Int32 )( evt.staticData.StatusEffectType().Type() ) ) );
+		evt.staticData.AIData().BehaviorSignalResendDelay( repeatSignalStatModifiers );
+		repeatSignalDelay = RPGManager.CalculateStatModifiers( repeatSignalStatModifiers, GetGame(), this, GetEntityID() );
+		if( alwaysTrigger )
+		{
+			SendStatusEffectSignal( priority, tags, flags, evt.staticData.GetID(), repeatSignalDelay, statusEffectDuration );
+		}
+		else if( !( ScriptedPuppet.IsOnOffMeshLink( this ) ) && !( NPCPuppet.IsUnstoppable( this ) ) )
+		{
+			SendStatusEffectSignal( priority, tags, flags, evt.staticData.GetID(), repeatSignalDelay, statusEffectDuration );
+			if( m_pendingSEEvent )
+			{
+				m_pendingSEEvent = NULL;
+			}
+		}
+		else
+		{
+			m_pendingSEEvent = evt;
+		}
+	}
+
+	protected function SendStatusEffectSignal( priority : Float, tags : array< CName >, flags : array< EAIGateSignalFlags >, statusEffectID : TweakDBID, repeatSignalDelay : Float, remainingStatusEffectDuration : Float )
+	{
+		var signal : AIGateSignal;
+		var i : Int32;
+		signal.priority = priority;
+		signal.lifeTime = remainingStatusEffectDuration;
+		for( i = 0; i < tags.Size(); i += 1 )
+		{
+			AIGateSignal.AddTag( signal, tags[ i ] );
+		}
+		for( i = 0; i < flags.Size(); i += 1 )
+		{
+			AIGateSignal.AddFlag( signal, flags[ i ] );
+		}
+		GetSignalHandlerComponent().AddSignal( signal, false );
+		m_lastStatusEffectSignalSent = TweakDBInterface.GetStatusEffectRecord( statusEffectID );
+		TryRepeatStatusEffectSignal( priority, tags, flags, statusEffectID, repeatSignalDelay, remainingStatusEffectDuration );
+	}
+
+	protected function TryRepeatStatusEffectSignal( priority : Float, tags : array< CName >, flags : array< EAIGateSignalFlags >, statusEffectID : TweakDBID, repeatSignalDelay : Float, remainingStatusEffectDuration : Float )
+	{
+		var repeatSignalEvent : StatusEffectSignalEvent;
+		var emptyDelayID : DelayID;
+		if( ( repeatSignalDelay <= 0.0 ) || ( remainingStatusEffectDuration < repeatSignalDelay ) )
+		{
+			return;
+		}
+		repeatSignalEvent = new StatusEffectSignalEvent;
+		repeatSignalEvent.priority = priority;
+		repeatSignalEvent.tags = tags;
+		repeatSignalEvent.flags = flags;
+		repeatSignalEvent.statusEffectID = statusEffectID;
+		repeatSignalEvent.repeatSignalDelay = repeatSignalDelay;
+		if( m_resendStatusEffectSignalDelayID != emptyDelayID )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_resendStatusEffectSignalDelayID );
+			m_resendStatusEffectSignalDelayID = emptyDelayID;
+		}
+		m_resendStatusEffectSignalDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, repeatSignalEvent, repeatSignalDelay );
+	}
+
+	protected event OnStatusEffectSignal( evt : StatusEffectSignalEvent )
+	{
+		var statusEffect : StatusEffect;
+		statusEffect = StatusEffectHelper.GetStatusEffectByID( this, evt.statusEffectID );
+		if( statusEffect )
+		{
+			if( !( evt.tags.Contains( 'reapplication' ) ) )
+			{
+				evt.tags.PushBack( 'reapplication' );
+			}
+			if( !( ScriptedPuppet.IsOnOffMeshLink( this ) ) )
+			{
+				SendStatusEffectSignal( evt.priority, evt.tags, evt.flags, evt.statusEffectID, evt.repeatSignalDelay, statusEffect.GetRemainingDuration() );
+			}
+		}
+	}
+
+	protected event OnStatusEffectRemoved( evt : RemoveStatusEffect )
+	{
+		var gmplTags : array< CName >;
+		var ttc : TargetTrackerComponent;
+		var secSys : SecuritySystemControllerPS;
+		super.OnStatusEffectRemoved( evt );
+		gmplTags = evt.staticData.GameplayTags();
+		if( gmplTags.Contains( 'Quickhack' ) )
+		{
+			OnQuickHackEffectRemoved( evt );
+		}
+		if( gmplTags.Contains( 'Blind' ) && evt.isFinalRemoval )
+		{
+			SenseComponent.ResetPreset( this );
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( this, 'CommsNoiseJam' ) ) )
+			{
+				secSys = GetSecuritySystem();
+				if( secSys && secSys.HasSupport( GetEntityID() ) )
+				{
+					SwitchTargetPlayerTrackedAccuracy( true );
+				}
+			}
+		}
+		if( gmplTags.Contains( 'ResetSquadSync' ) )
+		{
+			ttc = GetTargetTrackerComponent();
+			if( ttc )
+			{
+				ttc.PushSquadSync( AISquadType.Combat );
+				AISquadHelper.PullSquadSync( this, AISquadType.Combat );
+			}
+			AIActionHelper.QueuePullSquadSync( this );
+		}
+		if( gmplTags.Contains( 'DisableRagdoll' ) )
+		{
+			SetDisableRagdoll( false );
+		}
+		if( gmplTags.Contains( 'Defeated' ) && ScriptedPuppet.IsActive( this ) )
+		{
+			SetIsDefeatMechanicActive( GetNPCType() == gamedataNPCType.Human );
+		}
+		if( evt.staticData == m_lastStatusEffectSignalSent )
+		{
+			m_lastStatusEffectSignalSent = NULL;
+		}
+		switch( evt.staticData.StatusEffectType().Type() )
+		{
+			case gamedataStatusEffectType.UncontrolledMovement:
+				OnUncontrolledMovementStatusEffectRemoved();
+			break;
+			case gamedataStatusEffectType.DefeatedWithRecover:
+				OnDefeatedWithRecoverStatusEffectRemoved();
+			break;
+			default:
+				break;
+		}
+	}
+
+	private function OnQuickHackEffectRemoved( evt : RemoveStatusEffect )
+	{
+		var gmplTags : array< CName >;
+		var deadBodyEvent : DeadBodyEvent;
+		var secSys : SecuritySystemControllerPS;
+		gmplTags = evt.staticData.GameplayTags();
+		m_quickHackEffectsApplied -= ( ( Uint32 )( 1 ) );
+		if( m_quickHackEffectsApplied == ( ( Uint32 )( 0 ) ) )
+		{
+			StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.LocomotionMalfunctionLevel4Passive" );
+			StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.DoNotBlockShootingOnFriendlyFire" );
+			StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.CommsNoisePassiveEffect" );
+			if( m_hackingResistanceMod )
+			{
+				GameInstance.GetStatsSystem( GetGame() ).RemoveModifier( GetEntityID(), m_hackingResistanceMod );
+			}
+		}
+		if( gmplTags.Contains( 'CommsNoiseJam' ) && IsConnectedToSecuritySystem() )
+		{
+			AIActionHelper.QueueSecuritySystemCombatNotification( this );
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( this, 'Blind' ) ) )
+			{
+				secSys = GetSecuritySystem();
+				if( secSys && secSys.HasSupport( GetEntityID() ) )
+				{
+					SwitchTargetPlayerTrackedAccuracy( true );
+				}
+			}
+		}
+		if( gmplTags.Contains( 'CommsNoiseIgnore' ) && GetPS().GetWasIncapacitated() )
+		{
+			deadBodyEvent = new DeadBodyEvent;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, deadBodyEvent, 1.0 );
+		}
+	}
+
+	protected event OnCacheStatusEffectAnim( evt : CacheStatusEffectAnimEvent )
+	{
+		if( evt.removeCachedStatusEffect )
+		{
+			m_cachedStatusEffectAnim = NULL;
+		}
+		else
+		{
+			m_cachedStatusEffectAnim = m_lastStatusEffectSignalSent;
+		}
+	}
+
+	protected event OnApplyNewStatusEffect( evt : ApplyNewStatusEffectEvent )
+	{
+		StatusEffectHelper.ApplyStatusEffect( this, evt.effectID, evt.instigatorID );
+	}
+
+	protected event OnRemoveStatusEffect( evt : RemoveStatusEffectEvent )
+	{
+		GameInstance.GetStatusEffectSystem( GetGame() ).RemoveStatusEffect( GetEntityID(), evt.effectID, evt.removeCount );
+	}
+
+	protected event OnRemoveAllStatusEffectOfTypeEvent( evt : RemoveAllStatusEffectOfTypeEvent )
+	{
+		GameInstance.GetStatusEffectSystem( GetGame() ).RemoveAllStatusEffectOfType( GetEntityID(), evt.statusEffectType );
+	}
+
+	protected override function StopStatusEffectVFX( evt : RemoveStatusEffect )
+	{
+		if( m_cachedVFXList.Size() == 0 )
+		{
+			super.StopStatusEffectVFX( evt );
+		}
+	}
+
+	protected override function StopStatusEffectSFX( evt : RemoveStatusEffect )
+	{
+		if( m_cachedSFXList.Size() == 0 )
+		{
+			super.StopStatusEffectSFX( evt );
+		}
+	}
+
+	protected event OnCacheStatusEffectFX( evt : CacheStatusEffectFXEvent )
+	{
+		m_cachedVFXList = evt.vfxToCache;
+		m_cachedSFXList = evt.sfxToCache;
+	}
+
+	protected event OnRemoveCachedStatusEffectFX( evt : RemoveCachedStatusEffectFXEvent )
+	{
+		var i : Int32;
+		for( i = 0; i < m_cachedVFXList.Size(); i += 1 )
+		{
+			GameObjectEffectHelper.BreakEffectLoopEvent( this, m_cachedVFXList[ i ].Name() );
+		}
+		for( i = 0; i < m_cachedSFXList.Size(); i += 1 )
+		{
+			GameObjectEffectHelper.BreakEffectLoopEvent( this, m_cachedSFXList[ i ].Name() );
+		}
+		m_cachedVFXList.Clear();
+		m_cachedSFXList.Clear();
+	}
+
+	protected event OnExplorationLeftEvent( evt : ExplorationLeftEvent )
+	{
+		TriggerPendingSEEvent();
+	}
+
+	public export function OnSignalOnUnstoppableStateSignal( signalId : Uint16, newValue : Bool, userData : OnUnstoppableStateSignal )
+	{
+		if( !( newValue ) )
+		{
+			TriggerPendingSEEvent();
+		}
+	}
+
+	protected event OnDelayedSEReactionEvent( evt : DelayedStatusEffectApplicationEvent )
+	{
+		if( StatusEffectSystem.ObjectHasStatusEffect( this, evt.statusEffectEvent.staticData.GetID() ) )
+		{
+			ProcessStatusEffectApplication( evt.statusEffectEvent );
+		}
+	}
+
+	private function TriggerPendingSEEvent()
+	{
+		var statusEffectDuration : Float;
+		if( m_pendingSEEvent )
+		{
+			statusEffectDuration = StatusEffectHelper.GetStatusEffectByID( this, m_pendingSEEvent.staticData.GetID() ).GetRemainingDuration();
+			if( statusEffectDuration <= 0.0 )
+			{
+				m_pendingSEEvent = NULL;
+			}
+			else
+			{
+				TriggerStatusEffectBehavior( m_pendingSEEvent );
+			}
+		}
+	}
+
+	private function CacheStatusEffectAppliedByPlayer( evt : ApplyStatusEffectEvent )
+	{
+		if( evt.instigatorEntityID == GetPlayerID() )
+		{
+			m_lastSEAppliedByPlayer = StatusEffectHelper.GetStatusEffectByID( this, evt.staticData.GetID() );
+		}
+	}
+
+	public function GetLastSEAppliedByPlayer() : StatusEffect
+	{
+		return m_lastSEAppliedByPlayer;
+	}
+
+	protected function OnUncontrolledMovementStatusEffectAdded( evt : ApplyStatusEffectEvent )
+	{
+		var ragdollInstigator : weak< GameObject >;
+		ragdollInstigator = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), evt.instigatorEntityID ) ) );
+		if( ragdollInstigator )
+		{
+			m_ragdollInstigator = ragdollInstigator;
+		}
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new CheckUncontrolledMovementStatusEffectEvent, 1.5, true );
+	}
+
+	protected function OnUncontrolledMovementStatusEffectRemoved()
+	{
+		QueueEvent( new UncontrolledMovementEndEvent );
+		if( !( m_isRagdolling ) )
+		{
+			if( IsOutsideOfNavmeshWithTolerance( GetWorldPosition(), Vector4( 0.5, 0.5, 0.75, 1.0 ) ) )
+			{
+				QueueEvent( CreateForceRagdollEvent( 'OffNavmesh_UncontrolledStatusEffectRemoved' ) );
+			}
+			else
+			{
+				m_ragdollInstigator = NULL;
+			}
+		}
+	}
+
+	protected event OnCheckUncontrolledMovementStatusEffectEvent( evt : CheckUncontrolledMovementStatusEffectEvent )
+	{
+		var removeAllStatusEffectEvent : RemoveAllStatusEffectOfTypeEvent;
+		var hasStatusEffect : Bool;
+		hasStatusEffect = StatusEffectSystem.ObjectHasStatusEffectOfType( this, gamedataStatusEffectType.UncontrolledMovement );
+		if( hasStatusEffect )
+		{
+			if( m_isRagdolling || ( Vector4.Length( GetVelocity() ) < 0.01 ) )
+			{
+				removeAllStatusEffectEvent = new RemoveAllStatusEffectOfTypeEvent;
+				removeAllStatusEffectEvent.statusEffectType = gamedataStatusEffectType.UncontrolledMovement;
+				QueueEvent( removeAllStatusEffectEvent );
+				hasStatusEffect = false;
+			}
+		}
+		if( hasStatusEffect )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new CheckUncontrolledMovementStatusEffectEvent, 0.2, true );
+		}
+	}
+
+	protected event OnCheckRagdollStateEvent( evt : CheckPuppetRagdollStateEvent )
+	{
+		var checkRagdollEvent : CheckPuppetRagdollStateEvent;
+		var navmeshPos : Vector4;
+		var needToCheckStateAgain : Bool;
+		var moveSpeed : Float;
+		needToCheckStateAgain = false;
+		if( m_isRagdolling )
+		{
+			navmeshPos = GetWorldPosition();
+			moveSpeed = Vector4.Length( GetVelocity() );
+			if( ( moveSpeed < TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollRecoveryVelocityThreshold", 0.1 ) ) && ( m_ragdollActivationTimestamp <= 0.0 ) )
+			{
+				m_ragdollActivationTimestamp = EngineTime.ToFloat( GameInstance.GetSimTime( GetGame() ) );
+			}
+			if( ( moveSpeed >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollRecoveryVelocityThreshold", 0.1 ) ) || !( CanStandUpFromRagdoll( navmeshPos ) ) )
+			{
+				needToCheckStateAgain = true;
+			}
+		}
+		if( needToCheckStateAgain )
+		{
+			checkRagdollEvent = new CheckPuppetRagdollStateEvent;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, checkRagdollEvent, 0.2, true );
+		}
+		else
+		{
+			TriggerRagdollBehaviorEnd();
+		}
+	}
+
+	protected event OnAnimVisibilityChangedEvent( evt : AnimVisibilityChangedEvent )
+	{
+		m_isNotVisible = !( evt.isVisible );
+	}
+
+	protected function CanStandUpFromRagdoll( currentPosition : Vector4 ) : Bool
+	{
+		var player : weak< GameObject >;
+		var influenceMapScorePercentage : Float;
+		if( GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Unconscious || StatusEffectSystem.ObjectHasStatusEffect( this, T"BaseStatusEffect.Unconscious" ) )
+		{
+			if( m_isNotVisible )
+			{
+				return true;
+			}
+			if( !( GameObject.IsCooldownActive( this, 'UnconsciousRagdollFrustumCheck' ) ) )
+			{
+				if( ( Vector4.Distance( GetWorldPosition(), GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetWorldPosition() ) < 5.0 ) && !( GameInstance.GetCameraSystem( GetGame() ).IsInCameraFrustum( this, 0.60000002, 1.5 ) ) )
+				{
+					return true;
+				}
+				GameObject.StartCooldown( this, 'UnconsciousRagdollFrustumCheck', 0.30000001 );
+			}
+			return false;
+		}
+		player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject();
+		GetInfluenceMapScoreInRange( currentPosition, TweakDBInterface.GetFloat( T"AIGeneralSettings.influenceMapCheckRange", 0.60000002 ), influenceMapScorePercentage );
+		if( influenceMapScorePercentage <= TweakDBInterface.GetFloat( T"AIGeneralSettings.allowedInfluenceMapPercentage", 0.30000001 ) )
+		{
+			return true;
+		}
+		else if( GetAttitudeTowards( player ) == EAIAttitude.AIA_Friendly || GetRecord().Priority().Type() == gamedataSpawnableObjectPriority.Quest )
+		{
+			if( ( influenceMapScorePercentage <= TweakDBInterface.GetFloat( T"AIGeneralSettings.allowedInfluenceMapPercentageFriendly", 0.5 ) ) || ( ( EngineTime.ToFloat( GameInstance.GetSimTime( GetGame() ) ) - m_ragdollActivationTimestamp ) >= TweakDBInterface.GetFloat( T"AIGeneralSettings.recoveryDespiteInfluenceMapTimeout", 3.0 ) ) )
+			{
+				return true;
+			}
+		}
+		if( !( IsUnderneathVehicle() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected function IsUnderneathVehicle() : Bool
+	{
+		var overlapSuccessVehicle : Bool;
+		var hipsWorldTransform : WorldTransform;
+		var queryDimensions : array< Float >;
+		var queryExtents : Vector4;
+		var queryPosition : Vector4;
+		var queryOrientation : EulerAngles;
+		var fitTestOvelap : TraceResult;
+		var sqs : SpatialQueriesSystem;
+		queryDimensions = TDB.GetFloatArray( T"AIGeneralSettings.ragdollRecoveryVehicleCheckProbeDimensions" );
+		queryExtents = Vector4( queryDimensions[ 0 ] * 0.5, queryDimensions[ 1 ] * 0.5, queryDimensions[ 2 ] * 0.5, queryDimensions[ 3 ] );
+		GetSlotComponent().GetSlotTransform( 'Hips', hipsWorldTransform );
+		sqs = GameInstance.GetSpatialQueriesSystem( GetGame() );
+		queryPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( hipsWorldTransform ) );
+		queryOrientation = Quaternion.ToEulerAngles( GetWorldOrientation() );
+		queryPosition.Z += ( queryExtents.Z + 0.1 );
+		overlapSuccessVehicle = sqs.Overlap( queryExtents, queryPosition, queryOrientation, 'Vehicle', fitTestOvelap );
+		return overlapSuccessVehicle;
+	}
+
+	protected function GetInfluenceMapScoreInRange( currentPosition : Vector4, range : Float, out scorePercentage : Float ) : Int32
+	{
+		var score : Int32;
+		if( IsAnOccupiedInfluenceMapNode( currentPosition ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( range, 0.0, 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( -( range ), 0.0, 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( 0.0, range, 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( 0.0, -( range ), 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( ( range / 1.5 ), ( range / 1.5 ), 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( ( -( range ) / 1.5 ), ( -( range ) / 1.5 ), 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( ( -( range ) / 1.5 ), ( range / 1.5 ), 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		if( IsAnOccupiedInfluenceMapNode( currentPosition + Vector4( ( range / 1.5 ), ( -( range ) / 1.5 ), 0.0, 0.0 ) ) )
+		{
+			score += 1;
+		}
+		scorePercentage = ( ( Float )( score ) ) / 9.0;
+		return score;
+	}
+
+	protected event OnRagdollEnabledEvent( evt : RagdollNotifyEnabledEvent )
+	{
+		var checkRagdollEvent : CheckPuppetRagdollStateEvent;
+		var navmeshProbeResults : NavigationFindPointResult;
+		var ragdollInstigator : GameObject;
+		m_isRagdolling = true;
+		UpdateCollisionState();
+		UpdateAnimgraphRagdollState( m_isRagdolling );
+		navmeshProbeResults = GameInstance.GetAINavigationSystem( GetGame() ).FindPointInBoxForCharacter( GetWorldPosition(), Vector4( 0.2, 0.2, 0.75, 1.0 ), this );
+		if( navmeshProbeResults.status == worldNavigationRequestStatus.OK )
+		{
+			m_ragdollInitialPosition = navmeshProbeResults.point;
+		}
+		else
+		{
+			m_ragdollInitialPosition = GetWorldPosition();
+		}
+		if( IsCrowd() )
+		{
+			GetCrowdMemberComponent().TryStopTrafficMovement();
+		}
+		ragdollInstigator = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), evt.instigator ) ) );
+		if( ragdollInstigator )
+		{
+			m_ragdollInstigator = ragdollInstigator;
+		}
+		if( ScriptedPuppet.IsAlive( this ) )
+		{
+			checkRagdollEvent = new CheckPuppetRagdollStateEvent;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, checkRagdollEvent, 1.5, true );
+			GameInstance.GetStatusEffectSystem( GetGame() ).ApplyStatusEffect( GetEntityID(), T"BaseStatusEffect.NonInteractable" );
+			TriggerRagdollBehavior();
+		}
+		else if( IsUnderwater( 0.5 ) )
+		{
+			NPCPuppet.SetNPCDisposedFact( this );
+		}
+		else
+		{
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new CheckDeadPuppetDisposedEvent, 1.5, true );
+		}
+	}
+
+	protected function UpdateAnimgraphRagdollState( isActive : Bool )
+	{
+		var ragdollStateFeature : AnimFeature_RagdollState;
+		var hipsLeft, hipsForward, hipsToHead : Vector4;
+		var hipsTransform : WorldTransform;
+		var headTransform : WorldTransform;
+		var hipsPolePitch : Float;
+		ragdollStateFeature = new AnimFeature_RagdollState;
+		GetSlotComponent().GetSlotTransform( 'Hips', hipsTransform );
+		GetSlotComponent().GetSlotTransform( 'Head', headTransform );
+		hipsToHead = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( headTransform ) ) - WorldPosition.ToVector4( WorldTransform.GetWorldPosition( hipsTransform ) );
+		hipsLeft = Vector4.Cross( Quaternion.GetForward( WorldTransform.GetOrientation( hipsTransform ) ), hipsToHead );
+		hipsForward = Vector4.Cross( hipsLeft, hipsToHead );
+		hipsPolePitch = Vector4.GetAngleDegAroundAxis( Vector4.Normalize( hipsForward ), Vector4( 0.0, 0.0, 1.0, 0.0 ), Vector4.Normalize( hipsLeft ) ) + 90.0;
+		ragdollStateFeature.isActive = isActive;
+		ragdollStateFeature.hipsPolePitch = ( ( isActive ) ? ( hipsPolePitch ) : ( 0.0 ) );
+		ragdollStateFeature.speed = ( ( isActive ) ? ( Vector4.Length( GetVelocity() ) ) : ( 0.0 ) );
+		AnimationControllerComponent.ApplyFeatureToReplicate( this, 'ragdollState', ragdollStateFeature );
+	}
+
+	protected event OnCheckDeadPuppetDisposedEvent( evt : CheckDeadPuppetDisposedEvent )
+	{
+		if( IsUnderwater( 0.5 ) )
+		{
+			NPCPuppet.SetNPCDisposedFact( this );
+		}
+		else if( m_isRagdolling && ( Vector4.Length( GetVelocity() ) >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollRecoveryVelocityThreshold", 0.1 ) ) )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new CheckDeadPuppetDisposedEvent, 1.5, true );
+		}
+	}
+
+	protected event OnRagdollImpactEvent( evt : RagdollImpactEvent )
+	{
+		var i : Int32;
+		var currentPosition : Vector4;
+		var damageEvent : StartRagdollDamageEvent;
+		var isDead : Bool;
+		var isDefeated : Bool;
+		var isHitByPlayerVehicle : Bool;
+		var terminalVelocityReached : Bool;
+		var isHighFall : Bool;
+		var impactData : RagdollImpactPointData;
+		var vehicleObj : VehicleObject;
+		var vehicleHitEvent : gameVehicleHitEvent;
+		var attackInstigator : GameObject;
+		if( evt.triggeredSimulation )
+		{
+			vehicleObj = ( ( VehicleObject )( evt.otherEntity ) );
+			if( vehicleObj )
+			{
+				vehicleHitEvent = new gameVehicleHitEvent;
+				vehicleHitEvent.vehicleVelocity = vehicleObj.GetLinearVelocity();
+				vehicleHitEvent.preyVelocity = GetVelocity();
+				vehicleHitEvent.target = this;
+				vehicleHitEvent.hitPosition = WorldPosition.ToVector4( evt.impactPoints[ 0 ].worldPosition );
+				vehicleHitEvent.hitDirection = evt.impactPoints[ 0 ].worldNormal;
+				vehicleHitEvent.attackData = new AttackData;
+				attackInstigator = VehicleComponent.GetDriver( GetGame(), vehicleObj.GetEntityID() );
+				vehicleHitEvent.attackData.SetInstigator( attackInstigator );
+				vehicleHitEvent.attackData.SetSource( vehicleObj );
+				QueueEvent( vehicleHitEvent );
+				if( attackInstigator )
+				{
+					m_ragdollInstigator = attackInstigator;
+				}
+			}
+		}
+		isDead = IsDead() || StatusEffectSystem.ObjectHasStatusEffect( this, T"BaseStatusEffect.ForceKill" );
+		isDefeated = IsDefeated( this );
+		isHitByPlayerVehicle = VehicleComponent.IsMountedToVehicle( GetGame(), GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
+		for( i = 0; i < evt.impactPoints.Size(); i += 1 )
+		{
+			impactData = evt.impactPoints[ i ];
+			currentPosition = GetWorldPosition();
+			terminalVelocityReached = impactData.velocityChange >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollImpactKillVelocityThreshold", 11.0 );
+			isHighFall = ( impactData.velocityChange >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollHighFallVelocityThreshold", 8.0 ) ) && ( AbsF( m_ragdollInitialPosition.Z - currentPosition.Z ) >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollHighFallHeightThreshold", 6.0 ) );
+			if( ( ( ( NPCPuppet )( evt.otherEntity ) ) && !( ( ( NPCPuppet )( evt.otherEntity ) ).IsRagdolling() ) ) && !( m_ragdolledEntities.Contains( evt.otherEntity ) ) )
+			{
+				if( Vector4.Length( GetVelocity() ) <= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripNPCInstigatorVelThreshold", 0.2 ) )
+				{
+					if( ( !( GameObject.IsCooldownActive( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'RagdollTripGlobalCooldown' ) ) && ScriptedPuppet.CanTripOverRagdolls( ( ( NPCPuppet )( evt.otherEntity ) ) ) ) && ShouldTripVictim( ( ( NPCPuppet )( evt.otherEntity ) ) ) )
+					{
+						evt.otherEntity.QueueEvent( CreateForceRagdollEvent( 'Tripped over a ragdoll' ) );
+						GameObject.StartCooldown( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'RagdollTripGlobalCooldown', TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripGlobalCooldownDuration", 0.0 ) );
+					}
+				}
+				else
+				{
+					if( ( ( impactData.velocityChange >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollAnotherNPCVelocityThreshold", 1.0 ) ) && ( ( NPCPuppet )( evt.otherEntity ) ).GetNPCType() == gamedataNPCType.Human ) && ScriptedPuppet.CanRagdoll( ( ( NPCPuppet )( evt.otherEntity ) ) ) )
+					{
+						evt.otherEntity.QueueEvent( CreateForceRagdollEvent( 'Hit by a ragdolling NPC' ) );
+					}
+					else
+					{
+						SpawnRagdollBumpAttack( WorldPosition.ToVector4( impactData.worldPosition ) + ( Vector4.Normalize( impactData.worldNormal ) * 0.05 ) );
+					}
+				}
+				m_ragdolledEntities.PushBack( evt.otherEntity );
+			}
+			if( CanReceiveDamageFromRagdollImpacts( isDead, isDefeated, terminalVelocityReached, isHighFall ) )
+			{
+				if( impactData.velocityChange >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollDamageMinimumVelocity", 2.0 ) )
+				{
+					if( m_ragdollDamageData.maxVelocityChange == 0.0 )
+					{
+						if( attackInstigator )
+						{
+							m_ragdollInstigator = attackInstigator;
+						}
+						damageEvent = new StartRagdollDamageEvent;
+						GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, damageEvent, 0.30000001 );
+					}
+					if( impactData.velocityChange > m_ragdollDamageData.maxVelocityChange )
+					{
+						m_ragdollDamageData.worldPosition = impactData.worldPosition;
+						m_ragdollDamageData.worldNormal = impactData.worldNormal;
+						m_ragdollDamageData.maxVelocityChange = impactData.velocityChange;
+						m_ragdollDamageData.maxImpulseMagnitude = impactData.maxImpulseMagnitude;
+						m_ragdollDamageData.maxForceMagnitude = impactData.maxForceMagnitude;
+						m_ragdollDamageData.maxZDiff = AbsF( m_ragdollInitialPosition.Z - currentPosition.Z );
+					}
+				}
+			}
+			else if( isHitByPlayerVehicle && ( isDefeated || isDead ) )
+			{
+				SpawnRagdollSplatter( impactData, isDead );
+			}
+			if( !( m_ragdollFloorSplashSpawned ) && ( terminalVelocityReached || isHighFall ) )
+			{
+				SpawnRagdollFloorSplash( impactData );
+			}
+		}
+	}
+
+	protected function ShouldTripVictim( victim : NPCPuppet ) : Bool
+	{
+		var angle : Float;
+		angle = Vector4.GetAngleDegAroundAxis( victim.GetWorldForward(), victim.GetVelocity(), GetWorldUp() );
+		if( AbsF( angle ) <= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripForwardAngle", 90.0 ) )
+		{
+			if( ( Vector4.Length( victim.GetVelocity() ) >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripVictimForwardVelMin", 4.0 ) ) && ( RandRangeF( 0.0, 100.0 ) <= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripVictimForwardChance", 0.0 ) ) )
+			{
+				return true;
+			}
+		}
+		else
+		{
+			if( ( Vector4.Length( victim.GetVelocity() ) >= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripVictimBackwardVelMin", 0.1 ) ) && ( RandRangeF( 0.0, 100.0 ) <= TweakDBInterface.GetFloat( T"AIGeneralSettings.ragdollTripVictimBackwardChance", 100.0 ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected function CanReceiveDamageFromRagdollImpacts( isDead : Bool, isDefeated : Bool, terminalVelocityReached : Bool, isHighFall : Bool ) : Bool
+	{
+		if( ( ( !( isDead ) && !( isDefeated ) ) && !( IsCrowd() ) ) && !( IsBoss() ) )
+		{
+			return true;
+		}
+		if( ( IsCrowd() || GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Unconscious ) && ( terminalVelocityReached || isHighFall ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected function SpawnRagdollBumpAttack( position : Vector4 )
+	{
+		var attack : Attack_GameEffect;
+		var effect : EffectInstance;
+		var attackContext : AttackInitContext;
+		var statMods : array< gameStatModifierData >;
+		attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.RagdollBump" );
+		attackContext.instigator = this;
+		attackContext.source = this;
+		attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		attack.GetStatModList( statMods );
+		effect = attack.PrepareAttack( this );
+		EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.range, attackContext.record.Range() );
+		EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, attackContext.record.Range() );
+		EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position );
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+		GameInstance.GetDebugVisualizerSystem( GetGame() ).DrawWireSphere( position, attackContext.record.Range(), Color( 255, 0, 0, 255 ), 3.0 );
+		attack.StartAttack();
+	}
+
+	protected function SpawnRagdollFloorSplash( evt : RagdollImpactPointData )
+	{
+		var puppetPosition : Vector4;
+		var splashResource : FxResource;
+		var splashTransform : WorldTransform;
+		var orientation : Quaternion;
+		var transformQuaternion : Quaternion;
+		var transformMatrix : Matrix;
+		var spawnedEffect : FxInstance;
+		splashResource = GetFxResourceByKey( 'ragdollFloorSplash' );
+		puppetPosition = GetWorldPosition();
+		orientation = Quaternion.BuildFromDirectionVector( evt.worldNormal, GetWorldUp() );
+		Quaternion.SetAxisAngle( transformQuaternion, Vector4( 1.0, 0.0, 0.0, 0.0 ), Deg2Rad( -90.0 ) );
+		orientation *= transformQuaternion;
+		transformMatrix = Quaternion.ToMatrix( orientation );
+		transformMatrix *= Matrix.BuiltTranslation( puppetPosition );
+		WorldTransform.SetPosition( splashTransform, Matrix.GetTranslation( transformMatrix ) );
+		WorldTransform.SetOrientation( splashTransform, Matrix.ToQuat( transformMatrix ) );
+		spawnedEffect = GameInstance.GetFxSystem( GetGame() ).SpawnEffectOnGround( splashResource, splashTransform );
+		if( !( spawnedEffect ) )
+		{
+			GameInstance.GetFxSystem( GetGame() ).SpawnEffect( splashResource, splashTransform, true );
+		}
+		PlaySoundEvent( this, 'gmp_ragdoll_floor_splash' );
+		m_ragdollFloorSplashSpawned = true;
+	}
+
+	protected function SpawnRagdollSplatter( impactData : RagdollImpactPointData, isDead : Bool )
+	{
+		var allowedActors : array< Int32 >;
+		var allowedAmountOfSplatters : Int32;
+		var splatterChance : Float;
+		var splatterResource : FxResource;
+		var splatterTransform : WorldTransform;
+		var orientation : Quaternion;
+		var transformQuaternion : Quaternion;
+		var transformMatrix : Matrix;
+		allowedAmountOfSplatters = TweakDBInterface.GetInt( T"AIGeneralSettings.maximumRagdollSplattersPerNPC", -1 );
+		if( ( allowedAmountOfSplatters >= 0 ) && ( m_ragdollSplattersSpawned >= allowedAmountOfSplatters ) )
+		{
+			return;
+		}
+		if( impactData.forceMagnitude < TweakDBInterface.GetFloat( T"AIGeneralSettings.vehicleHitBloodSplatterThreshold", 500.0 ) )
+		{
+			return;
+		}
+		allowedActors = TDB.GetIntArray( T"AIGeneralSettings.vehicleHitBloodSplatterAllowedActors" );
+		if( ( allowedActors.Size() > 0 ) && !( allowedActors.Contains( ( ( Int32 )( impactData.ragdollProxyActorIndex ) ) ) ) )
+		{
+			return;
+		}
+		if( !( IsPointOnStaticMesh( WorldPosition.ToVector4( impactData.worldPosition ), impactData.worldNormal ) ) )
+		{
+			return;
+		}
+		if( isDead )
+		{
+			splatterChance = GameInstance.GetStatsDataSystem( GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', ( ( Float )( m_ragdollSplattersSpawned ) ), 'dead_puppet_blood_splatter_chance' );
+		}
+		else
+		{
+			splatterChance = GameInstance.GetStatsDataSystem( GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', ( ( Float )( m_ragdollSplattersSpawned ) ), 'defeated_puppet_blood_splatter_chance' );
+		}
+		if( RandF() >= splatterChance )
+		{
+			return;
+		}
+		splatterResource = GetFxResourceByKey( 'ragdollWallSplatter' );
+		orientation = Quaternion.BuildFromDirectionVector( impactData.worldNormal, GetWorldUp() );
+		Quaternion.SetAxisAngle( transformQuaternion, Vector4( 1.0, 0.0, 0.0, 0.0 ), Deg2Rad( -90.0 ) );
+		orientation *= transformQuaternion;
+		transformMatrix = Quaternion.ToMatrix( orientation );
+		transformMatrix *= Matrix.BuiltTranslation( WorldPosition.ToVector4( impactData.worldPosition ) );
+		WorldTransform.SetPosition( splatterTransform, Matrix.GetTranslation( transformMatrix ) );
+		WorldTransform.SetOrientation( splatterTransform, Matrix.ToQuat( transformMatrix ) );
+		GameInstance.GetFxSystem( GetGame() ).SpawnEffect( splatterResource, splatterTransform, true );
+		m_ragdollSplattersSpawned += 1;
+		if( !( IsFinal() ) )
+		{
+			Debug_Ragdoll();
+		}
+	}
+
+	protected function IsPointOnStaticMesh( position : Vector4, normal : Vector4 ) : Bool
+	{
+		var geometryDescription : GeometryDescriptionQuery;
+		var staticQueryFilter : QueryFilter;
+		var geometryDescriptionResult : GeometryDescriptionResult;
+		QueryFilter.AddGroup( staticQueryFilter, 'Static' );
+		geometryDescription = new GeometryDescriptionQuery;
+		geometryDescription.refPosition = position + ( Vector4.Normalize( normal ) * 0.1 );
+		geometryDescription.refDirection = -( normal );
+		geometryDescription.filter = staticQueryFilter;
+		geometryDescription.primitiveDimension = Vector4( 0.1, 0.1, 0.1, 0.0 );
+		geometryDescription.maxDistance = 0.5;
+		geometryDescription.maxExtent = 0.5;
+		geometryDescription.probingPrecision = 0.05;
+		geometryDescription.probingMaxDistanceDiff = 0.5;
+		geometryDescriptionResult = GameInstance.GetSpatialQueriesSystem( GetGame() ).GetGeometryDescriptionSystem().QueryExtents( geometryDescription );
+		return geometryDescriptionResult.queryStatus == worldgeometryDescriptionQueryStatus.OK;
+	}
+
+	protected function Debug_Ragdoll()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGame() ).CreateSink();
+		SDOSink.SetRoot( sink, ( "NPCRagdolls/[NPC: " + ( ( String )( GetEntityID() ) ) ) + "]" );
+		SDOSink.PushInt32( sink, "Total splatters spawned", m_ragdollSplattersSpawned );
+	}
+
+	protected event OnStartRagdollDamageEvent( evt : StartRagdollDamageEvent )
+	{
+		StartRagdollImpactAttack( m_ragdollDamageData );
+		m_ragdollDamageData.worldNormal = Vector4();
+		m_ragdollDamageData.maxForceMagnitude = 0.0;
+		m_ragdollDamageData.maxImpulseMagnitude = 0.0;
+		m_ragdollDamageData.maxVelocityChange = 0.0;
+		m_ragdollDamageData.maxZDiff = 0.0;
+	}
+
+	protected function StartRagdollImpactAttack( impactData : RagdollDamagePollData )
+	{
+		var evt : gameRagdollHitEvent;
+		var attackContext : AttackInitContext;
+		var attack : IAttack;
+		var ragdollInstigator : weak< GameObject >;
+		attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.RagdollImpact" );
+		attackContext.source = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject();
+		attack = IAttack.Create( attackContext );
+		evt = new gameRagdollHitEvent;
+		evt.target = this;
+		evt.hitPosition = WorldPosition.ToVector4( impactData.worldPosition );
+		evt.hitDirection = impactData.worldNormal;
+		evt.attackData = new AttackData;
+		evt.attackData.AddFlag( hitFlag.RagdollImpact, 'Ragdoll impact' );
+		evt.attackData.AddFlag( hitFlag.CanDamageSelf, 'Ragdoll impact' );
+		evt.attackData.AddFlag( hitFlag.DeterministicDamage, 'Ragdoll impact' );
+		evt.attackData.AddFlag( hitFlag.CannotModifyDamage, 'Ragdoll impact' );
+		if( GetRagdollInstigator( ragdollInstigator ) )
+		{
+			evt.attackData.SetInstigator( ragdollInstigator );
+		}
+		else
+		{
+			evt.attackData.SetInstigator( this );
+		}
+		evt.attackData.SetSource( this );
+		evt.attackData.SetAttackDefinition( attack );
+		evt.impactForce = impactData.maxForceMagnitude;
+		evt.speedDelta = impactData.maxVelocityChange;
+		evt.heightDelta = impactData.maxZDiff;
+		GameInstance.GetDamageSystem( GetGame() ).QueueHitEvent( evt, this );
+	}
+
+	public function GetRagdollInstigator( out ragdollInstigator : weak< GameObject > ) : Bool
+	{
+		var ragdollSE : StatusEffect;
+		ragdollInstigator = m_ragdollInstigator;
+		if( ragdollInstigator )
+		{
+			return true;
+		}
+		ragdollSE = StatusEffectHelper.GetTopPriorityEffect( this, gamedataStatusEffectType.UncontrolledMovement );
+		if( ragdollSE )
+		{
+			ragdollInstigator = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), ragdollSE.GetInstigatorEntityID() ) ) );
+			if( ragdollInstigator )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected event OnRagdollDisabledEvent( evt : RagdollNotifyDisabledEvent )
+	{
+		m_isRagdolling = false;
+		m_ragdollActivationTimestamp = -1.0;
+		m_ragdolledEntities.Clear();
+		UpdateCollisionState();
+		UpdateAnimgraphRagdollState( m_isRagdolling );
+		m_ragdollInstigator = NULL;
+		if( m_disableRagdollAfterRecovery )
+		{
+			SetDisableRagdoll( true );
+			m_disableRagdollAfterRecovery = false;
+		}
+	}
+
+	protected event OnAnimatedRagdollEnabledEvent( evt : AnimatedRagdollNotifyEnabledEvent )
+	{
+		var invistigator : ScriptedPuppet;
+		var invistigatorVehicle : weak< VehicleObject >;
+		var hitAngle : Float;
+		var npcOrientation : Vector4;
+		var distanceVector : Vector4;
+		var hitDirection : Int32;
+		var turnOnRagdollEvent : RagdollToggleDelayEvent;
+		m_hasAnimatedRagdoll = true;
+		UpdateCollisionState();
+		if( ( GetNPCType() != gamedataNPCType.Human || IsRagdolling() ) || GameObject.IsCooldownActive( this, 'bumpStaggerCooldown' ) )
+		{
+			return NULL;
+		}
+		invistigator = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetGame(), evt.instigator ) ) );
+		if( invistigator && VehicleComponent.IsMountedToVehicle( GetGame(), invistigator ) )
+		{
+			VehicleComponent.GetVehicle( GetGame(), evt.instigator, invistigatorVehicle );
+			if( ( ( invistigatorVehicle.GetBlackboard().GetFloat( GetAllBlackboardDefs().Vehicle.SpeedValue ) < TDB.GetFloat( T"AIGeneralSettings.vehicleStaggerSpeedThreshold" ) ) && !( IsRagdolling() ) ) && !( GameObject.IsCooldownActive( this, 'bumpStaggerCooldown' ) ) )
+			{
+				GameObject.StartCooldown( this, 'bumpStaggerCooldown', 1.0 );
+				npcOrientation = GetWorldForward();
+				distanceVector = invistigatorVehicle.GetWorldPosition() - GetWorldPosition();
+				hitAngle = Vector4.GetAngleDegAroundAxis( npcOrientation, distanceVector, GetWorldUp() );
+				if( AbsF( hitAngle ) <= 45.0 )
+				{
+					hitDirection = ( ( Int32 )( EAIHitDirection.Front ) );
+					hitDirection = 4;
+				}
+				else if( AbsF( hitAngle ) >= 135.0 )
+				{
+					hitDirection = ( ( Int32 )( EAIHitDirection.Back ) );
+					hitDirection = 2;
+				}
+				else if( ( hitAngle > 45.0 ) && ( hitAngle < 135.0 ) )
+				{
+					hitDirection = ( ( Int32 )( EAIHitDirection.Left ) );
+					hitDirection = 1;
+				}
+				else
+				{
+					hitDirection = ( ( Int32 )( EAIHitDirection.Right ) );
+					hitDirection = 3;
+				}
+				AISubActionForceHitReaction_Record_Implementation.SendForcedHitDataToAIBehavior( this, hitDirection, ( ( Int32 )( EAIHitIntensity.Medium ) ), ( ( Int32 )( animHitReactionType.Stagger ) ), ( ( Int32 )( EAIHitBodyPart.LeftLeg ) ), 0, 0, ( ( Int32 )( EAIHitSource.MeleeBlunt ) ) );
+				SpawnVehicleBumpAttack( invistigatorVehicle, invistigator );
+				turnOnRagdollEvent = new RagdollToggleDelayEvent;
+				turnOnRagdollEvent.target = this;
+				turnOnRagdollEvent.enable = true;
+				if( m_npcRagdollComponent.IsEnabled() && !( CanEnableRagdollComponent() ) )
+				{
+					turnOnRagdollEvent.force = true;
+					turnOnRagdollEvent.leaveRagdollEnabled = true;
+				}
+				SetDisableRagdoll( true );
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, turnOnRagdollEvent, TDB.GetFloat( T"AIGeneralSettings.vehicleStaggerRagdollImmunity", 0.15000001 ), true );
+			}
+		}
+	}
+
+	protected function SpawnVehicleBumpAttack( vehicle : weak< VehicleObject >, instigator : weak< GameObject > )
+	{
+		var vehicleHitEvent : gameVehicleHitEvent;
+		var hipsTransform : WorldTransform;
+		vehicleHitEvent = new gameVehicleHitEvent;
+		vehicleHitEvent.vehicleVelocity = vehicle.GetLinearVelocity();
+		vehicleHitEvent.preyVelocity = GetVelocity();
+		GetSlotComponent().GetSlotTransform( 'Hips', hipsTransform );
+		vehicleHitEvent.target = this;
+		vehicleHitEvent.hitPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( hipsTransform ) );
+		vehicleHitEvent.hitDirection = GetWorldPosition() - vehicle.GetWorldPosition();
+		vehicleHitEvent.attackData = new AttackData;
+		vehicleHitEvent.attackData.SetInstigator( instigator );
+		vehicleHitEvent.attackData.SetSource( vehicle );
+		QueueEvent( vehicleHitEvent );
+	}
+
+	protected event OnAnimatedRagdollDisabledEvent( evt : AnimatedRagdollNotifyDisabledEvent )
+	{
+		m_hasAnimatedRagdoll = false;
+		UpdateCollisionState();
+	}
+
+	protected function IsOutsideOfNavmesh( currentPosition : Vector4 ) : Bool
+	{
+		return !( GameInstance.GetAINavigationSystem( GetGame() ).IsPointOnNavmesh( this, currentPosition, Vector4( 0.2, 0.2, 0.75, 1.0 ) ) );
+	}
+
+	protected function IsOutsideOfNavmeshWithTolerance( currentPosition : Vector4, tolerance : Vector4 ) : Bool
+	{
+		return !( GameInstance.GetAINavigationSystem( GetGame() ).IsPointOnNavmesh( this, currentPosition, tolerance ) );
+	}
+
+	protected function IsOutsideOfNavmesh( currentPosition : Vector4, out navmeshPoint : Vector4 ) : Bool
+	{
+		return !( GameInstance.GetAINavigationSystem( GetGame() ).IsPointOnNavmesh( this, currentPosition, Vector4( 0.2, 0.2, 0.75, 1.0 ), navmeshPoint ) );
+	}
+
+	protected function IsAnOccupiedInfluenceMapNode( currentPosition : Vector4 ) : Bool
+	{
+		return GetInfluenceComponent().IsPositionEmpty( currentPosition ) == gameinfluenceCollisionTestOutcome.Full;
+	}
+
+	protected function TriggerRagdollBehavior()
+	{
+		var signal : AIGateSignal;
+		signal.priority = 10.0;
+		signal.lifeTime = 100.0;
+		AIGateSignal.AddTag( signal, 'Ragdoll' );
+		GetSignalHandlerComponent().AddSignal( signal, false );
+	}
+
+	protected function TriggerRagdollBehaviorEnd()
+	{
+		var signal : AIGateSignal;
+		signal.priority = 100.0;
+		signal.lifeTime = 100.0;
+		AIGateSignal.AddTag( signal, 'RagdollEnd' );
+		AIGateSignal.AddFlag( signal, EAIGateSignalFlags.AIGSF_InterruptsSamePriorityTask );
+		GetSignalHandlerComponent().AddSignal( signal, false );
+	}
+
+	public const function IsRagdolling() : Bool
+	{
+		return m_isRagdolling;
+	}
+
+	public const function IsRagdollEnabled() : Bool
+	{
+		return m_isRagdolling || m_hasAnimatedRagdoll;
+	}
+
+	public const function GetInitialRagdollPosition() : Vector4
+	{
+		return m_ragdollInitialPosition;
+	}
+
+	public const function KillIfUnderwater() : Bool
+	{
+		if( HasHeadUnderwater() )
+		{
+			PuppetSubmergedRequestRemovingStatusEffects( this );
+			if( StatusEffectHelper.HasStatusEffectFromInstigator( this, T"BaseStatusEffect.Unconscious", GetPlayerID() ) || StatusEffectHelper.HasStatusEffectFromInstigator( this, T"BaseStatusEffect.Defeated", GetPlayerID() ) )
+			{
+				StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.ForceKill", GetPlayerID() );
+			}
+			else
+			{
+				StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.ForceKill" );
+			}
+			NPCPuppet.SetNPCDisposedFact( this );
+		}
+		return false;
+	}
+
+	public const override function HasHeadUnderwater() : Bool
+	{
+		var slotComponent : SlotComponent;
+		var headTransform : WorldTransform;
+		var checkPosition : Vector4;
+		var waterLevel : Float;
+		slotComponent = GetSlotComponent();
+		if( slotComponent && slotComponent.GetSlotTransform( 'Head', headTransform ) )
+		{
+			checkPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( headTransform ) );
+		}
+		else
+		{
+			checkPosition = GetWorldPosition();
+		}
+		if( AIScriptUtils.GetWaterLevel( GetGame(), Vector4.Vector4To3( checkPosition ), waterLevel ) )
+		{
+			if( ( checkPosition.Z - waterLevel ) <= TDB.GetFloat( T"AIGeneralSettings.underwaterDepthKillThreshold" ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected event OnRagdollBodyPartWaterImpactEvent( evt : RagdollBodyPartWaterImpactEvent )
+	{
+		var waterSplashResource : FxResource;
+		var waterSplashInstance : FxInstance;
+		var waterSplashPosition : Vector4;
+		var waterSplashTransform : WorldTransform;
+		var impulseRadius, impulseStrength, impulseStrengthMin, impulseStrengthMax : Float;
+		var currentSpeed, maxSpeed, speedPercentage : Float;
+		currentSpeed = Vector4.Length( evt.linearVelocity );
+		maxSpeed = TDB.GetFloat( T"player.locomotion.maxAirXYSpeed" );
+		if( currentSpeed >= 2.0 )
+		{
+			GameObject.PlaySound( this, ( ( evt.isTorso ) ? ( 'w_melee_water_medium_splash' ) : ( 'w_bul_hit_water' ) ) );
+			waterSplashResource = GetFxResourceByKey( ( ( evt.isTorso ) ? ( 'ragdollTorsoWaterSplash' ) : ( 'ragdollExtremityWaterSplash' ) ) );
+			if( FxResource.IsValid( waterSplashResource ) )
+			{
+				waterSplashPosition = evt.worldPosition;
+				waterSplashPosition.Z -= evt.depthBelowSurface;
+				WorldTransform.SetPosition( waterSplashTransform, waterSplashPosition );
+				waterSplashInstance = GameInstance.GetFxSystem( GetGame() ).SpawnEffect( waterSplashResource, waterSplashTransform );
+				waterSplashInstance.SetBlackboardValue( 'ragdoll_body_part_speed', ProportionalClampF( 0.0, maxSpeed, currentSpeed, 0.0, 1.0 ) );
+			}
+		}
+		if( currentSpeed >= 0.1 )
+		{
+			if( evt.isTorso )
+			{
+				impulseRadius = 0.5;
+				impulseStrengthMin = 0.0002;
+				impulseStrengthMax = 0.008;
+			}
+			else
+			{
+				impulseRadius = 0.2;
+				impulseStrengthMin = 0.0002;
+				impulseStrengthMax = 0.003;
+			}
+			speedPercentage = ( ( FloatIsEqual( maxSpeed, 0.0 ) ) ? ( 0.0 ) : ( ClampF( currentSpeed / maxSpeed, 0.0, 1.0 ) ) );
+			impulseStrength = LerpF( speedPercentage, impulseStrengthMin, impulseStrengthMax );
+			RenderingSystem.AddWaterImpulse( evt.worldPosition, impulseRadius, impulseStrength );
+		}
+	}
+
+	protected event OnAttitudeChanged( evt : AttitudeChangedEvent )
+	{
+		var threat : weak< GameObject >;
+		if( IsPrevention() && evt.attitude != EAIAttitude.AIA_Hostile )
+		{
+			threat = ( ( GameObject )( evt.otherAgent.GetEntity() ) );
+			if( threat )
+			{
+				TriggerSecuritySystemNotification( threat.GetWorldPosition(), threat, ESecurityNotificationType.DEESCALATE );
+			}
+		}
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		super.OnHit( evt );
+	}
+
+	protected export override function DamagePipelineFinalized( evt : gameHitEvent )
+	{
+		super.DamagePipelineFinalized( evt );
+	}
+
+	protected event OnScanningLookedAt( evt : ScanningLookAtEvent )
+	{
+		super.OnScanningLookedAt( evt );
+		if( evt.state )
+		{
+			m_playerStatsListener = new PlayerStatsListener;
+			GameInstance.GetStatsSystem( GetGame() ).RegisterListener( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), m_playerStatsListener );
+		}
+		else
+		{
+			GameInstance.GetStatsSystem( GetGame() ).UnregisterListener( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), m_playerStatsListener );
+			m_playerStatsListener = NULL;
+		}
+	}
+
+	protected event OnRevealStateChanged( evt : RevealStateChangedEvent )
+	{
+		super.OnRevealStateChanged( evt );
+		SendRevealStateToAllWeakspots( evt.state );
+	}
+
+	protected function SendRevealStateToAllWeakspots( revealState : ERevealState )
+	{
+		var weakspots : array< weak< WeakspotObject > >;
+		var evt : RevealStateChangedEvent;
+		var i : Int32;
+		this.GetWeakspotComponent().GetWeakspots( weakspots );
+		for( i = 0; i < weakspots.Size(); i += 1 )
+		{
+			evt = new RevealStateChangedEvent;
+			evt.state = revealState;
+			weakspots[ i ].QueueEvent( evt );
+		}
+	}
+
+	protected event OnSetupWorkspotActionEvent( evt : SetupWorkspotActionEvent )
+	{
+		m_lastSetupWorkspotActionEvent = evt;
+	}
+
+	private function SetHitEventData( hitEvent : gameHitEvent, hitReactionFactor : Float, hitWoundsFactor : Float, hitDismembermentFactor : Float )
+	{
+		RWLock.Acquire( m_hitEventLock );
+		m_lastHitEvent = hitEvent;
+		if( ( !( hitEvent.attackData.HasFlag( hitFlag.DealNoDamage ) ) || !( IsAlive( this ) ) ) || IsDefeated( this ) )
+		{
+			if( IsAlive( this ) )
+			{
+				m_totalFrameReactionDamageReceived = hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health ) * hitReactionFactor;
+				m_totalFrameWoundsDamageReceived = hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health ) * hitWoundsFactor;
+			}
+			m_totalFrameDismembermentDamageReceived = hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health ) * hitDismembermentFactor;
+		}
+		else
+		{
+			m_totalFrameReactionDamageReceived = 0.0;
+			m_totalFrameWoundsDamageReceived = 0.0;
+			m_totalFrameDismembermentDamageReceived = 0.0;
+		}
+		RWLock.Release( m_hitEventLock );
+	}
+
+	private override final function OnHitAnimation( hitEvent : gameHitEvent )
+	{
+		var attackWeapon : weak< GameObject >;
+		var attackWeaponID : StatsObjectID;
+		var statsSystem : StatsSystem;
+		var hitReactionFactor : Float;
+		var hitWoundsFactor : Float;
+		var hitDismembermentFactor : Float;
+		attackWeapon = hitEvent.attackData.GetWeapon();
+		if( !( ShouldRequestHitReaction( hitEvent ) ) )
+		{
+			return;
+		}
+		hitReactionFactor = 1.0;
+		if( attackWeapon )
+		{
+			statsSystem = GameInstance.GetStatsSystem( attackWeapon.GetGame() );
+			attackWeaponID = attackWeapon.GetEntityID();
+			hitReactionFactor = statsSystem.GetStatValue( attackWeaponID, gamedataStatType.HitReactionFactor );
+			hitWoundsFactor = statsSystem.GetStatValue( attackWeaponID, gamedataStatType.HitWoundsFactor );
+			hitDismembermentFactor = statsSystem.GetStatValue( attackWeaponID, gamedataStatType.HitDismembermentFactor );
+		}
+		if( hitEvent.attackData.GetAttackType() == gamedataAttackType.Explosion )
+		{
+			hitReactionFactor = 2.0;
+		}
+		else if( ( hitReactionFactor < 1.0 ) && GetPuppetStateBlackboard().GetBool( GetAllBlackboardDefs().PuppetState.InAirAnimation ) )
+		{
+			hitReactionFactor = 1.0;
+		}
+		SetHitEventData( hitEvent, hitReactionFactor, hitWoundsFactor, hitDismembermentFactor );
+		RequestHitReaction( hitEvent );
+		super.OnHitAnimation( hitEvent );
+	}
+
+	protected event OnResetAttackBlockedBlackBoardValue( evt : ResetAttackBlockedBlackBoardValue )
+	{
+		GetAIControllerComponent().GetActionBlackboard().SetBool( GetAllBlackboardDefs().AIAction.attackBlocked, false );
+		GetAIControllerComponent().GetActionBlackboard().SetBool( GetAllBlackboardDefs().AIAction.attackParried, false );
+	}
+
+	private const final function ShouldRequestHitReaction( hitEvent : gameHitEvent ) : Bool
+	{
+		if( AttackData.IsEffect( hitEvent.attackData.GetAttackType() ) && !( hitEvent.attackData.HasFlag( hitFlag.VehicleDamage ) ) )
+		{
+			return false;
+		}
+		if( hitEvent.attackData.HasFlag( hitFlag.WasBlocked ) || hitEvent.attackData.HasFlag( hitFlag.WasDeflected ) )
+		{
+			return true;
+		}
+		if( hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health ) >= 0.0 )
+		{
+			return true;
+		}
+		if( GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Dead )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private final function RequestHitReaction( hitEvent : gameHitEvent )
+	{
+		var evt : HitReactionRequest;
+		evt = new HitReactionRequest;
+		evt.hitEvent = hitEvent;
+		QueueEvent( evt );
+	}
+
+	private override final function OnHitSounds( hitEvent : gameHitEvent )
+	{
+		var metadataEvent : AudioEvent;
+		var target : GameObject;
+		var totalAttackValue : Float;
+		var criticalDamageThreshold : Float;
+		var highDamageThreshold : Float;
+		var medDamageThreshold : Float;
+		var weakDamageThreshold : Float;
+		super.OnHitSounds( hitEvent );
+		if( ( hitEvent.attackData.GetWeapon() && hitEvent.attackData.GetWeapon().GetItemData() ) && hitEvent.attackData.GetWeapon().GetItemData().HasTag( WeaponObject.GetMeleeWeaponTag() ) )
+		{
+			return;
+		}
+		metadataEvent = new AudioEvent;
+		metadataEvent.eventFlags = audioAudioEventFlags.Metadata;
+		target = hitEvent.target;
+		criticalDamageThreshold = TDB.GetFloat( T"GlobalStats.DefaultKnockdownDamageThreshold.value", 60.0 );
+		highDamageThreshold = TDB.GetFloat( T"GlobalStats.DefaultStaggerDamageThreshold.value", 40.0 );
+		medDamageThreshold = TDB.GetFloat( T"GlobalStats.DefaultImpactDamageThreshold.value", 20.0 );
+		weakDamageThreshold = TDB.GetFloat( T"GlobalStats.DefaultTwitchDamageThreshold.value", 1.0 );
+		metadataEvent.floatData = Vector4.Distance( hitEvent.attackData.GetAttackPosition(), target.GetWorldPosition() );
+		if( false )
+		{
+			metadataEvent.eventName = 'npcImpact';
+		}
+		else
+		{
+			totalAttackValue = hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health );
+			if( totalAttackValue >= criticalDamageThreshold )
+			{
+				metadataEvent.eventName = 'critImpact';
+			}
+			else if( totalAttackValue >= highDamageThreshold )
+			{
+				metadataEvent.eventName = 'hiImpact';
+			}
+			else if( totalAttackValue >= medDamageThreshold )
+			{
+				metadataEvent.eventName = 'medImpact';
+			}
+			else if( totalAttackValue >= weakDamageThreshold )
+			{
+				metadataEvent.eventName = 'lowImpact';
+			}
+		}
+		target.QueueEvent( metadataEvent );
+	}
+
+	public const function GetTotalFrameDamage() : Float
+	{
+		var totalFrameReactionDamageReceived : Float;
+		RWLock.AcquireShared( m_hitEventLock );
+		totalFrameReactionDamageReceived = m_totalFrameReactionDamageReceived;
+		RWLock.ReleaseShared( m_hitEventLock );
+		return totalFrameReactionDamageReceived;
+	}
+
+	public const function GetTotalFrameWoundsDamage() : Float
+	{
+		var totalFrameWoundsDamageReceived : Float;
+		RWLock.AcquireShared( m_hitEventLock );
+		totalFrameWoundsDamageReceived = m_totalFrameWoundsDamageReceived;
+		RWLock.ReleaseShared( m_hitEventLock );
+		return totalFrameWoundsDamageReceived;
+	}
+
+	public const function GetTotalFrameDismembermentDamage() : Float
+	{
+		var totalFrameDismembermentDamageReceived : Float;
+		RWLock.AcquireShared( m_hitEventLock );
+		totalFrameDismembermentDamageReceived = m_totalFrameDismembermentDamageReceived;
+		RWLock.ReleaseShared( m_hitEventLock );
+		return totalFrameDismembermentDamageReceived;
+	}
+
+	protected event OnResetTotalFrameDamage( evt : ResetFrameDamage )
+	{
+		RWLock.Acquire( m_hitEventLock );
+		m_totalFrameReactionDamageReceived = 0.0;
+		m_totalFrameDismembermentDamageReceived = 0.0;
+		RWLock.Release( m_hitEventLock );
+	}
+
+	private const function GetLastHitAttackType() : gamedataAttackType
+	{
+		var attackType : gamedataAttackType;
+		RWLock.AcquireShared( m_hitEventLock );
+		attackType = m_lastHitEvent.attackData.GetAttackType();
+		RWLock.ReleaseShared( m_hitEventLock );
+		return attackType;
+	}
+
+	public const function GetLastHitInstigator() : weak< GameObject >
+	{
+		var instigator : weak< GameObject >;
+		RWLock.AcquireShared( m_hitEventLock );
+		instigator = m_lastHitEvent.attackData.GetInstigator();
+		RWLock.ReleaseShared( m_hitEventLock );
+		return instigator;
+	}
+
+	private const function GetLastHitAttackRecord() : Attack_GameEffect_Record
+	{
+		var attackRecord : Attack_GameEffect_Record;
+		RWLock.AcquireShared( m_hitEventLock );
+		attackRecord = ( ( Attack_GameEffect_Record )( m_lastHitEvent.attackData.GetAttackDefinition().GetRecord() ) );
+		RWLock.ReleaseShared( m_hitEventLock );
+		return attackRecord;
+	}
+
+	private const function HasLastHitFlag( flag : hitFlag ) : Bool
+	{
+		var hasFlag : Bool;
+		RWLock.AcquireShared( m_hitEventLock );
+		hasFlag = m_lastHitEvent.attackData.HasFlag( flag );
+		RWLock.ReleaseShared( m_hitEventLock );
+		return hasFlag;
+	}
+
+	private const function GetLastHitAttackValues() : array< Float >
+	{
+		var attackValues : array< Float >;
+		RWLock.AcquireShared( m_hitEventLock );
+		attackValues = m_lastHitEvent.attackComputed.GetAttackValues();
+		RWLock.ReleaseShared( m_hitEventLock );
+		return attackValues;
+	}
+
+	public const function GetLastHitAttackDirection() : Vector4
+	{
+		var hitDirection : Vector4;
+		RWLock.AcquireShared( m_hitEventLock );
+		hitDirection = m_lastHitEvent.hitDirection;
+		RWLock.ReleaseShared( m_hitEventLock );
+		return hitDirection;
+	}
+
+	private override final function OnHitUI( hitEvent : gameHitEvent )
+	{
+		if( !( ScriptedPuppet.IsAlive( this ) ) )
+		{
+			return;
+		}
+		super.OnHitUI( hitEvent );
+	}
+
+	public function WasJustKilledOrDefeated() : Bool
+	{
+		return m_wasJustKilledOrDefeated;
+	}
+
+	private function SendAfterDeathOrDefeatEvent()
+	{
+		var afterDeathOrDefeatEvt : NPCAfterDeathOrDefeatEvent;
+		afterDeathOrDefeatEvt = new NPCAfterDeathOrDefeatEvent;
+		QueueEvent( afterDeathOrDefeatEvt );
+	}
+
+	private function SendDataTrackingEvent( defeated : Bool, nonLethal : Bool )
+	{
+		var dataTrackingEvent : NPCKillDataTrackingRequest;
+		var damageHistory : DamageHistoryEntry;
+		dataTrackingEvent = new NPCKillDataTrackingRequest;
+		if( IsCharacterCivilian() )
+		{
+			return;
+		}
+		if( IsCrowd() )
+		{
+			return;
+		}
+		if( !( GetValidAttackFromDamageHistory( damageHistory ) ) )
+		{
+			return;
+		}
+		if( !( damageHistory.source ) )
+		{
+			return;
+		}
+		dataTrackingEvent.damageEntry = damageHistory;
+		dataTrackingEvent.isDownedRecorded = m_sentDownedEvent;
+		if( defeated && nonLethal )
+		{
+			dataTrackingEvent.eventType = EDownedType.Unconscious;
+		}
+		else if( defeated )
+		{
+			dataTrackingEvent.eventType = EDownedType.Defeated;
+		}
+		else if( IsDefeated( this ) )
+		{
+			dataTrackingEvent.eventType = EDownedType.Finished;
+		}
+		else
+		{
+			dataTrackingEvent.eventType = EDownedType.Killed;
+		}
+		GameInstance.GetScriptableSystemsContainer( GetGame() ).Get( 'DataTrackingSystem' ).QueueRequest( dataTrackingEvent );
+		m_sentDownedEvent = true;
+	}
+
+	protected event OnAfterDeathOrDefeat( evt : NPCAfterDeathOrDefeatEvent )
+	{
+		m_wasJustKilledOrDefeated = false;
+		m_shouldDie = false;
+		m_shouldBeDefeated = false;
+	}
+
+	public function ClearDefeatAndImmortality()
+	{
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.Defeated" );
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.Unconscious" );
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.CombatStim" );
+		StatusEffectHelper.RemoveStatusEffect( this, T"BaseStatusEffect.Invulnerable" );
+	}
+
+	protected event OnResetTimeDilation( evt : ResetTimeDilation )
+	{
+		var blackboard : IBlackboard;
+		var resetTimeDilationEvent : ResetTimeDilation;
+		blackboard = GetAIControllerComponent().GetActionBlackboard();
+		if( !( blackboard ) )
+		{
+			return false;
+		}
+		if( ( blackboard.GetFloat( GetAllBlackboardDefs().AIAction.ownerTimeDilation ) != -1.0 ) && !( HasIndividualTimeDilation() ) )
+		{
+			resetTimeDilationEvent = new ResetTimeDilation;
+			resetTimeDilationEvent.easeOut = evt.easeOut;
+			resetTimeDilationEvent.global = evt.global;
+			QueueEvent( resetTimeDilationEvent );
+		}
+		else
+		{
+			UnsetIndividualTimeDilation( evt.easeOut );
+			blackboard.SetFloat( GetAllBlackboardDefs().AIAction.ownerTimeDilation, -1.0 );
+			if( evt.global )
+			{
+				blackboard.SetFloat( GetAllBlackboardDefs().AIAction.ownerGlobalTimeDilation, -1.0 );
+			}
+		}
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		super.OnDeath( evt );
+		if( m_npcRagdollComponent )
+		{
+			m_npcRagdollComponent.Toggle( true );
+		}
+		TriggerEvent( 'RequestDeathAnimation' );
+		SendDataTrackingEvent( false, false );
+		CheckNPCKilledThrowingGrenade( evt.instigator );
+		ClearDefeatAndImmortality();
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( GetEntityID(), gamedataStatPoolType.Health, m_deathListener );
+		SendAfterDeathOrDefeatEvent();
+		AISquadHelper.NotifySquadOnIncapacitated( this );
+		AIComponent.InvokeBehaviorCallback( this, 'OnDeath' );
+		if( evt.instigator )
+		{
+			m_myKiller = evt.instigator;
+		}
+	}
+
+	private function EvaluateQuickHackPassivesIncapacitated()
+	{
+		var attackRecord : Attack_GameEffect_Record;
+		var hitFlags : array< String >;
+		var player : PlayerPuppet;
+		var i : Int32;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		for( i; i < m_receivedDamageHistory.Size(); i += 1 )
+		{
+			if( AttackData.IsExplosion( m_receivedDamageHistory[ i ].hitEvent.attackData.GetAttackType() ) && ( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.ExplosionKillsRecudeUltimateHacksCost ) == 1.0 ) )
+			{
+				StatusEffectHelper.ApplyStatusEffect( player, T"BaseStatusEffect.ReduceUltimateHackCostBy2" );
+				return;
+			}
+		}
+		if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.DefeatingEnemiesReduceHacksCost ) == 1.0 )
+		{
+			StatusEffectHelper.ApplyStatusEffect( player, T"BaseStatusEffect.ReduceNextHackCostBy1" );
+		}
+		if( GetNPCType() == gamedataNPCType.Human )
+		{
+			if( GetLastHitAttackType() == gamedataAttackType.Hack || HasLastHitFlag( hitFlag.QuickHack ) )
+			{
+				attackRecord = GetLastHitAttackRecord();
+				hitFlags = attackRecord.HitFlags();
+				if( hitFlags.Contains( "BrainMeltBurningHead" ) || ( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetPlayerID(), gamedataStatType.FearOnQuickHackKill ) == 1.0 ) )
+				{
+					GetStimBroadcasterComponent().TriggerSingleBroadcast( this, gamedataStimType.Terror, 10.0 );
+					return;
+				}
+			}
+		}
+	}
+
+	protected event OnPotentialDeath( evt : gamePotentialDeathEvent )
+	{
+		var nonLethalFlag : Bool;
+		SetMyKiller( evt.instigator );
+		PlayVOOnSquadMembers( evt.instigator.IsPlayer() );
+		PlayVOOnPlayerOrPlayerCompanion( evt.instigator );
+		if( IsDefeatMechanicActive() )
+		{
+			if( IsAboutToDie() )
+			{
+				Kill();
+			}
+			else
+			{
+				if( !( IsCrowd() ) && ( StatusEffectSystem.ObjectHasStatusEffect( evt.instigator, T"GameplayRestriction.FistFight" ) || StatusEffectSystem.ObjectHasStatusEffect( this, T"GameplayRestriction.FistFight" ) ) )
+				{
+					StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.DefeatedWithRecover" );
+					nonLethalFlag = true;
+				}
+				else
+				{
+					nonLethalFlag = SearchForNonlethalFlag();
+					if( nonLethalFlag && ( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( this.GetEntityID(), gamedataStatType.UnconsciousImmunity ) == 0.0 ) )
+					{
+						StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.Unconscious" );
+						if( ( GameInstance.GetGameFeatureManager( GetGame() ).AggressiveCrowdsEnabled() && IsCrowd() ) && IsAggressive() )
+						{
+							CallUnregisterAggressiveNPC();
+						}
+					}
+					else
+					{
+						StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.Defeated" );
+					}
+					StatusEffectHelper.ApplyStatusEffect( this, T"BaseStatusEffect.InvulnerableAfterDefeated" );
+				}
+				SendDataTrackingEvent( true, nonLethalFlag );
+				CheckNPCKilledThrowingGrenade( evt.instigator );
+				ProcessDoTAttackData();
+				SendAfterDeathOrDefeatEvent();
+				AISquadHelper.NotifySquadOnIncapacitated( this );
+			}
+		}
+	}
+
+	public static function FinisherEffectorActionOn( npc : weak< NPCPuppet >, instigator : weak< GameObject > )
+	{
+		var evt : FinisherEffectorActionOn;
+		if( !( npc ) || !( instigator ) )
+		{
+			return;
+		}
+		evt = new FinisherEffectorActionOn;
+		evt.instigator = instigator;
+		GameInstance.GetDelaySystem( npc.GetGame() ).DelayEvent( npc, evt, 0.1, false );
+	}
+
+	protected event OnFinisherEffectorActionOn( evt : FinisherEffectorActionOn )
+	{
+		if( ScriptedPuppet.IsActive( this ) && evt.instigator )
+		{
+			if( AIActionHelper.TryChangingAttitudeToHostile( this, evt.instigator ) )
+			{
+				TargetTrackingExtension.InjectThreat( this, evt.instigator, 1.0, 10.0 );
+				NPCPuppet.ChangeHighLevelState( this, gamedataNPCHighLevelState.Combat );
+			}
+		}
+	}
+
+	private function SearchForNonlethalFlag() : Bool
+	{
+		var i : Int32;
+		if( m_receivedDamageHistory.Size() > 0 )
+		{
+			for( i = 0; i < m_receivedDamageHistory.Size(); i += 1 )
+			{
+				if( m_receivedDamageHistory[ i ].hitEvent )
+				{
+					if( m_receivedDamageHistory[ i ].hitEvent.attackData.HasFlag( hitFlag.Nonlethal ) )
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	private function GetValidAttackFromDamageHistory( out entry : DamageHistoryEntry ) : Bool
+	{
+		var i : Int32;
+		i = 0;
+		if( m_receivedDamageHistory.Size() > 0 )
+		{
+			for( i; i < m_receivedDamageHistory.Size(); i += 1 )
+			{
+				if( m_receivedDamageHistory[ i ].hitEvent )
+				{
+					entry = m_receivedDamageHistory[ i ];
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private function ProcessDoTAttackData()
+	{
+		var statusEffectAttack : Attack_Record;
+		var gameEffectAttack : Attack_GameEffect_Record;
+		var i : Int32;
+		if( m_cachedStatusEffectAnim )
+		{
+			StatusEffectHelper.HasStatusEffectAttack( m_cachedStatusEffectAnim, statusEffectAttack );
+			if( statusEffectAttack )
+			{
+				gameEffectAttack = ( ( Attack_GameEffect_Record )( statusEffectAttack ) );
+				if( gameEffectAttack )
+				{
+					ScriptedPuppet.SendActionSignal( this, gameEffectAttack.AttackTag(), 1.0 );
+				}
+			}
+			return;
+		}
+		if( m_receivedDamageHistory.Size() > 0 )
+		{
+			for( i = 0; i < m_receivedDamageHistory.Size(); i += 1 )
+			{
+				if( m_receivedDamageHistory[ i ].hitEvent )
+				{
+					if( AttackData.IsDoT( m_receivedDamageHistory[ i ].hitEvent.attackData.GetAttackType() ) )
+					{
+						gameEffectAttack = ( ( Attack_GameEffect_Record )( m_receivedDamageHistory[ i ].hitEvent.attackData.GetAttackDefinition().GetRecord() ) );
+						if( gameEffectAttack )
+						{
+							ScriptedPuppet.SendActionSignal( this, gameEffectAttack.AttackTag(), 1.0 );
+						}
+						return;
+					}
+				}
+			}
+		}
+	}
+
+	public function UpdateCollisionState()
+	{
+		if( m_npcCollisionComponent )
+		{
+			if( ( StatusEffectSystem.ObjectHasStatusEffectOfType( this, gamedataStatusEffectType.SystemCollapse ) && GetNPCType() == gamedataNPCType.Android ) && !( IsRagdolling() ) )
+			{
+				return;
+			}
+			if( ( ( ( m_disableCollisionRequested || IsIncapacitated() ) || IsRagdolling() ) || m_hasAnimatedRagdoll ) || IsDefeated( this ) )
+			{
+				GetAIControllerComponent().DisableCollider();
+				if( m_npcTraceObstacleComponent != NULL )
+				{
+					m_npcTraceObstacleComponent.Toggle( false );
+				}
+			}
+			else
+			{
+				GetAIControllerComponent().EnableCollider();
+				if( m_npcTraceObstacleComponent != NULL )
+				{
+					m_npcTraceObstacleComponent.Toggle( true );
+				}
+			}
+		}
+	}
+
+	public function DisableCollision()
+	{
+		m_disableCollisionRequested = true;
+		UpdateCollisionState();
+	}
+
+	public function EnableCollision()
+	{
+		m_disableCollisionRequested = false;
+		UpdateCollisionState();
+	}
+
+	protected function OnDefeatedWithRecoverStatusEffectApplied()
+	{
+		UpdateCollisionState();
+		NPCPuppet.ChangeHighLevelState( this, gamedataNPCHighLevelState.Unconscious );
+	}
+
+	protected function OnDefeatedWithRecoverStatusEffectRemoved()
+	{
+		SetSenseObjectType( gamedataSenseObjectType.Npc );
+		UpdateCollisionState();
+		NPCPuppet.ChangeHighLevelState( this, gamedataNPCHighLevelState.Relaxed );
+	}
+
+	protected override function OnResurrected()
+	{
+		super.OnResurrected();
+		m_disableCollisionRequested = false;
+		UpdateCollisionState();
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValue( this.GetEntityID(), gamedataStatPoolType.Health, 100.0, NULL, true );
+		ClearDefeatAndImmortality();
+		SetSenseObjectType( gamedataSenseObjectType.Npc );
+	}
+
+	protected override function OnIncapacitated()
+	{
+		var fearSourceRadius : Float;
+		fearSourceRadius = 25.0;
+		if( !( IsIncapacitated() ) && !( GameInstance.GetReactionSystem( GetGame() ).UsesLoreAnimationWorkspot( GetEntityID() ) ) )
+		{
+			if( IsFinal() )
+			{
+				GameInstance.GetReactionSystem( GetGame() ).AddFearSource( ( ( Vector3 )( GetWorldPosition() ) ), fearSourceRadius );
+			}
+			else
+			{
+				GameInstance.GetReactionSystem( GetGame() ).AddFearSource( ( ( Vector3 )( GetWorldPosition() ) ), fearSourceRadius, StringToName( ( ( ( "[" + EntityID.ToDebugStringDecimal( GetEntityID() ) ) + "] Death (R=" ) + fearSourceRadius ) + ")" ) );
+			}
+			GameInstance.GetReactionSystem( GetGame() ).MarkDeadBody( GetEntityID(), IsAggressive(), GameInstance.GetSceneSystem( GetGame() ).GetScriptInterface().IsEntityInScene( GetEntityID() ) );
+		}
+		if( m_npcRagdollComponent )
+		{
+			m_npcRagdollComponent.Toggle( true );
+		}
+		if( ScriptedPuppet.CanRagdoll( this ) && !( WasIncapacitatedOnAttach() ) )
+		{
+			HandleRagdollOnDeath( true );
+		}
+		if( IsIncapacitated() )
+		{
+			UpdateCollisionState();
+			return;
+		}
+		QueueEvent( new TerminateReactionLookatEvent );
+		ReevaluateQuickHackPerkRewardsForPlayer();
+		EvaluateQuickHackPassivesIncapacitated();
+		if( GetNPCType() == gamedataNPCType.Android )
+		{
+			ProcessAndroidIncapacitated();
+		}
+		super.OnIncapacitated();
+		ProcessLoot();
+		AIActionHelper.CombatQueriesInit( this );
+		SetPuppetTargetingPlayer( false );
+		UpdateCollisionState();
+		SetSenseObjectType( gamedataSenseObjectType.Deadbody );
+		HandleRagdollOnDeath( false );
+	}
+
+	protected function HandleRagdollOnDeathByEvent( handleUncontrolledMovement : Bool )
+	{
+		var evt : HandleRagdollOnDeathEvent;
+		evt = new HandleRagdollOnDeathEvent;
+		evt.handleUncontrolledMovement = handleUncontrolledMovement;
+		QueueEvent( evt );
+	}
+
+	protected event OnHandleRagdollOnDeath( evt : HandleRagdollOnDeathEvent )
+	{
+		HandleRagdollOnDeath( evt.handleUncontrolledMovement );
+	}
+
+	protected function HandleRagdollOnDeath( handleUncontrolledMovement : Bool )
+	{
+		var uncontrolledMovementEvent : UncontrolledMovementStartEvent;
+		if( handleUncontrolledMovement )
+		{
+			uncontrolledMovementEvent = new UncontrolledMovementStartEvent;
+			uncontrolledMovementEvent.DebugSetSourceName( 'NPCPuppet - OnIncapacitated()' );
+			if( GetNPCType() == gamedataNPCType.Human && VehicleComponent.IsMountedToVehicle( GetGame(), this ) )
+			{
+				uncontrolledMovementEvent.ragdollOnCollision = false;
+			}
+			else
+			{
+				uncontrolledMovementEvent.ragdollOnCollision = true;
+			}
+			if( GetNPCType() == gamedataNPCType.Drone && !( GameInstance.GetNavigationSystem( GetGame() ).IsOnGround( this ) ) )
+			{
+				uncontrolledMovementEvent.ragdollNoGroundThreshold = -1.0;
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, CreateForceRagdollEvent( 'Drone aerial death fallback event' ), TweakDBInterface.GetFloat( GetRecordID() + T".airDeathRagdollDelay", 1.0 ), true );
+			}
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, uncontrolledMovementEvent, 0.2, true );
+		}
+		else
+		{
+			if( ( GetNPCType() == gamedataNPCType.Human || GetNPCType() == gamedataNPCType.Android ) && IsFloorSteepEnoughToRagdoll() )
+			{
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, CreateForceRagdollEvent( 'NPC died on sloped terrain' ), TDB.GetFloat( T"AIGeneralSettings.ragdollFloorAngleActivationDelay" ), true );
+			}
+		}
+	}
+
+	protected function IsFloorSteepEnoughToRagdoll() : Bool
+	{
+		var floorAngle : Float;
+		if( SpatialQueriesHelper.GetFloorAngle( this, floorAngle ) && ( floorAngle >= TDB.GetFloat( T"AIGeneralSettings.maxAllowedIncapacitatedFloorAngle" ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function ProcessAndroidIncapacitated()
+	{
+		var attackValues : array< Float >;
+		attackValues = GetLastHitAttackValues();
+		if( attackValues[ ( ( Int32 )( gamedataDamageType.Electric ) ) ] > 0.0 )
+		{
+			GameInstance.GetEffectorSystem( GetGame() ).ApplyEffector( GetEntityID(), GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), T"Effectors.Android_ExplodeOnElectricDeathEffector" );
+			GameInstance.GetEffectorSystem( GetGame() ).ApplyEffector( GetEntityID(), GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), T"Effectors.Android_ExplodeOnElectricDeathEffectorVFX" );
+		}
+	}
+
+	public const override function IsIncapacitated() : Bool
+	{
+		return GetPS().GetWasIncapacitated();
+	}
+
+	private function ReevaluateQuickHackPerkRewardsForPlayer()
+	{
+		var appliedStatusEffects : array< StatusEffect >;
+		var player : PlayerPuppet;
+		var value : Float;
+		var i : Int32;
+		var remainingDuration : Float;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		if( player && ( m_quickHackEffectsApplied > ( ( Uint32 )( 0 ) ) ) )
+		{
+			value = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.RestoreMemoryOnDefeat );
+			if( value > 0.0 )
+			{
+				GameInstance.GetStatPoolsSystem( GetGame() ).RequestChangingStatPoolValue( player.GetEntityID(), gamedataStatPoolType.Memory, value, player, true, false );
+			}
+			value = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.LowerActiveCooldownOnDefeat );
+			if( value > 0.0 )
+			{
+				if( StatusEffectHelper.GetAppliedEffectsWithTag( player, 'QuickHackCooldown', appliedStatusEffects ) )
+				{
+					for( i = 0; i < appliedStatusEffects.Size(); i += 1 )
+					{
+						remainingDuration = appliedStatusEffects[ i ].GetRemainingDuration();
+						GameInstance.GetStatusEffectSystem( GetGame() ).SetStatusEffectRemainingDuration( player.GetEntityID(), appliedStatusEffects[ i ].GetRecord().GetID(), remainingDuration * ( 1.0 - value ) );
+					}
+				}
+			}
+		}
+	}
+
+	protected event OnVehicleHijackEvent( evt : VehicleHijackEvent )
+	{
+		var resetEvent : ResetVehicleHijackEvent;
+		GetPuppetStateBlackboard().SetBool( GetAllBlackboardDefs().PuppetState.WorkspotAnimationInProgress, true );
+		resetEvent = new ResetVehicleHijackEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, resetEvent, 5.0, true );
+	}
+
+	protected event OnResetVehicleHijackEvent( evt : ResetVehicleHijackEvent )
+	{
+		var bb : IBlackboard;
+		bb = GetPuppetStateBlackboard();
+		if( bb )
+		{
+			bb.SetBool( GetAllBlackboardDefs().PuppetState.WorkspotAnimationInProgress, false );
+			bb.SetBool( GetAllBlackboardDefs().PuppetState.InPendingBehavior, false );
+		}
+	}
+
+	protected event OnCoverHit( evt : gameCoverHitEvent )
+	{
+		TriggerEvent( 'RequestCoverHitReaction' );
+	}
+
+	protected override function OnHitVFX( hitEvent : gameHitEvent )
+	{
+		var mountingInfo : MountingInfo;
+		var mountingSlotName : CName;
+		var isNPCMounted : Bool;
+		super.OnHitVFX( hitEvent );
+		mountingInfo = GameInstance.GetMountingFacility( hitEvent.target.GetGame() ).GetMountingInfoSingleWithObjects( hitEvent.target );
+		isNPCMounted = EntityID.IsDefined( mountingInfo.childId );
+		mountingSlotName = mountingInfo.slotId.id;
+		if( isNPCMounted && mountingSlotName == 'grapple' )
+		{
+			GameObjectEffectHelper.StartEffectEvent( this, 'human_shield' );
+		}
+	}
+
+	private function PlayImpactSound()
+	{
+		var voEvent : SoundPlayVo;
+		voEvent = new SoundPlayVo;
+		voEvent.voContext = 'battlecry_01';
+		voEvent.debugInitialContext = 'Scripts:PlayImpactSound()';
+		QueueEvent( voEvent );
+	}
+
+	private function SpawnHitVisualEffect( n : CName )
+	{
+		var spawnEffectEvent : entSpawnEffectEvent;
+		spawnEffectEvent = new entSpawnEffectEvent;
+		spawnEffectEvent.effectName = n;
+		QueueEvent( ( ( Event )( spawnEffectEvent ) ) );
+	}
+
+	public export const override function CompileScannerChunks() : Bool
+	{
+		var i : Int32;
+		var k : Int32;
+		var z : Int32;
+		var ps : ScriptedPuppetPS;
+		var thisEntity : GameObject;
+		var nameChunk : ScannerName;
+		var levelChunk : ScannerLevel;
+		var rarityChunk : ScannerRarity;
+		var archtypeChunk : ScannerArchetype;
+		var networkStatusChunk : ScannerNetworkStatus;
+		var factionChunk : ScannerFaction;
+		var attitudeChunk : ScannerAttitude;
+		var healthChunk : ScannerHealth;
+		var bountyChunk : ScannerBountySystem;
+		var basicWeaponChunk : ScannerWeaponBasic;
+		var detailedWeaponChunk : ScannerWeaponDetailed;
+		var vulnerabilitiesChunk : ScannerVulnerabilities;
+		var resistancesChunk : ScannerResistances;
+		var abilityChunk : ScannerAbilities;
+		var abilities : array< weak< GameplayAbility_Record > >;
+		var statPoolSystem : StatPoolsSystem;
+		var bountyUI : BountyUI;
+		var vulnerability : Vulnerability;
+		var resists : array< ScannerStatDetails >;
+		var puppetQuickHack : weak< ObjectAction_Record >;
+		var availablePlayerActions : array< TweakDBID >;
+		var quickHackActionRecords : array< weak< ObjectAction_Record > >;
+		var context : GetActionsContext;
+		var choices : array< InteractionChoice >;
+		var archetypeName : CName;
+		var NPCName : String;
+		var nameParams : inkTextParams;
+		var ap : AccessPointControllerPS;
+		var scannerBlackboard : weak< IBlackboard >;
+		var characterRecord : Character_Record;
+		var scannerPreset : ScannerModuleVisibilityPreset_Record;
+		var items : array< weak< NPCEquipmentItem_Record > >;
+		var bounty : Bounty;
+		var abilityGroups : array< weak< GameplayAbilityGroup_Record > >;
+		var archetypeData : weak< ArchetypeData_Record >;
+		var enemyDifficulty : EPowerDifferential;
+		var hasLinkToDB : Bool;
+		ps = GetPS();
+		characterRecord = TweakDBInterface.GetCharacterRecord( GetRecordID() );
+		scannerPreset = characterRecord.ScannerModulePreset();
+		thisEntity = ( ( GameObject )( EntityGameInterface.GetEntity( GetEntity() ) ) );
+		if( TDBID.IsValid( ps.GetForcedScannerPreset() ) )
+		{
+			scannerPreset = TweakDBInterface.GetScannerModuleVisibilityPresetRecord( ps.GetForcedScannerPreset() );
+		}
+		else
+		{
+			scannerPreset = characterRecord.ScannerModulePreset();
+		}
+		scannerBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_ScannerModules );
+		if( ( !( characterRecord ) || !( scannerPreset ) ) || !( scannerBlackboard ) )
+		{
+			return false;
+		}
+		scannerBlackboard.SetInt( GetAllBlackboardDefs().UI_ScannerModules.ObjectType, ( ( Int32 )( ScannerObjectType.PUPPET ) ), true );
+		if( scannerPreset.ShoulShowName() )
+		{
+			nameChunk = new ScannerName;
+			archetypeName = characterRecord.ArchetypeData().Type().LocalizedName();
+			if( archetypeName != '' && !( characterRecord.SkipDisplayArchetype() ) )
+			{
+				nameChunk.SetArchetype( true );
+			}
+			nameParams = new inkTextParams;
+			if( ps.HasAlternativeName() )
+			{
+				if( IsNameValid( characterRecord.AlternativeFullDisplayName() ) )
+				{
+					NPCName = LocKeyToString( characterRecord.AlternativeFullDisplayName() );
+				}
+				else
+				{
+					NPCName = LocKeyToString( characterRecord.AlternativeDisplayName() );
+				}
+			}
+			else if( IsCharacterCivilian() || characterRecord.BaseAttitudeGroup() == 'child_ow' )
+			{
+				if( IsNameValid( characterRecord.DisplayName() ) )
+				{
+					NPCName = LocKeyToString( characterRecord.DisplayName() );
+				}
+				else
+				{
+					NPCName = GetDisplayName();
+				}
+			}
+			else
+			{
+				if( IsNameValid( characterRecord.FullDisplayName() ) )
+				{
+					NPCName = LocKeyToString( characterRecord.FullDisplayName() );
+				}
+				else if( IsNameValid( characterRecord.DisplayName() ) )
+				{
+					NPCName = LocKeyToString( characterRecord.DisplayName() );
+				}
+				else
+				{
+					NPCName = GetDisplayName();
+				}
+			}
+			if( nameChunk.HasArchetype() )
+			{
+				nameParams = new inkTextParams;
+				if( NPCName == ( ( String )( archetypeName ) ) || ( !( IsNameValid( characterRecord.FullDisplayName() ) ) && !( IsNameValid( characterRecord.DisplayName() ) ) ) )
+				{
+					NPCName = "";
+				}
+				nameParams.AddLocalizedString( "TEXT_PRIMARY", NPCName );
+				nameParams.AddLocalizedString( "TEXT_SECONDARY", ( ( String )( archetypeName ) ) );
+				nameChunk.SetTextParams( nameParams );
+				archtypeChunk = new ScannerArchetype;
+				archtypeChunk.Set( characterRecord.ArchetypeData().Type().Type() );
+				scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerArchetype, archtypeChunk );
+			}
+			else
+			{
+				nameChunk.Set( NPCName );
+			}
+			scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerName, nameChunk );
+		}
+		if( scannerPreset.ShouldShowLevel() )
+		{
+			levelChunk = new ScannerLevel;
+			levelChunk.Set( 0 );
+			levelChunk.SetIndicator( ShouldShowIndicator( thisEntity ) );
+			scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerLevel, levelChunk );
+		}
+		if( scannerPreset.ShouldShowRarity() )
+		{
+			rarityChunk = new ScannerRarity;
+			hasLinkToDB = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetPlayer( GetGame() ).GetEntityID(), gamedataStatType.HasLinkToBountySystem ) > 0.0;
+			rarityChunk.Set( GetPuppetRarity().Type(), IsCharacterCivilian() && hasLinkToDB );
+			scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerRarity, rarityChunk );
+		}
+		if( scannerPreset.ShouldShowFaction() )
+		{
+			factionChunk = new ScannerFaction;
+			factionChunk.Set( LocKeyToString( characterRecord.Affiliation().LocalizedName() ) );
+			scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerFaction, factionChunk );
+		}
+		if( ( !( IsDead() ) && !( ScriptedPuppet.IsDefeated( this ) ) ) && scannerPreset.ShouldShowAttitude() )
+		{
+			attitudeChunk = new ScannerAttitude;
+			attitudeChunk.Set( GetAttitudeTowards( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+			scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerAttitude, attitudeChunk );
+		}
+		if( scannerPreset.ShouldShowHealth() )
+		{
+			healthChunk = new ScannerHealth;
+			statPoolSystem = GameInstance.GetStatPoolsSystem( GetGame() );
+			if( statPoolSystem )
+			{
+				healthChunk.Set( ( ( Int32 )( statPoolSystem.GetStatPoolValue( GetEntityID(), gamedataStatPoolType.Health, false ) ) ), ( ( Int32 )( GameInstance.GetStatPoolsSystem( GetGame() ).GetStatPoolMaxPointValue( GetEntityID(), gamedataStatPoolType.Health ) ) ) );
+				scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerHealth, healthChunk );
+			}
+		}
+		if( ( scannerPreset.ShouldShowBounty() && TDBID.IsValid( GetRecord().BountyDrawTable().GetID() ) ) && !( m_bounty.m_filteredOut ) )
+		{
+			if( m_bounty.m_transgressions.Size() <= 0 )
+			{
+				bounty = BountyManager.GenerateBounty( this );
+			}
+			else
+			{
+				bounty = m_bounty;
+			}
+			if( !( bounty.m_filteredOut ) )
+			{
+				bountyChunk = new ScannerBountySystem;
+				bountyUI.issuedBy = LocKeyToString( TweakDBInterface.GetAffiliationRecord( bounty.m_bountySetter ).LocalizedName() );
+				bountyUI.moneyReward = bounty.m_moneyAmount;
+				bountyUI.streetCredReward = bounty.m_streetCredAmount;
+				enemyDifficulty = RPGManager.CalculatePowerDifferential( thisEntity );
+				switch( enemyDifficulty )
+				{
+					case EPowerDifferential.TRASH:
+						bountyUI.level = 1;
+					break;
+					case EPowerDifferential.EASY:
+						bountyUI.level = 2;
+					break;
+					case EPowerDifferential.NORMAL:
+						bountyUI.level = 3;
+					break;
+					case EPowerDifferential.HARD:
+						bountyUI.level = 4;
+					break;
+					case EPowerDifferential.IMPOSSIBLE:
+						bountyUI.level = 5;
+					break;
+					default:
+					;
+				}
+				bountyUI.hasAccess = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetPlayer( GetGame() ).GetEntityID(), gamedataStatType.HasLinkToBountySystem ) > 0.0;
+				for( i = 0; i < bounty.m_transgressions.Size(); i += 1 )
+				{
+					bountyUI.transgressions.PushBack( TweakDBInterface.GetTransgressionRecord( bounty.m_transgressions[ i ] ).LocalizedDescription() );
+				}
+				bountyChunk.Set( bountyUI );
+				scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerBountySystem, bountyChunk );
+			}
+		}
+		if( ( !( IsDead() ) && !( ScriptedPuppet.IsDefeated( this ) ) ) && scannerPreset.ShouldShowWeaponData() )
+		{
+			AIActionTransactionSystem.CalculateEquipmentItems( ( ( ScriptedPuppet )( this ) ), GetRecord().PrimaryEquipment(), items, -1 );
+			if( false )
+			{
+				detailedWeaponChunk = new ScannerWeaponDetailed;
+				detailedWeaponChunk.Set( items[ 0 ].Item().DisplayName() );
+				scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerWeaponDetailed, detailedWeaponChunk );
+			}
+			else
+			{
+				basicWeaponChunk = new ScannerWeaponBasic;
+				basicWeaponChunk.Set( items[ 0 ].Item().DisplayName() );
+				scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerWeaponBasic, basicWeaponChunk );
+			}
+		}
+		if( ( !( IsDead() ) && !( ScriptedPuppet.IsDefeated( this ) ) ) && scannerPreset.ShouldShowVulnerabilities() )
+		{
+			vulnerabilitiesChunk = new ScannerVulnerabilities;
+			availablePlayerActions = RPGManager.GetPlayerQuickHackList( GetPlayer( GetGame() ) );
+			context = ps.GenerateContext( gamedeviceRequestType.Remote, Device.GetInteractionClearance(), Device.GetPlayerMainObjectStatic( GetGame() ), GetEntityID() );
+			quickHackActionRecords.Resize( availablePlayerActions.Size() );
+			for( i = 0; i < availablePlayerActions.Size(); i += 1 )
+			{
+				quickHackActionRecords[ i ] = TweakDBInterface.GetObjectActionRecord( availablePlayerActions[ i ] );
+			}
+			ps.GetValidChoices( quickHackActionRecords, context, NULL, false, choices );
+			for( i = 0; i < choices.Size(); i += 1 )
+			{
+				for( k = 0; k < choices[ i ].data.Size(); k += 1 )
+				{
+					puppetQuickHack = ( ( ScriptableDeviceAction )( choices[ i ].data[ k ] ) ).GetObjectActionRecord();
+					if( puppetQuickHack )
+					{
+						vulnerability.vulnerabilityName = puppetQuickHack.ObjectActionUI().Caption();
+						vulnerability.icon = puppetQuickHack.ObjectActionUI().CaptionIcon().TexturePartID().GetID();
+						for( z = 0; z < quickHackActionRecords.Size(); z += 1 )
+						{
+							if( quickHackActionRecords[ z ].GameplayCategory().GetID() == puppetQuickHack.GetID() )
+							{
+								vulnerability.isActive = true;
+							}
+						}
+						vulnerabilitiesChunk.PushBack( vulnerability );
+					}
+				}
+			}
+			if( vulnerabilitiesChunk.IsValid() )
+			{
+				scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerVulnerabilities, vulnerabilitiesChunk );
+			}
+		}
+		if( scannerPreset.ShouldShowNetworkStatus() )
+		{
+			networkStatusChunk = new ScannerNetworkStatus;
+			ap = ps.GetAccessPoint();
+			if( ap )
+			{
+				if( ap.IsBreached() )
+				{
+					networkStatusChunk.Set( ScannerNetworkState.BREACHED );
+				}
+				else
+				{
+					networkStatusChunk.Set( ScannerNetworkState.NOT_BREACHED );
+				}
+			}
+			else
+			{
+				networkStatusChunk.Set( ScannerNetworkState.NOT_CONNECTED );
+			}
+		}
+		if( ( !( IsDead() ) && !( ScriptedPuppet.IsDefeated( this ) ) ) && scannerPreset.ShouldShowResistances() )
+		{
+			resistancesChunk = new ScannerResistances;
+			resists.PushBack( RPGManager.GetScannerResistanceDetails( thisEntity, gamedataStatType.PhysicalResistance ) );
+			resists.PushBack( RPGManager.GetScannerResistanceDetails( thisEntity, gamedataStatType.ThermalResistance ) );
+			resists.PushBack( RPGManager.GetScannerResistanceDetails( thisEntity, gamedataStatType.ElectricResistance ) );
+			resists.PushBack( RPGManager.GetScannerResistanceDetails( thisEntity, gamedataStatType.ChemicalResistance ) );
+			resists.PushBack( RPGManager.GetScannerResistanceDetails( thisEntity, gamedataStatType.HackingResistance, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+			resistancesChunk.Set( resists );
+			scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerResistances, resistancesChunk );
+		}
+		if( !( IsDead() ) && !( ScriptedPuppet.IsDefeated( this ) ) )
+		{
+			abilityChunk = new ScannerAbilities;
+			archetypeData = characterRecord.ArchetypeData();
+			if( !( archetypeData ) )
+			{
+				return false;
+			}
+			if( archetypeData.GetAbilityGroupsCount() > 0 )
+			{
+				archetypeData.AbilityGroups( abilityGroups );
+				for( i = 0; i < abilityGroups.Size(); i += 1 )
+				{
+					abilityGroups[ i ].Abilities( abilities );
+					abilityChunk.Set( abilities );
+					scannerBlackboard.SetVariant( GetAllBlackboardDefs().UI_ScannerModules.ScannerAbilities, abilityChunk );
+				}
+			}
+		}
+		return true;
+	}
+
+	private static function ShouldShowIndicator( npc : GameObject ) : Bool
+	{
+		var enemyDifficulty : EPowerDifferential;
+		enemyDifficulty = RPGManager.CalculatePowerDifferential( npc );
+		if( enemyDifficulty == EPowerDifferential.IMPOSSIBLE )
+		{
+			return true;
+		}
+		else if( NPCManager.HasVisualTag( ( ( ScriptedPuppet )( npc ) ), 'Sumo' ) || NPCManager.HasVisualTag( ( ( ScriptedPuppet )( npc ) ), 'Police' ) )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected event OnSetExposeQuickHacks( evt : SetExposeQuickHacks )
+	{
+		super.OnSetExposeQuickHacks( evt );
+		SetScannerDirty( true );
+	}
+
+	protected event OnSmartBulletDeflectedEvent( evt : SmartBulletDeflectedEvent )
+	{
+		GameObject.StartReplicatedEffectEvent( this, 'glow_tattoo_promixity' );
+	}
+
+	public export override function UpdateAdditionalScanningData()
+	{
+		var stats : GameObjectScanStats;
+		var bb : IBlackboard;
+		var weapon : ItemID;
+		stats.scannerData.entityName = GetTweakDBFullDisplayName( true );
+		AIActionTransactionSystem.GetFirstItemID( this, TweakDBInterface.GetItemCategoryRecord( T"ItemCategory.Weapon" ), '', weapon );
+		bb = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		if( bb )
+		{
+			bb.SetVariant( GetAllBlackboardDefs().UI_Scanner.scannerObjectStats, stats );
+			bb.Signal( GetAllBlackboardDefs().UI_Scanner.scannerObjectStats );
+		}
+	}
+
+	private const function GetHighestDamageStat( item : gameItemData ) : gamedataDamageType
+	{
+		var returnType : gamedataDamageType;
+		var cachedThreshold : Float;
+		cachedThreshold = item.GetStatValueByType( gamedataStatType.PhysicalDamage );
+		returnType = gamedataDamageType.Physical;
+		if( item.GetStatValueByType( gamedataStatType.ThermalDamage ) > cachedThreshold )
+		{
+			cachedThreshold = item.GetStatValueByType( gamedataStatType.ThermalDamage );
+			returnType = gamedataDamageType.Thermal;
+		}
+		if( item.GetStatValueByType( gamedataStatType.ElectricDamage ) > cachedThreshold )
+		{
+			cachedThreshold = item.GetStatValueByType( gamedataStatType.ElectricDamage );
+			returnType = gamedataDamageType.Electric;
+		}
+		if( item.GetStatValueByType( gamedataStatType.ChemicalDamage ) > cachedThreshold )
+		{
+			cachedThreshold = item.GetStatValueByType( gamedataStatType.ChemicalDamage );
+			returnType = gamedataDamageType.Chemical;
+		}
+		return returnType;
+	}
+
+	public function MountingStartDisableComponents()
+	{
+		var i : Int32;
+		for( i = 0; i < m_npcMountedToPlayerComponents.Size(); i += 1 )
+		{
+			if( m_npcMountedToPlayerComponents[ i ] && IsIncapacitated() )
+			{
+				m_npcMountedToPlayerComponents[ i ].Toggle( false );
+			}
+		}
+		DisableCollision();
+		if( !( IsIncapacitated() ) )
+		{
+			GameInstance.GetStatusEffectSystem( GetGame() ).ApplyStatusEffect( GetEntityID(), T"BaseStatusEffect.Grappled" );
+		}
+	}
+
+	public function MountingEndEnableComponents()
+	{
+		var i : Int32;
+		for( i = 0; i < m_npcMountedToPlayerComponents.Size(); i += 1 )
+		{
+			if( m_npcMountedToPlayerComponents[ i ] )
+			{
+				m_npcMountedToPlayerComponents[ i ].Toggle( true );
+			}
+		}
+		EnableCollision();
+		if( !( IsIncapacitated() ) )
+		{
+			GameInstance.GetStatusEffectSystem( GetGame() ).RemoveStatusEffect( GetEntityID(), T"BaseStatusEffect.Grappled" );
+		}
+	}
+
+	public function GrappleTargetDeadEnableRagdollComponent( b : Bool )
+	{
+		var i : Int32;
+		for( i = 0; i < m_npcMountedToPlayerComponents.Size(); i += 1 )
+		{
+			if( m_npcMountedToPlayerComponents[ i ] )
+			{
+				m_npcMountedToPlayerComponents[ i ].Toggle( false );
+			}
+		}
+		SetDisableRagdoll( !( b ) );
+	}
+
+	public function SetMyKiller( killer : GameObject )
+	{
+		if( killer )
+		{
+			m_myKiller = killer;
+		}
+	}
+
+	protected event OnGrappleTargetDeadEnableRagdollWithDelay( evt : RagdollToggleDelayEvent )
+	{
+		if( evt.target )
+		{
+			SetDisableRagdoll( !( evt.enable ), evt.force, evt.leaveRagdollEnabled );
+		}
+	}
+
+	protected event OnHidePuppetDelayEvent( evt : HidePuppetDelayEvent )
+	{
+		if( evt.m_target )
+		{
+			evt.m_target.HideIrreversibly();
+		}
+	}
+
+	protected event On_TEMP_TestNPCOutsideNavmeshEvent( evt : TestNPCOutsideNavmeshEvent )
+	{
+		var navigationPath : NavigationPath;
+		var currentPosition : Vector4;
+		var DelayedGameEffectEvt : DelayedGameEffectEvent;
+		currentPosition = evt.target.GetWorldPosition();
+		navigationPath = GameInstance.GetAINavigationSystem( GetGame() ).CalculatePathForCharacter( currentPosition, currentPosition, 0.2, this );
+		if( evt.target && ( navigationPath == NULL ) )
+		{
+			DelayedGameEffectEvt = new DelayedGameEffectEvent;
+			DelayedGameEffectEvt.m_activator = evt.activator;
+			DelayedGameEffectEvt.m_target = evt.target;
+			DelayedGameEffectEvt.m_effectName = 'takedowns';
+			DelayedGameEffectEvt.m_effectTag = 'kill';
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( evt.activator, DelayedGameEffectEvt, 0.1 );
+		}
+	}
+
+	public const function GetScavengeComponent() : ScavengeComponent
+	{
+		return m_scavengeComponent;
+	}
+
+	public const function GetInfluenceComponent() : InfluenceComponent
+	{
+		return m_influenceComponent;
+	}
+
+	public const function GetComfortZoneComponent() : IComponent
+	{
+		return m_comfortZoneComponent;
+	}
+
+	protected event OnSetDeathParams( evt : gameDeathParamsEvent )
+	{
+		SetSkipDeathAnimation( evt.noAnimation );
+		SetDisableRagdoll( evt.noRagdoll );
+	}
+
+	protected event OnSetDeathDirection( evt : gameDeathDirectionEvent )
+	{
+		m_customDeathDirection = ( ( Int32 )( evt.direction ) );
+	}
+
+	public const function IsRipperdoc() : Bool
+	{
+		if( IsVendor() )
+		{
+			return TweakDBInterface.GetCharacterRecord( GetRecordID() ).VendorID().VendorType().Type() == gamedataVendorType.RipperDoc;
+		}
+		return false;
+	}
+
+	protected function RegisterCallbacks()
+	{
+		var blackBoard : IBlackboard;
+		var playerPuppet : PlayerPuppet;
+		playerPuppet = GetPlayer( GetGame() );
+		blackBoard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( !( m_upperBodyStateCallbackID ) )
+		{
+			m_upperBodyStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody, this, 'OnAimedAt' );
+		}
+		if( !( m_leftCyberwareStateCallbackID ) )
+		{
+			m_leftCyberwareStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.LeftHandCyberware, this, 'OnCyberware' );
+		}
+		if( !( m_meleeStateCallbackID ) )
+		{
+			m_meleeStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, this, 'OnMelee' );
+		}
+	}
+
+	protected function RegisterCallbacksForReactions()
+	{
+		var blackBoard : IBlackboard;
+		var playerPuppet : PlayerPuppet;
+		var newPlayerID : EntityID;
+		playerPuppet = GetPlayer( GetGame() );
+		if( playerPuppet == NULL )
+		{
+			if( EntityID.IsDefined( m_cachedPlayerID ) )
+			{
+				UnregisterCallbacksForReactions();
+			}
+			m_cachedPlayerID = newPlayerID;
+			return;
+		}
+		newPlayerID = playerPuppet.GetEntityID();
+		if( EntityID.IsDefined( m_cachedPlayerID ) && ( newPlayerID != m_cachedPlayerID ) )
+		{
+			UnregisterCallbacksForReactions();
+		}
+		m_cachedPlayerID = newPlayerID;
+		blackBoard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( m_cachedPlayerID, GetAllBlackboardDefs().PlayerStateMachine );
+		if( blackBoard == NULL )
+		{
+			return;
+		}
+		if( !( m_upperBodyStateCallbackID ) )
+		{
+			m_upperBodyStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody, this, 'OnAimedAt' );
+			blackBoard.SignalInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody );
+		}
+		if( !( m_leftCyberwareStateCallbackID ) )
+		{
+			m_leftCyberwareStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.LeftHandCyberware, this, 'OnCyberware' );
+			blackBoard.SignalInt( GetAllBlackboardDefs().PlayerStateMachine.LeftHandCyberware );
+		}
+		if( !( m_meleeStateCallbackID ) )
+		{
+			m_meleeStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, this, 'OnMelee' );
+			blackBoard.SignalInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon );
+		}
+		if( !( m_combatGadgetStateCallbackID ) )
+		{
+			m_combatGadgetStateCallbackID = blackBoard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.CombatGadget, this, 'OnCombatGadget' );
+			blackBoard.SignalInt( GetAllBlackboardDefs().PlayerStateMachine.CombatGadget );
+		}
+	}
+
+	protected function UnregisterCallbacksForReactions()
+	{
+		var blackBoard : IBlackboard;
+		blackBoard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( m_cachedPlayerID, GetAllBlackboardDefs().PlayerStateMachine );
+		if( blackBoard )
+		{
+			if( m_upperBodyStateCallbackID )
+			{
+				blackBoard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody, m_upperBodyStateCallbackID );
+			}
+			if( m_leftCyberwareStateCallbackID )
+			{
+				blackBoard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.LeftHandCyberware, m_leftCyberwareStateCallbackID );
+			}
+			if( m_meleeStateCallbackID )
+			{
+				blackBoard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, m_meleeStateCallbackID );
+			}
+			if( m_combatGadgetStateCallbackID )
+			{
+				blackBoard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.CombatGadget, m_combatGadgetStateCallbackID );
+			}
+		}
+		m_upperBodyStateCallbackID = NULL;
+		m_leftCyberwareStateCallbackID = NULL;
+		m_meleeStateCallbackID = NULL;
+		m_combatGadgetStateCallbackID = NULL;
+	}
+
+	protected event OnLookedAtEvent( evt : LookedAtEvent )
+	{
+		super.OnLookedAtEvent( evt );
+		m_isLookedAt = evt.isLookedAt;
+		ResolveReactiOnLookedAt( evt.isLookedAt );
+	}
+
+	private function ResolveReactiOnLookedAt( isLookedAt : Bool )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		if( isLookedAt )
+		{
+			RegisterCallbacksForReactions();
+		}
+		else
+		{
+			UnregisterCallbacksForReactions();
+			if( ( ( m_wasAimedAtLast || m_wasCWChargedAtLast ) || m_wasMeleeChargedAtLast ) || m_wasChargingGadgetAtLast )
+			{
+				broadcaster = GetPlayer( GetGame() ).GetStimBroadcasterComponent();
+				if( broadcaster )
+				{
+					broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.StopedAiming, this );
+				}
+			}
+			m_wasAimedAtLast = false;
+			m_wasCWChargedAtLast = false;
+			m_wasMeleeChargedAtLast = false;
+			m_wasChargingGadgetAtLast = false;
+		}
+	}
+
+	public static function TutorialAddIllegalActionFact( targetPuppet : NPCPuppet )
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( targetPuppet.GetGame() );
+		if( IsInCombat( targetPuppet ) )
+		{
+			return;
+		}
+		if( ( questSystem.GetFact( 'illegal_action_tutorial' ) == 0 ) && ( questSystem.GetFact( 'disable_tutorials' ) == 0 ) )
+		{
+			questSystem.SetFact( 'illegal_action_tutorial', 1 );
+		}
+	}
+
+	protected event OnQuestOverrideScannerPreset( evt : OverrideScannerPreset )
+	{
+		GetPS().SetForcedScannerPreset( evt.scannerPreset );
+	}
+
+	protected event OnQuestResetScannerPreset( evt : ResetScannerPreset )
+	{
+		GetPS().SetForcedScannerPreset( TDBID.None() );
+	}
+
+	protected event OnAimedAt( value : Int32 )
+	{
+		var weapon : WeaponObject;
+		var broadcaster : StimBroadcasterComponent;
+		weapon = GameObject.GetActiveWeapon( GetPlayer( GetGame() ) );
+		broadcaster = GetPlayer( GetGame() ).GetStimBroadcasterComponent();
+		if( ( ( ( Int32 )( gamePSMUpperBodyStates.Aim ) ) == value ) && weapon.IsRanged() )
+		{
+			if( m_isLookedAt )
+			{
+				if( broadcaster )
+				{
+					broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.AimingAt, this );
+				}
+				m_wasAimedAtLast = true;
+				if( IsCharacterCivilian() )
+				{
+					TutorialAddIllegalActionFact( this );
+				}
+			}
+		}
+		else if( m_wasAimedAtLast && weapon.IsRanged() )
+		{
+			if( broadcaster )
+			{
+				broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.StopedAiming, this );
+			}
+			m_wasAimedAtLast = false;
+		}
+	}
+
+	protected event OnCyberware( value : Int32 )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetPlayer( GetGame() ).GetStimBroadcasterComponent();
+		if( ( ( Int32 )( gamePSMLeftHandCyberware.Charge ) ) == value )
+		{
+			if( m_isLookedAt )
+			{
+				if( broadcaster )
+				{
+					broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.AimingAt, this );
+				}
+				m_wasCWChargedAtLast = true;
+			}
+		}
+		else if( m_wasCWChargedAtLast )
+		{
+			if( broadcaster )
+			{
+				broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.StopedAiming, this );
+			}
+			m_wasCWChargedAtLast = false;
+		}
+	}
+
+	protected event OnMelee( value : Int32 )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetPlayer( GetGame() ).GetStimBroadcasterComponent();
+		if( ( ( ( Int32 )( gamePSMMeleeWeapon.ChargedHold ) ) == value ) || ( ( ( Int32 )( gamePSMMeleeWeapon.Targeting ) ) == value ) )
+		{
+			if( m_isLookedAt )
+			{
+				if( broadcaster )
+				{
+					broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.AimingAt, this );
+				}
+				m_wasMeleeChargedAtLast = true;
+			}
+		}
+		else if( m_wasMeleeChargedAtLast )
+		{
+			if( broadcaster )
+			{
+				broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.StopedAiming, this );
+			}
+			m_wasMeleeChargedAtLast = false;
+		}
+	}
+
+	protected event OnCombatGadget( value : Int32 )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetPlayer( GetGame() ).GetStimBroadcasterComponent();
+		if( ( ( Int32 )( gamePSMCombatGadget.Charging ) ) == value )
+		{
+			if( m_isLookedAt )
+			{
+				if( broadcaster )
+				{
+					broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.AimingAt, this );
+				}
+				m_wasChargingGadgetAtLast = true;
+			}
+		}
+		else if( m_wasChargingGadgetAtLast )
+		{
+			if( broadcaster )
+			{
+				broadcaster.SendDrirectStimuliToTarget( this, gamedataStimType.StopedAiming, this );
+			}
+			m_wasChargingGadgetAtLast = false;
+		}
+	}
+
+	protected event OnNPCStartThrowingGrenadeEvent( evt : NPCThrowingGrenadeEvent )
+	{
+		if( evt.target )
+		{
+			if( evt.target.IsPlayer() )
+			{
+				m_isThrowingGrenadeToPlayer = true;
+				ReactionManagerComponent.SendVOEventToSquad( evt.target, 'grenade_enemy' );
+				GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_throwingGrenadeDelayEventID );
+				m_throwingGrenadeDelayEventID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new NPCThrowingGrenadeEvent, 5.0 );
+			}
+		}
+		else
+		{
+			m_isThrowingGrenadeToPlayer = false;
+		}
+	}
+
+	protected const function PlayVOOnSquadMembers( isPlayer : Bool )
+	{
+		var smi : SquadScriptInterface;
+		var squadMembersCount : Uint32;
+		var shouldPlayBattlecrySingleEnemy : Bool;
+		shouldPlayBattlecrySingleEnemy = false;
+		if( isPlayer && GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat )
+		{
+			if( AISquadHelper.GetSquadMemberInterface( this, smi ) )
+			{
+				squadMembersCount = smi.GetMembersCount();
+				if( squadMembersCount == ( ( Uint32 )( 2 ) ) )
+				{
+					shouldPlayBattlecrySingleEnemy = true;
+				}
+			}
+			if( !( shouldPlayBattlecrySingleEnemy ) )
+			{
+				ReactionManagerComponent.SendVOEventToSquad( this, 'squad_member_died' );
+			}
+			else
+			{
+				ReactionManagerComponent.SendVOEventToSquad( this, 'battlecry_single_enemy' );
+			}
+		}
+	}
+
+	protected const function PlayVOOnPlayerOrPlayerCompanion( instigator : GameObject )
+	{
+		if( !( instigator ) )
+		{
+			return;
+		}
+		if( ScriptedPuppet.IsPlayerCompanion( instigator ) )
+		{
+			GameObject.PlayVoiceOver( instigator, 'coop_reports_kill', 'Scripts:CheckIfKilledByPlayerCompanion' );
+		}
+		else if( instigator.IsPlayer() && ( ( PlayerPuppet )( instigator ) ).IsInCombat() )
+		{
+			if( AttackData.IsBullet( GetLastHitAttackType() ) )
+			{
+				ReactionManagerComponent.SendVOEventToSquad( instigator, 'coop_praise' );
+			}
+		}
+	}
+
+	protected const function CheckNPCKilledThrowingGrenade( instigator : GameObject )
+	{
+		var achievementRequest : AddAchievementRequest;
+		var dataTrackingSystem : DataTrackingSystem;
+		var achievement : gamedataAchievement;
+		achievement = gamedataAchievement.Denied;
+		if( !( instigator ) || !( m_isThrowingGrenadeToPlayer ) )
+		{
+			return;
+		}
+		if( !( instigator.IsPlayer() ) && !( instigator.IsPlayerControlled() ) )
+		{
+			return;
+		}
+		achievementRequest = new AddAchievementRequest;
+		achievementRequest.achievement = achievement;
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( GetGame() ).Get( 'DataTrackingSystem' ) ) );
+		dataTrackingSystem.QueueRequest( achievementRequest );
+	}
+
+	public function CanGoThroughDoors() : Bool
+	{
+		return m_canGoThroughDoors;
+	}
+
+	protected event OnEnteredPathWithDoors( evt : EnteredPathWithDoors )
+	{
+		m_canGoThroughDoors = true;
+	}
+
+	protected event OnFinishedPathWithDoors( evt : FinishedPathWithDoors )
+	{
+		m_canGoThroughDoors = false;
+	}
+
+	protected event OnEnteredSplineEvent( evt : EnteredSplineEvent )
+	{
+		if( evt.useDoors )
+		{
+			m_canGoThroughDoors = true;
+		}
+	}
+
+	protected event OnExitedSplineEvent( evt : ExitedSplineEvent )
+	{
+		m_canGoThroughDoors = false;
+	}
+
+	public function GetMyKiller() : weak< GameObject >
+	{
+		return m_myKiller;
+	}
+
+	public function GetThreatCalculationType() : EAIThreatCalculationType
+	{
+		if( m_temporaryThreatCalculationType != EAIThreatCalculationType.Regular )
+		{
+			return m_temporaryThreatCalculationType;
+		}
+		return m_primaryThreatCalculationType;
+	}
+
+	public function ReevaluatEAIThreatCalculationType()
+	{
+		if( IsBoss() )
+		{
+			m_primaryThreatCalculationType = EAIThreatCalculationType.Boss;
+		}
+		else
+		{
+			m_primaryThreatCalculationType = EAIThreatCalculationType.Regular;
+		}
+	}
+
+	public static function SetTemporaryThreatCalculationType( npc : weak< GameObject >, newType : EAIThreatCalculationType )
+	{
+		var evt : AIThreatCalculationEvent;
+		if( !( npc ) )
+		{
+			return;
+		}
+		evt = new AIThreatCalculationEvent;
+		evt.set = true;
+		evt.temporaryThreatCalculationType = newType;
+		npc.QueueEvent( evt );
+	}
+
+	public static function RemoveTemporaryThreatCalculationType( npc : weak< GameObject > )
+	{
+		var evt : AIThreatCalculationEvent;
+		if( !( npc ) )
+		{
+			return;
+		}
+		evt = new AIThreatCalculationEvent;
+		evt.set = false;
+		npc.QueueEvent( evt );
+	}
+
+	public static function IsInCombat( npc : weak< ScriptedPuppet > ) : Bool
+	{
+		var currentHighLevelState : gamedataNPCHighLevelState;
+		currentHighLevelState = ( ( gamedataNPCHighLevelState )( npc.GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HighLevel ) ) );
+		if( currentHighLevelState == gamedataNPCHighLevelState.Combat )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsInAlerted( npc : weak< ScriptedPuppet > ) : Bool
+	{
+		var currentHighLevelState : gamedataNPCHighLevelState;
+		currentHighLevelState = ( ( gamedataNPCHighLevelState )( npc.GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HighLevel ) ) );
+		if( currentHighLevelState == gamedataNPCHighLevelState.Alerted )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsUnstoppable( npc : weak< ScriptedPuppet > ) : Bool
+	{
+		var currentHitReactionMode : EHitReactionMode;
+		currentHitReactionMode = ( ( EHitReactionMode )( npc.GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HitReactionMode ) ) );
+		if( currentHitReactionMode == EHitReactionMode.Unstoppable )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsSusceptibleOnlyToStaggerAndHigher( npc : weak< ScriptedPuppet > ) : Bool
+	{
+		var currentHitReactionMode : EHitReactionMode;
+		currentHitReactionMode = ( ( EHitReactionMode )( npc.GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HitReactionMode ) ) );
+		if( currentHitReactionMode == EHitReactionMode.Unstoppable )
+		{
+			return true;
+		}
+		if( currentHitReactionMode == EHitReactionMode.StaggerMin )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected event OnAIThreatCalculationEvent( evt : AIThreatCalculationEvent )
+	{
+		if( evt.set )
+		{
+			m_temporaryThreatCalculationType = evt.temporaryThreatCalculationType;
+		}
+		else
+		{
+			m_temporaryThreatCalculationType = EAIThreatCalculationType.Regular;
+		}
+	}
+
+	public function OnHittingPlayer( playerPuppet : weak< GameObject >, damageInflicted : Float )
+	{
+		var damageInflictedPercent : Float;
+		var playerCurrentHealthPercent : Float;
+		var playerPuppetID : EntityID;
+		var statPoolSys : StatPoolsSystem;
+		var squadmates : array< weak< Entity > >;
+		if( ( ( playerPuppet == NULL ) || ( playerPuppet != GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) ) || ( !( AISquadHelper.GetSquadmates( ( ( ScriptedPuppet )( this ) ), squadmates ) ) && !( IsCrowd() ) ) )
+		{
+			return;
+		}
+		playerPuppetID = playerPuppet.GetEntityID();
+		statPoolSys = GameInstance.GetStatPoolsSystem( GetGame() );
+		damageInflictedPercent = 100.0 * ( damageInflicted / statPoolSys.GetStatPoolMaxPointValue( playerPuppetID, gamedataStatPoolType.Health ) );
+		playerCurrentHealthPercent = statPoolSys.GetStatPoolValue( playerPuppetID, gamedataStatPoolType.Health );
+		if( IsCrowd() )
+		{
+			PlayVoiceOver( this, 'crowd_combat', 'Scripts:NPCPuppet:OnHittingPlayer' );
+		}
+		else
+		{
+			if( playerCurrentHealthPercent <= 50.0 )
+			{
+				PlayVoiceOver( this, 'attack_fragile_player_order', 'Scripts:NPCPuppet:OnHittingPlayer', 0.5 );
+			}
+			if( ( damageInflictedPercent >= 3.0 ) || GameInstance.GetGodModeSystem( GetGame() ).HasGodMode( playerPuppetID, gameGodModeType.Invulnerable ) )
+			{
+				PlayVoiceOver( this, 'combat_target_hit', 'Scripts:NPCPuppet:OnHittingPlayer' );
+			}
+		}
+	}
+
+	protected event OnSmartDespawnRequest( evt : SmartDespawnRequest )
+	{
+		GameInstance.GetDelaySystem( GetGame() ).CancelDelay( smartDespawnDelayID );
+		if( !( GameInstance.GetCameraSystem( GetGame() ).IsInCameraFrustum( this, 2.0, 0.75 ) ) )
+		{
+			despawnTicks += ( ( Uint32 )( 1 ) );
+		}
+		else
+		{
+			despawnTicks = 0;
+		}
+		if( despawnTicks >= ( ( Uint32 )( 5 ) ) )
+		{
+			GameInstance.GetCompanionSystem( GetGame() ).DespawnSubcharacter( GetRecordID() );
+		}
+		else
+		{
+			smartDespawnDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 1.0 );
+		}
+	}
+
+	protected event OnCancelSmartDespawnRequest( evt : CancelSmartDespawnRequest )
+	{
+		GameInstance.GetDelaySystem( GetGame() ).CancelDelay( smartDespawnDelayID );
+	}
+
+	protected event OnUnregisterAggressiveCrowd( evt : UnregisterAggressiveCrowd )
+	{
+		UnregisterAggressiveNPC();
+	}
+
+	public function SetWasAggressiveCrowd( wasAggressive : Bool )
+	{
+		var evaluateRole : Bool;
+		evaluateRole = m_wasAggressiveCrowd != wasAggressive;
+		m_wasAggressiveCrowd = wasAggressive;
+		GetSensesComponent().SetCrowdsAggressiveState( m_wasAggressiveCrowd );
+		if( evaluateRole )
+		{
+			ForceReEvaluateGameplayRole();
+		}
+	}
+
+	public const override function GetWasAggressiveCrowd() : Bool
+	{
+		return m_wasAggressiveCrowd;
+	}
+
+	public function CallUnregisterAggressiveNPC()
+	{
+		var unregisterEvent : UnregisterAggressiveCrowd;
+		unregisterEvent = new UnregisterAggressiveCrowd;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, unregisterEvent, 1.0 );
+	}
+
+	private function UnregisterAggressiveNPC()
+	{
+		GetAIControllerComponent().GetActionBlackboard().SetFloat( GetAllBlackboardDefs().AIAction.avoidLOSTimeStamp, 0.0 );
+		GameInstance.GetReactionSystem( GetGame() ).TryUnregisteringAggressiveNPC( GetEntityID() );
+		SetWasAggressiveCrowd( false );
+		if( IsCrowd() )
+		{
+			GetSensesComponent().SetCrowdsAggressiveState( false );
+			GetSensesComponent().RemoveSenseMappin();
+		}
+		GetSensesComponent().IgnoreLODChange( false );
+		GetSensesComponent().Toggle( false );
+		GetTargetTrackerComponent().ClearThreats();
+		GetTargetTrackerComponent().Toggle( false );
+		GameObject.ChangeAttitudeToNeutral( this, GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() );
+	}
+
+	protected function ForceReEvaluateGameplayRole()
+	{
+		var evt : EvaluateGameplayRoleEvent;
+		evt = new EvaluateGameplayRoleEvent;
+		evt.force = true;
+		QueueEvent( evt );
+	}
+
+}
+
+class StartRagdollDamageEvent extends Event
+{
+}
+
+class SmartBulletDeflectedEvent extends Event
+{
+	var localToWorld : Matrix;
+	var instigator : weak< GameObject >;
+	var weapon : weak< GameObject >;
+}
+
+class AIThreatCalculationEvent extends Event
+{
+	var set : Bool;
+	var temporaryThreatCalculationType : EAIThreatCalculationType;
+}
+
+class SmartDespawnRequest extends Event
+{
+}
+
+class CancelSmartDespawnRequest extends Event
+{
+}
+
+class VehicleHijackEvent extends Event
+{
+}
+
+class ResetVehicleHijackEvent extends Event
+{
+}
+
+class NonStealthQuickHackVictimEvent extends Event
+{
+	var instigatorID : EntityID;
+
+	public static function Create( instigatorID : EntityID ) : NonStealthQuickHackVictimEvent
+	{
+		var evt : NonStealthQuickHackVictimEvent;
+		evt = new NonStealthQuickHackVictimEvent;
+		evt.instigatorID = instigatorID;
+		return evt;
+	}
+
+}
+
+class ResetAttackBlockedBlackBoardValue extends Event
+{
+}
+
+class ResetTimeDilation extends Event
+{
+	var easeOut : CName;
+	var global : Bool;
+}
+
+class UnregisterAggressiveCrowd extends Event
+{
+}
+
+exec function SetAnimFloatOnTarget( gameInstance : GameInstance, floatValue : String )
+{
+	var targetNPC : NPCPuppet;
+	var angleDist : EulerAngles;
+	targetNPC = ( ( NPCPuppet )( GameInstance.GetTargetingSystem( gameInstance ).GetObjectClosestToCrosshair( GameInstance.GetPlayerSystem( gameInstance ).GetLocalPlayerMainGameObject(), angleDist, TSQ_ALL() ) ) );
+	if( targetNPC )
+	{
+		AnimationControllerComponent.SetInputFloat( targetNPC, 'debug_float_a', StringToFloat( floatValue, 0.0 ) );
+	}
+	else
+	{
+		Log( "execSetAnimGraphFloat::: NPC NOT FOUND!!" );
+	}
+}
+

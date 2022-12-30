@@ -1,0 +1,624 @@
+class InteractiveDevice extends Device
+{
+	protected var m_interaction : InteractionComponent;
+	protected var m_interactionIndicator : gameLightComponent;
+	protected var m_disableAreaIndicatorID : DelayID;
+	protected var m_delayedUIRefreshID : DelayID;
+	private var m_isPlayerAround : Bool;
+	protected var m_disableAreaIndicatorDelayActive : Bool;
+	private var m_objectActionsCallbackCtrl : gameObjectActionsCallbackController;
+	private var m_investigationPositionsArray : array< Vector4 >;
+	private var m_actionRestrictionPlayerBB : weak< IBlackboard >;
+	private var m_actionRestrictionCallbackID : CallbackHandle;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		EntityRequestComponentsInterface.RequestComponent( ri, 'interaction', 'gameinteractionsComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'state_indicator_light', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'audio', 'soundComponent', false );
+		super.OnRequestComponents( ri );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_interaction = ( ( InteractionComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'interaction' ) ) );
+		m_interactionIndicator = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'state_indicator_light' ) ) );
+		super.OnTakeControl( ri );
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		DestroyObjectActionsCallbackController();
+		if( m_uiComponent )
+		{
+			UnregisterActionRestrictionCallback();
+		}
+	}
+
+	protected function ToggleDirectLayer( input : Bool )
+	{
+		var evt : InteractionSetEnableEvent;
+		evt = new InteractionSetEnableEvent;
+		evt.enable = input;
+		evt.layer = 'direct';
+		QueueEvent( evt );
+	}
+
+	protected function ToggleLogicLayer( input : Bool )
+	{
+		var evt : InteractionSetEnableEvent;
+		evt = new InteractionSetEnableEvent;
+		evt.enable = input;
+		evt.layer = 'logic';
+		QueueEvent( evt );
+	}
+
+	protected override function DeactivateDevice()
+	{
+		super.DeactivateDevice();
+		m_isPlayerAround = false;
+		if( m_interaction )
+		{
+			m_interaction.Toggle( false );
+		}
+	}
+
+	protected override function ActivateDevice()
+	{
+		if( m_interaction )
+		{
+			m_interaction.Toggle( true );
+		}
+		m_isUIdirty = true;
+		super.ActivateDevice();
+	}
+
+	protected override function CutPower()
+	{
+		m_isPlayerAround = false;
+		super.CutPower();
+	}
+
+	protected override function TurnOnDevice()
+	{
+		if( m_interaction )
+		{
+			m_interaction.Toggle( true );
+		}
+		TurnOnIndicator();
+		super.TurnOnDevice();
+	}
+
+	protected override function TurnOffDevice()
+	{
+		m_isPlayerAround = false;
+		TurnOffIndicator();
+		super.TurnOffDevice();
+	}
+
+	protected override function UpdateDeviceState( optional isDelayed : Bool ) : Bool
+	{
+		if( super.UpdateDeviceState( isDelayed ) )
+		{
+			if( GetDevicePS().HasPlaystyle( EPlaystyle.NETRUNNER ) )
+			{
+				QuickhackModule.RequestRefreshQuickhackMenu( GetGame(), GetEntityID() );
+			}
+			if( !( IsActive() ) )
+			{
+				if( GetDevicePS().IsDistracting() || GetDevicePS().IsGlitching() )
+				{
+					GetDevicePS().FinishDistraction();
+				}
+			}
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected virtual function TurnOnIndicator()
+	{
+		if( m_interactionIndicator )
+		{
+			m_interactionIndicator.ToggleLight( true );
+		}
+	}
+
+	protected virtual function TurnOffIndicator()
+	{
+		if( m_interactionIndicator )
+		{
+			m_interactionIndicator.ToggleLight( false );
+		}
+	}
+
+	public const override function IsPlayerAround() : Bool
+	{
+		return m_isPlayerAround;
+	}
+
+	protected event OnInteractionActivated( evt : InteractionActivationEvent )
+	{
+		var requestType : gamedeviceRequestType;
+		var processInitiatorObject : weak< GameObject >;
+		var generatedContext : GetActionsContext;
+		var radialRequest : ResolveQuickHackRadialRequest;
+		if( GetDevicePS().GetDeviceOperationsContainer() != NULL )
+		{
+			GetDevicePS().GetDeviceOperationsContainer().EvaluateInteractionAreaTriggers( evt.layerData.tag, this, evt.activator, evt.eventType );
+		}
+		if( !( ( ( PlayerPuppet )( evt.activator ) ) ) && !( ( ( Muppet )( evt.activator ) ) ) )
+		{
+			return false;
+		}
+		EstimateIfPlayerEntersOrLeaves( evt );
+		if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate )
+		{
+			if( evt.layerData.tag == 'LogicArea' )
+			{
+				m_isInsideLogicArea = true;
+				if( IsVisible() )
+				{
+					RefreshUI();
+				}
+				EvaluateProximityMappinInteractionLayerState();
+				EvaluateProximityRevealInteractionLayerState();
+				if( m_uiComponent && IsGameplayRelevant() )
+				{
+					RegisterActionRestrictionCallback();
+				}
+			}
+			if( evt.layerData.tag == 'direct' )
+			{
+				requestType = gamedeviceRequestType.Direct;
+				processInitiatorObject = evt.activator;
+				GetDevicePS().AddActiveContext( gamedeviceRequestType.Direct );
+				if( ( ( Door )( evt.hotspot ) ) )
+				{
+					SetIsDoorInteractionActiveBB( evt, true );
+				}
+				CreateObjectActionsCallbackController( evt.activator );
+				if( IsUIdirty() )
+				{
+					RefreshUI();
+				}
+			}
+			if( evt.layerData.tag == 'ForceReveal' )
+			{
+				StartRevealingOnProximity();
+			}
+			if( evt.layerData.tag == 'ForceShowIcon' )
+			{
+				ShowMappinOnProximity();
+			}
+			RequestDebuggerRegistration( ( ( ScriptedPuppet )( evt.activator ) ) );
+			if( requestType == gamedeviceRequestType.Direct || requestType == gamedeviceRequestType.Remote )
+			{
+				generatedContext = ( ( ScriptableDeviceComponentPS )( GetDevicePS() ) ).GenerateContext( requestType, GetInteractionClearance(), processInitiatorObject );
+				DetermineInteractionStateByTask( generatedContext );
+			}
+		}
+		else
+		{
+			if( m_interaction )
+			{
+				m_interaction.ResetChoices( '', true );
+			}
+			if( evt.layerData.tag == 'LogicArea' )
+			{
+				ResolveGameplayObjectives( false );
+				m_isInsideLogicArea = false;
+				if( m_uiComponent )
+				{
+					UnregisterActionRestrictionCallback();
+				}
+			}
+			if( evt.layerData.tag == 'direct' )
+			{
+				DestroyObjectActionsCallbackController();
+				GetDevicePS().RemoveActiveContext( gamedeviceRequestType.Direct );
+				if( ( ( Door )( evt.hotspot ) ) )
+				{
+					SetIsDoorInteractionActiveBB( evt, false );
+				}
+			}
+			if( evt.layerData.tag == 'ForceReveal' )
+			{
+				StopRevealingOnProximity( GetRevealOnProximityStopLifetimeValue() );
+			}
+			if( evt.layerData.tag == 'ForceShowIcon' )
+			{
+				HideMappinOnProximity();
+			}
+		}
+		radialRequest = new ResolveQuickHackRadialRequest;
+		GetHudManager().QueueRequest( radialRequest );
+		if( !( IsFinal() ) )
+		{
+			UpdateDebugInfo();
+		}
+	}
+
+	protected override function OnVisibilityChanged()
+	{
+		if( IsReadyForUI() && IsUIdirty() )
+		{
+			RefreshUI();
+		}
+	}
+
+	protected event OnLogicReady( evt : SetLogicReadyEvent )
+	{
+		super.OnLogicReady( evt );
+		if( IsPotentiallyQuickHackable() )
+		{
+			m_investigationPositionsArray = GetNodePosition();
+		}
+	}
+
+	protected const override function GetCachedInvestigationPositionsArray() : array< Vector4 >
+	{
+		return m_investigationPositionsArray;
+	}
+
+	protected override function SetInvestigationPositionsArray( arr : array< Vector4 > )
+	{
+		m_investigationPositionsArray = arr;
+	}
+
+	protected const override function HasInvestigationPositionsArrayCached() : Bool
+	{
+		return m_investigationPositionsArray.Size() > 0;
+	}
+
+	protected virtual function SetIsDoorInteractionActiveBB( evt : InteractionActivationEvent, isActive : Bool )
+	{
+		var playerSMBlackboard : IBlackboard;
+		playerSMBlackboard = GetPlayerStateMachineBB( evt.activator );
+		playerSMBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsDoorInteractionActive, isActive );
+	}
+
+	private function GetPlayerStateMachineBB( requester : GameObject ) : IBlackboard
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerPuppet : PlayerPuppet;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( requester.GetGame() ).GetLocalPlayerMainGameObject() ) );
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( requester.GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return playerStateMachineBlackboard;
+	}
+
+	protected event OnInteractionUsed( evt : InteractionChoiceEvent )
+	{
+		ExecuteAction( evt.choice, evt.activator, evt.layerData.tag );
+	}
+
+	protected event OnPerformedAction( evt : PerformedAction )
+	{
+		var currentContext : GetActionsContext;
+		var sDeviceAction : ScriptableDeviceAction;
+		super.OnPerformedAction( evt );
+		sDeviceAction = ( ( ScriptableDeviceAction )( evt.m_action ) );
+		if( ( sDeviceAction && GetDevicePS().HasActiveContext( gamedeviceRequestType.Direct ) ) || GetDevicePS().HasActiveContext( gamedeviceRequestType.Remote ) )
+		{
+			currentContext = ( ( ScriptableDeviceComponentPS )( GetDevicePS() ) ).GenerateContext( sDeviceAction.GetRequestType(), GetInteractionClearance(), sDeviceAction.GetExecutor() );
+			DetermineInteractionStateByTask( currentContext );
+		}
+	}
+
+	protected function RefreshInteraction( requestType : gamedeviceRequestType, executor : weak< GameObject > )
+	{
+		var taskData : RefreshInteractionTaskData;
+		taskData = new RefreshInteractionTaskData;
+		taskData.requestType = requestType;
+		taskData.executor = executor;
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, taskData, 'RefreshInteractionTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function RefreshInteractionTask( data : ScriptTaskData )
+	{
+		var currentContext : GetActionsContext;
+		var taskData : RefreshInteractionTaskData;
+		taskData = ( ( RefreshInteractionTaskData )( data ) );
+		currentContext = GetDevicePS().GenerateContext( taskData.requestType, GetInteractionClearance(), taskData.executor );
+		DetermineInteractionState( currentContext );
+	}
+
+	private function EstimateIfPlayerEntersOrLeaves( evt : InteractionActivationEvent )
+	{
+		if( evt.layerData.tag != 'LogicArea' )
+		{
+			return;
+		}
+		if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate )
+		{
+			m_isPlayerAround = true;
+		}
+		else
+		{
+			m_isPlayerAround = false;
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var playerPuppet : PlayerPuppet;
+		if( ListenerAction.GetName( action ) == 'UI_Exit' )
+		{
+			playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+			SetZoomBlackboardValues( false, 0.5 );
+			RemoveHudButtonHelper();
+			RegisterPlayerInputListener( false );
+			ToggleCameraZoom( false );
+			GetDevicePS().SetAdvancedInteractionModeOn( false );
+			RefreshInteraction( gamedeviceRequestType.Direct, playerPuppet );
+		}
+	}
+
+	protected event OnUIRefreshedEvent( evt : UIRefreshedEvent )
+	{
+		m_isUIdirty = false;
+	}
+
+	protected event OnUIUnstreamedEvent( evt : UIUnstreamedEvent )
+	{
+		m_isUIdirty = true;
+	}
+
+	protected override function RefreshUI( optional isDelayed : Bool )
+	{
+		var evt : DelayedUIRefreshEvent;
+		if( m_uiComponent )
+		{
+			if( m_delayedUIRefreshID != GetInvalidDelayID() )
+			{
+				return;
+			}
+			else if( isDelayed )
+			{
+				evt = new DelayedUIRefreshEvent;
+				m_delayedUIRefreshID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 0.1, false );
+			}
+			else
+			{
+				GetDevicePS().RefreshUI( GetBlackboard() );
+			}
+		}
+	}
+
+	protected event OnForceUIRefreshEvent( evt : ForceUIRefreshEvent )
+	{
+		RefreshUI();
+	}
+
+	protected event OnDelayedUIRefreshEvent( evt : DelayedUIRefreshEvent )
+	{
+		m_delayedUIRefreshID = GetInvalidDelayID();
+		m_isUIdirty = false;
+		GetDevicePS().RefreshUI( GetBlackboard() );
+	}
+
+	public const override function IsReadyForUI() : Bool
+	{
+		return ( m_isVisible && m_isInsideLogicArea ) || GetDevicePS().ForceResolveGameplayStateOnAttach();
+	}
+
+	protected override function DetermineInteractionState( optional context : GetActionsContext )
+	{
+		var player : GameObject;
+		var currentlyUsedContext : GetActionsContext;
+		player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject();
+		if( context.requestType == gamedeviceRequestType.Direct || context.requestType == gamedeviceRequestType.Remote )
+		{
+			currentlyUsedContext = context;
+			if( currentlyUsedContext.processInitiatorObject == NULL )
+			{
+				currentlyUsedContext.processInitiatorObject = player;
+			}
+		}
+		else if( GetDevicePS().HasActiveContext( gamedeviceRequestType.Remote ) )
+		{
+			currentlyUsedContext = GetDevicePS().GenerateContext( gamedeviceRequestType.Remote, GetInteractionClearance(), player, GetEntityID() );
+		}
+		else
+		{
+			currentlyUsedContext = GetDevicePS().GenerateContext( gamedeviceRequestType.Direct, GetInteractionClearance(), player, GetEntityID() );
+		}
+		GetDevicePS().DetermineInteractionState( m_interaction, currentlyUsedContext );
+	}
+
+	protected override function ResetChoicesByEvent()
+	{
+		var evt : InteractionResetChoicesEvent;
+		evt = new InteractionResetChoicesEvent;
+		QueueEvent( evt );
+	}
+
+	protected event OnToggleUIInteractivity( evt : ToggleUIInteractivity )
+	{
+		super.OnToggleUIInteractivity( evt );
+		ToggleDirectLayer( evt.m_isInteractive );
+	}
+
+	protected virtual function StartUsing() {}
+
+	protected virtual function StopUsing() {}
+
+	private function RequestDebuggerRegistration( activator : ScriptedPuppet )
+	{
+		if( !( activator ) )
+		{
+			return;
+		}
+		if( ShouldInitiateDebug() )
+		{
+			ScriptedPuppet.RequestDeviceDebug( activator, this );
+		}
+	}
+
+	private function UpdateDebugInfo()
+	{
+		var i : Int32;
+		for( i = 0; i < m_debugOptions.m_layerIDs.Size(); i += 1 )
+		{
+			GameInstance.GetDebugVisualizerSystem( GetGame() ).ClearLayer( m_debugOptions.m_layerIDs[ i ] );
+			m_debugOptions.m_layerIDs.Clear();
+		}
+		if( ShouldInitiateDebug() )
+		{
+			PrintWorldSpaceDebug();
+		}
+	}
+
+	private function PrintWorldSpaceDebug()
+	{
+		var interactionPositionMatrix : Matrix;
+		var position : Vector4;
+		if( m_interaction )
+		{
+			interactionPositionMatrix = m_interaction.GetLocalToWorld();
+			position = Matrix.GetTranslation( interactionPositionMatrix );
+			m_debugOptions.m_layerIDs.PushBack( GameInstance.GetDebugVisualizerSystem( GetGame() ).DrawText3D( position, "TO DO", SColor.Red() ) );
+		}
+	}
+
+	public const override function GetNetworkBeamEndpoint() : Vector4
+	{
+		var beamPos : Vector4;
+		var transform : WorldTransform;
+		var offset : Vector4;
+		if( !( GetUISlotComponent().GetSlotTransform( 'NetworkLink', transform ) ) )
+		{
+			WorldTransform.SetPosition( transform, GetWorldPosition() );
+			WorldTransform.SetOrientation( transform, GetWorldOrientation() );
+			if( m_interaction )
+			{
+				offset = m_interaction.GetLocalPosition() + m_networkGridBeamOffset;
+			}
+			beamPos = WorldPosition.ToVector4( WorldTransform.TransformPoint( transform, offset ) );
+		}
+		else
+		{
+			beamPos = super.GetNetworkBeamEndpoint();
+		}
+		return beamPos;
+	}
+
+	protected const override function HasAnyDirectInteractionActive() : Bool
+	{
+		var player : GameObject;
+		var currentlyUsedContext : GetActionsContext;
+		var actions : array< DeviceAction >;
+		player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject();
+		currentlyUsedContext = GetDevicePS().GenerateContext( gamedeviceRequestType.Direct, GetInteractionClearance(), player, GetEntityID() );
+		GetDevicePS().GetActions( actions, currentlyUsedContext );
+		return actions.Size() > 0;
+	}
+
+	protected event OnEMPHitEvent( evt : EMPHitEvent )
+	{
+		var empEnded : EMPEnded;
+		if( IsActive() )
+		{
+			GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.Start, 'emp_hit' );
+			ExecuteAction( GetDevicePS().ActionSetDeviceUnpowered() );
+			empEnded = new EMPEnded;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, empEnded, evt.lifetime );
+		}
+	}
+
+	protected event OnEMPEnded( evt : EMPEnded )
+	{
+		GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.BreakLoop, 'emp_hit' );
+		ExecuteAction( GetDevicePS().ActionSetDevicePowered() );
+	}
+
+	protected event OnSetUICameraZoomEvent( evt : SetUICameraZoomEvent )
+	{
+		var action : DeviceAction;
+		if( !( GetDevicePS().AllowsUICameraZoomDynamicSwitch() ) )
+		{
+			return false;
+		}
+		if( GetDevicePS().HasUICameraZoom() != evt.hasUICameraZoom )
+		{
+			if( !( evt.hasUICameraZoom ) && GetDevicePS().IsAdvancedInteractionModeOn() )
+			{
+				action = GetDevicePS().ActionToggleZoomInteraction();
+				ExecuteAction( action, GetPlayer( GetGame() ) );
+			}
+			GetDevicePS().SetHasUICameraZoom( evt.hasUICameraZoom );
+			DetermineInteractionStateByTask();
+		}
+	}
+
+	private function CreateObjectActionsCallbackController( instigator : weak< Entity > )
+	{
+		m_objectActionsCallbackCtrl = gameObjectActionsCallbackController.Create( EntityGameInterface.GetEntity( GetEntity() ), instigator, GetGame() );
+		m_objectActionsCallbackCtrl.RegisterSkillCheckCallbacks();
+	}
+
+	private function DestroyObjectActionsCallbackController()
+	{
+		m_objectActionsCallbackCtrl.UnregisterSkillCheckCallbacks();
+		m_objectActionsCallbackCtrl = NULL;
+	}
+
+	protected event OnObjectActionRefreshEvent( evt : gameObjectActionRefreshEvent )
+	{
+		if( m_objectActionsCallbackCtrl )
+		{
+			m_objectActionsCallbackCtrl.UnlockNotifications();
+			DetermineInteractionStateByTask();
+		}
+	}
+
+	private function RegisterActionRestrictionCallback()
+	{
+		m_actionRestrictionPlayerBB = GetPlayer( GetGame() ).GetPlayerStateMachineBlackboard();
+		m_actionRestrictionCallbackID = m_actionRestrictionPlayerBB.RegisterListenerVariant( GetAllBlackboardDefs().PlayerStateMachine.ActionRestriction, this, 'OnActionRestrictionChanged' );
+	}
+
+	private function UnregisterActionRestrictionCallback()
+	{
+		if( m_actionRestrictionCallbackID )
+		{
+			if( m_actionRestrictionPlayerBB )
+			{
+				m_actionRestrictionPlayerBB.UnregisterListenerVariant( GetAllBlackboardDefs().PlayerStateMachine.ActionRestriction, m_actionRestrictionCallbackID );
+			}
+			m_actionRestrictionPlayerBB = NULL;
+			m_actionRestrictionCallbackID = NULL;
+		}
+	}
+
+	protected event OnActionRestrictionChanged( value : Variant )
+	{
+		m_isUIdirty = true;
+		if( GetDevicePS().IsInDirectInteractionRange() )
+		{
+			DetermineInteractionStateByTask();
+			RefreshUI();
+		}
+		else if( IsReadyForUI() )
+		{
+			RefreshUI();
+		}
+	}
+
+}
+
+class RefreshInteractionTaskData extends ScriptTaskData
+{
+	var requestType : gamedeviceRequestType;
+	var executor : weak< GameObject >;
+}
+
+class DetermineInteractionStateTaskData extends ScriptTaskData
+{
+	var context : GetActionsContext;
+}
+

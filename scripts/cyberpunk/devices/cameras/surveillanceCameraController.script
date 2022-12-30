@@ -1,0 +1,637 @@
+class SurveillanceCameraController extends SensorDeviceController
+{
+
+	public const override function GetPS() : SurveillanceCameraControllerPS
+	{
+		return ( ( SurveillanceCameraControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+struct CameraSetup
+{
+	instanceeditable var m_canStreamVideo : Bool;
+	default m_canStreamVideo = false;
+}
+
+struct CameraQuestProperties
+{
+	var m_factOnFeedReceived : CName;
+	instanceeditable var m_questFactOnDetection : CName;
+	persistent var m_isInFollowMode : Bool;
+	persistent var m_followedTargetID : EntityID;
+}
+
+class SurveillanceCameraControllerPS extends SensorDeviceControllerPS
+{
+	default m_deviceName = "LocKey#100";
+	default m_canPlayerTakeOverControl = true;
+	default m_canBeInDeviceChain = true;
+	default m_tweakDBRecord = T"Devices.SurveillanceCamera";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.SurveillanceCamera";
+	default m_lookAtPresetVert = T"LookatPreset.CameraVertical";
+	default m_lookAtPresetHor = T"LookatPreset.CameraHorizontal";
+	private instanceeditable persistent var m_cameraProperties : CameraSetup;
+	private instanceeditable persistent var m_cameraQuestProperties : CameraQuestProperties;
+	private persistent var m_cameraState : ESurveillanceCameraStatus;
+	private persistent var m_shouldStream : Bool;
+	default m_shouldStream = false;
+	private var m_isDetecting : Bool;
+	private persistent var m_feedReceivers : array< EntityID >;
+	private persistent var m_mostRecentRequester : EntityID;
+	private var m_virtualComponentName : CName;
+	private persistent var m_isFeedReplacedWithBink : Bool;
+	private var m_binkVideoPath : ResRef;
+	private persistent var m_shouldRevealEnemies : Bool;
+	private instanceeditable inlined var m_cameraSkillChecks : EngDemoContainer;
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+		if( !( IsStringValid( m_deviceName ) ) )
+		{
+			m_deviceName = "Gameplay-Devices-DisplayNames-SurveillanceCamera";
+		}
+	}
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+	}
+
+	protected override function LogicReady()
+	{
+		super.LogicReady();
+		InitializeSkillChecks( m_cameraSkillChecks, false );
+	}
+
+	public export function PushResaveData( data : SurveillanceCameraResaveData ) {}
+
+	public const function GetCameraState() : ESurveillanceCameraStatus
+	{
+		return m_cameraState;
+	}
+
+	protected override function DetermineGameplayViability( context : GetActionsContext, hasActiveActions : Bool ) : Bool
+	{
+		return SurveillanceCameraViabilityInterpreter.Evaluate( this, hasActiveActions );
+	}
+
+	public function ForceRevealEnemies( reveal : Bool )
+	{
+		m_shouldRevealEnemies = reveal;
+	}
+
+	public const function ShouldRevealEnemies() : Bool
+	{
+		return m_shouldRevealEnemies;
+	}
+
+	public function GetQuestFactOnDetection() : CName
+	{
+		return m_cameraQuestProperties.m_questFactOnDetection;
+	}
+
+	public const override function GetDeviceStatusAction() : SurveillanceCameraStatus
+	{
+		return ActionSurveillanceCameraStatus();
+	}
+
+	private const function ActionSurveillanceCameraStatus() : SurveillanceCameraStatus
+	{
+		var action : SurveillanceCameraStatus;
+		action = new SurveillanceCameraStatus;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetStatusClearance();
+		action.SetUp( this );
+		action.SetProperties( this );
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	private function ActionToggleStreamFeed( shouldStream : Bool ) : ToggleStreamFeed
+	{
+		var action : ToggleStreamFeed;
+		action = new ToggleStreamFeed;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleStreamFeedClearance();
+		action.SetUp( this );
+		action.SetProperties( shouldStream );
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	private virtual function ActionCameraTagSeenEnemies() : CameraTagSeenEnemies
+	{
+		var action : CameraTagSeenEnemies;
+		action = new CameraTagSeenEnemies;
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		action.CreateInteraction();
+		return action;
+	}
+
+	private function ActionQuestForceReplaceStreamWithVideo() : QuestForceReplaceStreamWithVideo
+	{
+		var action : QuestForceReplaceStreamWithVideo;
+		action = new QuestForceReplaceStreamWithVideo;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties( 'binkPathNotProvied' );
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	private function ActionQuestForceStopReplacingStream() : QuestForceStopReplacingStream
+	{
+		var action : QuestForceStopReplacingStream;
+		action = new QuestForceStopReplacingStream;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public override function GetActions( out actions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		if( !( super.GetActions( actions, context ) ) )
+		{
+			return false;
+		}
+		if( SurveillanceCameraStatus.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionSurveillanceCameraStatus() );
+		}
+		if( TogglePower.IsDefaultConditionMet( this, context ) && context.requestType == gamedeviceRequestType.External )
+		{
+			actions.PushBack( ActionTogglePower() );
+		}
+		if( ToggleON.IsDefaultConditionMet( this, context ) && ( context.requestType != gamedeviceRequestType.Direct && context.requestType != gamedeviceRequestType.Remote ) )
+		{
+			actions.PushBack( ActionToggleON() );
+		}
+		if( ToggleTakeOverControl.IsDefaultConditionMet( this, context ) && context.requestType == gamedeviceRequestType.External )
+		{
+			actions.PushBack( ActionToggleTakeOverControl() );
+		}
+		if( ToggleStreamFeed.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionToggleStreamFeed( IsRequesterOnTheList( context.requestorID ) ) );
+		}
+		SetActionIllegality( actions, m_illegalActions.regularActions );
+		return true;
+	}
+
+	protected const override function CanCreateAnyQuickHackActions() : Bool
+	{
+		return true;
+	}
+
+	protected override function GetQuickHackActions( out actions : array< DeviceAction >, context : GetActionsContext )
+	{
+		var currentAction : ScriptableDeviceAction;
+		if( GetDurabilityState() == EDeviceDurabilityState.NOMINAL )
+		{
+			super.GetQuickHackActions( actions, context );
+			currentAction = ActionToggleTakeOverControl();
+			currentAction.SetObjectActionID( T"DeviceAction.TakeControlCameraClassHack" );
+			currentAction.SetInactiveWithReason( m_canPlayerTakeOverControl && GetDurabilityState() == EDeviceDurabilityState.NOMINAL, "LocKey#7004" );
+			currentAction.SetInactiveWithReason( !( PlayerPuppet.IsSwimming( GetPlayer( GetGameInstance() ) ) ), "LocKey#7003" );
+			currentAction.SetInactiveWithReason( PlayerPuppet.GetSceneTier( GetPlayer( GetGameInstance() ) ) <= ( ( Int32 )( gamePSMHighLevel.SceneTier1 ) ), "LocKey#7003" );
+			actions.PushBack( currentAction );
+			currentAction = ActionForceIgnoreTargets();
+			currentAction.SetObjectActionID( T"DeviceAction.OverrideAttitudeClassHack" );
+			currentAction.SetInactiveWithReason( IsON(), "LocKey#7005" );
+			currentAction.SetInactiveWithReason( GetBehaviourCanDetectIntruders(), "LocKey#7007" );
+			currentAction.SetInactiveWithReason( IsAttitudeFromContextHostile(), "LocKey#7008" );
+			actions.PushBack( currentAction );
+			currentAction = ActionQuickHackToggleON();
+			currentAction.SetObjectActionID( T"DeviceAction.ToggleStateClassHack" );
+			actions.PushBack( currentAction );
+		}
+		FinalizeGetQuickHackActions( actions, context );
+	}
+
+	protected override function GetMinigameActions( out actions : array< DeviceAction >, context : GetActionsContext )
+	{
+		var action : ScriptableDeviceAction;
+		action = ActionProgramSetDeviceOff();
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( this );
+		action.AddDeviceName( m_deviceName );
+		actions.PushBack( action );
+		action = ActionProgramSetDeviceAttitude();
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( this );
+		action.AddDeviceName( m_deviceName );
+		actions.PushBack( action );
+	}
+
+	public override function GetQuestActionByName( actionName : CName ) : DeviceAction
+	{
+		var action : DeviceAction;
+		action = super.GetQuestActionByName( actionName );
+		if( action == NULL )
+		{
+			switch( actionName )
+			{
+				case 'QuestForceReplaceStreamWithVideo':
+					action = ActionQuestForceReplaceStreamWithVideo();
+				break;
+				case 'QuestForceStopReplacingStream':
+					action = ActionQuestForceStopReplacingStream();
+				break;
+				case 'QuestForceTakeControlOverCamera':
+					action = ActionQuestForceTakeControlOverCamera();
+				break;
+				case 'QuestForceTakeControlOverCameraWithChain':
+					action = ActionQuestForceTakeControlOverCameraWithChain();
+				break;
+				case 'QuestFollowTarget':
+					action = ActionQuestFollowTarget();
+				break;
+				case 'QuestStopFollowingTarget':
+					action = ActionQuestStopFollowingTarget();
+				break;
+				case 'QuestLookAtTarget':
+					action = ActionQuestLookAtTarget();
+				break;
+				case 'QuestStopLookAtTarget':
+					action = ActionQuestStopLookAtTarget();
+				break;
+				case 'QuestSetDetectionToTrue':
+					action = ActionQuestSetDetectionToTrue();
+				break;
+				case 'QuestSetDetectionToFalse':
+					action = ActionQuestSetDetectionToFalse();
+				break;
+				case 'QuestForceAttitude':
+					action = ActionQuestForceAttitude();
+				break;
+				case 'QuestSpotTargetReference':
+					action = ActionQuestSpotTargetReference();
+				break;
+				case 'QuestForceScanEffect':
+					action = ActionQuestForceScanEffect();
+				break;
+				case 'QuestForceScanEffectStop':
+					action = ActionQuestForceScanEffectStop();
+				break;
+			}
+		}
+		return action;
+	}
+
+	protected override function GetQuestActions( out actions : array< DeviceAction >, context : GetActionsContext )
+	{
+		super.GetQuestActions( actions, context );
+		actions.PushBack( ActionQuestForceReplaceStreamWithVideo() );
+		actions.PushBack( ActionQuestForceStopReplacingStream() );
+		actions.PushBack( ActionQuestForceTakeControlOverCamera() );
+		actions.PushBack( ActionQuestForceTakeControlOverCameraWithChain() );
+		actions.PushBack( ActionQuestForceStopTakeControlOverCamera() );
+		actions.PushBack( ActionQuestFollowTarget() );
+		actions.PushBack( ActionQuestStopFollowingTarget() );
+		actions.PushBack( ActionQuestLookAtTarget() );
+		actions.PushBack( ActionQuestStopLookAtTarget() );
+		actions.PushBack( ActionQuestSetDetectionToTrue() );
+		actions.PushBack( ActionQuestSetDetectionToFalse() );
+		actions.PushBack( ActionQuestForceAttitude() );
+		actions.PushBack( ActionQuestSpotTargetReference() );
+		actions.PushBack( ActionQuestForceScanEffect() );
+		actions.PushBack( ActionQuestForceScanEffectStop() );
+	}
+
+	public function OnToggleStreamFeed( evt : ToggleStreamFeed ) : EntityNotificationType
+	{
+		if( m_deviceState != EDeviceStatus.ON || !( m_cameraProperties.m_canStreamVideo ) )
+		{
+			m_shouldStream = false;
+			return SendActionFailedEvent( evt, evt.GetRequesterID() );
+		}
+		m_mostRecentRequester = evt.GetRequesterID();
+		HandleFeedReceiversArray( !( ( ( Bool )evt.prop.first ) ), evt.vRoomFake );
+		if( m_feedReceivers.Size() > 0 )
+		{
+			m_shouldStream = true;
+			if( ( ( Int32 )( m_cameraState ) ) < 2 )
+			{
+				m_cameraState = ESurveillanceCameraStatus.STREAMING;
+			}
+		}
+		else
+		{
+			m_shouldStream = false;
+			if( ( ( Int32 )( m_cameraState ) ) < 2 )
+			{
+				m_cameraState = ESurveillanceCameraStatus.WORKING;
+			}
+		}
+		evt.prop.first = m_shouldStream;
+		UseNotifier( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public export override function OnToggleON( evt : ToggleON ) : EntityNotificationType
+	{
+		super.OnToggleON( evt );
+		if( !( IsON() ) )
+		{
+			m_shouldStream = false;
+		}
+		else
+		{
+			if( ( ( Int32 )( m_cameraState ) ) < 2 )
+			{
+				m_cameraState = ESurveillanceCameraStatus.WORKING;
+			}
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public function OnQuestForceReplaceStreamWithVideo( evt : QuestForceReplaceStreamWithVideo ) : EntityNotificationType
+	{
+		var cachedStatus : SurveillanceCameraStatus;
+		cachedStatus = ( ( SurveillanceCameraStatus )( GetDeviceStatusAction() ) );
+		m_isFeedReplacedWithBink = true;
+		if( IsNameValid( ( ( CName )evt.prop.first ) ) )
+		{
+			m_binkVideoPath = ResRef.FromHash( ( ( Uint64 )evt.prop.first ) );
+		}
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function OnQuestForceStopReplacingStream( evt : QuestForceStopReplacingStream ) : EntityNotificationType
+	{
+		var i : Int32;
+		var binkEvent : BinkVideoEvent;
+		m_isFeedReplacedWithBink = false;
+		binkEvent = new BinkVideoEvent;
+		binkEvent.shouldPlay = false;
+		for( i = 0; i < m_feedReceivers.Size(); i += 1 )
+		{
+			GetPersistencySystem().QueueEntityEvent( m_feedReceivers[ i ], binkEvent );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function OnCameraTagSeenEnemies( evt : CameraTagSeenEnemies ) : EntityNotificationType
+	{
+		m_canTagEnemies = true;
+		SetIsIdleForced( true );
+		UseNotifier( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDeviceAttitude( evt : SetDeviceAttitude ) : EntityNotificationType
+	{
+		ExecutePSAction( ActionCameraTagSeenEnemies() );
+		super.OnSetDeviceAttitude( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function HandleFeedReceiversArray( shouldAdd : Bool, hasHack : Bool )
+	{
+		var toSendEvent : Event;
+		var hackEvent : VRoomFeed;
+		var feedEvent : FeedEvent;
+		var binkEvent : BinkVideoEvent;
+		if( hasHack )
+		{
+			hackEvent = new VRoomFeed;
+			hackEvent.On = shouldAdd;
+			toSendEvent = hackEvent;
+		}
+		else
+		{
+			feedEvent = new FeedEvent;
+			feedEvent.On = shouldAdd;
+			feedEvent.virtualComponentName = m_virtualComponentName;
+			toSendEvent = feedEvent;
+		}
+		if( shouldAdd )
+		{
+			m_feedReceivers.PushBack( m_mostRecentRequester );
+		}
+		else
+		{
+			m_feedReceivers.Remove( m_mostRecentRequester );
+		}
+		GetPersistencySystem().QueueEntityEvent( m_mostRecentRequester, toSendEvent );
+		if( m_isFeedReplacedWithBink )
+		{
+			binkEvent = new BinkVideoEvent;
+			binkEvent.path = m_binkVideoPath;
+			binkEvent.shouldPlay = shouldAdd;
+			GetPersistencySystem().QueueEntityEvent( m_mostRecentRequester, binkEvent );
+		}
+	}
+
+	private function IsRequesterOnTheList( requester : EntityID ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_feedReceivers.Size(); i += 1 )
+		{
+			if( m_feedReceivers[ i ] == requester )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function GetMostRecentRequester() : EntityID
+	{
+		return m_mostRecentRequester;
+	}
+
+	public const function GetFeedReceiversArray() : array< EntityID >
+	{
+		return m_feedReceivers;
+	}
+
+	public const function ShouldStream() : Bool
+	{
+		return m_shouldStream;
+	}
+
+	public const function GetfollowedTargetID() : EntityID
+	{
+		return m_cameraQuestProperties.m_followedTargetID;
+	}
+
+	public quest const function IsStreaming() : Bool
+	{
+		if( m_deviceState == EDeviceStatus.ON )
+		{
+			if( m_cameraState == ESurveillanceCameraStatus.STREAMING )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public quest const function IsDetecting() : Bool
+	{
+		return m_isDetecting;
+	}
+
+	public const override function IsDetectingDebug() : Bool
+	{
+		return m_isDetecting;
+	}
+
+	public const override function GetVirtualSystemType() : EVirtualSystem
+	{
+		return EVirtualSystem.SurveillanceSystem;
+	}
+
+	public override function GetWidgetTypeName() : CName
+	{
+		return 'GenericDeviceWidget';
+	}
+
+	public override function GetDeviceIconPath() : String
+	{
+		return "base/gameplay/gui/brushes/devices/icon_camera.widgetbrush";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.CameraDeviceBackground";
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.CameraDeviceIcon";
+	}
+
+	public override function GetDeviceWidget( context : GetActionsContext ) : SDeviceWidgetPackage
+	{
+		var widgetData : SDeviceWidgetPackage;
+		widgetData = super.GetDeviceWidget( context );
+		if( m_cameraState == ESurveillanceCameraStatus.THREAT )
+		{
+			widgetData.widgetState = EWidgetState.LOCKED;
+		}
+		return widgetData;
+	}
+
+	public function ClearFeedReceivers()
+	{
+		var i : Int32;
+		var feedEvent : FeedEvent;
+		feedEvent = new FeedEvent;
+		feedEvent.On = false;
+		for( i = 0; i < m_feedReceivers.Size(); i += 1 )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( m_feedReceivers[ i ], feedEvent );
+		}
+		m_feedReceivers.Clear();
+	}
+
+	public function CanStreamVideo() : Bool
+	{
+		return m_cameraProperties.m_canStreamVideo;
+	}
+
+	public function ThreatDetected( isDetected : Bool )
+	{
+		if( m_isDetecting != isDetected )
+		{
+			RefreshPS();
+		}
+		m_isDetecting = isDetected;
+		if( isDetected )
+		{
+			m_cameraState = ESurveillanceCameraStatus.THREAT;
+		}
+		else
+		{
+			if( m_shouldStream )
+			{
+				m_cameraState = ESurveillanceCameraStatus.STREAMING;
+			}
+			else if( IsON() )
+			{
+				m_cameraState = ESurveillanceCameraStatus.WORKING;
+			}
+		}
+	}
+
+	protected export override function OnTCSTakeOverControlDeactivate( evt : TCSTakeOverControlDeactivate ) : EntityNotificationType
+	{
+		var returnType : EntityNotificationType;
+		returnType = super.OnTCSTakeOverControlDeactivate( evt );
+		if( m_wasStateCached )
+		{
+			if( m_cachedDeviceState == EDeviceStatus.OFF )
+			{
+				ExecutePSAction( ActionSetDeviceOFF() );
+			}
+		}
+		return returnType;
+	}
+
+	public function GetFakeToggleStreamAction( startStream : Bool, whoIsReceiving : EntityID ) : ToggleStreamFeed
+	{
+		var toggleStreamAction : ToggleStreamFeed;
+		toggleStreamAction = ActionToggleStreamFeed( !( startStream ) );
+		toggleStreamAction.vRoomFake = true;
+		toggleStreamAction.RegisterAsRequester( whoIsReceiving );
+		return toggleStreamAction;
+	}
+
+	protected override function LogActionDetails( action : ScriptableDeviceAction, cachedStatus : BaseDeviceStatus, optional context : String, optional status : String, optional overrideStatus : Bool )
+	{
+		if( IsLogInExclusiveMode() && !( m_debugDevice ) )
+		{
+			return;
+		}
+		overrideStatus = true;
+		status = ActionSurveillanceCameraStatus().GetCurrentDisplayString();
+		super.LogActionDetails( action, cachedStatus, context, status, overrideStatus );
+	}
+
+	protected override function ActionEngineering( context : GetActionsContext ) : ActionEngineering
+	{
+		var action : ActionEngineering;
+		var displayName : String;
+		action = super.ActionEngineering( context );
+		displayName = "Off";
+		action.ResetCaption();
+		action.CreateInteraction( context.processInitiatorObject, , displayName );
+		return action;
+	}
+
+	public override function OnActionEngineering( evt : ActionEngineering ) : EntityNotificationType
+	{
+		if( !( evt.WasPassed() ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		super.OnActionEngineering( evt );
+		if( evt.IsCompleted() )
+		{
+			Override( evt );
+			RPGManager.GiveReward( evt.GetExecutor().GetGame(), T"RPGActionRewards.ExtractPartsSecurityTurret" );
+			return EntityNotificationType.SendThisEventToEntity;
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function Override( action : ScriptableDeviceAction )
+	{
+		var actionToSend : ScriptableDeviceAction;
+		ExecutePSAction( ActionSetDeviceOFF() );
+		SetBlockSecurityWakeUp( true );
+		GetPersistencySystem().QueuePSDeviceEvent( actionToSend );
+	}
+
+}
+

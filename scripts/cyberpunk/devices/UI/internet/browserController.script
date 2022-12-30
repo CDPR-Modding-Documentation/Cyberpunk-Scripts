@@ -1,0 +1,630 @@
+class BrowserGameController extends inkGameController
+{
+	[ category = "Widget Refs" ]
+	editable var m_logicControllerRef : inkWidgetRef;
+	protected var m_journalManager : weak< JournalManager >;
+	private var m_locationTags : array< CName >;
+
+	protected event OnInitialize()
+	{
+		var gameInstance : GameInstance;
+		var locationManager : LocationManager;
+		var logicScript : weak< BrowserController >;
+		logicScript = ( ( BrowserController )( inkWidgetRef.GetController( m_logicControllerRef ) ) );
+		logicScript.Init( this );
+		gameInstance = ( ( GameObject )( GetOwnerEntity() ) ).GetGame();
+		locationManager = GameInstance.GetLocationManager( gameInstance );
+		locationManager.GetLocationTags( GetOwnerEntity().GetEntityID(), m_locationTags );
+		PushWebsiteData();
+		m_journalManager = GameInstance.GetJournalManager( gameInstance );
+		m_journalManager.RegisterScriptCallback( this, 'OnJournalEntryStateChanged', gameJournalListenerType.State );
+	}
+
+	protected event OnJournalEntryStateChanged( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		if( className == 'gameJournalInternetPage' || className == 'gameJournalInternetSite' )
+		{
+			PushWebsiteData();
+		}
+	}
+
+	public function PushWebsiteData()
+	{
+		var context : JournalRequestContext;
+		var entries : array< weak< JournalEntry > >;
+		var logicScript : weak< BrowserController >;
+		context.stateFilter.active = true;
+		if( m_journalManager )
+		{
+			m_journalManager.GetInternetPages( context, entries );
+		}
+		logicScript = ( ( BrowserController )( inkWidgetRef.GetController( m_logicControllerRef ) ) );
+		logicScript.SetWebsiteData( entries );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_journalManager.UnregisterScriptCallback( this, 'OnJournalEntryStateChanged' );
+	}
+
+	public function GetJournalManager() : JournalManager
+	{
+		return m_journalManager;
+	}
+
+}
+
+class BrowserController extends inkLogicController
+{
+	protected editable var m_homeButton : inkWidgetRef;
+	protected editable var m_homeButtonCoontroller : weak< LinkController >;
+	protected editable var m_addressText : inkTextRef;
+	protected editable var m_pageContentRoot : inkWidgetRef;
+	protected editable var m_spinnerPath : ResRef;
+	protected editable var m_webPageLibraryID : CName;
+	protected editable var m_defaultDevicePage : String;
+	private var m_gameController : weak< BrowserGameController >;
+	private var m_websiteData : array< weak< JournalInternetPage > >;
+	private var m_currentRequestedPage : weak< JournalInternetPage >;
+	private var m_currentPage : weak< inkCompoundWidget >;
+	private var m_spinner : weak< inkWidget >;
+	private var m_webPageSpawnRequest : weak< inkAsyncSpawnRequest >;
+
+	public function Init( gameController : BrowserGameController )
+	{
+		m_gameController = gameController;
+		m_homeButtonCoontroller = ( ( LinkController )( inkWidgetRef.GetController( m_homeButton ) ) );
+		if( m_homeButtonCoontroller )
+		{
+			m_homeButtonCoontroller.RegisterToCallback( 'OnRelease', this, 'OnHomeButtonPressed' );
+		}
+		AsyncSpawnFromExternal( inkWidgetRef.Get( m_pageContentRoot ), m_spinnerPath, 'Root', this, 'OnSpinnerSpawned' );
+	}
+
+	protected event OnSpinnerSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		m_spinner = widget;
+		SetDefaultContent();
+	}
+
+	public function SetWebsiteData( pageEntries : array< weak< JournalEntry > > )
+	{
+		var pageEntry : weak< JournalInternetPage >;
+		var i : Int32;
+		m_websiteData.Clear();
+		for( i = 0; i < pageEntries.Size(); i += 1 )
+		{
+			pageEntry = ( ( JournalInternetPage )( pageEntries[ i ] ) );
+			m_websiteData.PushBack( pageEntry );
+		}
+	}
+
+	public function SetDefaultPage( startingPage : String )
+	{
+		m_gameController.PushWebsiteData();
+		m_defaultDevicePage = startingPage;
+		SetDefaultContent();
+	}
+
+	public const function GetDefaultpage() : String
+	{
+		return m_defaultDevicePage;
+	}
+
+	private function SetDefaultContent()
+	{
+		m_homeButtonCoontroller.SetLinkAddress( m_defaultDevicePage );
+		m_homeButtonCoontroller.SetColors( Color( 255, 255, 255, 255 ), Color( 255, 255, 255, 0 ) );
+		LoadWebPage( m_defaultDevicePage );
+	}
+
+	private function TryGetWebsiteData( address : String ) : weak< JournalInternetPage >
+	{
+		var i : Int32;
+		for( i = 0; i < m_websiteData.Size(); i += 1 )
+		{
+			if( m_websiteData[ i ].GetAddress() == address )
+			{
+				return m_websiteData[ i ];
+			}
+		}
+		for( i = 0; i < m_websiteData.Size(); i += 1 )
+		{
+			if( m_websiteData[ i ].GetAddress() == "NETdir://page_not_found" )
+			{
+				return m_websiteData[ i ];
+			}
+		}
+		return NULL;
+	}
+
+	protected event OnProcessLinkPressed( e : weak< inkWidget > )
+	{
+		var page : WebPage;
+		page = ( ( WebPage )( e.GetController() ) );
+		LoadWebPage( page.GetLastLinkClicked() );
+	}
+
+	private function OnHomeButtonPressed( e : inkPointerEvent )
+	{
+		var linkController : LinkController;
+		if( e.IsAction( 'click' ) )
+		{
+			linkController = ( ( LinkController )( e.GetTarget().GetController() ) );
+			if( linkController )
+			{
+				LoadWebPage( linkController.GetLinkAddress() );
+			}
+		}
+	}
+
+	private function LoadWebPage( address : String )
+	{
+		if( m_webPageSpawnRequest != NULL )
+		{
+			m_webPageSpawnRequest.Cancel();
+		}
+		UnloadCurrentWebsite();
+		m_currentRequestedPage = TryGetWebsiteData( address );
+		if( m_currentRequestedPage == NULL )
+		{
+			if( m_spinner != NULL )
+			{
+				m_spinner.SetVisible( true );
+			}
+			return;
+		}
+		inkTextRef.SetText( m_addressText, m_currentRequestedPage.GetAddress() );
+		m_webPageSpawnRequest = AsyncSpawnFromExternal( inkWidgetRef.Get( m_pageContentRoot ), m_currentRequestedPage.GetWidgetPath(), m_webPageLibraryID, this, 'OnPageSpawned' );
+	}
+
+	protected event OnPageSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var currentController : WebPage;
+		var scale : Vector2;
+		m_currentPage = ( ( inkCompoundWidget )( widget ) );
+		m_currentPage.SetAnchor( inkEAnchor.Fill );
+		scale.X = m_currentRequestedPage.GetScale();
+		scale.Y = m_currentRequestedPage.GetScale();
+		m_currentPage.SetScale( scale );
+		currentController = ( ( WebPage )( m_currentPage.GetController() ) );
+		if( currentController )
+		{
+			currentController.FillPage( m_currentRequestedPage, m_gameController.GetJournalManager() );
+			currentController.RegisterToCallback( 'OnLinkPressed', this, 'OnProcessLinkPressed' );
+		}
+		SetFacts( m_currentRequestedPage );
+		if( m_spinner != NULL )
+		{
+			m_spinner.SetVisible( false );
+		}
+		m_webPageSpawnRequest = NULL;
+	}
+
+	private function SetFacts( page : weak< JournalInternetPage > )
+	{
+		var factsToSet : array< JournalFactNameValue >;
+		var i : Int32;
+		factsToSet = page.GetFactsToSet();
+		for( i = 0; i < factsToSet.Size(); i += 1 )
+		{
+			if( factsToSet[ i ].factName != '' )
+			{
+				SetFactValue( GetOwnerGameObject().GetGame(), factsToSet[ i ].factName, factsToSet[ i ].factValue );
+			}
+		}
+	}
+
+	private function UnloadCurrentWebsite()
+	{
+		var currentController : WebPage;
+		if( m_currentPage != NULL )
+		{
+			currentController = ( ( WebPage )( m_currentPage.GetController() ) );
+			currentController.UnregisterFromCallback( 'OnLinkPressed', this, 'OnProcessLinkPressed' );
+			( ( inkCompoundWidget )( inkWidgetRef.Get( m_pageContentRoot ) ) ).RemoveChild( m_currentPage );
+		}
+	}
+
+	private function GetOwnerGameObject() : Computer
+	{
+		return ( ( Computer )( m_gameController.GetOwnerEntity() ) );
+	}
+
+}
+
+class LinkController extends inkButtonController
+{
+	private var m_linkAddress : String;
+	private var m_defaultColor : HDRColor;
+	private var m_hoverColor : HDRColor;
+	private var IGNORED_COLOR : HDRColor;
+
+	protected event OnInitialize()
+	{
+		IGNORED_COLOR = HDRColor( 1.0, 1.0, 1.0, 0.0 );
+		m_hoverColor = HDRColor( 1.0, 1.0, 1.0, 1.0 );
+	}
+
+	protected event OnButtonStateChanged( controller : weak< inkButtonController >, oldState : inkEButtonState, newState : inkEButtonState )
+	{
+		var widget : inkWidget;
+		if( StrLen( m_linkAddress ) == 0 )
+		{
+			return true;
+		}
+		if( m_hoverColor == HDRColor( 1.0, 1.0, 1.0, 0.0 ) )
+		{
+			return true;
+		}
+		widget = GetRootWidget();
+		if( oldState == inkEButtonState.Normal )
+		{
+			m_defaultColor = widget.GetTintColor();
+		}
+		switch( newState )
+		{
+			case inkEButtonState.Normal:
+				widget.SetTintColor( m_defaultColor );
+			break;
+			case inkEButtonState.Hover:
+			case inkEButtonState.Press:
+				widget.SetTintColor( m_hoverColor );
+			break;
+			case inkEButtonState.Disabled:
+				widget.SetTintColor( m_defaultColor );
+			break;
+		}
+	}
+
+	public function GetLinkAddress() : String
+	{
+		return m_linkAddress;
+	}
+
+	public function SetLinkAddress( link : String )
+	{
+		m_linkAddress = link;
+	}
+
+	public function SetColors( color : Color, hoverColor : Color )
+	{
+		var widget : inkWidget;
+		if( Color.ToHDRColorDirect( color ) == IGNORED_COLOR )
+		{
+			widget = GetRootWidget();
+			m_defaultColor = widget.GetTintColor();
+		}
+		else
+		{
+			m_defaultColor = Color.ToHDRColorDirect( color );
+		}
+		m_hoverColor = Color.ToHDRColorDirect( hoverColor );
+	}
+
+}
+
+class WebPage extends inkLogicController
+{
+	protected const editable var m_textList : array< inkTextRef >;
+	protected const editable var m_rectangleList : array< inkRectangleRef >;
+	protected const editable var m_imageList : array< inkImageRef >;
+	protected const editable var m_videoList : array< inkVideoRef >;
+	private var m_lastClickedLinkAddress : String;
+	private var HOME_IMAGE_NAME : String;
+	default HOME_IMAGE_NAME = "ImageLink";
+	private var HOME_TEXT_NAME : String;
+	default HOME_TEXT_NAME = "TextLink";
+
+	public function FillPage( page : weak< JournalInternetPage >, journalManager : JournalManager )
+	{
+		if( page != NULL )
+		{
+			FillPageFromJournal( page );
+			if( page.IsAdditionallyFilledFromScripts() )
+			{
+				FillPageFromScripts( page.GetAddress(), journalManager );
+			}
+		}
+	}
+
+	private function FillPageFromScripts( address : String, journalManager : JournalManager )
+	{
+		var context : JournalRequestContext;
+		var entries : array< weak< JournalEntry > >;
+		var siteEntry : weak< JournalInternetSite >;
+		var pageEntry : weak< JournalInternetPage >;
+		var pageAddress : String;
+		var iconAtlasPath : ResRef;
+		var iconTexturePart : CName;
+		var i : Int32;
+		var slotNumber : Int32;
+		var MAX_ICONS_COUNT : Int32;
+		MAX_ICONS_COUNT = 60;
+		for( slotNumber = 1; slotNumber <= MAX_ICONS_COUNT; slotNumber += 1 )
+		{
+			if( !( ClearSlot( slotNumber ) ) )
+			{
+				break;
+			}
+		}
+		if( address == "NETdir://ncity.pub" )
+		{
+			context.stateFilter.active = true;
+			journalManager.GetInternetSites( context, entries );
+			slotNumber = 1;
+			for( i = 0; i < Min( entries.Size(), MAX_ICONS_COUNT ); i += 1 )
+			{
+				siteEntry = ( ( JournalInternetSite )( entries[ i ] ) );
+				if( siteEntry )
+				{
+					if( !( siteEntry.IsIgnoredAtDesktop() ) )
+					{
+						pageEntry = journalManager.GetMainInternetPage( siteEntry );
+						if( pageEntry != NULL )
+						{
+							pageAddress = pageEntry.GetAddress();
+						}
+						iconAtlasPath = siteEntry.GetAtlasPath();
+						iconTexturePart = siteEntry.GetTexturePart();
+						SetSlot( slotNumber, siteEntry.GetShortName(), pageAddress, iconAtlasPath, iconTexturePart );
+						slotNumber += 1;
+					}
+				}
+			}
+		}
+	}
+
+	private function SetSlot( number : Int32, shortName : String, pageAddress : String, iconAtlasPath : ResRef, iconTexturePart : CName )
+	{
+		var textRef : inkTextRef;
+		var imageRef : inkImageRef;
+		textRef = GetTextRef( GetRefName( HOME_TEXT_NAME, number ) );
+		if( inkTextRef.IsValid( textRef ) )
+		{
+			inkTextRef.SetVisible( textRef, true );
+			inkTextRef.SetText( textRef, shortName );
+			AddLink( textRef, pageAddress );
+		}
+		imageRef = GetImageRef( GetRefName( HOME_IMAGE_NAME, number ) );
+		if( inkImageRef.IsValid( imageRef ) )
+		{
+			inkImageRef.SetVisible( imageRef, true );
+			inkImageRef.SetAtlasResource( imageRef, iconAtlasPath );
+			inkImageRef.SetTexturePart( imageRef, iconTexturePart );
+			AddLink( imageRef, pageAddress );
+		}
+	}
+
+	private function ClearSlot( number : Int32 ) : Bool
+	{
+		var textRef : inkTextRef;
+		var imageRef : inkImageRef;
+		textRef = GetTextRef( GetRefName( HOME_TEXT_NAME, number ) );
+		imageRef = GetImageRef( GetRefName( HOME_IMAGE_NAME, number ) );
+		if( !( inkTextRef.IsValid( textRef ) ) && inkImageRef.IsValid( imageRef ) )
+		{
+			return false;
+		}
+		if( inkTextRef.IsValid( textRef ) )
+		{
+			inkTextRef.SetVisible( textRef, false );
+		}
+		if( inkImageRef.IsValid( imageRef ) )
+		{
+			inkImageRef.SetVisible( imageRef, false );
+		}
+		return true;
+	}
+
+	private function GetRefName( prefix : String, number : Int32 ) : CName
+	{
+		if( number <= 9 )
+		{
+			return StringToName( ( prefix + "0" ) + number );
+		}
+		return StringToName( prefix + number );
+	}
+
+	private function GetTextRef( instanceName : CName ) : inkTextRef
+	{
+		var dummy : inkTextRef;
+		var i : Int32;
+		for( i = 0; i < m_textList.Size(); i += 1 )
+		{
+			if( inkTextRef.GetName( m_textList[ i ] ) == instanceName )
+			{
+				return m_textList[ i ];
+			}
+		}
+		return dummy;
+	}
+
+	private function GetImageRef( instanceName : CName ) : inkImageRef
+	{
+		var dummy : inkImageRef;
+		var i : Int32;
+		for( i = 0; i < m_imageList.Size(); i += 1 )
+		{
+			if( inkImageRef.GetName( m_imageList[ i ] ) == instanceName )
+			{
+				return m_imageList[ i ];
+			}
+		}
+		return dummy;
+	}
+
+	private function FillPageFromJournal( page : weak< JournalInternetPage > )
+	{
+		var texts : array< JournalInternetText >;
+		var rectangles : array< JournalInternetRectangle >;
+		var images : array< JournalInternetImage >;
+		var videos : array< JournalInternetVideo >;
+		var templateTextRef : inkTextRef;
+		var templateRectangleRef : inkRectangleRef;
+		var templateImageRef : inkImageRef;
+		var templateVideoRef : inkVideoRef;
+		var instanceName : CName;
+		var i, t : Int32;
+		var IGNORED_COLOR : Color;
+		IGNORED_COLOR = Color( 255, 255, 255, 0 );
+		texts = page.GetTexts();
+		for( i = 0; i < texts.Size(); i += 1 )
+		{
+			instanceName = texts[ i ].GetName();
+			for( t = 0; t < m_textList.Size(); t += 1 )
+			{
+				templateTextRef = m_textList[ t ];
+				if( inkTextRef.GetName( templateTextRef ) == instanceName )
+				{
+					inkTextRef.SetText( templateTextRef, texts[ i ].GetText() );
+					if( texts[ i ].GetColor() != IGNORED_COLOR )
+					{
+						inkTextRef.SetTintColor( templateTextRef, texts[ i ].GetColor() );
+					}
+					AddLink( templateTextRef, texts[ i ] );
+					break;
+				}
+			}
+		}
+		rectangles = page.GetRectangles();
+		for( i = 0; i < rectangles.Size(); i += 1 )
+		{
+			instanceName = rectangles[ i ].GetName();
+			for( t = 0; t < m_rectangleList.Size(); t += 1 )
+			{
+				templateRectangleRef = m_rectangleList[ t ];
+				if( inkRectangleRef.GetName( templateRectangleRef ) == instanceName )
+				{
+					if( rectangles[ i ].GetColor() != IGNORED_COLOR )
+					{
+						inkRectangleRef.SetTintColor( templateRectangleRef, rectangles[ i ].GetColor() );
+					}
+					AddLink( templateRectangleRef, rectangles[ i ] );
+					break;
+				}
+			}
+		}
+		images = page.GetImages();
+		for( i = 0; i < images.Size(); i += 1 )
+		{
+			instanceName = images[ i ].GetName();
+			for( t = 0; t < m_imageList.Size(); t += 1 )
+			{
+				templateImageRef = m_imageList[ t ];
+				if( inkImageRef.GetName( templateImageRef ) == instanceName )
+				{
+					inkImageRef.SetAtlasResource( templateImageRef, images[ i ].GetAtlasPath() );
+					inkImageRef.SetTexturePart( templateImageRef, images[ i ].GetTexturePart() );
+					if( rectangles[ i ].GetColor() != IGNORED_COLOR )
+					{
+						inkImageRef.SetTintColor( templateImageRef, images[ i ].GetColor() );
+					}
+					AddLink( templateImageRef, images[ i ] );
+					break;
+				}
+			}
+		}
+		videos = page.GetVideos();
+		for( i = 0; i < videos.Size(); i += 1 )
+		{
+			instanceName = videos[ i ].GetName();
+			for( t = 0; t < m_videoList.Size(); t += 1 )
+			{
+				templateVideoRef = m_videoList[ t ];
+				if( inkVideoRef.GetName( templateVideoRef ) == instanceName )
+				{
+					inkVideoRef.SetVideoPath( templateVideoRef, videos[ i ].GetVideoPath() );
+					inkVideoRef.Play( templateVideoRef );
+					AddLink( templateVideoRef, videos[ i ] );
+					break;
+				}
+			}
+		}
+	}
+
+	private function AddLink( widget : inkWidgetRef, address : String )
+	{
+		var linkController : LinkController;
+		if( StrLen( address ) > 0 )
+		{
+			if( !( inkWidgetRef.IsInteractive( widget ) ) )
+			{
+				Log( ( "Widget [" + NameToString( inkWidgetRef.GetName( widget ) ) ) + "] is not set as interactive, it cannot be clicked" );
+			}
+			inkWidgetRef.RegisterToCallback( widget, 'OnRelease', this, 'OnLinkCallback' );
+			linkController = ( ( LinkController )( inkWidgetRef.GetController( widget ) ) );
+			if( linkController )
+			{
+				linkController.SetLinkAddress( address );
+			}
+			else
+			{
+				Log( ( "Missing LinkController for a widget [" + NameToString( inkWidgetRef.GetName( widget ) ) ) + "]" );
+			}
+		}
+	}
+
+	private function AddLink( widget : inkWidgetRef, baseElement : JournalInternetBase )
+	{
+		var linkAddress : String;
+		var linkController : LinkController;
+		linkAddress = baseElement.GetLinkAddress();
+		if( StrLen( linkAddress ) > 0 )
+		{
+			if( !( inkWidgetRef.IsInteractive( widget ) ) )
+			{
+				Log( ( "Widget [" + NameToString( inkWidgetRef.GetName( widget ) ) ) + "] is not set as interactive, it cannot be clicked" );
+			}
+			inkWidgetRef.RegisterToCallback( widget, 'OnRelease', this, 'OnLinkCallback' );
+			linkController = ( ( LinkController )( inkWidgetRef.GetController( widget ) ) );
+			if( linkController )
+			{
+				linkController.SetLinkAddress( linkAddress );
+				linkController.SetColors( baseElement.GetColor(), baseElement.GetHoverColor() );
+			}
+			else
+			{
+				Log( ( "Missing LinkController for a widget [" + NameToString( inkWidgetRef.GetName( widget ) ) ) + "]" );
+			}
+		}
+	}
+
+	private function OnLinkCallback( e : inkPointerEvent )
+	{
+		var linkController : LinkController;
+		if( e.IsAction( 'click' ) )
+		{
+			linkController = ( ( LinkController )( e.GetTarget().GetController() ) );
+			if( linkController )
+			{
+				m_lastClickedLinkAddress = linkController.GetLinkAddress();
+				CallCustomCallback( 'OnLinkPressed' );
+			}
+			else
+			{
+				Log( "Missing link controller" );
+			}
+		}
+	}
+
+	public function GetLastLinkClicked() : String
+	{
+		return m_lastClickedLinkAddress;
+	}
+
+}
+
+class WebsiteLoadingSpinner extends inkLogicController
+{
+
+	protected event OnInitialize()
+	{
+		var infiniteloop : inkAnimOptions;
+		infiniteloop.loopType = inkanimLoopType.Cycle;
+		infiniteloop.loopInfinite = true;
+		PlayLibraryAnimation( 'loadingLoop', infiniteloop );
+	}
+
+}
+

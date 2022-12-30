@@ -1,0 +1,329 @@
+struct SecurityAlarmSetup
+{
+	instanceeditable var useSound : Bool;
+	[ customEditor = "AudioEvent" ]
+	instanceeditable var alarmSound : CName;
+}
+
+class SecurityAlarmController extends MasterController
+{
+
+	public const override function GetPS() : SecurityAlarmControllerPS
+	{
+		return ( ( SecurityAlarmControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class SecurityAlarmControllerPS extends MasterControllerPS
+{
+	default m_deviceName = "LocKey#109";
+	default m_tweakDBRecord = T"Devices.SecurityAlarm";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.SecurityAlarm";
+	protected instanceeditable persistent var m_securityAlarmSetup : SecurityAlarmSetup;
+	private var m_securityAlarmState : ESecuritySystemState;
+	default m_securityAlarmState = ESecuritySystemState.SAFE;
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+		if( !( IsStringValid( m_deviceName ) ) )
+		{
+			m_deviceName = "Gameplay-Devices-DisplayNames-Alarm";
+		}
+	}
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+		RefreshSlaves_Event();
+	}
+
+	public const function GetAlarmState() : ESecuritySystemState
+	{
+		return m_securityAlarmState;
+	}
+
+	public const function UsesSound() : Bool
+	{
+		return m_securityAlarmSetup.useSound;
+	}
+
+	public const function AlarmSound() : CName
+	{
+		return m_securityAlarmSetup.alarmSound;
+	}
+
+	protected const override function CanCreateAnyQuickHackActions() : Bool
+	{
+		return true;
+	}
+
+	protected override function GetQuickHackActions( out outActions : array< DeviceAction >, context : GetActionsContext )
+	{
+		var currentAction : ScriptableDeviceAction;
+		currentAction = ActionToggleAlarm();
+		currentAction.SetObjectActionID( T"DeviceAction.ToggleStateClassHack" );
+		if( !( ToggleAlarm.IsDefaultConditionMet( this, context ) ) )
+		{
+			currentAction.SetInactiveWithReason( false, "LocKey#7005" );
+		}
+		outActions.PushBack( currentAction );
+		currentAction = ActionQuickHackDistraction();
+		currentAction.SetObjectActionID( T"DeviceAction.MalfunctionClassHack" );
+		currentAction.SetDurationValue( GetDistractionDuration( currentAction ) );
+		if( !( QuickHackDistraction.IsDefaultConditionMet( this, context ) ) )
+		{
+			currentAction.SetInactiveWithReason( false, "LocKey#7003" );
+		}
+		outActions.PushBack( currentAction );
+		FinalizeGetQuickHackActions( outActions, context );
+	}
+
+	public override function GetQuestActions( out outActions : array< DeviceAction >, context : GetActionsContext )
+	{
+		super.GetQuestActions( outActions, context );
+		if( Clearance.IsInRange( context.clearance, DefaultActionsParametersHolder.GetQuestClearance() ) )
+		{
+			outActions.PushBack( ActionQuestForceSecuritySystemSafe() );
+			outActions.PushBack( ActionQuestForceSecuritySystemArmed() );
+		}
+		return;
+	}
+
+	public export override function OnTargetAssessmentRequest( evt : TargetAssessmentRequest ) : EntityNotificationType
+	{
+		if( GetSecuritySystem() )
+		{
+			m_securityAlarmState = ( ( SecuritySystemControllerPS )( GetSecuritySystem() ) ).GetSecurityState();
+		}
+		RefreshSlaves_Event();
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function OnSecuritySystemOutput( evt : SecuritySystemOutput ) : EntityNotificationType
+	{
+		super.OnSecuritySystemOutput( evt );
+		m_securityAlarmState = evt.GetCachedSecurityState();
+		RefreshSlaves_Event();
+		NotifyParents();
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public export override function OnSecurityAlarmBreachResponse( evt : SecurityAlarmBreachResponse ) : EntityNotificationType
+	{
+		if( evt.GetSecurityState() == ESecuritySystemState.ALERTED || evt.GetSecurityState() == ESecuritySystemState.COMBAT )
+		{
+			WakeUpDevice();
+		}
+		m_securityAlarmState = evt.GetSecurityState();
+		RefreshSlaves_Event();
+		NotifyParents();
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function OnQuestForceSecuritySystemSafe( evt : QuestForceSecuritySystemSafe ) : EntityNotificationType
+	{
+		QuestForceState( ESecuritySystemState.SAFE );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function OnQuestForceSecuritySystemArmed( evt : QuestForceSecuritySystemArmed ) : EntityNotificationType
+	{
+		QuestForceState( ESecuritySystemState.COMBAT );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function QuestForceState( state : ESecuritySystemState )
+	{
+		m_securityAlarmState = state;
+		RefreshSlaves_Event();
+		NotifyParents();
+	}
+
+	protected function ActionToggleAlarm() : ToggleAlarm
+	{
+		var action : ToggleAlarm;
+		action = new ToggleAlarm;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleAlarmClearance();
+		action.SetUp( this );
+		action.SetProperties( m_securityAlarmState );
+		action.AddDeviceName( m_deviceName );
+		action.SetObjectActionID( T"DeviceAction.ToggleStateClassHack" );
+		action.CreateInteraction();
+		action.SetDurationValue( GetDistractionDuration( action ) );
+		return action;
+	}
+
+	public function OnToggleAlarm( evt : ToggleAlarm ) : EntityNotificationType
+	{
+		var toggledState : ESecuritySystemState;
+		toggledState = ( ( m_securityAlarmState == ESecuritySystemState.COMBAT ) ? ( ESecuritySystemState.SAFE ) : ( ESecuritySystemState.COMBAT ) );
+		if( evt.IsStarted() )
+		{
+			evt.SetCanTriggerStim( true );
+			m_securityAlarmState = toggledState;
+			ExecutePSActionWithDelay( evt, this, evt.GetDurationValue() );
+		}
+		else
+		{
+			evt.SetCanTriggerStim( false );
+			if( IsConnectedToSecuritySystem() )
+			{
+				m_securityAlarmState = GetSecuritySystem().GetSecurityState();
+			}
+			else
+			{
+				m_securityAlarmState = toggledState;
+			}
+		}
+		RefreshSlaves_Event();
+		UseNotifier( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected function ActionSecurityAlarmEscalate() : SecurityAlarmEscalate
+	{
+		var action : SecurityAlarmEscalate;
+		action = new SecurityAlarmEscalate;
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		action.CreateInteraction();
+		action.SetDurationValue( GetDistractionDuration( action ) );
+		return action;
+	}
+
+	public function OnSecurityAlarmEscalate( evt : SecurityAlarmEscalate ) : EntityNotificationType
+	{
+		if( evt.IsStarted() )
+		{
+			evt.SetCanTriggerStim( true );
+			TriggerSecuritySystemNotification( GetPlayerMainObject(), GetOwnerEntityWeak().GetWorldPosition(), ESecurityNotificationType.COMBAT );
+			ExecutePSActionWithDelay( evt, this, evt.GetDurationValue() );
+		}
+		else
+		{
+			evt.SetCanTriggerStim( false );
+		}
+		RefreshSlaves_Event();
+		UseNotifier( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function CreateAlarmResponse( alarmState : ESecuritySystemState ) : SecurityAlarmBreachResponse
+	{
+		var action : SecurityAlarmBreachResponse;
+		if( alarmState == ESecuritySystemState.UNINITIALIZED )
+		{
+			alarmState = m_securityAlarmState;
+		}
+		action = new SecurityAlarmBreachResponse;
+		action.SetUp( this );
+		action.SetProperties( alarmState );
+		action.AddDeviceName( GetDeviceName() );
+		return action;
+	}
+
+	protected export override function OnRefreshSlavesEvent( evt : RefreshSlavesEvent ) : EntityNotificationType
+	{
+		RefreshSlaves();
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function RefreshSlaves()
+	{
+		var i : Int32;
+		var devices : array< DeviceComponentPS >;
+		var alarmResponse : SecurityAlarmBreachResponse;
+		devices = GetImmediateSlaves();
+		if( IsON() )
+		{
+			alarmResponse = CreateAlarmResponse( m_securityAlarmState );
+		}
+		else
+		{
+			alarmResponse = CreateAlarmResponse( ESecuritySystemState.SAFE );
+		}
+		for( i = 0; i < devices.Size(); i = i + 1 )
+		{
+			if( devices[ i ] == this )
+			{
+				continue;
+			}
+			ExecutePSAction( alarmResponse, devices[ i ] );
+		}
+	}
+
+	public quest const function IsAlarmStateCombat() : Bool
+	{
+		if( m_securityAlarmState == ESecuritySystemState.COMBAT )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public quest const function IsAlarmStateNotCombat() : Bool
+	{
+		if( m_securityAlarmState == ESecuritySystemState.COMBAT )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	public quest const function IsAlarmStateSafe() : Bool
+	{
+		if( m_securityAlarmState == ESecuritySystemState.SAFE )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public quest const function IsAlarmStateNotSafe() : Bool
+	{
+		if( m_securityAlarmState == ESecuritySystemState.SAFE )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	public quest const function IsAlarmStateAlerted() : Bool
+	{
+		if( m_securityAlarmState == ESecuritySystemState.ALERTED )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceIcon";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceBackground";
+	}
+
+}
+

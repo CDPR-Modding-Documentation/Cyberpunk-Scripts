@@ -1,0 +1,442 @@
+class ItemModificationSystem extends ScriptableSystem
+{
+	private var m_blackboard : weak< IBlackboard >;
+	private persistent var CYBMETA1695 : Bool;
+
+	private export override function OnAttach()
+	{
+		m_blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_ItemModSystem );
+	}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		var factVal : Int32;
+		factVal = GetFact( GetGameInstance(), 'ClothingModsRemoved' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1500 ) )
+		{
+			RemoveAllModsFromClothing();
+			SetFactValue( GetGameInstance(), 'ClothingModsRemoved', 1 );
+		}
+		if( !( CYBMETA1695 ) )
+		{
+			CYBMETA1695();
+		}
+	}
+
+	private function InstallItemPart( obj : GameObject, itemID : ItemID, partItemID : ItemID, optional slotID : TweakDBID ) : Bool
+	{
+		var ts : TransactionSystem;
+		var itemData : weak< gameItemData >;
+		var partInstallRequest : PartInstallRequest;
+		var partData : InnerItemData;
+		var itemType : gamedataItemType;
+		var previousPartID : ItemID;
+		var result : Bool;
+		var defaultSlotID : TweakDBID;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		itemType = RPGManager.GetItemRecord( partItemID ).ItemType().Type();
+		itemData = ts.GetItemData( obj, itemID );
+		if( TweakDBInterface.GetAttachmentSlotRecord( slotID ) )
+		{
+			itemData.GetItemPart( partData, slotID );
+			previousPartID = InnerItemData.GetItemID( partData );
+			if( ItemID.IsValid( previousPartID ) )
+			{
+				RemovePartEquipGLPs( obj, previousPartID );
+			}
+			result = ts.ForcePartInSlot( obj, itemID, partItemID, slotID );
+			if( itemType == gamedataItemType.Prt_Program )
+			{
+				RemoveLowerShards( obj, itemID, partItemID );
+			}
+			if( ItemID.IsValid( previousPartID ) && ( RPGManager.GetItemType( previousPartID ) == gamedataItemType.Prt_Mod || RPGManager.IsClothingMod( previousPartID ) ) )
+			{
+				ts.RemoveItem( obj, previousPartID, 1 );
+			}
+		}
+		else
+		{
+			defaultSlotID = EquipmentSystem.GetPlacementSlot( partItemID );
+			result = ts.ForcePartInSlot( obj, itemID, partItemID, defaultSlotID );
+			if( itemType == gamedataItemType.Prt_Mod || RPGManager.IsClothingMod( itemType ) )
+			{
+				ts.RemoveItem( obj, partItemID, 1 );
+			}
+		}
+		if( result )
+		{
+			partInstallRequest = new PartInstallRequest;
+			partInstallRequest.owner = obj;
+			partInstallRequest.itemID = itemID;
+			partInstallRequest.partID = partItemID;
+			GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'EquipmentSystem' ).QueueRequest( partInstallRequest );
+			GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'UIInventoryScriptableSystem' ).QueueRequest( partInstallRequest );
+		}
+		PlayerPuppet.ChacheQuickHackListCleanup( ( ( PlayerPuppet )( obj ) ) );
+		return result;
+	}
+
+	private const function RemoveItemPart( obj : GameObject, itemID : ItemID, slotID : TweakDBID, shouldUpdateEntity : Bool ) : ItemID
+	{
+		var ts : TransactionSystem;
+		var removedPartID : ItemID;
+		var itemData : weak< gameItemData >;
+		var emptyItem : ItemID;
+		var partUninstallRequest : PartUninstallRequest;
+		var partData : InnerItemData;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		itemData = ts.GetItemData( obj, itemID );
+		if( itemData.HasPartInSlot( slotID ) )
+		{
+			itemData.GetItemPart( partData, slotID );
+			ts.RemovePart( obj, itemID, slotID, shouldUpdateEntity );
+			removedPartID = InnerItemData.GetItemID( partData );
+			partUninstallRequest = new PartUninstallRequest;
+			partUninstallRequest.owner = obj;
+			partUninstallRequest.itemID = itemID;
+			partUninstallRequest.partID = removedPartID;
+			GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'EquipmentSystem' ).QueueRequest( partUninstallRequest );
+			SetPingTutorialFact( removedPartID, true, obj );
+			PlayerPuppet.ChacheQuickHackListCleanup( ( ( PlayerPuppet )( obj ) ) );
+			return removedPartID;
+		}
+		else
+		{
+			PlayerPuppet.ChacheQuickHackListCleanup( ( ( PlayerPuppet )( obj ) ) );
+			emptyItem = ItemID.None();
+			return emptyItem;
+		}
+	}
+
+	private function RemoveLowerShards( obj : GameObject, item : ItemID, shardID : ItemID )
+	{
+		var usedSlots : array< TweakDBID >;
+		var deckData : gameItemData;
+		var ts : TransactionSystem;
+		var i : Int32;
+		var partData : InnerItemData;
+		var instQuality, shardQuality : gamedataQuality;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		ts.GetUsedSlotsOnItem( obj, item, usedSlots );
+		deckData = ts.GetItemData( obj, item );
+		for( i = 0; i < usedSlots.Size(); i += 1 )
+		{
+			deckData.GetItemPart( partData, usedSlots[ i ] );
+			instQuality = RPGManager.GetItemRecord( InnerItemData.GetItemID( partData ) ).Quality().Type();
+			shardQuality = RPGManager.GetItemRecord( shardID ).Quality().Type();
+			if( TweakDBInterface.GetCName( ItemID.GetTDBID( InnerItemData.GetItemID( partData ) ) + T".shardType", '' ) == TweakDBInterface.GetCName( ItemID.GetTDBID( shardID ) + T".shardType", '' ) && ( instQuality < shardQuality ) )
+			{
+				RemoveItemPart( obj, item, usedSlots[ i ], false );
+			}
+		}
+	}
+
+	private const function SetPingTutorialFact( itemID : ItemID, isUnequip : Bool, obj : GameObject )
+	{
+		var shard : CName;
+		var questSystem : QuestsSystem;
+		shard = TweakDBInterface.GetCName( ItemID.GetTDBID( itemID ) + T".shardType", '' );
+		if( shard == 'Ping' )
+		{
+			questSystem = GameInstance.GetQuestsSystem( obj.GetGame() );
+			if( isUnequip && ( questSystem.GetFact( 'ping_installed' ) == 1 ) )
+			{
+				questSystem.SetFact( 'ping_installed', 0 );
+			}
+			else if( questSystem.GetFact( 'ping_installed' ) == 0 )
+			{
+				questSystem.SetFact( 'ping_installed', 1 );
+			}
+		}
+	}
+
+	private function RemovePartEquipGLPs( obj : weak< GameObject >, itemID : ItemID )
+	{
+		var itemRecord : Item_Record;
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		var i : Int32;
+		var glpSys : GameplayLogicPackageSystem;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		itemRecord.OnEquip( packages );
+		glpSys = GameInstance.GetGameplayLogicPackageSystem( obj.GetGame() );
+		for( i = 0; i < packages.Size(); i += 1 )
+		{
+			glpSys.RemovePackage( obj, packages[ i ].GetID() );
+		}
+	}
+
+	private function SwapItemPart( obj : GameObject, itemID : ItemID, partItemID : ItemID, slotID : TweakDBID ) : Bool
+	{
+		if( !( IsBasePart( obj, itemID, slotID ) ) )
+		{
+			RemoveItemPart( obj, itemID, slotID, false );
+		}
+		else
+		{
+			return false;
+		}
+		return InstallItemPart( obj, itemID, partItemID, slotID );
+	}
+
+	public static function IsBasePart( obj : GameObject, itemID : ItemID, slotID : TweakDBID ) : Bool
+	{
+		var ts : TransactionSystem;
+		var itemData : weak< gameItemData >;
+		var part : InnerItemData;
+		var partRecord : Item_Record;
+		var tags : array< CName >;
+		var i : Int32;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		itemData = ts.GetItemData( obj, itemID );
+		itemData.GetItemPart( part, slotID );
+		partRecord = InnerItemData.GetStaticData( part );
+		tags = partRecord.Tags();
+		for( i = 0; i < tags.Size(); i += 1 )
+		{
+			if( tags[ i ] == 'parentPart' )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsItemSlotTaken( obj : GameObject, itemID : ItemID, slotID : TweakDBID ) : Bool
+	{
+		var ts : TransactionSystem;
+		var itemData : weak< gameItemData >;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		itemData = ts.GetItemData( obj, itemID );
+		return itemData.HasPartInSlot( slotID );
+	}
+
+	public static function GetAllSlots( obj : GameObject, item : ItemID ) : array< SPartSlots >
+	{
+		var allParts : array< SPartSlots >;
+		var part : SPartSlots;
+		var emptySlots : array< TweakDBID >;
+		var usedSlots : array< TweakDBID >;
+		var itemData : gameItemData;
+		var ts : TransactionSystem;
+		var i : Int32;
+		var partData : InnerItemData;
+		var installableItems : array< ItemID >;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		ts.GetEmptySlotsOnItem( obj, item, emptySlots );
+		ts.GetUsedSlotsOnItem( obj, item, usedSlots );
+		itemData = ts.GetItemData( obj, item );
+		ts.GetItemsInstallableInSlot( obj, item, T"AttachmentSlots.FabricEnhancer2", installableItems );
+		for( i = 0; i < usedSlots.Size(); i += 1 )
+		{
+			itemData.GetItemPart( partData, usedSlots[ i ] );
+			part.status = ESlotState.Taken;
+			part.slotID = usedSlots[ i ];
+			part.installedPart = InnerItemData.GetItemID( partData );
+			part.innerItemData = partData;
+			allParts.PushBack( part );
+		}
+		for( i = 0; i < emptySlots.Size(); i += 1 )
+		{
+			part.status = ESlotState.Empty;
+			part.slotID = emptySlots[ i ];
+			part.installedPart = ItemID.None();
+			allParts.PushBack( part );
+		}
+		return allParts;
+	}
+
+	public static function GetAllSlots( itemData : gameItemData ) : array< SPartSlots >
+	{
+		var allParts : array< SPartSlots >;
+		var part : SPartSlots;
+		var attachments : array< weak< AttachmentSlot_Record > >;
+		var usedSlots : array< weak< SlotItemPartPreset_Record > >;
+		var i : Int32;
+		var partData : InnerItemData;
+		var partDatas : array< InnerItemData >;
+		RPGManager.GetItemRecord( itemData.GetID() ).SlotPartListPreset( usedSlots );
+		GetattachementFromBlueprint( RPGManager.GetItemRecord( itemData.GetID() ).Blueprint().RootElement(), attachments );
+		itemData.GetItemParts( partDatas );
+		for( i = 0; i < usedSlots.Size(); i += 1 )
+		{
+			itemData.GetItemPart( partData, usedSlots[ i ].Slot().GetID() );
+			part.status = ESlotState.Taken;
+			part.slotID = usedSlots[ i ].Slot().GetID();
+			part.installedPart = ItemID.FromTDBID( usedSlots[ i ].ItemPartPreset().GetID() );
+			part.innerItemData = partData;
+			allParts.PushBack( part );
+		}
+		for( i = 0; i < attachments.Size(); i += 1 )
+		{
+			part.status = ESlotState.Empty;
+			part.slotID = attachments[ i ].GetID();
+			part.installedPart = ItemID.None();
+			allParts.PushBack( part );
+		}
+		return allParts;
+	}
+
+	private static function GetattachementFromBlueprint( blueprintRecord : weak< ItemBlueprintElement_Record >, out attachments : array< weak< AttachmentSlot_Record > > )
+	{
+		var childElements : array< weak< ItemBlueprintElement_Record > >;
+		var i : Int32;
+		attachments.PushBack( blueprintRecord.Slot() );
+		blueprintRecord.ChildElements( childElements );
+		for( i = 0; i < childElements.Size(); i += 1 )
+		{
+			GetattachementFromBlueprint( childElements[ i ], attachments );
+		}
+	}
+
+	public static function HasBetterShardInstalled( obj : GameObject, cyberdeckID : ItemID, shardID : ItemID ) : Bool
+	{
+		var usedSlots : array< TweakDBID >;
+		var deckData : gameItemData;
+		var ts : TransactionSystem;
+		var i : Int32;
+		var partData : InnerItemData;
+		var instQuality, shardQuality : gamedataQuality;
+		var shardType : CName;
+		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
+		ts.GetUsedSlotsOnItem( obj, cyberdeckID, usedSlots );
+		deckData = ts.GetItemData( obj, cyberdeckID );
+		shardType = TweakDBInterface.GetCName( ItemID.GetTDBID( shardID ) + T".shardType", '' );
+		if( shardType != '' )
+		{
+			for( i = 0; i < usedSlots.Size(); i += 1 )
+			{
+				deckData.GetItemPart( partData, usedSlots[ i ] );
+				instQuality = RPGManager.GetItemRecord( InnerItemData.GetItemID( partData ) ).Quality().Type();
+				shardQuality = RPGManager.GetItemRecord( shardID ).Quality().Type();
+				if( TweakDBInterface.GetCName( ItemID.GetTDBID( InnerItemData.GetItemID( partData ) ) + T".shardType", '' ) == shardType && ( shardQuality <= instQuality ) )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private function RemoveAllModsFromClothing()
+	{
+		var i : Int32;
+		var j : Int32;
+		var gi : GameInstance;
+		var player : weak< PlayerPuppet >;
+		var transactionSystem : TransactionSystem;
+		var itemList : array< weak< gameItemData > >;
+		var usedSlots : array< TweakDBID >;
+		var currentItem : ItemID;
+		gi = GetGameInstance();
+		player = GetPlayer( gi );
+		if( player )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( gi );
+			transactionSystem.GetItemList( player, itemList );
+			for( i = 0; i < itemList.Size(); i += 1 )
+			{
+				currentItem = itemList[ i ].GetID();
+				if( RPGManager.IsItemClothing( currentItem ) )
+				{
+					usedSlots.Clear();
+					transactionSystem.GetUsedSlotsOnItem( player, currentItem, usedSlots );
+					for( j = 0; j < usedSlots.Size(); j += 1 )
+					{
+						RemoveItemPart( player, currentItem, usedSlots[ j ], false );
+					}
+				}
+			}
+		}
+	}
+
+	private function SendCallback()
+	{
+		m_blackboard.SetVariant( GetAllBlackboardDefs().UI_ItemModSystem.ItemModSystemUpdated, true );
+		m_blackboard.SignalVariant( GetAllBlackboardDefs().UI_ItemModSystem.ItemModSystemUpdated );
+	}
+
+	private function OnInstallItemPart( request : InstallItemPart )
+	{
+		InstallItemPart( request.obj, request.baseItem, request.partToInstall, request.slotID );
+		SendCallback();
+	}
+
+	private function OnRemoveItemPart( request : RemoveItemPart )
+	{
+		RemoveItemPart( request.obj, request.baseItem, request.slotToEmpty, true );
+		SendCallback();
+	}
+
+	private function OnSwapItemPart( request : SwapItemPart )
+	{
+		SwapItemPart( request.obj, request.baseItem, request.partToInstall, request.slotID );
+		SendCallback();
+	}
+
+	private function CYBMETA1695()
+	{
+		var ts : TransactionSystem;
+		var mainPlayer : GameObject;
+		var items : array< weak< gameItemData > >;
+		ts = GameInstance.GetTransactionSystem( GetGameInstance() );
+		mainPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( !( ts ) || !( mainPlayer ) )
+		{
+			return;
+		}
+		ts.GetItemList( mainPlayer, items );
+		RemoveRedundantScopesFromAchillesRifles( items );
+		CYBMETA1695 = true;
+	}
+
+	public const function RemoveRedundantScopesFromAchillesRifles( items : array< weak< gameItemData > > )
+	{
+		var mainPlayer : GameObject;
+		var weaponParts : array< InnerItemData >;
+		var achilleses : array< ItemID >;
+		var i : Int32;
+		var k : Int32;
+		var scopeTDBID : TweakDBID;
+		scopeTDBID = T"AttachmentSlots.Scope";
+		mainPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( !( mainPlayer ) )
+		{
+			return;
+		}
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			if( items[ i ].GetName() == 'w_rifle_precision_militech_achilles' )
+			{
+				items[ i ].GetItemParts( weaponParts );
+				for( k = 0; k < weaponParts.Size(); k += 1 )
+				{
+					if( InnerItemData.GetSlotID( weaponParts[ k ] ) == scopeTDBID )
+					{
+						achilleses.PushBack( items[ i ].GetID() );
+					}
+				}
+			}
+		}
+		for( i = 0; i < achilleses.Size(); i += 1 )
+		{
+			RemoveItemPart( mainPlayer, achilleses[ i ], scopeTDBID, true );
+		}
+	}
+
+}
+
+importonly struct SPartSlots
+{
+	import var status : ESlotState;
+	import var installedPart : ItemID;
+	import var slotID : TweakDBID;
+	import var innerItemData : InnerItemData;
+}
+
+import enum ESlotState
+{
+	Taken,
+	Empty,
+	Available,
+}
+

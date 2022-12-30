@@ -1,0 +1,1225 @@
+class LateInit extends Event
+{
+}
+
+class EquipmentChangeTaskData extends ScriptTaskData
+{
+	var eqData : SPaperdollEquipData;
+}
+
+class ForceRadialWheelShutdown extends Event
+{
+}
+
+class RadialWheelUserData extends IScriptable
+{
+	var m_Slot : RadialSlot;
+}
+
+class RadialWheelController extends inkHUDGameController
+{
+	private const editable inlined var radialWeapons : array< WeaponRadialSlot >;
+	private editable inlined var inputHintController : RadialSlot;
+	private editable inlined var activeSlotTooltip : RadialSlot;
+	private editable inlined var statusEffects : RadialSlot;
+	private editable var pointerRef : inkWidgetRef;
+	private var activeSlot : WeaponRadialSlot;
+	private var pointer : weak< PointerController >;
+	private var activeIndex : Int32;
+	private var initialized : Bool;
+	private var isActive : Bool;
+	private var pendingRadialSlotAsyncSpawnCount : Int32;
+	private var consSlotCachedData : InventoryItemData;
+	private var gadgetSlotCachedData : InventoryItemData;
+	private var cyclingActionRegistered : CName;
+	private var registeredInputHints : array< InputHintData >;
+	private var applyInputHint : InputHintData;
+	private var cycleInputHintDataLeft : InputHintData;
+	private var cycleInputHintDataRight : InputHintData;
+	private var radialMode : ERadialMode;
+	default radialMode = ERadialMode.ApplyActiveSlotAndConsumables;
+	private var inventoryManager : InventoryDataManagerV2;
+	private var equipmentSystem : weak< EquipmentSystem >;
+	private var transactionSystem : weak< TransactionSystem >;
+	private var quickSlotBlackboard : weak< IBlackboard >;
+	private var QuickSlotBlackboardDef : UI_QuickSlotsDataDef;
+	private var axisInputCallbackID : CallbackHandle;
+	private var UISystemBB : weak< IBlackboard >;
+	private var UISystemDef : UI_SystemDef;
+	private var isInMenuCallbackID : CallbackHandle;
+	private var equipmentUIBlackboard : weak< IBlackboard >;
+	private var EquipmentBlackboardDef : UI_EquipmentDef;
+	private var equipmentUICallbackID : CallbackHandle;
+	var dbg_int : Int32;
+	var dbg_layers : array< Uint32 >;
+	var dbg_activeSlotLayers : array< Uint32 >;
+
+	protected function HandleEquipmentChangeByTask( eqData : SPaperdollEquipData )
+	{
+		var taskData : EquipmentChangeTaskData;
+		taskData = new EquipmentChangeTaskData;
+		taskData.eqData = eqData;
+		GameInstance.GetDelaySystem( GetPlayer().GetGame() ).QueueTask( this, taskData, 'HandleEquipmentChangeTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function HandleEquipmentChangeTask( data : ScriptTaskData )
+	{
+		var taskData : EquipmentChangeTaskData;
+		taskData = ( ( EquipmentChangeTaskData )( data ) );
+		if( taskData )
+		{
+			HandleEquipmentChange( taskData.eqData );
+		}
+	}
+
+	protected event OnInitialize()
+	{
+		var playerControlledObject : GameObject;
+		if( initialized )
+		{
+			return false;
+		}
+		GetRootWidget().SetVisible( false );
+		inventoryManager = new InventoryDataManagerV2;
+		inventoryManager.Initialize( ( ( PlayerPuppet )( GetPlayerControlledObject() ) ), this );
+		transactionSystem = GameInstance.GetTransactionSystem( GetPlayer().GetGame() );
+		playerControlledObject = GetPlayerControlledObject();
+		playerControlledObject.RegisterInputListener( this, 'OpenPauseMenu' );
+		playerControlledObject.RegisterInputListener( this, 'UI_PreviousAbility' );
+		playerControlledObject.RegisterInputListener( this, 'UI_NextAbility' );
+		playerControlledObject.RegisterInputListener( this, 'SelectWheelItem' );
+		playerControlledObject.RegisterInputListener( this, 'CloseWheel' );
+		pointer = ( ( PointerController )( inkWidgetRef.GetController( pointerRef ) ) );
+		RegisterBlackboards( true );
+		SpawnRadialWeapons();
+		SpawnSlotWidget( inputHintController );
+		SpawnSlotWidget( activeSlotTooltip );
+		SpawnSlotWidget( statusEffects );
+		CacheInputHintData();
+		PopupStateUtils.SetBackgroundBlurBlendTime( this, 0.1 );
+	}
+
+	protected event OnLateInit( evt : LateInit )
+	{
+		CacheData();
+		RefreshSlots();
+		SetActiveSlot( radialWeapons[ 0 ] );
+		pointer.SetRotation( Vector4( 0.0, 0.0, 0.0, 0.0 ), activeSlot.GetAngle(), 0 );
+		pointer.Enable();
+		initialized = true;
+		UpdateActiveTooltip();
+	}
+
+	protected event OnUninitialize()
+	{
+		Shutdown();
+		if( GetPlayerControlledObject() )
+		{
+			GetPlayerControlledObject().UnregisterInputListener( this );
+		}
+		RegisterBlackboards( false );
+		initialized = false;
+	}
+
+	protected function RegisterBlackboards( shouldRegister : Bool )
+	{
+		if( shouldRegister )
+		{
+			QuickSlotBlackboardDef = GetAllBlackboardDefs().UI_QuickSlotsData;
+			quickSlotBlackboard = GetBlackboardSystem().Get( QuickSlotBlackboardDef );
+			if( !( quickSlotBlackboard ) )
+			{
+				return;
+			}
+			axisInputCallbackID = quickSlotBlackboard.RegisterDelayedListenerVector4( QuickSlotBlackboardDef.leftStick, this, 'OnRadialAngleChanged' );
+			UISystemDef = GetAllBlackboardDefs().UI_System;
+			UISystemBB = GetBlackboardSystem().Get( UISystemDef );
+			if( !( UISystemBB ) )
+			{
+				return;
+			}
+			isInMenuCallbackID = UISystemBB.RegisterDelayedListenerBool( UISystemDef.IsInMenu, this, 'OnIsInMenuChanged' );
+			EquipmentBlackboardDef = GetAllBlackboardDefs().UI_Equipment;
+			equipmentUIBlackboard = GetBlackboardSystem().Get( EquipmentBlackboardDef );
+			if( !( equipmentUIBlackboard ) )
+			{
+				return;
+			}
+			equipmentUICallbackID = equipmentUIBlackboard.RegisterDelayedListenerVariant( EquipmentBlackboardDef.lastModifiedArea, this, 'OnEquipmentChanged' );
+		}
+		else
+		{
+			if( quickSlotBlackboard && axisInputCallbackID )
+			{
+				quickSlotBlackboard.UnregisterDelayedListener( QuickSlotBlackboardDef.leftStick, axisInputCallbackID );
+			}
+			if( UISystemBB && isInMenuCallbackID )
+			{
+				UISystemBB.UnregisterDelayedListener( UISystemDef.IsInMenu, isInMenuCallbackID );
+			}
+			if( equipmentUIBlackboard && equipmentUICallbackID )
+			{
+				equipmentUIBlackboard.UnregisterDelayedListener( EquipmentBlackboardDef.lastModifiedArea, equipmentUICallbackID );
+			}
+		}
+	}
+
+	private function Shutdown()
+	{
+		PlayLibraryAnimation( 'exit' );
+		ClearInputHints();
+		ClearDebug();
+		ClearActiveSlotDebug();
+		GetRootWidget().SetVisible( false );
+		if( GetPlayerControlledObject() )
+		{
+			GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() ).PopGameContext( UIGameContext.RadialWheel );
+		}
+		PopupStateUtils.SetBackgroundBlur( this, false );
+		TimeDilationHelper.SetTimeDilationWithProfile( GetPlayer(), "radialMenu", false );
+		if( isActive )
+		{
+			PlaySound( 'RadialMenu', 'OnClose' );
+		}
+		isActive = false;
+		SendPSMRadialCloseRequest();
+	}
+
+	private function SendPSMRadialCloseRequest()
+	{
+		var psmEvent : PSMPostponedParameterBool;
+		psmEvent = new PSMPostponedParameterBool;
+		psmEvent.id = 'RadialWheelCloseRequest';
+		psmEvent.value = true;
+		GetPlayerControlledObject().QueueEvent( psmEvent );
+	}
+
+	public override function UpdateRequired()
+	{
+		if( !( initialized ) || !( isActive ) )
+		{
+			return;
+		}
+		RefreshSlots();
+	}
+
+	private function GetValidNeighbouringIndex( arr : array< InventoryItemData >, fromIndex : Int32, searchNext : Bool ) : Int32
+	{
+		if( ( fromIndex > ( arr.Size() - 1 ) ) || ( fromIndex < 0 ) )
+		{
+			return -1;
+		}
+		if( searchNext )
+		{
+			if( fromIndex == ( arr.Size() - 1 ) )
+			{
+				return 0;
+			}
+			else
+			{
+				return fromIndex += 1;
+			}
+		}
+		else
+		{
+			if( fromIndex == 0 )
+			{
+				return arr.Size() - 1;
+			}
+			else
+			{
+				return fromIndex -= 1;
+			}
+		}
+	}
+
+	private function CacheData()
+	{
+		var root_anchorCenter_vector : Vector4;
+		var margin : inkMargin;
+		var slotAnchorPos : Vector2;
+		var normalized : Vector4;
+		var slotAnchorWidget : inkWidget;
+		var i : Int32;
+		for( i = 0; i < radialWeapons.Size(); i += 1 )
+		{
+			slotAnchorWidget = inkWidgetRef.Get( radialWeapons[ i ].slotAnchorRef );
+			if( slotAnchorWidget )
+			{
+				margin = slotAnchorWidget.GetMargin();
+				slotAnchorPos = ConvertMarginToVector( margin );
+				root_anchorCenter_vector = Vector4( slotAnchorPos.X, slotAnchorPos.Y, 0.0, 0.0 );
+				normalized = Vector4.Normalize2D( root_anchorCenter_vector );
+				radialWeapons[ i ].SetTargetAngle( ConvertVectorToAngle( normalized ) );
+			}
+			radialWeapons[ i ].SetIndex( i );
+		}
+	}
+
+	private function CacheInputHintData()
+	{
+		var source : CName;
+		source = 'RadialWheel';
+		applyInputHint.action = 'SelectWheelItem';
+		applyInputHint.source = source;
+		applyInputHint.queuePriority = 4;
+		applyInputHint.sortingPriority = 4;
+		applyInputHint.localizedLabel = "LocKey#23206";
+		cycleInputHintDataLeft.action = 'UI_PreviousAbility';
+		cycleInputHintDataLeft.source = source;
+		cycleInputHintDataLeft.queuePriority = 3;
+		cycleInputHintDataLeft.sortingPriority = 3;
+		cycleInputHintDataLeft.localizedLabel = "LocKey#77776";
+		cycleInputHintDataRight.action = 'UI_NextAbility';
+		cycleInputHintDataRight.source = source;
+		cycleInputHintDataRight.queuePriority = 2;
+		cycleInputHintDataRight.sortingPriority = 2;
+		cycleInputHintDataRight.localizedLabel = "LocKey#77775";
+	}
+
+	private function ConvertMarginToVector( margin : inkMargin ) : Vector2
+	{
+		var v : Vector2;
+		var x : Float;
+		var y : Float;
+		x = margin.left + margin.right;
+		y = margin.top + margin.bottom;
+		v = Vector2( x, y );
+		v.Y = -( v.Y );
+		return v;
+	}
+
+	private function DetermineActiveSlot( angle : Float ) : WeaponRadialSlot
+	{
+		var i : Int32;
+		var angleDistance : Float;
+		var bestAngleDistance : Float;
+		var bestSlot : WeaponRadialSlot;
+		bestAngleDistance = 999.0;
+		for( i = 0; i < radialWeapons.Size(); i += 1 )
+		{
+			angleDistance = AbsF( AngleDistance( radialWeapons[ i ].GetAngle(), angle ) );
+			if( angleDistance <= bestAngleDistance )
+			{
+				bestAngleDistance = angleDistance;
+				bestSlot = radialWeapons[ i ];
+			}
+		}
+		return bestSlot;
+	}
+
+	private function SetActiveSlot( newActiveSlot : WeaponRadialSlot ) : Bool
+	{
+		var cyclableSlot : CyclableRadialSlot;
+		var hintsRequireUpdate : Bool;
+		if( newActiveSlot == activeSlot )
+		{
+			return false;
+		}
+		PlayLibraryAnimation( 'active_slot' );
+		if( newActiveSlot.IsCyclable() )
+		{
+			cyclableSlot = ( ( CyclableRadialSlot )( newActiveSlot ) );
+			cyclableSlot.SetCanCycle( CanPlayerCycleSlot( cyclableSlot ) );
+		}
+		if( activeSlot )
+		{
+			if( ( !( activeSlot.CanCycle() ) && newActiveSlot.CanCycle() ) || ( activeSlot.CanCycle() && !( newActiveSlot.CanCycle() ) ) )
+			{
+				hintsRequireUpdate = true;
+			}
+		}
+		if( activeSlot )
+		{
+			activeSlot.Deactivate();
+		}
+		activeSlot = newActiveSlot;
+		activeIndex = activeSlot.GetIndex();
+		if( activeSlot )
+		{
+			activeSlot.Activate();
+		}
+		DrawActiveSlotDebug();
+		if( GetRootWidget().IsVisible() && hintsRequireUpdate )
+		{
+			UpdateInputHints();
+		}
+		UpdateActiveTooltip();
+		return true;
+	}
+
+	private function ConvertVectorToAngle( input : Vector4 ) : Float
+	{
+		var referenceVector : Vector4;
+		var angle : Float;
+		var dbg_root : Vector4;
+		referenceVector = Vector4( 0.0, 1.0, 0.0, 0.0 );
+		dbg_root = Vector4( 500.0, 700.0, 0.0, 0.0 );
+		if( ( input.X == 0.0 ) && ( input.Y == 0.0 ) )
+		{
+			return -1.0;
+		}
+		angle = Vector4.GetAngleBetween( referenceVector, input );
+		if( input.X < 0.0 )
+		{
+			angle = 360.0 - angle;
+		}
+		if( !( IsFinal() ) && isActive )
+		{
+			ClearDebug();
+			DrawDebug( GameInstance.GetDebugVisualizerSystem( GetPlayerControlledObject().GetGame() ).DrawText( Vector4( 500.0, 500.0, 0.0, 0.0 ), ( ( "X: " + FloatToString( input.X ) ) + " | Y: " ) + FloatToString( input.Y ), , SColor.White() ) );
+			DrawDebug( GameInstance.GetDebugVisualizerSystem( GetPlayerControlledObject().GetGame() ).DrawText( Vector4( 500.0, 600.0, 0.0, 0.0 ), "Angle: " + FloatToString( angle ), , SColor.White() ) );
+			DrawDebug( GameInstance.GetDebugVisualizerSystem( GetPlayerControlledObject().GetGame() ).DrawLine( dbg_root, dbg_root - ( referenceVector * 40.0 ), SColor.Blue() ) );
+			DrawDebug( GameInstance.GetDebugVisualizerSystem( GetPlayerControlledObject().GetGame() ).DrawLine( dbg_root, Vector4( dbg_root.X + ( input.X * 40.0 ), dbg_root.Y - ( input.Y * 40.0 ), 0.0, 0.0 ), SColor.Red() ) );
+		}
+		return angle;
+	}
+
+	private function SpawnRadialWeapons()
+	{
+		var i : Int32;
+		for( i = 0; i < radialWeapons.Size(); i += 1 )
+		{
+			SpawnSlotWidget( radialWeapons[ i ] );
+		}
+	}
+
+	private function SpawnSlotWidget( slot : RadialSlot ) : Bool
+	{
+		var spawnedWidget : inkWidget;
+		var userData : RadialWheelUserData;
+		var spawnData : AsyncSpawnData;
+		userData = new RadialWheelUserData;
+		userData.m_Slot = slot;
+		spawnData = new AsyncSpawnData;
+		spawnData.Initialize( this, 'OnSlotWidgetSpawned', userData, this );
+		if( inkWidgetLibraryResource.IsValid( slot.libraryRef.widgetLibrary ) )
+		{
+			pendingRadialSlotAsyncSpawnCount += 1;
+			CreateWidgetAsync( inkWidgetRef.Get( slot.slotAnchorRef ), slot.libraryRef.widgetItem, inkWidgetLibraryResource.GetPath( slot.libraryRef.widgetLibrary ), spawnData );
+		}
+		else
+		{
+			spawnedWidget = inkWidgetRef.Get( slot.slotAnchorRef );
+			SetupWidgetForSlot( spawnedWidget, slot );
+		}
+		return true;
+	}
+
+	protected event OnSlotWidgetSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var radialUserData : RadialWheelUserData;
+		var lateInit : LateInit;
+		var spawnData : AsyncSpawnData;
+		if( !( userData ) )
+		{
+			return false;
+		}
+		spawnData = ( ( AsyncSpawnData )( userData ) );
+		radialUserData = ( ( RadialWheelUserData )spawnData.m_widgetData );
+		if( !( radialUserData ) )
+		{
+			return false;
+		}
+		if( !( radialUserData.m_Slot ) )
+		{
+			return false;
+		}
+		SetupWidgetForSlot( widget, radialUserData.m_Slot );
+		pendingRadialSlotAsyncSpawnCount = pendingRadialSlotAsyncSpawnCount - 1;
+		if( pendingRadialSlotAsyncSpawnCount == 0 )
+		{
+			lateInit = new LateInit;
+			QueueEvent( lateInit );
+		}
+	}
+
+	private function SetupWidgetForSlot( widget : inkWidget, slot : RadialSlot )
+	{
+		if( widget )
+		{
+			if( slot.slotType == SlotType.TOOLTIP )
+			{
+				widget.SetAnchor( inkEAnchor.TopRight );
+				widget.SetAnchorPoint( Vector2( 1.0, 0.0 ) );
+			}
+			else
+			{
+				widget.SetAnchor( inkEAnchor.Centered );
+				widget.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+			}
+			slot.Construct( widget );
+			return;
+		}
+	}
+
+	private function RefreshSlots()
+	{
+		RefreshWeapons();
+		RefreshCyberware();
+		RefreshHotkeys();
+		UpdateActiveTooltip();
+		UpdatePointer( Vector4(), 0.0 );
+		UpdateStatusEffects();
+	}
+
+	private function RefreshWeapons()
+	{
+		var controller : InventoryItemDisplayController;
+		var player : weak< GameObject >;
+		var itemData : array< InventoryItemData >;
+		var i : Int32;
+		var size : Int32;
+		player = GetPlayerControlledObject();
+		if( !( player ) )
+		{
+			return;
+		}
+		itemData = inventoryManager.GetEquippedWeapons();
+		size = itemData.Size();
+		if( size > 3 )
+		{
+			size = 3;
+		}
+		for( i = 0; i < size; i += 1 )
+		{
+			controller = ( ( InventoryItemDisplayController )( radialWeapons[ i ].GetWidget().GetController() ) );
+			if( controller )
+			{
+				controller.Setup( itemData[ i ] );
+			}
+		}
+	}
+
+	private function RefreshHotkeys()
+	{
+		var slot4, slot5 : CyclableRadialSlot;
+		slot4 = ( ( CyclableRadialSlot )( radialWeapons[ 4 ] ) );
+		slot5 = ( ( CyclableRadialSlot )( radialWeapons[ 5 ] ) );
+		RefreshHotkey( slot4 );
+		RefreshHotkey( slot5 );
+	}
+
+	private function RefreshHotkey( slot : CyclableRadialSlot )
+	{
+		var validItems : array< InventoryItemData >;
+		var hotkeyItem : InventoryItemData;
+		var i : Int32;
+		validItems = GetValidItemsForMiscSlot( slot );
+		if( validItems.Size() == 0 )
+		{
+			GetController( slot ).Setup( hotkeyItem, ItemDisplayContext.DPAD_RADIAL );
+			return;
+		}
+		hotkeyItem = inventoryManager.GetHotkeyItemData( slot.GetHotkey() );
+		for( i = 0; i < validItems.Size(); i += 1 )
+		{
+			if( InventoryItemData.GetID( validItems[ i ] ) == InventoryItemData.GetID( hotkeyItem ) )
+			{
+				GetController( slot ).Setup( hotkeyItem, ItemDisplayContext.DPAD_RADIAL );
+				return;
+			}
+		}
+		GetController( slot ).Setup( validItems[ 0 ], ItemDisplayContext.DPAD_RADIAL );
+	}
+
+	private function RefreshCyberware()
+	{
+		var ts : TransactionSystem;
+		var hasFistsEquipped : Bool;
+		var hasCyberwareEquipped : Bool;
+		var armsCyberware : InventoryItemData;
+		var baseFists : InventoryItemData;
+		var slot : CyclableRadialSlot;
+		var controller : InventoryItemDisplayController;
+		var player : weak< GameObject >;
+		slot = ( ( CyclableRadialSlot )( radialWeapons[ 6 ] ) );
+		controller = GetController( slot );
+		player = GetPlayerControlledObject();
+		ts = GameInstance.GetTransactionSystem( player.GetGame() );
+		if( ( !( controller ) || !( player ) ) || !( ts ) )
+		{
+			return;
+		}
+		armsCyberware = GetValidCombatCyberware();
+		baseFists = GetBaseFists();
+		if( !( ItemID.IsValid( InventoryItemData.GetID( baseFists ) ) ) )
+		{
+		}
+		if( !( ItemID.IsValid( InventoryItemData.GetID( armsCyberware ) ) ) )
+		{
+			controller.Setup( baseFists );
+			return;
+		}
+		else
+		{
+			if( InventoryItemData.GetItemType( armsCyberware ) == gamedataItemType.Cyb_StrongArms )
+			{
+				controller.Setup( armsCyberware );
+				return;
+			}
+			hasCyberwareEquipped = ts.HasItemInAnySlot( player, InventoryItemData.GetID( armsCyberware ) );
+			hasFistsEquipped = ts.HasItemInAnySlot( player, InventoryItemData.GetID( baseFists ) );
+			if( hasCyberwareEquipped )
+			{
+				controller.Setup( baseFists );
+			}
+			else if( hasFistsEquipped )
+			{
+				controller.Setup( armsCyberware );
+			}
+			else
+			{
+				controller.Setup( armsCyberware );
+			}
+		}
+	}
+
+	private function BindItem( slot : CyclableRadialSlot, requestType : EHotkeyRequestType ) : Bool
+	{
+		var request : HotkeyAssignmentRequest;
+		request = HotkeyAssignmentRequest.Construct( GetItemID( slot ), slot.GetHotkey(), GetPlayerControlledObject(), requestType );
+		if( request.IsValid() )
+		{
+			GetEquipmentSystem().QueueRequest( request );
+			return true;
+		}
+		return false;
+	}
+
+	private function DrawItem( slot : RadialSlot ) : Bool
+	{
+		var draw : DrawItemRequest;
+		var itemData : InventoryItemData;
+		var owner : weak< GameObject >;
+		itemData = GetController( slot ).GetItemData();
+		owner = GetPlayerControlledObject();
+		if( ( ( ( StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'NoCombat' ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'FirearmsNoSwitch' ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'ShootingRangeCompetition' ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'Fists' ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'FirearmsNoUnequipNoSwitch' ) )
+		{
+			return false;
+		}
+		if( ItemID.IsValid( InventoryItemData.GetID( itemData ) ) )
+		{
+			draw = new DrawItemRequest;
+			draw.owner = owner;
+			draw.itemID = InventoryItemData.GetID( itemData );
+			GetEquipmentSystem().QueueRequest( draw );
+			if( slot == radialWeapons[ 6 ] )
+			{
+				( ( CyclableRadialSlot )( radialWeapons[ 6 ] ) ).SetCanCycle( false );
+			}
+			return true;
+		}
+		return false;
+	}
+
+	private function ApplySlot( slot : RadialSlot )
+	{
+		var successful : Bool;
+		PlayLibraryAnimation( 'apply_slot' );
+		switch( slot.slotType )
+		{
+			case SlotType.MISC:
+				successful = BindItem( ( ( CyclableRadialSlot )( slot ) ), EHotkeyRequestType.Assign );
+			break;
+			case SlotType.HOLSTER:
+				successful = true;
+			DisarmPlayer();
+			break;
+			default:
+				successful = DrawItem( slot );
+			break;
+		}
+		if( successful )
+		{
+			Shutdown();
+		}
+	}
+
+	private function DisarmPlayer()
+	{
+		var request : EquipmentSystemWeaponManipulationRequest;
+		var eqs : EquipmentSystem;
+		var owner : weak< GameObject >;
+		owner = GetPlayerControlledObject();
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'FirearmsNoUnequip' ) )
+		{
+			return;
+		}
+		eqs = GetEquipmentSystem();
+		request = new EquipmentSystemWeaponManipulationRequest;
+		request.owner = GetPlayer();
+		request.requestType = EquipmentManipulationAction.UnequipAll;
+		request.equipAnimType = gameEquipAnimationType.Default;
+		eqs.QueueRequest( request );
+	}
+
+	private function CycleSlot( cyclableSlot : CyclableRadialSlot, actionName : CName )
+	{
+		var next : Bool;
+		PlayLibraryAnimation( 'cycle_hotkey' );
+		if( actionName == 'UI_NextAbility' )
+		{
+			next = true;
+		}
+		if( cyclableSlot.GetHotkey() != EHotkey.INVALID )
+		{
+			CycleHotkeys( cyclableSlot, next );
+		}
+		else
+		{
+			CycleCyberware( cyclableSlot );
+		}
+		cyclingActionRegistered = actionName;
+		cyclableSlot.CycleStart( next );
+		DrawActiveSlotDebug();
+		UpdateActiveTooltip();
+		return;
+	}
+
+	private function CycleHotkeys( cyclableSlot : CyclableRadialSlot, next : Bool )
+	{
+		var i : Int32;
+		var validIndex : Int32;
+		var totalItems : array< InventoryItemData >;
+		var slotItemData : InventoryItemData;
+		var matchFound : Bool;
+		totalItems = GetValidItemsForMiscSlot( cyclableSlot );
+		if( totalItems.Size() == 0 )
+		{
+			return;
+		}
+		slotItemData = GetController( cyclableSlot ).GetItemData();
+		validIndex = -1;
+		if( ItemID.IsValid( InventoryItemData.GetID( slotItemData ) ) )
+		{
+			for( i = 0; i < totalItems.Size(); i += 1 )
+			{
+				if( InventoryItemData.GetID( totalItems[ i ] ) == InventoryItemData.GetID( slotItemData ) )
+				{
+					validIndex = GetValidNeighbouringIndex( totalItems, i, next );
+					if( validIndex >= 0 )
+					{
+						GetController( activeSlot ).Setup( totalItems[ validIndex ], ItemDisplayContext.DPAD_RADIAL );
+						matchFound = true;
+						break;
+					}
+				}
+			}
+		}
+		if( !( matchFound ) )
+		{
+			GetController( activeSlot ).Setup( totalItems[ 0 ], ItemDisplayContext.DPAD_RADIAL );
+		}
+		if( radialMode == ERadialMode.ApplyActiveSlotAndConsumables )
+		{
+			BindItem( ( ( CyclableRadialSlot )( activeSlot ) ), EHotkeyRequestType.Cycle );
+		}
+	}
+
+	private function CycleCyberware( cyclableSlot : CyclableRadialSlot )
+	{
+		var baseFists : InventoryItemData;
+		var armsCyberware : InventoryItemData;
+		baseFists = GetBaseFists();
+		armsCyberware = GetValidCombatCyberware();
+		if( GetItemID( cyclableSlot ) == InventoryItemData.GetID( baseFists ) )
+		{
+			GetController( cyclableSlot ).Setup( armsCyberware );
+			return;
+		}
+		if( GetItemID( cyclableSlot ) == InventoryItemData.GetID( armsCyberware ) )
+		{
+			GetController( cyclableSlot ).Setup( baseFists );
+			return;
+		}
+	}
+
+	private function UpdatePointer( rawInputVector : Vector4, rawAngle : Float )
+	{
+		pointer.SetRotation( rawInputVector, rawAngle, activeIndex );
+	}
+
+	private function UpdateStatusEffects() {}
+
+	private function UpdateActiveTooltip()
+	{
+		var tooltipController : ItemTooltipController;
+		var activeSlotController : InventoryItemDisplayController;
+		if( ( activeSlot == radialWeapons[ 3 ] ) || ( GetItemID( activeSlot ) == ItemID.None() ) )
+		{
+			inkWidgetRef.Get( activeSlotTooltip.slotAnchorRef ).SetVisible( false );
+			return;
+		}
+		else
+		{
+			inkWidgetRef.Get( activeSlotTooltip.slotAnchorRef ).SetVisible( true );
+		}
+		tooltipController = ( ( ItemTooltipController )( activeSlotTooltip.GetWidget().GetController() ) );
+		activeSlotController = GetController( activeSlot );
+		if( ( tooltipController && activeSlotController ) && inventoryManager )
+		{
+			tooltipController.SetData( inventoryManager.GetTooltipDataForInventoryItem( activeSlotController.GetItemData(), true ) );
+			tooltipController.ForceNoEquipped();
+		}
+	}
+
+	private function RestoreCachedSlots()
+	{
+		radialWeapons[ 4 ].GetController().Setup( consSlotCachedData, ItemDisplayContext.DPAD_RADIAL );
+		radialWeapons[ 5 ].GetController().Setup( gadgetSlotCachedData, ItemDisplayContext.DPAD_RADIAL );
+		BindItem( ( ( CyclableRadialSlot )( radialWeapons[ 4 ] ) ), EHotkeyRequestType.Restore );
+		BindItem( ( ( CyclableRadialSlot )( radialWeapons[ 5 ] ) ), EHotkeyRequestType.Restore );
+	}
+
+	private function ClearInputHints()
+	{
+		var i : Int32;
+		for( i = registeredInputHints.Size() - 1; i >= 0; i -= 1 )
+		{
+			AddInputHint( registeredInputHints[ i ], false );
+		}
+	}
+
+	private function UpdateInputHints()
+	{
+		var add : Bool;
+		add = activeSlot.CanCycle();
+		AddInputHint( cycleInputHintDataLeft, add );
+		AddInputHint( cycleInputHintDataRight, add );
+	}
+
+	private function AddInputHint( inputHint : InputHintData, add : Bool )
+	{
+		var i : Int32;
+		if( add )
+		{
+			registeredInputHints.PushBack( inputHint );
+		}
+		else
+		{
+			for( i = registeredInputHints.Size() - 1; i >= 0; i -= 1 )
+			{
+				if( registeredInputHints[ i ].action == inputHint.action )
+				{
+					registeredInputHints.Erase( i );
+				}
+			}
+		}
+		SendInputHintEvent( inputHint, add );
+	}
+
+	private function SendInputHintEvent( inputHint : InputHintData, show : Bool )
+	{
+		var evt : UpdateInputHintEvent;
+		PlayLibraryAnimation( 'input_update' );
+		evt = new UpdateInputHintEvent;
+		evt.data = inputHint;
+		evt.show = show;
+		evt.targetHintContainer = 'RadialInputHintController';
+		QueueEvent( evt );
+	}
+
+	protected event OnOpenWheelRequest( evt : QuickSlotButtonHoldStartEvent )
+	{
+		if( evt.dPadItemDirection == EDPadSlot.WeaponsWheel )
+		{
+			AddInputHint( applyInputHint, true );
+			TimeDilationHelper.SetTimeDilationWithProfile( GetPlayer(), "radialMenu", true );
+			RefreshSlots();
+			GetRootWidget().SetVisible( true );
+			PlayLibraryAnimation( 'enter' );
+			PlaySound( 'RadialMenu', 'OnOpen' );
+			if( radialMode == ERadialMode.ApplyActiveSlotAndConsumables )
+			{
+				consSlotCachedData = GetInventoryItemData( radialWeapons[ 4 ] );
+				gadgetSlotCachedData = GetInventoryItemData( radialWeapons[ 5 ] );
+			}
+			GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() ).PushGameContext( UIGameContext.RadialWheel );
+			PopupStateUtils.SetBackgroundBlur( this, true );
+			isActive = true;
+		}
+	}
+
+	protected event OnForceRadialWheelShutdown( evt : ForceRadialWheelShutdown )
+	{
+		if( isActive )
+		{
+			Shutdown();
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var cyclableSlot : CyclableRadialSlot;
+		var aName : CName;
+		var aType : gameinputActionType;
+		var isJustReleased : Bool;
+		aName = ListenerAction.GetName( action );
+		aType = ListenerAction.GetType( action );
+		isJustReleased = ListenerAction.IsButtonJustReleased( action );
+		if( !( isActive ) )
+		{
+			return false;
+		}
+		if( ( isJustReleased && aName == cyclingActionRegistered ) && ( ( CyclableRadialSlot )( activeSlot ) ).isCycling )
+		{
+			( ( CyclableRadialSlot )( activeSlot ) ).CycleStop();
+			cyclingActionRegistered = '';
+			RefreshHotkeys();
+		}
+		if( activeSlot && aType == gameinputActionType.BUTTON_PRESSED )
+		{
+			if( aName == 'OpenPauseMenu' )
+			{
+				ListenerActionConsumer.DontSendReleaseEvent( consumer );
+				Shutdown();
+			}
+			if( aName == 'UI_PreviousAbility' || aName == 'UI_NextAbility' )
+			{
+				cyclableSlot = ( ( CyclableRadialSlot )( activeSlot ) );
+				if( cyclableSlot && cyclableSlot.CanCycle() )
+				{
+					CycleSlot( cyclableSlot, aName );
+				}
+			}
+			else if( aName == 'SelectWheelItem' )
+			{
+				ApplySlot( activeSlot );
+			}
+		}
+		else if( aType == gameinputActionType.BUTTON_RELEASED )
+		{
+			if( aName == 'CloseWheel' )
+			{
+				Shutdown();
+			}
+			else
+			{
+				if( aName == cyclingActionRegistered && ( ( CyclableRadialSlot )( activeSlot ) ).isCycling )
+				{
+					( ( CyclableRadialSlot )( activeSlot ) ).CycleStop();
+					cyclingActionRegistered = '';
+				}
+			}
+		}
+	}
+
+	protected event OnRadialAngleChanged( v : Vector4 )
+	{
+		var angle : Float;
+		if( !( isActive ) )
+		{
+			return false;
+		}
+		angle = ConvertVectorToAngle( v );
+		pointer.UpdateCenterPiece( v );
+		if( angle < 0.0 )
+		{
+			return false;
+		}
+		SetActiveSlot( DetermineActiveSlot( angle ) );
+		UpdatePointer( v, angle );
+	}
+
+	protected event OnIsInMenuChanged( param : Bool )
+	{
+		if( isActive && param )
+		{
+			Shutdown();
+		}
+	}
+
+	protected event OnEquipmentChanged( value : Variant )
+	{
+		var data : SPaperdollEquipData;
+		data = ( ( SPaperdollEquipData )value );
+		HandleEquipmentChangeByTask( data );
+	}
+
+	private function HandleEquipmentChange( data : SPaperdollEquipData )
+	{
+		var itemObject : ItemObject;
+		var itemID : ItemID;
+		var player : GameObject;
+		var i : Int32;
+		if( data.placementSlot == T"AttachmentSlots.WeaponRight" )
+		{
+			RefreshWeapons();
+			player = GetPlayer();
+			itemObject = transactionSystem.GetItemInSlot( player, data.placementSlot );
+			if( itemObject )
+			{
+				itemID = itemObject.GetItemID();
+				if( !( ItemID.IsValid( itemID ) ) )
+				{
+					return;
+				}
+				for( i = 0; i < radialWeapons.Size(); i += 1 )
+				{
+					if( radialWeapons[ i ].GetController().GetItemID() == itemID )
+					{
+						SetActiveSlot( radialWeapons[ i ] );
+					}
+				}
+			}
+		}
+	}
+
+	private function GetController( slot : RadialSlot ) : InventoryItemDisplayController
+	{
+		if( slot && slot.GetWidget() )
+		{
+			return ( ( InventoryItemDisplayController )( slot.GetWidget().GetController() ) );
+		}
+		return NULL;
+	}
+
+	private function CanPlayerCycleCyberware() : Bool
+	{
+		var hasCyberwareEquipped : Bool;
+		var hasFistsEquipped : Bool;
+		var player : GameObject;
+		var armsCyberware : InventoryItemData;
+		var baseFists : InventoryItemData;
+		var ts : TransactionSystem;
+		player = GetPlayer();
+		ts = GameInstance.GetTransactionSystem( player.GetGame() );
+		armsCyberware = GetValidCombatCyberware();
+		baseFists = GetBaseFists();
+		hasCyberwareEquipped = ts.HasItemInAnySlot( player, InventoryItemData.GetID( armsCyberware ) );
+		hasFistsEquipped = ts.HasItemInAnySlot( player, InventoryItemData.GetID( baseFists ) );
+		if( ( ( !( ItemID.IsValid( InventoryItemData.GetID( armsCyberware ) ) ) || hasCyberwareEquipped ) || hasFistsEquipped ) || InventoryItemData.GetItemType( armsCyberware ) == gamedataItemType.Cyb_StrongArms )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	private function GetValidItemsForMiscSlot( cyclableSlot : CyclableRadialSlot ) : array< InventoryItemData >
+	{
+		var i : Int32;
+		var k : Int32;
+		var slotTypes : array< gamedataItemType >;
+		var freshItems : array< InventoryItemData >;
+		var totalItems : array< InventoryItemData >;
+		var currentItemID : ItemID;
+		slotTypes = Hotkey.GetScope( cyclableSlot.GetHotkey() );
+		for( i = 0; i < slotTypes.Size(); i += 1 )
+		{
+			freshItems = inventoryManager.GetPlayerItemsByType( slotTypes[ i ] );
+			for( k = 0; k < freshItems.Size(); k += 1 )
+			{
+				currentItemID = InventoryItemData.GetID( freshItems[ k ] );
+				if( !( ItemID.IsValid( currentItemID ) ) || totalItems.Contains( freshItems[ k ] ) )
+				{
+					continue;
+				}
+				if( GetItemData( currentItemID ).GetItemType() == gamedataItemType.Cyb_Ability || GetItemData( currentItemID ).GetItemType() == gamedataItemType.Cyb_Launcher )
+				{
+					if( !( GetEquipmentSystem().IsEquipped( GetPlayer(), currentItemID ) ) )
+					{
+						continue;
+					}
+				}
+				totalItems.PushBack( freshItems[ k ] );
+			}
+		}
+		return totalItems;
+	}
+
+	private function CanPlayerCycleMisc( cyclableSlot : CyclableRadialSlot ) : Bool
+	{
+		var validItems : array< InventoryItemData >;
+		validItems = GetValidItemsForMiscSlot( cyclableSlot );
+		return validItems.Size() > 1;
+	}
+
+	private function CanPlayerCycleSlot( slot : CyclableRadialSlot ) : Bool
+	{
+		if( slot.slotType == SlotType.COMBAT_CYBERWARE )
+		{
+			return CanPlayerCycleCyberware();
+		}
+		return CanPlayerCycleMisc( slot );
+	}
+
+	protected function GetWeapons() : array< weak< gameItemData > >
+	{
+		var ts : TransactionSystem;
+		var allItems : array< weak< gameItemData > >;
+		var weapons : array< weak< gameItemData > >;
+		var player : GameObject;
+		player = GetPlayer();
+		ts = GameInstance.GetTransactionSystem( player.GetGame() );
+		if( ts && player )
+		{
+			ts.GetItemList( player, allItems );
+			RPGManager.ExtractItemsOfEquipArea( gamedataEquipmentArea.Weapon, allItems, weapons );
+			RPGManager.ExtractItemsOfEquipArea( gamedataEquipmentArea.QuickSlot, allItems, weapons );
+		}
+		return weapons;
+	}
+
+	private function GetValidCombatCyberware() : InventoryItemData
+	{
+		var armsCyberware : InventoryItemData;
+		var emptyData : InventoryItemData;
+		armsCyberware = inventoryManager.GetItemDataEquippedInArea( gamedataEquipmentArea.ArmsCW );
+		if( ItemID.IsValid( InventoryItemData.GetID( armsCyberware ) ) && InventoryItemData.GetItemType( armsCyberware ) != gamedataItemType.Cyb_Launcher )
+		{
+			return armsCyberware;
+		}
+		return emptyData;
+	}
+
+	private function GetBaseFists() : InventoryItemData
+	{
+		var fistsIDs : array< ItemID >;
+		var emptyData : InventoryItemData;
+		var player : GameObject;
+		player = GetPlayer();
+		fistsIDs = EquipmentSystem.GetItemsInArea( player, gamedataEquipmentArea.BaseFists );
+		if( fistsIDs.Size() > 0 )
+		{
+			return inventoryManager.GetInventoryItemData( player, GetItemData( fistsIDs[ 0 ] ), false, true );
+		}
+		return emptyData;
+	}
+
+	private function GetEquipmentSystem() : weak< EquipmentSystem >
+	{
+		if( !( equipmentSystem ) )
+		{
+			equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( GetPlayerControlledObject().GetGame() ).Get( 'EquipmentSystem' ) ) );
+		}
+		return equipmentSystem;
+	}
+
+	private function GetItemData( itemID : ItemID ) : weak< gameItemData >
+	{
+		if( !( transactionSystem ) )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( GetPlayerControlledObject().GetGame() );
+		}
+		return transactionSystem.GetItemData( GetPlayerControlledObject(), itemID );
+	}
+
+	private function GetInventoryItemData( slot : RadialSlot ) : InventoryItemData
+	{
+		var slotItemData : InventoryItemData;
+		if( GetController( slot ) )
+		{
+			slotItemData = GetController( slot ).GetItemData();
+		}
+		return slotItemData;
+	}
+
+	private function GetItemID( slot : RadialSlot ) : ItemID
+	{
+		var slotItemData : InventoryItemData;
+		slotItemData = GetInventoryItemData( slot );
+		return InventoryItemData.GetID( slotItemData );
+	}
+
+	private function GetPlayer() : GameObject
+	{
+		return GetPlayerControlledObject();
+	}
+
+	private function DrawDebug( id : Uint32 )
+	{
+		var i : Int32;
+		for( i = 0; i < dbg_layers.Size(); i += 1 )
+		{
+			if( id == dbg_layers[ i ] )
+			{
+				return;
+			}
+		}
+		dbg_layers.PushBack( id );
+	}
+
+	private function ClearDebug()
+	{
+		var i : Int32;
+		for( i = 0; i < dbg_layers.Size(); i += 1 )
+		{
+			GameInstance.GetDebugVisualizerSystem( GetPlayer().GetGame() ).ClearLayer( dbg_layers[ i ] );
+		}
+		dbg_layers.Clear();
+	}
+
+	private function ClearActiveSlotDebug()
+	{
+		var i : Int32;
+		for( i = 0; i < dbg_activeSlotLayers.Size(); i += 1 )
+		{
+			GameInstance.GetDebugVisualizerSystem( GetPlayer().GetGame() ).ClearLayer( dbg_activeSlotLayers[ i ] );
+		}
+		dbg_activeSlotLayers.Clear();
+	}
+
+	private function DrawActiveSlotDebug()
+	{
+		var i : Int32;
+		var base : array< String >;
+		var info : array< String >;
+		var itemData : InventoryItemData;
+		var potentialItemData : array< InventoryItemData >;
+		if( !( isActive ) || IsFinal() )
+		{
+			return;
+		}
+		ClearActiveSlotDebug();
+		itemData = GetInventoryItemData( activeSlot );
+		base.PushBack( TDBID.ToStringDEBUG( ItemID.GetTDBID( InventoryItemData.GetID( itemData ) ) ) );
+		base.PushBack( "-" * 32 );
+		activeSlot.GetDebugInfo( info );
+		for( i = 0; i < info.Size(); i += 1 )
+		{
+			base.PushBack( info[ i ] );
+		}
+		if( activeSlot.CanCycle() )
+		{
+			if( activeSlot.slotType == SlotType.COMBAT_CYBERWARE )
+			{
+				potentialItemData.PushBack( GetValidCombatCyberware() );
+				potentialItemData.PushBack( GetBaseFists() );
+			}
+			else if( activeSlot.slotType == SlotType.MISC )
+			{
+				potentialItemData = GetValidItemsForMiscSlot( ( ( CyclableRadialSlot )( activeSlot ) ) );
+			}
+		}
+		for( i = 0; i < potentialItemData.Size(); i += 1 )
+		{
+			base.PushBack( TDBID.ToStringDEBUG( ItemID.GetTDBID( InventoryItemData.GetID( potentialItemData[ i ] ) ) ) );
+		}
+		for( i = 0; i < base.Size(); i += 1 )
+		{
+			dbg_activeSlotLayers.PushBack( GameInstance.GetDebugVisualizerSystem( GetPlayer().GetGame() ).DrawText( Vector4( 300.0, 300.0 + ( ( ( Float )( i ) ) * 30.0 ), 0.0, 0.0 ), base[ i ], , SColor.Green() ) );
+		}
+	}
+
+}
+
+enum SlotType
+{
+	DEFAULT = 0,
+	HOLSTER = 1,
+	WEAPON = 2,
+	COMBAT_CYBERWARE = 3,
+	TOOLTIP = 4,
+	MISC = 5,
+}
+
+enum ERadialMode
+{
+	ApplyOnlyActiveSlot = 0,
+	ApplyActiveSlotAndConsumables = 1,
+}
+

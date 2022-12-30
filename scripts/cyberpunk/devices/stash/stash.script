@@ -1,0 +1,332 @@
+class OpenStash extends ActionBool
+{
+
+	public function SetProperties()
+	{
+		actionName = 'OpenStash';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, true, 'LocKey#15799', 'LocKey#15799' );
+	}
+
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	{
+		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsAvailable( device : ScriptableDeviceComponentPS ) : Bool
+	{
+		if( device.IsUnpowered() || device.IsDisabled() )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsClearanceValid( clearance : Clearance ) : Bool
+	{
+		if( Clearance.IsInRange( clearance, DefaultActionsParametersHolder.GetInteractiveClearance() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class Stash extends InteractiveDevice
+{
+	default m_controllerTypeName = 'StashController';
+	var m_inventory : Inventory;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		EntityRequestComponentsInterface.RequestComponent( ri, 'inventory', 'Inventory', false );
+		super.OnRequestComponents( ri );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_inventory = ( ( Inventory )( EntityResolveComponentsInterface.GetComponent( ri, 'inventory' ) ) );
+		super.OnTakeControl( ri );
+		m_controller = ( ( StashController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected event OnInteractionActivated( evt : InteractionActivationEvent )
+	{
+		var actorUpdateData : HUDActorUpdateData;
+		super.OnInteractionActivated( evt );
+		if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate )
+		{
+			if( evt.layerData.tag == 'LogicArea' )
+			{
+				actorUpdateData = new HUDActorUpdateData;
+				actorUpdateData.updateIsInIconForcedVisibilityRange = true;
+				actorUpdateData.isInIconForcedVisibilityRangeValue = true;
+				RequestHUDRefresh( actorUpdateData );
+			}
+		}
+		else
+		{
+			if( evt.layerData.tag == 'LogicArea' )
+			{
+				actorUpdateData = new HUDActorUpdateData;
+				actorUpdateData.updateIsInIconForcedVisibilityRange = true;
+				actorUpdateData.isInIconForcedVisibilityRangeValue = false;
+				RequestHUDRefresh( actorUpdateData );
+			}
+		}
+	}
+
+	public const override function DeterminGameplayRoleMappinVisuaState( data : SDeviceMappinData ) : EMappinVisualState
+	{
+		if( GetDevicePS().IsDisabled() )
+		{
+			return EMappinVisualState.Inactive;
+		}
+		else
+		{
+			return EMappinVisualState.Default;
+		}
+	}
+
+	public const override function GetDevicePS() : StashControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	private const override function GetController() : StashController
+	{
+		return ( ( StashController )( m_controller ) );
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.PlayerStash;
+	}
+
+	protected event OnOpenStash( evt : OpenStash )
+	{
+		var transactionSystem : TransactionSystem;
+		var player : GameObject;
+		var storageBB : IBlackboard;
+		var storageData : StorageUserData;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGame() );
+		player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject();
+		if( transactionSystem && player )
+		{
+			ProcessStashRetroFixes( this );
+			storageData = new StorageUserData;
+			storageData.storageObject = this;
+			storageBB = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().StorageBlackboard );
+			if( storageBB )
+			{
+				storageBB.SetVariant( GetAllBlackboardDefs().StorageBlackboard.StorageData, storageData, true );
+			}
+		}
+	}
+
+	public const override function IsPlayerStash() : Bool
+	{
+		return true;
+	}
+
+	public static function ProcessStashRetroFixes( stashObj : GameObject )
+	{
+		var game : GameInstance;
+		var factVal : Int32;
+		if( !( stashObj ) )
+		{
+			return;
+		}
+		game = stashObj.GetGame();
+		factVal = GetFact( game, 'ClothingModsRemovedStash' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1500 ) )
+		{
+			RemoveAllModsFromClothing( stashObj );
+			SetFactValue( game, 'ClothingModsRemovedStash', 1 );
+		}
+		factVal = GetFact( game, 'DLCPlayerStashItemsRevamp' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1500 ) )
+		{
+			InstallModsToRedesignedItems( stashObj );
+			SetFactValue( game, 'DLCPlayerStashItemsRevamp', 1 );
+		}
+		factVal = GetFact( game, 'CYBMETA1695' );
+		if( factVal <= 0 )
+		{
+			RemoveRedundantScopesFromAchillesRifles( stashObj );
+			SetFactValue( game, 'CYBMETA1695', 1 );
+		}
+		factVal = GetFact( game, 'BuckGradScopeStashFix' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1600 ) )
+		{
+			InstallModsToRedesignedItems( stashObj );
+			SetFactValue( game, 'BuckGradScopeStashFix', 1 );
+		}
+	}
+
+	private static function InstallModsToRedesignedItems( stashObj : GameObject )
+	{
+		var i : Int32;
+		var storageItems : array< weak< gameItemData > >;
+		var itemData : gameItemData;
+		var transactionSystem : TransactionSystem;
+		var itemModificationSystem : weak< ItemModificationSystem >;
+		var partItemID : ItemID;
+		transactionSystem = GameInstance.GetTransactionSystem( stashObj.GetGame() );
+		itemModificationSystem = ( ( ItemModificationSystem )( GameInstance.GetScriptableSystemsContainer( stashObj.GetGame() ).Get( 'ItemModificationSystem' ) ) );
+		transactionSystem.GetItemList( stashObj, storageItems );
+		for( i = 0; i < storageItems.Size(); i += 1 )
+		{
+			itemData = storageItems[ i ];
+			if( itemData && itemData.HasTag( 'DLCStashItem' ) )
+			{
+				partItemID = ItemID.FromTDBID( T"Items.DLCItemsQualityUpgradeMod" );
+				transactionSystem.GiveItem( stashObj, partItemID, 1 );
+				itemModificationSystem.QueueRequest( CreateInstallPartRequest( stashObj, itemData, partItemID ) );
+			}
+			if( itemData && itemData.HasTag( 'Buck_Grad' ) )
+			{
+				partItemID = ItemID.FromTDBID( T"Items.Buck_scope" );
+				transactionSystem.GiveItem( stashObj, partItemID, 1 );
+				itemModificationSystem.QueueRequest( CreateInstallPartRequest( stashObj, itemData, partItemID ) );
+			}
+		}
+	}
+
+	private static function CreateInstallPartRequest( stashObj : GameObject, itemData : gameItemData, part : ItemID ) : InstallItemPart
+	{
+		var installPartRequest : InstallItemPart;
+		var slotID : TweakDBID;
+		switch( itemData.GetItemType() )
+		{
+			case gamedataItemType.Clo_InnerChest:
+				slotID = T"AttachmentSlots.InnerChestFabricEnhancer4";
+			break;
+			case gamedataItemType.Clo_OuterChest:
+				slotID = T"AttachmentSlots.OuterChestFabricEnhancer4";
+			break;
+			case gamedataItemType.Wea_Katana:
+				slotID = T"AttachmentSlots.IconicMeleeWeaponMod1";
+			break;
+			case gamedataItemType.Wea_SniperRifle:
+				slotID = T"AttachmentSlots.Scope";
+			break;
+			default:
+				break;
+		}
+		installPartRequest = new InstallItemPart;
+		installPartRequest.Set( stashObj, itemData.GetID(), part, slotID );
+		return installPartRequest;
+	}
+
+	private static function RemoveAllModsFromClothing( stashObj : GameObject )
+	{
+		var i, j : Int32;
+		var storageItems : array< weak< gameItemData > >;
+		var itemData : gameItemData;
+		var transactionSystem : TransactionSystem;
+		var itemModificationSystem : weak< ItemModificationSystem >;
+		var usedSlots : array< TweakDBID >;
+		var currentItem : ItemID;
+		transactionSystem = GameInstance.GetTransactionSystem( stashObj.GetGame() );
+		itemModificationSystem = ( ( ItemModificationSystem )( GameInstance.GetScriptableSystemsContainer( stashObj.GetGame() ).Get( 'ItemModificationSystem' ) ) );
+		transactionSystem.GetItemList( stashObj, storageItems );
+		for( i = 0; i < storageItems.Size(); i += 1 )
+		{
+			itemData = storageItems[ i ];
+			if( itemData )
+			{
+				currentItem = itemData.GetID();
+				if( RPGManager.IsItemClothing( currentItem ) )
+				{
+					usedSlots.Clear();
+					transactionSystem.GetUsedSlotsOnItem( stashObj, currentItem, usedSlots );
+					for( j = 0; j < usedSlots.Size(); j += 1 )
+					{
+						itemModificationSystem.QueueRequest( CreateRemovePartRequest( stashObj, currentItem, usedSlots[ j ] ) );
+					}
+				}
+			}
+		}
+	}
+
+	private static function RemoveRedundantScopesFromAchillesRifles( stashObj : GameObject )
+	{
+		var ts : TransactionSystem;
+		var ims : ItemModificationSystem;
+		var stashItems : array< weak< gameItemData > >;
+		ts = GameInstance.GetTransactionSystem( stashObj.GetGame() );
+		ims = ( ( ItemModificationSystem )( GameInstance.GetScriptableSystemsContainer( stashObj.GetGame() ).Get( 'ItemModificationSystem' ) ) );
+		if( !( ts ) || !( ims ) )
+		{
+			return;
+		}
+		ts.GetItemList( stashObj, stashItems );
+		ims.RemoveRedundantScopesFromAchillesRifles( stashItems );
+	}
+
+	private static function CreateRemovePartRequest( stashObj : GameObject, item : ItemID, slotID : TweakDBID ) : RemoveItemPart
+	{
+		var removePartRequest : RemoveItemPart;
+		removePartRequest = new RemoveItemPart;
+		removePartRequest.Set( stashObj, item, slotID );
+		return removePartRequest;
+	}
+
+}
+
+class StashController extends ScriptableDeviceComponent
+{
+
+	public const override function GetPS() : StashControllerPS
+	{
+		return ( ( StashControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class StashControllerPS extends ScriptableDeviceComponentPS
+{
+	default m_shouldScannerShowNetwork = false;
+	default m_shouldScannerShowStatus = false;
+	default m_shouldScannerShowAttitude = false;
+	default m_shouldScannerShowHealth = false;
+
+	private const function ActionOpenStash() : OpenStash
+	{
+		var action : OpenStash;
+		action = new OpenStash;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		action.CreateInteraction();
+		return action;
+	}
+
+	private function OnOpenStash( evt : OpenStash ) : EntityNotificationType
+	{
+		UseNotifier( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function GetActions( out outActions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		if( !( super.GetActions( outActions, context ) ) )
+		{
+			return false;
+		}
+		if( OpenStash.IsDefaultConditionMet( this, context ) )
+		{
+			outActions.PushBack( ActionOpenStash() );
+		}
+		SetActionIllegality( outActions, m_illegalActions.regularActions );
+		return true;
+	}
+
+}
+

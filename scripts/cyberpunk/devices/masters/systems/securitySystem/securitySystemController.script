@@ -1,0 +1,3132 @@
+class SecuritySystemInputTaskData extends ScriptTaskData
+{
+	var cachedEvt : SecuritySystemInput;
+}
+
+struct ReprimandData
+{
+	[ unsavable = "true" ]
+	persistent var isActive : Bool;
+	[ unsavable = "true" ]
+	persistent var receiver : EntityID;
+	[ unsavable = "true" ]
+	persistent var receiverAttitudeGroup : CName;
+	[ unsavable = "true" ]
+	persistent var reprimandID : Int32;
+	[ unsavable = "true" ]
+	persistent var count : Int32;
+}
+
+class MorphData extends IScriptable
+{
+	var changed : Bool;
+}
+
+class State extends MorphData
+{
+	var state : ESecuritySystemState;
+}
+
+class Blacklist extends MorphData
+{
+}
+
+class Reprimand extends MorphData
+{
+	var reprimandData : ReprimandData;
+}
+
+class ProtectedEntities extends MorphData
+{
+	var protectedEntities : array< EntityID >;
+}
+
+class EntitiesAtGate extends MorphData
+{
+	var entitiesAtGate : array< EntityID >;
+}
+
+struct SecuritySystemMorphData
+{
+	var state : State;
+	var reprimandData : Reprimand;
+	var blacklist : Blacklist;
+	var protectedEntities : ProtectedEntities;
+	var entitiesAtGate : EntitiesAtGate;
+}
+
+class SecuritySystemController extends DeviceSystemBaseController
+{
+
+	public const override function GetPS() : SecuritySystemControllerPS
+	{
+		return ( ( SecuritySystemControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
+{
+	default m_deviceName = "LocKey#50988";
+	default m_tweakDBRecord = T"Devices.SecuritySystem";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.SecuritySystem";
+	default m_revealDevicesGrid = false;
+	default m_drawGridLink = false;
+	private mutable instanceeditable var m_level_0 : array< SecurityAccessLevelEntry >;
+	private mutable instanceeditable var m_level_1 : array< SecurityAccessLevelEntry >;
+	private mutable instanceeditable var m_level_2 : array< SecurityAccessLevelEntry >;
+	private mutable instanceeditable var m_level_3 : array< SecurityAccessLevelEntry >;
+	private mutable instanceeditable var m_level_4 : array< SecurityAccessLevelEntry >;
+	[ tooltip = "if all security areas are safe and/or disabled then security system will disable itself and hide from the minimap" ]
+	private instanceeditable var m_allowSecuritySystemToDisableItself : Bool;
+	default m_allowSecuritySystemToDisableItself = true;
+	[ customEditor = "TweakDBGroupInheritance;AttitudeGroup" ][ tooltip = "All devices connected to security system will have this attitude group set. It DOES NOT Have to be the same attitude group as NPCs" ]
+	private instanceeditable persistent var m_attitudeGroup : TweakDBID;
+	[ tooltip = "BE CAREFUL WHEN SETTING UP! IF YOU TURN THIS ON -> Security System will still work normally, but the relation of security system group will not change towards anyone with whom Security System is in COMBAT. You can still change attitude through quest block" ]
+	private instanceeditable var m_suppressAbilityToModifyAttitude : Bool;
+	private persistent var m_attitudeChangeMode : EShouldChangeAttitude;
+	[ tooltip = "In case player triggers Security System, how much time should pass before security system changes its attitude towards player back to default. Setting this up is optional. If unchanged Security System will not reset automatically" ]
+	private instanceeditable var m_performAutomaticResetAfter : Time;
+	[ tooltip = "IF TRUE > Player will not see areas on the minimap and he will not receive UI Notification that he is in certain area" ]
+	private instanceeditable persistent var m_hideAreasOnMinimap : Bool;
+	private persistent var m_isUnderStrictQuestControl : Bool;
+	private persistent var m_securitySystemState : ESecuritySystemState;
+	default m_securitySystemState = ESecuritySystemState.SAFE;
+	[ unsavable = "true" ]
+	private persistent var m_agentsRegistry : AgentRegistry;
+	private var m_securitySystem : SecuritySystemControllerPS;
+	[ unsavable = "true" ]
+	private persistent var m_latestOutputEngineTime : Float;
+	private var m_updateInterval : Float;
+	default m_updateInterval = 1.0f;
+	private const var m_restartDuration : Int32;
+	default m_restartDuration = 60;
+	[ unsavable = "true" ]
+	private persistent var m_protectedEntityIDs : array< EntityID >;
+	[ unsavable = "true" ]
+	private persistent var m_entitiesRemainingAtGate : array< EntityID >;
+	[ unsavable = "true" ]
+	private persistent var m_blacklist : array< BlacklistEntry >;
+	[ unsavable = "true" ]
+	private persistent var m_currentReprimandID : Int32;
+	[ unsavable = "true" ]
+	private persistent var m_blacklistDelayValid : Bool;
+	[ unsavable = "true" ]
+	private persistent var m_blacklistDelayID : DelayID;
+	private const var m_maxGlobalWarningsCount : Int32;
+	default m_maxGlobalWarningsCount = 4;
+	[ unsavable = "true" ]
+	private persistent var m_delayIDValid : Bool;
+	[ unsavable = "true" ]
+	private persistent var m_deescalationEventID : DelayID;
+	[ unsavable = "true" ]
+	private persistent var m_outputsSend : Int32;
+	[ unsavable = "true" ]
+	private persistent var m_inputsReceived : Int32;
+
+	protected function HandleSecuritySystemInputByTask( inputEvent : SecuritySystemInput )
+	{
+		var data : SecuritySystemInputTaskData;
+		data = new SecuritySystemInputTaskData;
+		data.cachedEvt = inputEvent;
+		GameInstance.GetDelaySystem( GetGameInstance() ).QueueTask( this, data, 'HandleSecuritySystemInputTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function HandleSecuritySystemInputTask( data : ScriptTaskData )
+	{
+		var inputData : SecuritySystemInputTaskData;
+		inputData = ( ( SecuritySystemInputTaskData )( data ) );
+		if( inputData )
+		{
+			HandleSecuritySystemInput( inputData.cachedEvt );
+		}
+	}
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+		if( !( IsRegistryReady() ) )
+		{
+			InitiateAgentRegistry();
+		}
+		if( !( IsNameValid( GetSecuritySystemAttitudeGroupName() ) ) )
+		{
+			SetSecuritySystemAttitudeGroup( T"Attitudes.Group_Neutral" );
+		}
+		NotifyAboutAttitudeChange();
+	}
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+		m_attitudeChangeMode = EShouldChangeAttitude.TEMPORARLY;
+		if( !( IsRegistryReady() ) )
+		{
+			InitiateAgentRegistry();
+		}
+		if( IsPoliceSecuritySystem() )
+		{
+			PreventionSystem.PreventionPoliceSecuritySystemRequest( GetGameInstance(), GetID() );
+		}
+	}
+
+	private const function IsRegistryReady() : Bool
+	{
+		return m_agentsRegistry.IsReady();
+	}
+
+	private function InitiateAgentRegistry()
+	{
+		var areas : array< SecurityAreaControllerPS >;
+		if( IsDisabled() )
+		{
+			return;
+		}
+		areas = GetSecurityAreas();
+		if( areas.Size() == 0 )
+		{
+			return;
+		}
+		CompileSecurityAgentRegistry();
+	}
+
+	private function CreateRegistry()
+	{
+		m_agentsRegistry = AgentRegistry.Construct();
+	}
+
+	private function CompileSecurityAgentRegistry()
+	{
+		var i : Int32;
+		var slaves : array< DeviceComponentPS >;
+		if( IsDisabled() )
+		{
+			return;
+		}
+		if( !( m_agentsRegistry.IsReady() ) )
+		{
+			CreateRegistry();
+		}
+		GetAllDescendants( slaves );
+		for( i = 0; i < slaves.Size(); i += 1 )
+		{
+			if( ( ( SecurityAreaControllerPS )( slaves[ i ] ) ) || ( ( CommunityProxyPS )( slaves[ i ] ) ) )
+			{
+				continue;
+			}
+			AddAgentRecord( DeviceLink.Construct( ( ( SharedGameplayPS )( slaves[ i ] ) ) ), slaves[ i ].GetSecurityAreas( true ), false );
+		}
+	}
+
+	private function AddAgentRecord( agent : DeviceLink, connectedAreas : array< SecurityAreaControllerPS >, requestLatestOutput : Bool )
+	{
+		m_agentsRegistry.RegisterAgent( agent, connectedAreas );
+		if( requestLatestOutput )
+		{
+			RequestLatestOutput( DeviceLink.GetLinkID( agent ) );
+		}
+	}
+
+	public const function GetSensors() : array< SensorDeviceControllerPS >
+	{
+		var sensAgents : array< Agent >;
+		var sensControllers : array< SensorDeviceControllerPS >;
+		var sensor : SensorDeviceControllerPS;
+		var i : Int32;
+		sensAgents = GetAgentRegistry().GetSensors();
+		for( i = 0; i < sensAgents.Size(); i += 1 )
+		{
+			sensor = ( ( SensorDeviceControllerPS )( GetPS( sensAgents[ i ].link ) ) );
+			if( sensor )
+			{
+				sensControllers.PushBack( sensor );
+			}
+		}
+		return sensControllers;
+	}
+
+	public quest const function IsSystemSafe() : Bool
+	{
+		return m_securitySystemState == ESecuritySystemState.SAFE;
+	}
+
+	public quest const function IsSystemAlerted() : Bool
+	{
+		return m_securitySystemState == ESecuritySystemState.ALERTED;
+	}
+
+	public export quest const function IsSystemInCombat() : Bool
+	{
+		return m_securitySystemState == ESecuritySystemState.COMBAT;
+	}
+
+	public const function IsHidden() : Bool
+	{
+		return m_hideAreasOnMinimap;
+	}
+
+	public const function GetAgentRegistry() : AgentRegistry
+	{
+		return m_agentsRegistry;
+	}
+
+	public const function GetSecurityState() : ESecuritySystemState
+	{
+		return m_securitySystemState;
+	}
+
+	public const override function GetDeviceStatusAction() : SecuritySystemStatus
+	{
+		return ActionSecuritySystemStatus();
+	}
+
+	public const function GetSecuritySystemAttitudeGroupName() : CName
+	{
+		var record : AttitudeGroup_Record;
+		var attitudeName : CName;
+		record = TweakDBInterface.GetAttitudeGroupRecord( m_attitudeGroup );
+		if( record )
+		{
+			attitudeName = record.Name();
+		}
+		return attitudeName;
+	}
+
+	public const function IsPoliceSecuritySystem() : Bool
+	{
+		return GetSecuritySystemAttitudeGroupName() == 'police';
+	}
+
+	public const function GetReprimandReceiver( agentID : PersistentID ) : EntityID
+	{
+		return m_agentsRegistry.GetReprimandReceiver( agentID );
+	}
+
+	public const function DetermineSecurityAreaTypeForEntityID( entityID : EntityID ) : ESecurityAreaType
+	{
+		var areaType : ESecurityAreaType;
+		var i : Int32;
+		areaType = GetMostDangerousSecurityAreaForEntityID( entityID ).GetSecurityAreaType();
+		if( areaType == ESecurityAreaType.DANGEROUS )
+		{
+			for( i = 0; i < m_entitiesRemainingAtGate.Size(); i += 1 )
+			{
+				if( entityID == m_entitiesRemainingAtGate[ i ] )
+				{
+					areaType = ESecurityAreaType.RESTRICTED;
+				}
+			}
+		}
+		return areaType;
+	}
+
+	public const function GetMostDangerousSecurityAreaForEntityID( entityID : EntityID ) : SecurityAreaControllerPS
+	{
+		var secAreas : array< SecurityAreaControllerPS >;
+		var currentSecAreaType : ESecurityAreaType;
+		var foundSecurityArea : SecurityAreaControllerPS;
+		var i : Int32;
+		currentSecAreaType = ESecurityAreaType.DISABLED;
+		secAreas = GetSecurityAreasWithUserInside( entityID );
+		if( secAreas.Size() == 0 )
+		{
+			return NULL;
+		}
+		for( i = 0; i < secAreas.Size(); i += 1 )
+		{
+			if( ( ( Int64 )( secAreas[ i ].GetSecurityAreaType() ) ) > ( ( Int64 )( currentSecAreaType ) ) )
+			{
+				foundSecurityArea = secAreas[ i ];
+				currentSecAreaType = secAreas[ i ].GetSecurityAreaType();
+			}
+		}
+		return foundSecurityArea;
+	}
+
+	public const function GetMostDangerousSecurityAreaForEntityID( go : GameObject ) : SecurityAreaControllerPS
+	{
+		if( go )
+		{
+			return GetMostDangerousSecurityAreaForEntityID( go.GetEntityID() );
+		}
+		return NULL;
+	}
+
+	public const function ShouldReactToTarget( suspect, reporter : EntityID ) : Bool
+	{
+		if( IsDisabled() || IsUnpowered() )
+		{
+			return false;
+		}
+		Debug( false, false, TraceToString() );
+		if( m_agentsRegistry.IsAgent( suspect ) && GetAttitudeTowards( suspect ) != EAIAttitude.AIA_Hostile )
+		{
+			return false;
+		}
+		if( GetAttitudeTowards( suspect ) == EAIAttitude.AIA_Friendly )
+		{
+			return false;
+		}
+		if( GetAttitudeTowards( suspect ) == EAIAttitude.AIA_Hostile )
+		{
+			return true;
+		}
+		if( IsEntityBlacklistedForAtLeast( suspect, BlacklistReason.COMBAT ) )
+		{
+			return true;
+		}
+		if( ( m_securitySystemState > ESecuritySystemState.ALERTED ) && IsEntityBlacklistedForSpecificReason( suspect, BlacklistReason.TRESPASSING ) )
+		{
+			return true;
+		}
+		if( m_securitySystemState > ESecuritySystemState.ALERTED )
+		{
+			return IsUserInsideSystem( suspect );
+		}
+		return IsTargetTresspassingMyZone( suspect, reporter );
+	}
+
+	public function TryReleaseFromReprimand( entityID : EntityID )
+	{
+		var target : EntityID;
+		if( IsReprimandOngoing() )
+		{
+			target = GetReprimandReceiver( entityID );
+			if( EntityID.IsDefined( target ) )
+			{
+				ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.CONCLUDE_SUCCESSFUL, target );
+			}
+		}
+	}
+
+	protected const function GetAgentAreas( agentID : PersistentID ) : array< SecurityAreaControllerPS >
+	{
+		var area : SecurityAreaControllerPS;
+		var areas : array< SecurityAreaControllerPS >;
+		var areaLinks : array< DeviceLink >;
+		var i : Int32;
+		if( m_agentsRegistry )
+		{
+			areaLinks = m_agentsRegistry.GetAgentAreas( agentID );
+			for( i = 0; i < areaLinks.Size(); i += 1 )
+			{
+				area = ( ( SecurityAreaControllerPS )( GetPS( areaLinks[ i ] ) ) );
+				if( area )
+				{
+					areas.PushBack( area );
+				}
+			}
+		}
+		return areas;
+	}
+
+	public const function GetSecurityBlacklist() : array< BlacklistEntry >
+	{
+		return m_blacklist;
+	}
+
+	public const function IsTargetTresspassingMyZone( suspect, reporter : EntityID ) : Bool
+	{
+		var commonAreas, validAreas : array< SecurityAreaControllerPS >;
+		var breachLevel : ESecurityAccessLevel;
+		var i : Int32;
+		Debug( false, false, TraceToString() );
+		if( IsEntityBlacklistedForAtLeast( suspect, BlacklistReason.COMBAT ) )
+		{
+			return true;
+		}
+		commonAreas = GetOverlappingAreas( GetAgentAreas( reporter ), GetSecurityAreasWithUserInside( suspect ) );
+		for( i = 0; i < commonAreas.Size(); i += 1 )
+		{
+			if( commonAreas[ i ].GetSecurityAreaType() > ESecurityAreaType.SAFE )
+			{
+				validAreas.PushBack( commonAreas[ i ] );
+			}
+		}
+		if( validAreas.Size() == 0 )
+		{
+			return false;
+		}
+		breachLevel = FindHighestSecurityAccessLevel( validAreas );
+		return !( IsUserAuthorized( suspect, breachLevel ) );
+	}
+
+	public const function IsUserInsideSystem( userToBeChecked : EntityID ) : Bool
+	{
+		var trash : ESecurityAccessLevel;
+		return IsUserInsideSystem( userToBeChecked, trash );
+	}
+
+	public const function IsUserInsideSystem( userToBeChecked : EntityID, out highestSecurityAccessLevel : ESecurityAccessLevel ) : Bool
+	{
+		var threat : ESecurityAreaType;
+		return IsUserInsideSystem( userToBeChecked, highestSecurityAccessLevel, threat );
+	}
+
+	public const function IsUserInsideSystem( userToBeChecked : EntityID, out highestSecurityAccessLevel : ESecurityAccessLevel, out highestThreat : ESecurityAreaType ) : Bool
+	{
+		var i : Int32;
+		var secAreas : array< SecurityAreaControllerPS >;
+		var isInside : Bool;
+		secAreas = GetSecurityAreas();
+		for( i = 0; i < secAreas.Size(); i += 1 )
+		{
+			if( secAreas[ i ].IsUserInside( userToBeChecked ) )
+			{
+				if( highestSecurityAccessLevel < secAreas[ i ].GetSecurityAccessLevel() )
+				{
+					highestSecurityAccessLevel = secAreas[ i ].GetSecurityAccessLevel();
+				}
+				if( highestThreat < secAreas[ i ].GetSecurityAreaType() )
+				{
+					highestThreat = secAreas[ i ].GetSecurityAreaType();
+				}
+				isInside = true;
+			}
+		}
+		return isInside;
+	}
+
+	public const function IsEntityBlacklisted( entityID : EntityID ) : Bool
+	{
+		var index : Int32;
+		index = GetEntityBlacklistIndex( entityID );
+		if( index >= 0 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function IsEntityBlacklisted( gameObject : GameObject ) : Bool
+	{
+		if( gameObject )
+		{
+			return IsEntityBlacklisted( gameObject.GetEntityID() );
+		}
+		return false;
+	}
+
+	public const function IsEntityBlacklistedForAtLeast( entityID : EntityID, reason : BlacklistReason ) : Bool
+	{
+		var entryIndex : Int32;
+		entryIndex = GetEntityBlacklistIndex( entityID );
+		if( entryIndex >= 0 )
+		{
+			if( ( ( Int32 )( reason ) ) > ( ( Int32 )( m_blacklist[ entryIndex ].GetReason() ) ) )
+			{
+				return false;
+			}
+			if( reason == BlacklistReason.REPRIMAND )
+			{
+				return m_blacklist[ entryIndex ].GetWarningsCount() > m_maxGlobalWarningsCount;
+			}
+			else
+			{
+				if( ( ( Int32 )( m_blacklist[ entryIndex ].GetReason() ) ) >= ( ( Int32 )( reason ) ) )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	protected const function IsEntityBlacklistedForSpecificReason( entityID : EntityID, reason : BlacklistReason ) : Bool
+	{
+		var entryIndex : Int32;
+		entryIndex = GetEntityBlacklistIndex( entityID );
+		if( entryIndex >= 0 )
+		{
+			if( ( ( Int32 )( m_blacklist[ entryIndex ].GetReason() ) ) == ( ( Int32 )( reason ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function IsEntityBlacklistedForAtLeast( go : GameObject, reason : BlacklistReason ) : Bool
+	{
+		if( go )
+		{
+			return IsEntityBlacklistedForAtLeast( go.GetEntityID(), reason );
+		}
+		return false;
+	}
+
+	public const function HasEntityBeenSpottedTooManyTimes( reporter : PersistentID, target : EntityID ) : Bool
+	{
+		if( HasSurpassedGlobalWarningsCount( target ) )
+		{
+			return true;
+		}
+		if( m_agentsRegistry )
+		{
+			return m_agentsRegistry.HasEntityBeenSpottedTooManyTimes( reporter, target );
+		}
+		return false;
+	}
+
+	public const function HasEntityBeenSpottedTooManyTimes( reporter : PersistentID, target : GameObject, notificationType : ESecurityNotificationType ) : Bool
+	{
+		if( notificationType == ESecurityNotificationType.REPRIMAND_SUCCESSFUL )
+		{
+			return false;
+		}
+		if( target )
+		{
+			return HasEntityBeenSpottedTooManyTimes( reporter, target.GetEntityID() );
+		}
+		return false;
+	}
+
+	public const function HasSurpassedGlobalWarningsCount( target : EntityID ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_blacklist.Size(); i += 1 )
+		{
+			if( ( m_blacklist[ i ].GetEntityID() == target ) && ( m_blacklist[ i ].GetWarningsCount() > m_maxGlobalWarningsCount ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function IsReprimandOngoing() : Bool
+	{
+		return m_agentsRegistry.IsReprimandOngoing();
+	}
+
+	public const function IsReprimandOngoingAgainst( suspect : EntityID ) : Bool
+	{
+		return m_agentsRegistry.IsReprimandOngoingAgainst( suspect );
+	}
+
+	public const function GetReprimandPerformer( optional target : EntityID ) : GameObject
+	{
+		var agent : Agent;
+		var ps : DeviceComponentPS;
+		if( !( EntityID.IsDefined( target ) ) )
+		{
+			target = GetPlayer( GetGameInstance() ).GetEntityID();
+		}
+		if( m_agentsRegistry.GetReprimandPerformer( target, agent ) )
+		{
+			ps = GetPS( agent.link );
+			return ( ( GameObject )( ps.GetOwnerEntityWeak() ) );
+		}
+		return NULL;
+	}
+
+	public const override function GetSecurityAreas( optional includeInactive : Bool, optional acquireOnlyDirectlyConnected : Bool ) : array< SecurityAreaControllerPS >
+	{
+		var children : array< DeviceComponentPS >;
+		var areas : array< SecurityAreaControllerPS >;
+		var i : Int32;
+		children = GetImmediateSlaves();
+		for( i = 0; i < children.Size(); i += 1 )
+		{
+			if( ( ( SecurityAreaControllerPS )( children[ i ] ) ) )
+			{
+				if( ( ( SecurityAreaControllerPS )( children[ i ] ) ).IsActive() )
+				{
+					areas.PushBack( ( ( SecurityAreaControllerPS )( children[ i ] ) ) );
+				}
+				else if( includeInactive )
+				{
+					areas.PushBack( ( ( SecurityAreaControllerPS )( children[ i ] ) ) );
+				}
+			}
+		}
+		return areas;
+	}
+
+	protected function SetSecuritySystemAttitudeGroup( newAttitude : TweakDBID )
+	{
+		var i : Int32;
+		if( newAttitude == m_attitudeGroup )
+		{
+			return;
+		}
+		m_attitudeGroup = newAttitude;
+		m_agentsRegistry.CleanUpOnNewAttitudeGroup( GetGameInstance(), GetSecuritySystemAttitudeGroupName() );
+		for( i = m_blacklist.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( GetAttitudeSystem().GetAttitudeRelation( GetAttitudeSystem().GetAttitudeGroup( m_blacklist[ i ].GetEntityID() ), GetSecuritySystemAttitudeGroupName() ) == EAIAttitude.AIA_Friendly )
+			{
+				m_blacklist.Erase( i );
+			}
+		}
+		NotifyAboutAttitudeChange();
+	}
+
+	protected function NotifyAboutAttitudeChange()
+	{
+		var forceAttitudeChange : SecuritySystemForceAttitudeChange;
+		forceAttitudeChange = new SecuritySystemForceAttitudeChange;
+		forceAttitudeChange.newAttitude = GetSecuritySystemAttitudeGroupName();
+		SendActionToAllSlaves( forceAttitudeChange );
+		RequestTargetsAssessment( , NULL );
+	}
+
+	private function SetSecuritySystemAttitude( desiredAttitude : EAIAttitude, input : SecuritySystemInput, optional isComingFromQuest : Bool )
+	{
+		var targetAttitudeGroup : CName;
+		var currentRelation : EAIAttitude;
+		if( m_attitudeGroup == T"Attitudes.Group_Friendly" )
+		{
+			return;
+		}
+		if( m_attitudeGroup == T"Attitudes.Group_Neutral" )
+		{
+			return;
+		}
+		if( m_attitudeGroup == T"Attitudes.Group_Hostile" )
+		{
+			return;
+		}
+		if( IsPoliceSecuritySystem() )
+		{
+			return;
+		}
+		if( !( isComingFromQuest ) )
+		{
+			if( m_suppressAbilityToModifyAttitude )
+			{
+				return;
+			}
+		}
+		targetAttitudeGroup = GameInstance.GetAttitudeSystem( GetGameInstance() ).GetAttitudeGroup( input.GetWhoBreached().GetEntityID() );
+		if( !( CanChangeAttitudeRelationFor( targetAttitudeGroup ) ) )
+		{
+			return;
+		}
+		currentRelation = GetAttitudeSystem().GetAttitudeRelation( GetSecuritySystemAttitudeGroupName(), targetAttitudeGroup );
+		if( currentRelation == desiredAttitude )
+		{
+			return;
+		}
+		if( ( !( isComingFromQuest ) && currentRelation == EAIAttitude.AIA_Friendly ) && desiredAttitude == EAIAttitude.AIA_Hostile )
+		{
+			return;
+		}
+		if( !( m_suppressAbilityToModifyAttitude ) )
+		{
+			if( m_attitudeChangeMode == EShouldChangeAttitude.TEMPORARLY )
+			{
+				GetAttitudeSystem().SetAttitudeRelation( GetSecuritySystemAttitudeGroupName(), targetAttitudeGroup, desiredAttitude );
+			}
+			else if( m_attitudeChangeMode == EShouldChangeAttitude.PERSISTENTLY )
+			{
+				GetAttitudeSystem().SetAttitudeGroupRelationPersistent( GetSecuritySystemAttitudeGroupName(), targetAttitudeGroup, desiredAttitude );
+			}
+		}
+		if( desiredAttitude == EAIAttitude.AIA_Friendly )
+		{
+			RemoveFromBlacklist( input.GetWhoBreached() );
+		}
+		NotifyAboutAttitudeChange();
+	}
+
+	private function SetSecurityState( newState : ESecuritySystemState, optional input : SecuritySystemInput, optional isComingFromQuest : Bool )
+	{
+		if( m_securitySystemState == newState )
+		{
+			return;
+		}
+		if( newState == ESecuritySystemState.COMBAT )
+		{
+			m_securitySystem = this;
+			SetSecuritySystemAttitude( EAIAttitude.AIA_Hostile, input, isComingFromQuest );
+			SendSupportEvents( , false );
+		}
+		if( m_securitySystemState == ESecuritySystemState.COMBAT )
+		{
+			m_securitySystem = NULL;
+			SendSupportEvents( , true );
+		}
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, input, ( ( "Security System state changed from: " + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( m_securitySystemState ) ) ) ) + " to: " ) + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( newState ) ) ) );
+		}
+		m_securitySystemState = newState;
+		if( input )
+		{
+			Debug( false, true, TraceToString(), , input );
+		}
+		else
+		{
+			Debug( false, false, TraceToString() );
+		}
+		NotifyParents();
+	}
+
+	protected function OnMadnessDebuff( evt : MadnessDebuff ) : EntityNotificationType
+	{
+		if( !( IsRegistryReady() ) )
+		{
+			InitiateAgentRegistry();
+		}
+		ReleaseAllReprimands();
+		m_agentsRegistry.UnregisterAgent( evt.object.GetDeviceLink().GetID() );
+		CleanSecuritySystemMemory();
+		BlacklistEntityID( evt.object.GetEntityID(), BlacklistReason.COMBAT );
+		RequestTargetsAssessment( , NULL );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnSuppressSecuritySystemReaction( evt : SuppressSecuritySystemReaction ) : EntityNotificationType
+	{
+		var securityAreaType : ESecurityAreaType;
+		var dummyInputEvent : SecuritySystemInput;
+		if( evt.entered )
+		{
+			if( !( m_entitiesRemainingAtGate.Contains( evt.protectedEntityID ) ) )
+			{
+				m_entitiesRemainingAtGate.PushBack( evt.protectedEntityID );
+			}
+		}
+		else if( m_entitiesRemainingAtGate.Size() > 0 )
+		{
+			if( evt.hasEntityWithdrawn )
+			{
+				if( IsReprimandOngoingAgainst( evt.protectedEntityID ) )
+				{
+					securityAreaType = GetMostDangerousSecurityAreaForEntityID( evt.protectedEntityID ).GetSecurityAreaType();
+					if( securityAreaType < ESecurityAreaType.RESTRICTED )
+					{
+						Deescalate( dummyInputEvent );
+						ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.CONCLUDE_SUCCESSFUL, evt.protectedEntityID );
+					}
+				}
+			}
+			m_entitiesRemainingAtGate.Remove( evt.protectedEntityID );
+		}
+		if( evt.enableProtection )
+		{
+			if( !( IsEntityBlacklistedForAtLeast( evt.protectedEntityID, BlacklistReason.REPRIMAND ) ) && !( m_protectedEntityIDs.Contains( evt.protectedEntityID ) ) )
+			{
+				m_protectedEntityIDs.PushBack( evt.protectedEntityID );
+			}
+		}
+		else
+		{
+			RevokeProtection( evt.protectedEntityID );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function RevokeProtection( entityID : EntityID )
+	{
+		if( m_protectedEntityIDs.Contains( entityID ) )
+		{
+			m_protectedEntityIDs.Remove( entityID );
+			RequestTargetsAssessment( , NULL );
+		}
+	}
+
+	public export override function OnSecurityAreaCrossingPerimeter( evt : SecurityAreaCrossingPerimeter ) : EntityNotificationType
+	{
+		var dummyInputEvent : SecuritySystemInput;
+		var mostDangerousArea : SecurityAreaControllerPS;
+		var securityAreaData : SecurityAreaData;
+		var securityAreaType : ESecurityAreaType;
+		var playerStateMachineBB : IBlackboard;
+		var bbSystem : BlackboardSystem;
+		var playerControlledObj : PlayerPuppet;
+		var modifyOverlapEvent : ModifyOverlappedSecurityAreas;
+		var secData : SecurityAreaData;
+		var areas : array< SecurityAreaControllerPS >;
+		mostDangerousArea = GetMostDangerousSecurityAreaForEntityID( evt.GetWhoBreached() );
+		if( mostDangerousArea )
+		{
+			securityAreaType = mostDangerousArea.GetSecurityAreaType();
+		}
+		else
+		{
+			if( !( IsSystemInCombat() ) )
+			{
+				m_securitySystem = NULL;
+			}
+		}
+		if( !( evt.GetEnteredState() ) && IsReprimandOngoingAgainst( evt.GetWhoBreached().GetEntityID() ) )
+		{
+			if( securityAreaType < ESecurityAreaType.RESTRICTED )
+			{
+				Deescalate( dummyInputEvent );
+				ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.CONCLUDE_SUCCESSFUL, evt.GetWhoBreached().GetEntityID() );
+			}
+		}
+		if( IsDisabled() )
+		{
+			if( !( evt.GetEnteredState() ) )
+			{
+				PreventionSystem.PreventionSecurityAreaEnterRequest( GetGameInstance(), false, evt.GetSecurityAreaID() );
+			}
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( evt.GetWhoBreached().IsPlayer() )
+		{
+			secData = evt.GetSecurityAreaData();
+			areas.PushBack( secData.securityArea );
+			RequestTargetsAssessment( m_agentsRegistry.GetAgents( areas ), evt.GetWhoBreached() );
+			if( evt.GetEnteredState() )
+			{
+				if( ( securityAreaType > ESecurityAreaType.SAFE ) && !( IsPoliceSecuritySystem() ) )
+				{
+					PreventionSystem.PreventionSecurityAreaEnterRequest( GetGameInstance(), true, evt.GetSecurityAreaID() );
+				}
+			}
+			else
+			{
+				PreventionSystem.PreventionSecurityAreaEnterRequest( GetGameInstance(), false, evt.GetSecurityAreaID() );
+			}
+		}
+		if( IsHidden() )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		dummyInputEvent = new SecuritySystemInput;
+		playerControlledObj = ( ( PlayerPuppet )( evt.GetWhoBreached() ) );
+		if( playerControlledObj != NULL )
+		{
+			bbSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
+			playerStateMachineBB = bbSystem.GetLocalInstanced( evt.GetWhoBreached().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+			if( mostDangerousArea )
+			{
+				securityAreaData = mostDangerousArea.GetSecurityAreaData();
+				if( IsEntityBlacklistedForAtLeast( playerControlledObj.GetEntityID(), BlacklistReason.COMBAT ) || HasSurpassedGlobalWarningsCount( playerControlledObj.GetEntityID() ) )
+				{
+					securityAreaData.securityAreaType = ESecurityAreaType.DANGEROUS;
+				}
+			}
+			else
+			{
+				securityAreaData = SecurityAreaData();
+			}
+			modifyOverlapEvent = new ModifyOverlappedSecurityAreas;
+			securityAreaData.entered = evt.GetEnteredState();
+			modifyOverlapEvent.isEntering = evt.GetEnteredState();
+			modifyOverlapEvent.zoneID = evt.GetSecurityAreaID();
+			playerControlledObj.SetSecurityAreaTypeE3HACK( securityAreaType );
+			playerControlledObj.QueueEvent( modifyOverlapEvent );
+			playerStateMachineBB.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, securityAreaData, true );
+			if( !( evt.GetEnteredState() ) || ( securityAreaData.securityAreaType > ESecurityAreaType.SAFE ) )
+			{
+				if( evt.GetEnteredState() )
+				{
+					GameInstance.GetAudioSystem( GetGameInstance() ).HandleDynamicMixAreaEnter( playerControlledObj );
+				}
+				else
+				{
+					GameInstance.GetAudioSystem( GetGameInstance() ).HandleDynamicMixAreaExit( playerControlledObj );
+				}
+			}
+		}
+		Debug( false, false, TraceToString() );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private export function OnAgentSpawned( evt : SecurityAgentSpawnedEvent ) : EntityNotificationType
+	{
+		if( evt.eventType == gameEntitySpawnerEventType.Spawn )
+		{
+			AddAgentRecord( evt.spawnedAgent, evt.securityAreas, true );
+		}
+		else
+		{
+			m_agentsRegistry.UnregisterAgent( DeviceLink.GetLinkID( evt.spawnedAgent ) );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const function HasSupport( agentID : PersistentID ) : Bool
+	{
+		var agent : Agent;
+		m_agentsRegistry.GetAgent( agentID, agent );
+		return Agent.HasSupport( agent );
+	}
+
+	protected export function OnPlayerSpotted( evt : PlayerSpotted ) : EntityNotificationType
+	{
+		var modifiedAgents : array< Agent >;
+		var hasAnySupport : Bool;
+		if( m_agentsRegistry.ProcessOnPlayerSpotted( evt, modifiedAgents, hasAnySupport ) )
+		{
+			if( IsSystemInCombat() )
+			{
+				SendSupportEvents( modifiedAgents, false );
+			}
+		}
+		if( hasAnySupport )
+		{
+			m_securitySystem = this;
+		}
+		else if( !( IsSystemInCombat() ) )
+		{
+			m_securitySystem = NULL;
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function SendSupportEvents( optional modifiedAgents : array< Agent >, forceRevokeSupport : Bool )
+	{
+		var i : Int32;
+		var supportEvent : SecuritySystemSupport;
+		var agents : array< Agent >;
+		if( forceRevokeSupport )
+		{
+			m_agentsRegistry.ClearSupport();
+		}
+		if( modifiedAgents.Size() > 0 )
+		{
+			agents = modifiedAgents;
+		}
+		else
+		{
+			agents = m_agentsRegistry.GetAgents();
+		}
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			supportEvent = new SecuritySystemSupport;
+			supportEvent.supportGranted = Agent.HasSupport( agents[ i ] );
+			QueuePSEvent( GetPS( agents[ i ].link ), supportEvent );
+		}
+	}
+
+	public const function RequestLatestOutput( id : PersistentID )
+	{
+		var agent : Agent;
+		var agentAreas : array< SecurityAreaControllerPS >;
+		var outputs : array< SecuritySystemOutput >;
+		var output : SecuritySystemOutput;
+		var i : Int32;
+		if( !( m_agentsRegistry ) || !( m_agentsRegistry.GetAgent( id, agent ) ) )
+		{
+			return;
+		}
+		agentAreas = GetAgentAreas( id );
+		for( i = 0; i < agentAreas.Size(); i += 1 )
+		{
+			output = agentAreas[ i ].GetLastOutput();
+			if( output )
+			{
+				outputs.PushBack( output );
+			}
+		}
+		for( i = 0; i < outputs.Size(); i += 1 )
+		{
+			if( outputs[ i ].GetOriginalInputEvent().GetID() > output.GetOriginalInputEvent().GetID() )
+			{
+				output = outputs[ i ];
+			}
+		}
+		if( output )
+		{
+			QueuePSEvent( GetPS( agent.link ), output );
+		}
+	}
+
+	public const function GetTurrets( area : SecurityAreaControllerPS, turrets : ref< array< SecurityTurretControllerPS > > ) : Bool
+	{
+		var filter : array< SecurityAreaControllerPS >;
+		var agents : array< Agent >;
+		var turret : SecurityTurretControllerPS;
+		var found : Bool;
+		var i : Int32;
+		filter.PushBack( area );
+		agents = m_agentsRegistry.GetAgents( filter );
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			turret = ( ( SecurityTurretControllerPS )( GetPS( agents[ i ].link ) ) );
+			if( turret )
+			{
+				turrets.PushBack( turret );
+				found = true;
+			}
+		}
+		return found;
+	}
+
+	private export function OnSecurityAreaTypeChangedNotification( evt : SecurityAreaTypeChangedNotification ) : EntityNotificationType
+	{
+		if( evt.currentType == ESecurityAreaType.SAFE || evt.currentType == ESecurityAreaType.DISABLED )
+		{
+			if( ShouldSecuritySystemDisableItself() )
+			{
+				DisableSecuritySystem( evt.wasScheduled );
+				return EntityNotificationType.DoNotNotifyEntity;
+			}
+		}
+		if( evt.currentType == ESecurityAreaType.DISABLED )
+		{
+			HandleAreaBeingDisabled( evt.area );
+		}
+		else if( evt.previousType == ESecurityAreaType.DISABLED )
+		{
+			if( IsDisabled() )
+			{
+				OnQuestForceON( ActionQuestForceON() );
+			}
+			else
+			{
+				HandleAreaBeingEnabled( evt.area );
+			}
+		}
+		RequestTargetsAssessment( , NULL );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function HandleAreaBeingEnabled( area : SecurityAreaControllerPS )
+	{
+		var slaves : array< DeviceComponentPS >;
+		if( m_agentsRegistry )
+		{
+			area.GetChildren( slaves );
+			m_agentsRegistry.AddArea( area, slaves );
+		}
+		else
+		{
+			InitiateAgentRegistry();
+		}
+	}
+
+	private function HandleAreaBeingDisabled( area : SecurityAreaControllerPS )
+	{
+		var updateData : OnDisableAreaData;
+		var dataArray : array< OnDisableAreaData >;
+		var affectedAgents : array< Agent >;
+		var filter : array< SecurityAreaControllerPS >;
+		var i : Int32;
+		if( !( m_agentsRegistry ) )
+		{
+			return;
+		}
+		filter.PushBack( area );
+		affectedAgents = m_agentsRegistry.GetAgents( filter );
+		for( i = 0; i < affectedAgents.Size(); i += 1 )
+		{
+			updateData.agent = DeviceLink.GetLinkID( affectedAgents[ i ].link );
+			updateData.remainingAreas = GetPS( affectedAgents[ i ] ).GetSecurityAreas();
+			dataArray.PushBack( updateData );
+		}
+		m_agentsRegistry.RemoveArea( dataArray );
+	}
+
+	private function DisableSecuritySystem( wasScheduled : Bool )
+	{
+		var bbSystem : BlackboardSystem;
+		var playerStateMachineBB : IBlackboard;
+		var securityAreaData : SecurityAreaData;
+		var areas : array< SecurityAreaControllerPS >;
+		var i : Int32;
+		var disableArea : QuestExecuteTransition;
+		var transition : AreaTypeTransition;
+		var agents : array< Agent >;
+		var ps : DeviceComponentPS;
+		SetSecurityState( ESecuritySystemState.UNINITIALIZED );
+		DisableDevice();
+		transition.transitionTo = ESecurityAreaType.DISABLED;
+		transition.transitionMode = ETransitionMode.FORCED;
+		Debug( false, false, TraceToString() );
+		areas = GetSecurityAreas();
+		for( i = 0; i < areas.Size(); i += 1 )
+		{
+			disableArea = new QuestExecuteTransition;
+			disableArea.transition = transition;
+			PreventionSystem.PreventionSecurityAreaEnterRequest( GetGameInstance(), false, areas[ i ].GetID() );
+			QueuePSEvent( areas[ i ], disableArea );
+			if( !( wasScheduled ) )
+			{
+				QueuePSEvent( areas[ i ], new PurgeAllTransitions );
+			}
+		}
+		agents = m_agentsRegistry.GetAgents();
+		SendSupportEvents( , true );
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			ps = GetPS( agents[ i ].link );
+			if( ps )
+			{
+				QueuePSEvent( ps, new SecuritySystemDisabled );
+			}
+		}
+		bbSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
+		securityAreaData.securityAreaType = ESecurityAreaType.DISABLED;
+		securityAreaData.accessLevel = ESecurityAccessLevel.ESL_NONE;
+		playerStateMachineBB = bbSystem.GetLocalInstanced( GetPlayer( GetGameInstance() ).GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( playerStateMachineBB )
+		{
+			playerStateMachineBB.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, securityAreaData, true );
+		}
+		CleanSecuritySystemMemory();
+		GetPersistencySystem().ForgetObject( GetID(), false );
+	}
+
+	private function ShouldSecuritySystemDisableItself() : Bool
+	{
+		var areas : array< SecurityAreaControllerPS >;
+		var i : Int32;
+		areas = GetSecurityAreas();
+		if( !( m_allowSecuritySystemToDisableItself ) || ( IsDisabled() && ( areas.Size() == 0 ) ) )
+		{
+			return false;
+		}
+		for( i = 0; i < areas.Size(); i += 1 )
+		{
+			if( areas[ i ].GetSecurityAreaType() != ESecurityAreaType.SAFE )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	protected const function ProcessBreachNotificationWithRecipientsList( addresseeList : array< EntityID >, securitySystemInput : SecuritySystemInput )
+	{
+		securitySystemInput.AttachCustomRecipientsList( addresseeList );
+		QueuePSEvent( GetID(), GetClassName(), securitySystemInput );
+	}
+
+	public const function ReportPotentialSituation( input : SecuritySystemInput ) : Bool
+	{
+		var puppetTarget : ScriptedPuppet;
+		m_inputsReceived += 1;
+		puppetTarget = ( ( ScriptedPuppet )( input.GetWhoBreached() ) );
+		if( puppetTarget && ( puppetTarget.IsCharacterCivilian() || !( puppetTarget.IsActive() ) ) )
+		{
+			return false;
+		}
+		if( ( IsRestarting() || IsUnpowered() ) || IsDisabled() )
+		{
+			return false;
+		}
+		return ProcessInput( input );
+	}
+
+	private const function ProcessInput( input : SecuritySystemInput ) : Bool
+	{
+		var relation : EAIAttitude;
+		var forward : Bool;
+		if( input.GetNotificationType() == ESecurityNotificationType.ALARM || input.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+		{
+			forward = true;
+		}
+		else
+		{
+			relation = GetAttitudeTowards( input.GetWhoBreached() );
+			if( relation == EAIAttitude.AIA_Friendly )
+			{
+				forward = ProcessFriendly( input );
+			}
+			else if( ( relation == EAIAttitude.AIA_Hostile || input.GetNotificationType() == ESecurityNotificationType.COMBAT ) || IsEntityBlacklistedForAtLeast( input.GetWhoBreached().GetEntityID(), BlacklistReason.COMBAT ) )
+			{
+				forward = ProcessHostile();
+			}
+			else
+			{
+				forward = ProcessNeutral( input );
+			}
+		}
+		if( forward )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( GetID(), GetClassName(), input );
+			return true;
+		}
+		return false;
+	}
+
+	private const function ProcessHostile() : Bool
+	{
+		if( IsRefreshRequired() || m_securitySystemState != ESecuritySystemState.COMBAT )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private const function ProcessNeutral( input : SecuritySystemInput ) : Bool
+	{
+		var isReprimandOngoing : Bool;
+		if( IsNotificationValid( input ) )
+		{
+			isReprimandOngoing = IsReprimandOngoing();
+			if( ( ( ( ( IsRefreshRequired() || input.GetNotificationType() == ESecurityNotificationType.COMBAT ) || ( isReprimandOngoing && input.GetNotificationType() == ESecurityNotificationType.REPRIMAND_SUCCESSFUL ) ) || ( isReprimandOngoing && input.GetNotificationType() == ESecurityNotificationType.REPRIMAND_ESCALATE ) ) || ( !( isReprimandOngoing ) && input.CanPerformReprimand() ) ) || m_securitySystemState != DetermineSecuritySystemState( input, true ) )
+			{
+				return true;
+			}
+			return false;
+		}
+		return false;
+	}
+
+	private const function ProcessFriendly( input : SecuritySystemInput ) : Bool
+	{
+		return IsReprimandOngoingAgainst( input.GetWhoBreached().GetEntityID() );
+	}
+
+	private const function IsRefreshRequired() : Bool
+	{
+		var currentTime : Float;
+		currentTime = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+		if( ( currentTime - m_latestOutputEngineTime ) > m_updateInterval )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public export function OnSecuritySystemInput( evt : SecuritySystemInput ) : EntityNotificationType
+	{
+		HandleSecuritySystemInputByTask( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function HandleSecuritySystemInput( evt : SecuritySystemInput )
+	{
+		var i : Int32;
+		if( evt.GetNotificationType() > ESecurityNotificationType.REPRIMAND_ESCALATE )
+		{
+			for( i = 0; i < m_protectedEntityIDs.Size(); i += 1 )
+			{
+				if( m_protectedEntityIDs[ i ] == evt.GetWhoBreached().GetEntityID() )
+				{
+					RevokeProtection( evt.GetWhoBreached().GetEntityID() );
+					break;
+				}
+			}
+		}
+		ResolveNotificationImmediately( evt );
+	}
+
+	public const function GetValidRecipients( input : SecuritySystemInput ) : array< SecuritySystemOutputData >
+	{
+		var areasOfAgentInCombat : array< SecurityAreaControllerPS >;
+		var breachedAreas : array< SecurityAreaControllerPS >;
+		var recipients : array< SecuritySystemOutputData >;
+		var i : Int32;
+		if( ( ( ( SecurityGateControllerPS )( input.GetNotifierHandle() ) ) || input.GetNotificationType() == ESecurityNotificationType.ALARM ) || input.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+		{
+			breachedAreas = GetAgentAreas( input.GetNotifierHandle().GetID() );
+		}
+		else
+		{
+			breachedAreas = GetOverlappingAreas( input );
+		}
+		if( input.GetNotificationType() == ESecurityNotificationType.COMBAT || GetAttitudeTowards( input.GetWhoBreached() ) == EAIAttitude.AIA_Hostile )
+		{
+			areasOfAgentInCombat = GetAgentAreas( input.GetNotifierHandle().GetID() );
+			for( i = 0; i < areasOfAgentInCombat.Size(); i += 1 )
+			{
+				if( breachedAreas.Contains( areasOfAgentInCombat[ i ] ) )
+				{
+					continue;
+				}
+				else
+				{
+					breachedAreas.PushBack( areasOfAgentInCombat[ i ] );
+				}
+			}
+		}
+		recipients = m_agentsRegistry.GetValidAgents( GetSecurityState(), breachedAreas );
+		return recipients;
+	}
+
+	private function ProduceOutput( input : SecuritySystemInput, securityStateChanged : Bool )
+	{
+		var output : SecuritySystemOutput;
+		var recipients : array< SecuritySystemOutputData >;
+		var i : Int32;
+		var secAreas : array< SecurityAreaControllerPS >;
+		var closestDistance : Float;
+		var closestIndex : Int32;
+		var ent : Entity;
+		var agentData : AgentDistanceToTarget;
+		var agentsData : array< AgentDistanceToTarget >;
+		m_outputsSend += 1;
+		Debug( false, true, TraceToString(), , input );
+		output = new SecuritySystemOutput;
+		output = ActionSecuritySystemBreachResponse( input );
+		output.SetSecurityStateChanged( securityStateChanged );
+		if( input.HasCustomRecipients() )
+		{
+			output.SetBreachOrigin( EBreachOrigin.LOCAL );
+			SendResponseToCustomRecipients( output );
+			return;
+		}
+		recipients = GetValidRecipients( input );
+		if( input.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+		{
+			for( i = 0; i < recipients.Size(); i += 1 )
+			{
+				if( recipients[ i ].delayDuration > 0.0 )
+				{
+					ent = GameInstance.FindEntityByID( GetGameInstance(), PersistentID.ExtractEntityID( DeviceLink.GetLinkID( recipients[ i ].link ) ) );
+					if( ent )
+					{
+						agentData.distance = Vector4.DistanceSquared( ent.GetWorldPosition(), input.GetLastKnownPosition() );
+						agentData.index = i;
+						agentsData.PushBack( agentData );
+					}
+				}
+			}
+			for( i = 0; i < agentsData.Size(); i += 1 )
+			{
+				if( closestDistance > agentsData[ i ].distance )
+				{
+					closestDistance = agentsData[ i ].distance;
+					closestIndex = agentsData[ i ].index;
+				}
+			}
+			QueuePSEvent( GetPS( recipients[ closestIndex ].link ), output );
+			recipients.EraseFast( closestIndex );
+		}
+		for( i = 0; i < recipients.Size(); i += 1 )
+		{
+			output = new SecuritySystemOutput;
+			output = ActionSecuritySystemBreachResponse( input );
+			output.SetSecurityStateChanged( securityStateChanged );
+			output.SetBreachOrigin( recipients[ i ].breachOrigin );
+			if( recipients[ i ].delayDuration > 0.0 )
+			{
+				GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( DeviceLink.GetLinkID( recipients[ i ].link ), DeviceLink.GetLinkClassName( recipients[ i ].link ), output, recipients[ i ].delayDuration );
+			}
+			else
+			{
+				QueuePSEvent( GetPS( recipients[ i ].link ), output );
+			}
+		}
+		m_latestOutputEngineTime = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+		secAreas = GetSecurityAreas( true );
+		for( i = 0; i < secAreas.Size(); i += 1 )
+		{
+			output = new SecuritySystemOutput;
+			output = ActionSecuritySystemBreachResponse( input );
+			output.SetSecurityStateChanged( securityStateChanged );
+			output.SetBreachOrigin( EBreachOrigin.EXTERNAL );
+			QueuePSEvent( secAreas[ i ], output );
+		}
+		NotifyParents();
+	}
+
+	private function ResolveNotificationImmediately( evt : SecuritySystemInput )
+	{
+		var desiredSecurityState : ESecuritySystemState;
+		var notifiedSecSysAboutCombat : NotifiedSecSysAboutCombat;
+		desiredSecurityState = DetermineSecuritySystemState( evt );
+		if( IsSystemSafe() && desiredSecurityState == ESecuritySystemState.SAFE )
+		{
+			if( evt.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+			{
+				SetSecurityStateAndTriggerResponse( desiredSecurityState, evt );
+			}
+			return;
+		}
+		if( desiredSecurityState == ESecuritySystemState.COMBAT )
+		{
+			notifiedSecSysAboutCombat = new NotifiedSecSysAboutCombat;
+			QueuePSEvent( evt.GetNotifierHandle(), notifiedSecSysAboutCombat );
+		}
+		if( desiredSecurityState == ESecuritySystemState.ALERTED || desiredSecurityState == ESecuritySystemState.COMBAT )
+		{
+			InitiateAutomaticDeescalationEvent( evt );
+		}
+		ResolveReprimand( evt, desiredSecurityState );
+		if( IsReprimandOngoing() )
+		{
+			return;
+		}
+		SetSecurityStateAndTriggerResponse( desiredSecurityState, evt );
+	}
+
+	public const function DetermineSecuritySystemState( evt : SecuritySystemInput, optional isSimulation : Bool ) : ESecuritySystemState
+	{
+		if( GetAttitudeTowards( evt.GetWhoBreached() ) == EAIAttitude.AIA_Hostile )
+		{
+			if( !( isSimulation ) )
+			{
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, "Attitude towards target is hostile. RESOLUTION: COMBAT" );
+				}
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		if( HasEntityBeenSpottedTooManyTimes( evt.GetNotifierHandle().GetID(), evt.GetWhoBreached(), evt.GetNotificationType() ) )
+		{
+			if( !( isSimulation ) )
+			{
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, "Target has been spotted too many times. RESOLUTION: COMBAT" );
+				}
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		if( IsEntityBlacklistedForAtLeast( evt.GetWhoBreached(), BlacklistReason.COMBAT ) )
+		{
+			if( !( isSimulation ) )
+			{
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, "Target blacklisted for combat. RESOLUTION: COMBAT" );
+				}
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		switch( m_securitySystemState )
+		{
+			case ESecuritySystemState.SAFE:
+				return ResolveTransitionFromSafe( evt, isSimulation );
+			case ESecuritySystemState.ALERTED:
+				return ResolveTransitionFromAlerted( evt, isSimulation );
+			case ESecuritySystemState.COMBAT:
+				return ResolveTransitionFromCombat( evt, isSimulation );
+		}
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, evt, "ResolveSecuritySystemState / Unknown state", ELogType.ERROR );
+		}
+	}
+
+	private const function ResolveTransitionFromSafe( evt : SecuritySystemInput, optional isSimulation : Bool ) : ESecuritySystemState
+	{
+		var breachedAreaType : ESecurityAreaType;
+		var logMessage : String;
+		logMessage = "Resolving transition from safe: ";
+		if( HasEntityBeenSpottedTooManyTimes( evt.GetNotifierHandle().GetID(), evt.GetWhoBreached(), evt.GetNotificationType() ) )
+		{
+			logMessage += "and entity was already blacklisted for reprimand. Result: COMBAT";
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, evt, logMessage );
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		if( evt.GetNotificationType() == ESecurityNotificationType.SECURITY_GATE )
+		{
+			logMessage += "Security Gate breached. Security Gate set to: REPRIMAND";
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, evt, logMessage );
+			}
+			return ESecuritySystemState.ALERTED;
+		}
+		if( evt.GetNotificationType() == ESecurityNotificationType.ALARM )
+		{
+			logMessage += "Someone is requesting ALARM";
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, evt, logMessage );
+			}
+			return ESecuritySystemState.ALERTED;
+		}
+		breachedAreaType = DetermineSecurityAreaTypeForEntityID( evt.GetWhoBreached().GetEntityID() );
+		if( breachedAreaType == ESecurityAreaType.DANGEROUS || evt.GetNotificationType() == ESecurityNotificationType.COMBAT )
+		{
+			logMessage += "breached area = dangerous or notification type = combat. Result: COMBAT";
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, evt, logMessage );
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		if( breachedAreaType == ESecurityAreaType.RESTRICTED )
+		{
+			logMessage += "breached area = restricted ";
+			logMessage += "Result: ALERTED";
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, evt, logMessage );
+			}
+			return ESecuritySystemState.ALERTED;
+		}
+		if( breachedAreaType == ESecurityAreaType.SAFE )
+		{
+			logMessage += "breached area = safe ";
+			if( evt.GetNotificationType() == ESecurityNotificationType.ILLEGAL_ACTION || evt.GetNotificationType() == ESecurityNotificationType.SECURITY_GATE )
+			{
+				logMessage += "and illegal action spotted. Result: ALERTED";
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, logMessage );
+				}
+				return ESecuritySystemState.ALERTED;
+			}
+		}
+		logMessage += "Result: SAFE";
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, evt, logMessage );
+		}
+		return ESecuritySystemState.SAFE;
+	}
+
+	private const function ResolveTransitionFromAlerted( evt : SecuritySystemInput, optional isSimulation : Bool ) : ESecuritySystemState
+	{
+		var breachedAreaType : ESecurityAreaType;
+		var logMessage : String;
+		logMessage = "Resolving transition from alerted: ";
+		breachedAreaType = DetermineSecurityAreaTypeForEntityID( evt.GetWhoBreached().GetEntityID() );
+		if( breachedAreaType == ESecurityAreaType.DANGEROUS || evt.GetNotificationType() == ESecurityNotificationType.COMBAT )
+		{
+			if( !( isSimulation ) )
+			{
+				logMessage += "breached area = dangerous or notification type = combat. Result: COMBAT";
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, logMessage );
+				}
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		if( IsReprimandOngoing() )
+		{
+			if( evt.GetNotificationType() == ESecurityNotificationType.REPRIMAND_SUCCESSFUL )
+			{
+				if( !( isSimulation ) )
+				{
+					logMessage += "reprimand successful. Result: SAFE";
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, evt, logMessage );
+					}
+				}
+				return ESecuritySystemState.SAFE;
+			}
+			if( evt.GetNotificationType() == ESecurityNotificationType.ILLEGAL_ACTION )
+			{
+				if( !( isSimulation ) )
+				{
+					logMessage += "and illegal action spotted. Result: COMBAT";
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, evt, logMessage );
+					}
+				}
+				return ESecuritySystemState.COMBAT;
+			}
+			if( !( isSimulation ) )
+			{
+				logMessage += "Result: ALERTED";
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, logMessage );
+				}
+			}
+			return ESecuritySystemState.ALERTED;
+		}
+		else
+		{
+			if( IsEntityBlacklistedForAtLeast( evt.GetWhoBreached(), BlacklistReason.COMBAT ) || evt.GetNotificationType() == ESecurityNotificationType.ILLEGAL_ACTION )
+			{
+				if( !( isSimulation ) )
+				{
+					logMessage += "entity was already blacklisted for combat or illegal action noticed. Result: COMBAT";
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, evt, logMessage );
+					}
+				}
+				return ESecuritySystemState.COMBAT;
+			}
+			else
+			{
+				if( !( isSimulation ) )
+				{
+					logMessage += "Result: ALERTED";
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, evt, logMessage );
+					}
+				}
+				return ESecuritySystemState.ALERTED;
+			}
+		}
+	}
+
+	private const function ResolveTransitionFromCombat( evt : SecuritySystemInput, optional isSimulation : Bool ) : ESecuritySystemState
+	{
+		var i : Int32;
+		var logMessage : String;
+		logMessage = "Resolving transition from combat: ";
+		if( evt.GetNotificationType() > ESecurityNotificationType.DEESCALATE )
+		{
+			if( !( isSimulation ) )
+			{
+				logMessage += "notification is not about deescalating. Result: COMBAT";
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, logMessage );
+				}
+			}
+			return ESecuritySystemState.COMBAT;
+		}
+		logMessage += "checking if deescalation is possible...";
+		for( i = 0; i < m_blacklist.Size(); i += 1 )
+		{
+			if( IsUserInsideSystem( m_blacklist[ i ].GetEntityID() ) && m_blacklist[ i ].GetReason() == BlacklistReason.COMBAT )
+			{
+				if( !( isSimulation ) )
+				{
+					logMessage += " entity still within system and blacklisted for combat. Result: COMBAT";
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, evt, logMessage );
+					}
+				}
+				return ESecuritySystemState.COMBAT;
+			}
+		}
+		if( !( isSimulation ) )
+		{
+			logMessage += "entity left system vicinity. Result: ALERTED";
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, evt, logMessage );
+			}
+		}
+		return ESecuritySystemState.ALERTED;
+	}
+
+	private function ResolveReprimand( evt : SecuritySystemInput, determinedState : ESecuritySystemState ) : Bool
+	{
+		var target : EntityID;
+		if( !( evt.GetWhoBreached() ) )
+		{
+			return false;
+		}
+		if( !( evt.GetWhoBreached().IsActive() ) )
+		{
+			return false;
+		}
+		target = evt.GetWhoBreached().GetEntityID();
+		if( determinedState == ESecuritySystemState.COMBAT )
+		{
+			ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.CONCLUDE_FAILED, target );
+			return true;
+		}
+		if( determinedState == ESecuritySystemState.SAFE )
+		{
+			ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.CONCLUDE_SUCCESSFUL, target );
+			return true;
+		}
+		if( evt.GetNotificationType() == ESecurityNotificationType.REPRIMAND_SUCCESSFUL )
+		{
+			ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.CONCLUDE_SUCCESSFUL, target );
+			return true;
+		}
+		if( !( evt.CanPerformReprimand() ) )
+		{
+			return false;
+		}
+		if( HasEntityBeenSpottedTooManyTimes( evt.GetNotifierHandle().GetID(), evt.GetWhoBreached(), evt.GetNotificationType() ) )
+		{
+			return false;
+		}
+		if( !( IsReprimandOngoing() ) )
+		{
+			m_currentReprimandID += 1;
+			SetReprimandPerformer( evt, EReprimandInstructions.INITIATE_FIRST );
+			return true;
+		}
+		else
+		{
+			if( ( ( Device )( GetReprimandPerformer( evt.GetWhoBreached().GetEntityID() ) ) ) && evt.GetNotifierHandle().IsPuppet() )
+			{
+				SetReprimandPerformer( evt, EReprimandInstructions.TAKEOVER );
+				return true;
+			}
+			else if( evt.GetNotificationType() == ESecurityNotificationType.REPRIMAND_ESCALATE )
+			{
+				m_currentReprimandID += 1;
+				SetReprimandPerformer( evt, EReprimandInstructions.INITIATE_FIRST );
+				return true;
+			}
+			return false;
+		}
+	}
+
+	private function SetSecurityStateAndTriggerResponse( newState : ESecuritySystemState, evt : SecuritySystemInput, optional isComingFromQuest : Bool ) : Bool
+	{
+		var changed : Bool;
+		if( m_securitySystemState != newState )
+		{
+			changed = true;
+			RequestTargetsAssessment( , evt.GetWhoBreached() );
+			if( m_isUnderStrictQuestControl && evt.GetNotificationType() != ESecurityNotificationType.QUEST )
+			{
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, evt, "State Change ABORTED. Security System under strict quest control", ELogType.WARNING );
+				}
+				ProduceOutput( evt, changed );
+				return false;
+			}
+			if( newState == ESecuritySystemState.ALERTED && ( m_securitySystemState < ESecuritySystemState.ALERTED ) )
+			{
+				BlacklistEntityID( evt.GetWhoBreached(), BlacklistReason.TRESPASSING );
+			}
+			if( newState == ESecuritySystemState.COMBAT )
+			{
+				BlacklistEntityID( evt.GetWhoBreached(), BlacklistReason.COMBAT );
+			}
+			if( !( IsFinal() ) )
+			{
+				if( evt.GetNotifierHandle() )
+				{
+					LogDevices( this, evt, ( ( ( ( ( ( ( ( ( ( "State changed from: " + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( m_securitySystemState ) ) ) ) + " to " ) + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( newState ) ) ) ) + ". NOTIFIER(" ) + NameToString( evt.GetNotifierHandle().GetClassName() ) ) + " " ) + PersistentID.ToDebugString( evt.GetNotifierHandle().GetID() ) ) + ") " ) + " NOTIFICATION( " ) + EnumValueToString( "ESecurityNotificationType", ( ( Int32 )( evt.GetNotificationType() ) ) ) ) + ") " );
+				}
+			}
+			SetSecurityState( newState, evt, isComingFromQuest );
+		}
+		ProduceOutput( evt, changed );
+		return changed;
+	}
+
+	private const function SendResponseToCustomRecipients( response : SecuritySystemOutput )
+	{
+		var recipientsIDs : array< EntityID >;
+		var i : Int32;
+		recipientsIDs = response.GetOriginalInputEvent().GetCustomRecipientsList();
+		for( i = 0; i < recipientsIDs.Size(); i += 1 )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( recipientsIDs[ i ], 'ScriptedPuppetPS', response );
+		}
+	}
+
+	private function RequestTargetsAssessment( optional providedAgents : array< Agent >, target : GameObject )
+	{
+		var i : Int32;
+		var request : TargetAssessmentRequest;
+		var agents : array< Agent >;
+		request = new TargetAssessmentRequest;
+		if( providedAgents.Size() > 0 )
+		{
+			agents = providedAgents;
+		}
+		else
+		{
+			agents = m_agentsRegistry.GetAgents();
+		}
+		if( target )
+		{
+			request.targetToAssess = target;
+		}
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			QueuePSEvent( GetPS( agents[ i ].link ), request );
+		}
+	}
+
+	private const function IsNotificationValid( evt : SecuritySystemInput ) : Bool
+	{
+		var breachLevel : ESecurityAccessLevel;
+		var i : Int32;
+		var commonAreas : array< SecurityAreaControllerPS >;
+		if( m_agentsRegistry && m_agentsRegistry.IsAgent( evt.GetWhoBreached().GetEntityID() ) )
+		{
+			return false;
+		}
+		if( evt.GetNotificationType() >= ESecurityNotificationType.REPRIMAND_ESCALATE )
+		{
+			return true;
+		}
+		if( IsEntityBlacklistedForAtLeast( evt.GetWhoBreached().GetEntityID(), BlacklistReason.COMBAT ) )
+		{
+			return true;
+		}
+		if( evt.GetNotificationType() == ESecurityNotificationType.REPRIMAND_SUCCESSFUL )
+		{
+			return true;
+		}
+		if( ( m_securitySystemState == ESecuritySystemState.SAFE && evt.GetNotificationType() == ESecurityNotificationType.ALARM ) || evt.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+		{
+			return true;
+		}
+		if( IsReprimandOngoingAgainst( evt.GetWhoBreached().GetEntityID() ) )
+		{
+			return true;
+		}
+		if( evt.GetNotificationType() <= ESecurityNotificationType.REPRIMAND_ESCALATE )
+		{
+			for( i = 0; i < m_protectedEntityIDs.Size(); i += 1 )
+			{
+				if( m_protectedEntityIDs[ i ] == evt.GetWhoBreached().GetEntityID() )
+				{
+					return false;
+				}
+			}
+		}
+		commonAreas = GetOverlappingAreas( GetAgentAreas( evt.GetNotifierHandle().GetID() ), GetSecurityAreasWithUserInside( evt.GetWhoBreached().GetEntityID() ) );
+		breachLevel = FindHighestSecurityAccessLevel( commonAreas );
+		return !( IsUserAuthorized( evt.GetWhoBreached().GetEntityID(), breachLevel ) );
+	}
+
+	private const function GetOverlappingAreas( input : SecuritySystemInput ) : array< SecurityAreaControllerPS >
+	{
+		var empty : array< SecurityAreaControllerPS >;
+		if( !( input.GetNotifierHandle() ) )
+		{
+			return empty;
+		}
+		if( !( input.GetWhoBreached() ) )
+		{
+			return empty;
+		}
+		return GetOverlappingAreas( GetAgentAreas( input.GetNotifierHandle().GetID() ), GetSecurityAreasWithUserInside( input.GetWhoBreached().GetEntityID() ) );
+	}
+
+	private const function GetOverlappingAreas( bunch1 : array< SecurityAreaControllerPS >, bunch2 : array< SecurityAreaControllerPS > ) : array< SecurityAreaControllerPS >
+	{
+		var i, k : Int32;
+		var bunch3 : array< SecurityAreaControllerPS >;
+		if( ( bunch1.Size() == 0 ) || ( bunch2.Size() == 0 ) )
+		{
+			return bunch3;
+		}
+		for( i = 0; i < bunch1.Size(); i += 1 )
+		{
+			if( !( bunch1[ i ] ) )
+			{
+				continue;
+			}
+			for( k = 0; k < bunch2.Size(); k += 1 )
+			{
+				if( !( bunch2[ k ] ) )
+				{
+					continue;
+				}
+				if( bunch1[ i ].GetID() == bunch2[ k ].GetID() )
+				{
+					bunch3.PushBack( bunch1[ i ] );
+				}
+			}
+		}
+		return bunch3;
+	}
+
+	private const function IsSystemClean() : Bool
+	{
+		var i, k : Int32;
+		var areas : array< SecurityAreaControllerPS >;
+		areas = GetSecurityAreas();
+		for( i = 0; i < m_blacklist.Size(); i += 1 )
+		{
+			for( k = 0; k < areas.Size(); k += 1 )
+			{
+				if( areas[ k ].IsUserInside( m_blacklist[ i ].GetEntityID() ) )
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private function SetReprimandPerformer( evt : SecuritySystemInput, instructions : EReprimandInstructions )
+	{
+		var reprimandUpdate : ReprimandUpdate;
+		var target : EntityID;
+		var globalWarningsCount : Int32;
+		var i : Int32;
+		if( !( evt.GetNotifierHandle() ) )
+		{
+			return;
+		}
+		target = evt.GetWhoBreached().GetEntityID();
+		if( instructions == EReprimandInstructions.TAKEOVER )
+		{
+			ReleaseCurrentPerformerFromReprimand( EReprimandInstructions.RELEASE_TO_ANOTHER_ENTITY, target );
+		}
+		BlacklistEntityID( target, BlacklistReason.REPRIMAND );
+		if( instructions == EReprimandInstructions.INITIATE_FIRST )
+		{
+			for( i = 0; i < m_blacklist.Size(); i += 1 )
+			{
+				if( m_blacklist[ i ].GetEntityID() == target )
+				{
+					globalWarningsCount = m_blacklist[ i ].GetWarningsCount();
+					break;
+				}
+			}
+			if( ( m_agentsRegistry.HowManyTimesEntityReprimandedByThisAgentAlready( target, evt.GetNotifierHandle().GetID() ) > 0 ) || ( globalWarningsCount == ( m_maxGlobalWarningsCount - 1 ) ) )
+			{
+				instructions = EReprimandInstructions.INITIATE_SUCCESSIVE;
+			}
+		}
+		m_agentsRegistry.StoreReprimand( evt.GetNotifierHandle().GetID(), target, m_currentReprimandID, GetAttitudeSystem().GetAttitudeGroup( target ) );
+		reprimandUpdate = ReprimandUpdate.Construct( ( ( GameObject )( evt.GetNotifierHandle().GetOwnerEntityWeak() ) ), target, instructions, evt.GetLastKnownPosition() );
+		SendReprimandEvent( reprimandUpdate );
+		Debug( true, true, TraceToString(), instructions, evt );
+	}
+
+	private function ReleaseAllReprimands()
+	{
+		var reprimandUpdate : ReprimandUpdate;
+		var agents : array< Agent >;
+		var i : Int32;
+		m_agentsRegistry.ReleaseAllReprimands( agents );
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			reprimandUpdate = ReprimandUpdate.Construct( ( ( GameObject )( GetPS( agents[ i ].link ).GetOwnerEntityWeak() ) ), Agent.GetReprimandReceiver( agents[ i ] ), EReprimandInstructions.CONCLUDE_SUCCESSFUL );
+			SendReprimandEvent( reprimandUpdate );
+		}
+		Debug( false, false, TraceToString() );
+	}
+
+	private function ReleaseCurrentPerformerFromReprimand( instructions : EReprimandInstructions, target : EntityID )
+	{
+		var reprimandUpdate : ReprimandUpdate;
+		var agent : Agent;
+		var agentGO : GameObject;
+		if( !( IsReprimandOngoing() ) )
+		{
+			return;
+		}
+		if( ( instructions == EReprimandInstructions.INITIATE_FIRST || instructions == EReprimandInstructions.INITIATE_SUCCESSIVE ) || instructions == EReprimandInstructions.TAKEOVER )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "Someone is trying to release reprimand performer with wrong instruction. Debug", ELogType.WARNING );
+			}
+			return;
+		}
+		if( instructions == EReprimandInstructions.CONCLUDE_SUCCESSFUL )
+		{
+		}
+		if( m_agentsRegistry.GetReprimandPerformer( target, agent ) )
+		{
+			agentGO = ( ( GameObject )( GetPS( agent.link ).GetOwnerEntityWeak() ) );
+			reprimandUpdate = ReprimandUpdate.Construct( agentGO, target, instructions );
+			SendReprimandEvent( reprimandUpdate );
+			m_agentsRegistry.ReleaseFromReprimandAgainst( target, DeviceLink.GetLinkID( agent.link ) );
+		}
+		Debug( true, false, TraceToString(), instructions );
+	}
+
+	private function SendReprimandEvent( evt : ReprimandUpdate )
+	{
+		var performer : EntityID;
+		performer = evt.currentPerformer.GetEntityID();
+		if( EntityID.IsDefined( performer ) )
+		{
+			QueueEntityEvent( performer, evt );
+		}
+	}
+
+	private const function ResolvePotentialDeescalation() : Bool
+	{
+		var dummyInputEvent : SecuritySystemInput;
+		dummyInputEvent = new SecuritySystemInput;
+		if( IsReprimandOngoing() )
+		{
+			return false;
+		}
+		if( m_securitySystemState == ESecuritySystemState.SAFE || m_securitySystemState == ESecuritySystemState.UNINITIALIZED )
+		{
+			return false;
+		}
+		if( IsSystemClean() )
+		{
+			Deescalate( dummyInputEvent );
+			return true;
+		}
+		return false;
+	}
+
+	private function InitiateAutomaticDeescalationEvent( evt : SecuritySystemInput )
+	{
+		var autoDeescalate : AutomaticDeescalationEvent;
+		CancelAutomaticDeescalationEvent();
+		autoDeescalate = new AutomaticDeescalationEvent;
+		autoDeescalate.originalNotification = evt;
+		m_deescalationEventID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( GetID(), GetClassName(), autoDeescalate, 30.0 );
+		m_delayIDValid = true;
+	}
+
+	private function CancelAutomaticDeescalationEvent()
+	{
+		if( !( m_delayIDValid ) )
+		{
+			return;
+		}
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_deescalationEventID );
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_deescalationEventID );
+		m_delayIDValid = false;
+	}
+
+	public function OnAutomaticDeescalationEvent( evt : AutomaticDeescalationEvent ) : EntityNotificationType
+	{
+		if( GetSecurityState() == ESecuritySystemState.SAFE )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( IsReprimandOngoing() )
+		{
+			InitiateAutomaticDeescalationEvent( evt.originalNotification );
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( !( IsSystemClean() ) )
+		{
+			InitiateAutomaticDeescalationEvent( evt.originalNotification );
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		Deescalate( evt.originalNotification );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private const function Deescalate( evt : SecuritySystemInput )
+	{
+		var deescalationEvent : DeescalationEvent;
+		deescalationEvent = new DeescalationEvent;
+		deescalationEvent.originalNotification = evt;
+		QueuePSEvent( GetID(), GetClassName(), deescalationEvent );
+	}
+
+	public export function OnDeescalate( evt : DeescalationEvent ) : EntityNotificationType
+	{
+		var newState : ESecuritySystemState;
+		var i : Int32;
+		if( m_securitySystemState == ESecuritySystemState.COMBAT )
+		{
+			for( i = 0; i < m_blacklist.Size(); i += 1 )
+			{
+				if( IsUserInsideSystem( m_blacklist[ i ].GetEntityID() ) )
+				{
+					InitiateAutomaticDeescalationEvent( evt.originalNotification );
+					return EntityNotificationType.DoNotNotifyEntity;
+				}
+			}
+		}
+		newState = ( ( ESecuritySystemState )( ( ( Int32 )( m_securitySystemState ) ) - 1 ) );
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, "Deescalating..." );
+		}
+		SetSecurityStateAndTriggerResponse( newState, evt.originalNotification );
+		if( m_securitySystemState != ESecuritySystemState.SAFE )
+		{
+			InitiateAutomaticDeescalationEvent( evt.originalNotification );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function BlacklistEntityID( entityID : EntityID, reason : BlacklistReason )
+	{
+		var newEntry : BlacklistEntry;
+		var blacklistedEntityIndex : Int32;
+		var reasonChanged : Bool;
+		if( !( EntityID.IsDefined( entityID ) ) )
+		{
+			return;
+		}
+		newEntry = new BlacklistEntry;
+		newEntry.Initialize( entityID, reason, m_currentReprimandID );
+		blacklistedEntityIndex = GetEntityBlacklistIndex( entityID );
+		if( blacklistedEntityIndex >= 0 )
+		{
+			reasonChanged = m_blacklist[ blacklistedEntityIndex ].UpdateBlacklistEntry( reason, m_currentReprimandID );
+			if( reasonChanged )
+			{
+				TriggerBlacklistWipeCountdown( true, entityID );
+			}
+			return;
+		}
+		else
+		{
+			TriggerBlacklistWipeCountdown( true, entityID );
+			m_blacklist.PushBack( newEntry );
+		}
+		Debug( false, false, TraceToString() );
+	}
+
+	private function TriggerBlacklistWipeCountdown( start : Bool, entityID : EntityID )
+	{
+		var blacklistWipe : BlacklistPeriodEnded;
+		if( !( IsPlayersEntityID( entityID ) ) )
+		{
+			return;
+		}
+		if( start )
+		{
+			TriggerBlacklistWipeCountdown( false, entityID );
+			blacklistWipe = new BlacklistPeriodEnded;
+			blacklistWipe.entityID = entityID;
+			m_blacklistDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( GetID(), GetClassName(), blacklistWipe, 3600.0, false );
+			m_blacklistDelayValid = true;
+		}
+		else if( m_blacklistDelayValid )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_blacklistDelayID );
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_blacklistDelayID );
+			m_blacklistDelayValid = false;
+			m_blacklistDelayID = DelayID();
+		}
+	}
+
+	private function OnBlacklistPeriodEnded( evt : BlacklistPeriodEnded ) : EntityNotificationType
+	{
+		if( !( m_blacklistDelayValid ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		m_blacklistDelayValid = false;
+		m_blacklistDelayID = DelayID();
+		RemoveFromBlacklist( evt.entityID );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function BlacklistEntityID( go : GameObject, reason : BlacklistReason )
+	{
+		if( go )
+		{
+			BlacklistEntityID( go.GetEntityID(), reason );
+		}
+	}
+
+	private const function GetEntityBlacklistIndex( entityID : EntityID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_blacklist.Size(); i += 1 )
+		{
+			if( m_blacklist[ i ].GetEntityID() == entityID )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function RemoveFromBlacklist( entityID : EntityID )
+	{
+		var removeFromBlacklist : RemoveFromBlacklistEvent;
+		removeFromBlacklist = new RemoveFromBlacklistEvent;
+		if( IsEntityBlacklisted( entityID ) )
+		{
+			removeFromBlacklist = new RemoveFromBlacklistEvent;
+			removeFromBlacklist.entityIDToRemove = entityID;
+			GetPersistencySystem().QueuePSEvent( GetID(), GetClassName(), removeFromBlacklist );
+		}
+	}
+
+	public const function RemoveFromBlacklist( go : GameObject )
+	{
+		if( go )
+		{
+			RemoveFromBlacklist( go.GetEntityID() );
+		}
+	}
+
+	private export function OnRemoveFromBlacklist( evt : RemoveFromBlacklistEvent ) : EntityNotificationType
+	{
+		if( IsEntityBlacklisted( evt.entityIDToRemove ) )
+		{
+			m_blacklist.Erase( GetEntityBlacklistIndex( evt.entityIDToRemove ) );
+			m_agentsRegistry.WipeReprimandData( evt.entityIDToRemove );
+			TriggerBlacklistWipeCountdown( false, evt.entityIDToRemove );
+			Debug( false, false, TraceToString() );
+			ResolvePotentialDeescalation();
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function IsPlayersEntityID( entityID : EntityID ) : Bool
+	{
+		var localPlayer : GameObject;
+		var mainPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject();
+		mainPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( ( entityID == localPlayer.GetEntityID() ) || ( entityID == mainPlayer.GetEntityID() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function GetSecurityAccessData( level : ESecurityAccessLevel ) : array< SecurityAccessLevelEntry >
+	{
+		var emptyData : array< SecurityAccessLevelEntry >;
+		switch( level )
+		{
+			case ESecurityAccessLevel.ESL_NONE:
+				return emptyData;
+			case ESecurityAccessLevel.ESL_0:
+				return ProvideAccessDataLevel_0();
+			case ESecurityAccessLevel.ESL_1:
+				return ProvideAccessDataLevel_1();
+			case ESecurityAccessLevel.ESL_2:
+				return ProvideAccessDataLevel_2();
+			case ESecurityAccessLevel.ESL_3:
+				return ProvideAccessDataLevel_3();
+			case ESecurityAccessLevel.ESL_4:
+				return ProvideAccessDataLevel_4();
+		}
+		if( !( IsFinal() ) )
+		{
+			LogDevices( "SecuritySystemControllerPS: GetSecurityAccessData \ Unhandled security level" );
+		}
+	}
+
+	public const function IsUserAuthorized( user : EntityID, level : ESecurityAccessLevel ) : Bool
+	{
+		var i : Int32;
+		if( level == ESecurityAccessLevel.ESL_NONE )
+		{
+			return true;
+		}
+		if( GetAttitudeTowards( user ) == EAIAttitude.AIA_Friendly )
+		{
+			return true;
+		}
+		for( i = 0; i < m_currentlyAuthorizedUsers.Size(); i += 1 )
+		{
+			if( m_currentlyAuthorizedUsers[ i ].user == user )
+			{
+				if( ( ( Int32 )( m_currentlyAuthorizedUsers[ i ].level ) ) >= ( ( Int32 )( level ) ) )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public const function IsUserAuthorized( user : GameObject, level : ESecurityAccessLevel ) : Bool
+	{
+		if( user )
+		{
+			return IsUserAuthorized( user.GetEntityID(), level );
+		}
+		return false;
+	}
+
+	public const override function GetUserAuthorizationLevel( user : EntityID ) : ESecurityAccessLevel
+	{
+		var i : Int32;
+		for( i = 0; i < m_currentlyAuthorizedUsers.Size(); i += 1 )
+		{
+			if( m_currentlyAuthorizedUsers[ i ].user == user )
+			{
+				return m_currentlyAuthorizedUsers[ i ].level;
+			}
+		}
+		return ESecurityAccessLevel.ESL_NONE;
+	}
+
+	public function AddAccessLevelData( entryLevel : ESecurityAccessLevel, optional password : CName, optional keycard : TweakDBID )
+	{
+		switch( entryLevel )
+		{
+			case ESecurityAccessLevel.ESL_0:
+				AddAccessLevelEntry( m_level_0, password, keycard );
+			break;
+			case ESecurityAccessLevel.ESL_1:
+				AddAccessLevelEntry( m_level_1, password, keycard );
+			break;
+			case ESecurityAccessLevel.ESL_2:
+				AddAccessLevelEntry( m_level_2, password, keycard );
+			break;
+			case ESecurityAccessLevel.ESL_3:
+				AddAccessLevelEntry( m_level_3, password, keycard );
+			break;
+			case ESecurityAccessLevel.ESL_4:
+				AddAccessLevelEntry( m_level_4, password, keycard );
+			break;
+		}
+	}
+
+	public const function AuthorizeUser( user : EntityID, optional password : CName ) : Bool
+	{
+		var currentUserLevel : ESecurityAccessLevel;
+		var passLevel : ESecurityAccessLevel;
+		var keycardLevel : ESecurityAccessLevel;
+		currentUserLevel = FindCurrentAuthorizationLevelForUser( user );
+		if( IsNameValid( password ) )
+		{
+			passLevel = PerformAuthorizationAttemptUsingPassword( user, password );
+		}
+		keycardLevel = PerformAuthorizationAttemptUsingKeycard( user );
+		if( ( ( ( Int32 )( currentUserLevel ) ) >= ( ( Int32 )( passLevel ) ) ) && ( ( ( Int32 )( currentUserLevel ) ) >= ( ( Int32 )( keycardLevel ) ) ) )
+		{
+			return false;
+		}
+		if( ( ( Int32 )( keycardLevel ) ) > ( ( Int32 )( passLevel ) ) )
+		{
+			AddUser( user, keycardLevel );
+		}
+		else
+		{
+			AddUser( user, passLevel );
+		}
+		return true;
+	}
+
+	public const function AuthorizeUser( user : EntityID, level : ESecurityAccessLevel )
+	{
+		AddUser( user, level );
+		ResolvePotentialDeescalation();
+	}
+
+	public override function OnAddUserEvent( evt : AddUserEvent ) : EntityNotificationType
+	{
+		super.OnAddUserEvent( evt );
+		RemoveFromBlacklist( evt.userEntry.user );
+		RequestTargetsAssessment( , NULL );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnRevokeAuthorization( evt : RevokeAuthorization ) : EntityNotificationType
+	{
+		var i : Int32;
+		for( i = 0; i < m_currentlyAuthorizedUsers.Size(); i += 1 )
+		{
+			if( m_currentlyAuthorizedUsers[ i ].user == evt.user )
+			{
+				if( m_currentlyAuthorizedUsers[ i ].level > evt.level )
+				{
+					return EntityNotificationType.DoNotNotifyEntity;
+				}
+				else
+				{
+					m_currentlyAuthorizedUsers[ i ].level = ESecurityAccessLevel.ESL_NONE;
+				}
+			}
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function RemoveUser( user : EntityID ) : Bool
+	{
+		var removeUserSuccessful : Bool;
+		removeUserSuccessful = super.RemoveUser( user );
+		RequestTargetsAssessment( , NULL );
+		return removeUserSuccessful;
+	}
+
+	private function AddAccessLevelEntry( out level : array< SecurityAccessLevelEntry >, optional password : CName, optional keycard : TweakDBID )
+	{
+		var newEntry : SecurityAccessLevelEntry;
+		if( TDBID.IsValid( keycard ) )
+		{
+			newEntry.m_keycard = keycard;
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, ( "Keycard - " + GetKeycardLocalizedString( keycard ) ) + " added" );
+			}
+		}
+		if( IsNameValid( password ) )
+		{
+			newEntry.m_password = password;
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, ( "Pasword - " + NameToString( password ) ) + " added" );
+			}
+		}
+		level.PushBack( newEntry );
+	}
+
+	private const function ProvideAccessDataLevel_0() : array< SecurityAccessLevelEntry >
+	{
+		var accessData : array< SecurityAccessLevelEntry >;
+		var higherLevelAccessData : array< SecurityAccessLevelEntry >;
+		var i : Int32;
+		accessData = m_level_0;
+		higherLevelAccessData = ProvideAccessDataLevel_1();
+		for( i = 0; i < higherLevelAccessData.Size(); i += 1 )
+		{
+			accessData.PushBack( higherLevelAccessData[ i ] );
+		}
+		return accessData;
+	}
+
+	private const function ProvideAccessDataLevel_1() : array< SecurityAccessLevelEntry >
+	{
+		var accessData : array< SecurityAccessLevelEntry >;
+		var higherLevelAccessData : array< SecurityAccessLevelEntry >;
+		var i : Int32;
+		accessData = m_level_1;
+		higherLevelAccessData = ProvideAccessDataLevel_2();
+		for( i = 0; i < higherLevelAccessData.Size(); i += 1 )
+		{
+			accessData.PushBack( higherLevelAccessData[ i ] );
+		}
+		return accessData;
+	}
+
+	private const function ProvideAccessDataLevel_2() : array< SecurityAccessLevelEntry >
+	{
+		var accessData : array< SecurityAccessLevelEntry >;
+		var higherLevelAccessData : array< SecurityAccessLevelEntry >;
+		var i : Int32;
+		accessData = m_level_2;
+		higherLevelAccessData = ProvideAccessDataLevel_3();
+		for( i = 0; i < higherLevelAccessData.Size(); i += 1 )
+		{
+			accessData.PushBack( higherLevelAccessData[ i ] );
+		}
+		return accessData;
+	}
+
+	private const function ProvideAccessDataLevel_3() : array< SecurityAccessLevelEntry >
+	{
+		var accessData : array< SecurityAccessLevelEntry >;
+		var higherLevelAccessData : array< SecurityAccessLevelEntry >;
+		var i : Int32;
+		accessData = m_level_3;
+		higherLevelAccessData = ProvideAccessDataLevel_4();
+		for( i = 0; i < higherLevelAccessData.Size(); i += 1 )
+		{
+			accessData.PushBack( higherLevelAccessData[ i ] );
+		}
+		return accessData;
+	}
+
+	private const function ProvideAccessDataLevel_4() : array< SecurityAccessLevelEntry >
+	{
+		return m_level_4;
+	}
+
+	private const function PerformAuthorizationAttemptUsingKeycard( user : EntityID ) : ESecurityAccessLevel
+	{
+		var minimumLevel : ESecurityAccessLevel;
+		var currentLevel : ESecurityAccessLevel;
+		var keycardMatchNotFound : Bool;
+		minimumLevel = FindCurrentAuthorizationLevelForUser( user );
+		currentLevel = ESecurityAccessLevel.ESL_4;
+		keycardMatchNotFound = true;
+		while( keycardMatchNotFound )
+		{
+			keycardMatchNotFound = !( IsUserAuthorizedViaCard( user, currentLevel ) );
+			if( keycardMatchNotFound && currentLevel == minimumLevel )
+			{
+				return ESecurityAccessLevel.ESL_NONE;
+			}
+			if( keycardMatchNotFound == false )
+			{
+				return currentLevel;
+			}
+			currentLevel = ReduceLevelByOne( currentLevel );
+		}
+		return ESecurityAccessLevel.ESL_NONE;
+	}
+
+	private const function PerformAuthorizationAttemptUsingPassword( user : EntityID, password : CName ) : ESecurityAccessLevel
+	{
+		var minimumLevel : ESecurityAccessLevel;
+		var currentLevel : ESecurityAccessLevel;
+		var passwordNotFound : Bool;
+		minimumLevel = FindCurrentAuthorizationLevelForUser( user );
+		currentLevel = ESecurityAccessLevel.ESL_4;
+		passwordNotFound = true;
+		while( passwordNotFound )
+		{
+			passwordNotFound = !( IsUserAuthorizedViaPassword( password, currentLevel ) );
+			if( passwordNotFound && currentLevel == minimumLevel )
+			{
+				return ESecurityAccessLevel.ESL_NONE;
+			}
+			if( passwordNotFound == false )
+			{
+				return currentLevel;
+			}
+			currentLevel = ReduceLevelByOne( currentLevel );
+		}
+		return ESecurityAccessLevel.ESL_NONE;
+	}
+
+	private const function IsUserAuthorizedViaCard( user : EntityID, level : ESecurityAccessLevel ) : Bool
+	{
+		var validSecurityData : array< SecurityAccessLevelEntry >;
+		var viableKeycards : array< TweakDBID >;
+		var transactionSystem : TransactionSystem;
+		var i : Int32;
+		validSecurityData = GetSecurityAccessData( level );
+		viableKeycards = ExtractKeycardsFromAuthorizationData( validSecurityData );
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		for( i = 0; i < viableKeycards.Size(); i += 1 )
+		{
+			if( transactionSystem.HasItem( ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), user ) ) ), ItemID.CreateQuery( viableKeycards[ i ] ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private const function IsUserAuthorizedViaPassword( password : CName, level : ESecurityAccessLevel ) : Bool
+	{
+		var validSecurityData : array< SecurityAccessLevelEntry >;
+		var viablePasswords : array< CName >;
+		var i : Int32;
+		validSecurityData = GetSecurityAccessData( level );
+		viablePasswords = ExtractPasswordsFromAuthorizationData( validSecurityData );
+		for( i = 0; i < viablePasswords.Size(); i += 1 )
+		{
+			if( viablePasswords[ i ] == password )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public override function GetActions( out actions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		if( !( super.GetActions( actions, context ) ) )
+		{
+			return false;
+		}
+		if( FullSystemRestart.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionFullSystemRestart() );
+		}
+		SetActionIllegality( actions, m_illegalActions.regularActions );
+		return true;
+	}
+
+	protected const function ActionSecuritySystemStatus() : SecuritySystemStatus
+	{
+		var action : SecuritySystemStatus;
+		action = new SecuritySystemStatus;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetStatusClearance();
+		action.SetUp( this );
+		action.SetProperties( this );
+		action.AddDeviceName( GetDeviceName() );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public const function ActionSecuritySystemBreachResponse( notificationEvent : SecuritySystemInput ) : SecuritySystemOutput
+	{
+		var action : SecuritySystemOutput;
+		action = new SecuritySystemOutput;
+		action.SetUp( this );
+		action.SetProperties( m_securitySystemState, notificationEvent );
+		action.AddDeviceName( GetDeviceName() );
+		return action;
+	}
+
+	private const function ActionFullSystemRestart() : FullSystemRestart
+	{
+		var action : FullSystemRestart;
+		action = new FullSystemRestart;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetSystemCompatibleClearance();
+		action.SetUp( this );
+		action.SetProperties( m_isRestarting, m_restartDuration );
+		action.AddDeviceName( GetDeviceName() );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public override function OnFullSystemRestart( evt : FullSystemRestart ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetExternalOnly();
+		if( m_isRestarting )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, ( "Full Security System Restart Performed. Restart duration: " + IntToString( evt.m_restartDuration ) ) + " s" );
+		}
+		super.OnFullSystemRestart( evt );
+		SendActionToAllSlaves( evt );
+		Notify( notifier, evt );
+		NotifyParents();
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnQuestForceON( evt : QuestForceON ) : EntityNotificationType
+	{
+		var agents : array< Agent >;
+		var i : Int32;
+		if( !( IsDisabled() ) || !( IsOFF() ) )
+		{
+		}
+		super.OnQuestForceON( evt );
+		InitiateAgentRegistry();
+		agents = m_agentsRegistry.GetAgents();
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			QueuePSEvent( GetPS( agents[ i ].link ), new SecuritySystemEnabled );
+		}
+		NotifyParents();
+		Debug( false, false, TraceToString() );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnActionTakeOverSecuritySystem( evt : TakeOverSecuritySystem ) : EntityNotificationType
+	{
+		if( evt.GetExecutor().IsPlayer() )
+		{
+			SetSecuritySystemAttitudeGroup( T"Attitudes.Group_Player" );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public override function OnActionForceResetDevice( evt : ActionForceResetDevice ) : EntityNotificationType
+	{
+		var restart : FullSystemRestart;
+		restart = ActionFullSystemRestart();
+		restart.SetProperties( true, evt.m_restartDuration );
+		CleanSecuritySystemMemory();
+		OnFullSystemRestart( restart );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function CleanSecuritySystemMemory()
+	{
+		ReleaseAllReprimands();
+		m_agentsRegistry = NULL;
+		InitiateAgentRegistry();
+		m_blacklistDelayValid = false;
+		m_currentReprimandID = 0;
+		m_blacklist.Clear();
+		m_securitySystemState = ESecuritySystemState.SAFE;
+	}
+
+	private const function GetPS( agent : Agent ) : DeviceComponentPS
+	{
+		return GetPS( agent.link );
+	}
+
+	private const function ReduceLevelByOne( level : ESecurityAccessLevel ) : ESecurityAccessLevel
+	{
+		var reducedLevel : ESecurityAccessLevel;
+		if( level == ESecurityAccessLevel.ESL_NONE )
+		{
+			return level;
+		}
+		reducedLevel = ( ( ESecurityAccessLevel )( ( ( Int32 )( level ) ) - 1 ) );
+		return reducedLevel;
+	}
+
+	private const function GetAttitudeSystem() : AttitudeSystem
+	{
+		return GameInstance.GetAttitudeSystem( GetGameInstance() );
+	}
+
+	private const function GetAttitudeTowards( target : EntityID ) : EAIAttitude
+	{
+		if( EntityID.IsDefined( target ) )
+		{
+			return GetAttitudeTowards( GetAttitudeSystem().GetAttitudeGroup( target ) );
+		}
+		else
+		{
+			return EAIAttitude.AIA_Neutral;
+		}
+	}
+
+	private const function GetAttitudeTowards( target : GameObject ) : EAIAttitude
+	{
+		if( target )
+		{
+			return GetAttitudeTowards( target.GetEntityID() );
+		}
+		return EAIAttitude.AIA_Friendly;
+	}
+
+	private const function GetAttitudeTowards( otherGroup : CName ) : EAIAttitude
+	{
+		var secSysGroup : CName;
+		var relation : EAIAttitude;
+		secSysGroup = GetSecuritySystemAttitudeGroupName();
+		relation = GetAttitudeSystem().GetAttitudeRelation( secSysGroup, otherGroup );
+		return relation;
+	}
+
+	protected function OnQuestIllegalActionNotification( evt : QuestIllegalActionNotification ) : EntityNotificationType
+	{
+		QuestIllegalActionNotification( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnQuestCombatActionNotification( evt : QuestCombatActionNotification ) : EntityNotificationType
+	{
+		QuestCombatActionNotification( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export function OnSetSecuritySystemState( evt : SetSecuritySystemState ) : EntityNotificationType
+	{
+		QuestChangeSecuritySystemState( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export function OnQuestAuthorizePlayer( evt : AuthorizePlayerInSecuritySystem ) : EntityNotificationType
+	{
+		QuestAuthorizePlayer( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export function OnQuestBlackListPlayer( evt : BlacklistPlayer ) : EntityNotificationType
+	{
+		QuestBlacklistPlayer( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnQuestExclusiveQuestControl( evt : SuppressSecuritySystemStateChange ) : EntityNotificationType
+	{
+		QuestSuppressSecuritySystem( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnQuestChangeSecuritySystemAttitudeGroup( evt : QuestChangeSecuritySystemAttitudeGroup ) : EntityNotificationType
+	{
+		QuestChangeSecuritySystemAttitudeGroup( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public function QuestChangeSecuritySystemAttitudeGroup( evt : QuestChangeSecuritySystemAttitudeGroup )
+	{
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, ( ( "SM: Quest attempts to change attitude group from: " + NameToString( GetSecuritySystemAttitudeGroupName() ) ) + " to: " ) + NameToString( TweakDBInterface.GetAttitudeGroupRecord( evt.newAttitudeGroup ).Name() ) );
+		}
+		SetSecuritySystemAttitudeGroup( evt.newAttitudeGroup );
+	}
+
+	private function ExtractNPCIDsFromQuestNotification( evt : QuestSecuritySystemInput ) : array< EntityID >
+	{
+		var i : Int32;
+		var k : Int32;
+		var spawnersData : array< SpawnerData >;
+		var currentSpawnerID : EntityID;
+		var spawnerFound : Bool;
+		var agentsList : array< PersistentID >;
+		var secAreasWithPlayer : array< SecurityAreaControllerPS >;
+		var specificNPCs : array< EntityID >;
+		for( i = 0; i < evt.notifySpecificNPCs.Size(); i += 1 )
+		{
+			spawnerFound = false;
+			if( NPCReference.IsValid( evt.notifySpecificNPCs[ i ] ) )
+			{
+				currentSpawnerID = NPCReference.GetSpawnerEntityID( evt.notifySpecificNPCs[ i ] );
+				for( k = 0; k < spawnersData.Size(); k += 1 )
+				{
+					if( spawnersData[ k ].spawnerID == currentSpawnerID )
+					{
+						spawnersData[ k ].entryNames.PushBack( evt.notifySpecificNPCs[ i ].entryName );
+						spawnerFound = true;
+					}
+				}
+				if( !( spawnerFound ) )
+				{
+					spawnersData.PushBack( SpawnerData.Construct( currentSpawnerID, evt.notifySpecificNPCs[ i ].entryName ) );
+				}
+			}
+		}
+		if( evt.notificationScope == SecurityEventScopeSettings.GLOBAL )
+		{
+			agentsList = m_agentsRegistry.GetAgentsIDs();
+		}
+		else if( evt.notificationScope == SecurityEventScopeSettings.AREA_WHERE_PLAYER_IS )
+		{
+			secAreasWithPlayer = GetSecurityAreasWithUserInside( GetPlayerEntityID() );
+			if( secAreasWithPlayer.Size() > 0 )
+			{
+				agentsList = m_agentsRegistry.GetAgentsIDs( secAreasWithPlayer );
+			}
+		}
+		for( i = 0; i < spawnersData.Size(); i += 1 )
+		{
+			GetFixedEntityIdsFromSpawnerEntityID( spawnersData[ i ].spawnerID, spawnersData[ i ].entryNames, GetGameInstance(), specificNPCs );
+		}
+		for( i = 0; i < agentsList.Size(); i += 1 )
+		{
+			specificNPCs.PushBack( PersistentID.ExtractEntityID( agentsList[ i ] ) );
+		}
+		return specificNPCs;
+	}
+
+	public function QuestIllegalActionNotification( evt : QuestIllegalActionNotification )
+	{
+		var actionSecuritySystemInput : SecuritySystemInput;
+		var specificNPCs : array< EntityID >;
+		var LKP : Vector4;
+		var playerPup : GameObject;
+		specificNPCs = ExtractNPCIDsFromQuestNotification( evt );
+		if( specificNPCs.Size() == 0 )
+		{
+			return;
+		}
+		if( evt.revealPlayerSettings.revealPlayer == ERevealPlayerType.REVEAL_ONCE )
+		{
+			playerPup = GetPlayerMainObject();
+			if( playerPup )
+			{
+				LKP = playerPup.GetWorldPosition();
+			}
+		}
+		actionSecuritySystemInput = ActionSecurityBreachNotification( LKP, playerPup, ESecurityNotificationType.ILLEGAL_ACTION );
+		ProcessBreachNotificationWithRecipientsList( specificNPCs, actionSecuritySystemInput );
+	}
+
+	public function QuestCombatActionNotification( evt : QuestCombatActionNotification )
+	{
+		var actionSecuritySystemInput : SecuritySystemInput;
+		var specificNPCs : array< EntityID >;
+		var LKP : Vector4;
+		var playerPup : GameObject;
+		specificNPCs = ExtractNPCIDsFromQuestNotification( evt );
+		if( specificNPCs.Size() == 0 )
+		{
+			return;
+		}
+		if( evt.revealPlayerSettings.revealPlayer == ERevealPlayerType.REVEAL_ONCE )
+		{
+			playerPup = GetPlayerMainObject();
+			if( playerPup )
+			{
+				LKP = playerPup.GetWorldPosition();
+			}
+		}
+		actionSecuritySystemInput = ActionSecurityBreachNotification( LKP, playerPup, ESecurityNotificationType.COMBAT );
+		ProcessBreachNotificationWithRecipientsList( specificNPCs, actionSecuritySystemInput );
+	}
+
+	public function QuestChangeSecuritySystemState( evt : SetSecuritySystemState )
+	{
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, ( ( "SM: Quest attemtps to change state from: " + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( m_securitySystemState ) ) ) ) + " to " ) + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( evt.state ) ) ) );
+		}
+		SetSecurityStateAndTriggerResponse( evt.state, ActionSecurityBreachNotification( GetLocalPlayerControlledGameObject().GetWorldPosition(), GetLocalPlayerControlledGameObject(), ESecurityNotificationType.QUEST ), true );
+	}
+
+	public function QuestSuppressSecuritySystem( evt : SuppressSecuritySystemStateChange )
+	{
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, "SM: Security system under QUEST CONTROL: " + BoolToString( evt.forceSecuritySystemIntoStrictQuestControl ) );
+		}
+		m_isUnderStrictQuestControl = evt.forceSecuritySystemIntoStrictQuestControl;
+		RequestTargetsAssessment( , NULL );
+	}
+
+	public function QuestAuthorizePlayer( evt : AuthorizePlayerInSecuritySystem )
+	{
+		if( evt.forceRemoveFromBlacklist )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "SM: Quest attempts to remove player from the blacklist" );
+			}
+			RemoveFromBlacklist( GetPlayerEntityID() );
+		}
+		if( evt.authorize )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "SM: Quest attempts to authorize player" );
+			}
+			AddUser( GetPlayerEntityID(), evt.ESL );
+		}
+		else
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "SM: Quest attempts to deauthorize player" );
+			}
+			RemoveUser( GetPlayerEntityID() );
+		}
+	}
+
+	public function QuestBlacklistPlayer( evt : BlacklistPlayer )
+	{
+		if( evt.forceRemoveAuthorization )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "SM: Quest attempts to deauthorize player" );
+			}
+			RemoveUser( GetPlayerEntityID() );
+		}
+		if( evt.blacklist )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "SM: Quest attempts to blacklist player" );
+			}
+			BlacklistEntityID( GetPlayerEntityID(), evt.reason );
+		}
+		else
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "SM: Quest attempts to remove player from blacklist" );
+			}
+			RemoveFromBlacklist( GetPlayerEntityID() );
+		}
+	}
+
+	public const function DebugGetOutputsCount() : Int32
+	{
+		return m_outputsSend;
+	}
+
+	public const function DebugGetInputsCount() : Int32
+	{
+		return m_inputsReceived;
+	}
+
+	private const function Debug( instructionAdded, inputAdded : Bool, trace : String, optional instruction : EReprimandInstructions, optional input : SecuritySystemInput )
+	{
+		var request : UpdateDebuggerRequest;
+		var debugger : SecSystemDebugger;
+		if( IsFinal() || ( GameInstance.GetQuestsSystem( GetGameInstance() ).GetFact( 'debugSS' ) == 0 ) )
+		{
+			return;
+		}
+		request = new UpdateDebuggerRequest;
+		request.m_system = this;
+		request.m_time = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+		request.m_instructionAttached = instructionAdded;
+		request.m_inputAttached = inputAdded;
+		request.m_callstack = StringToName( trace );
+		request.m_instruction = instruction;
+		request.m_recentInput = input;
+		debugger = ( ( SecSystemDebugger )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'SecSystemDebugger' ) ) );
+		debugger.QueueRequest( request );
+	}
+
+	public override function OnMaraudersMapDeviceDebug( sink : MaraudersMapDevicesSink )
+	{
+		if( IsFinal() )
+		{
+			return;
+		}
+		sink.BeginCategory( "SecuritySystem Specific" );
+		sink.PushString( "STATE: ", ( ( String )( m_securitySystemState ) ) );
+		sink.PushString( "PLAYER BLACKLIST STATUS: ", EnumValueToString( "BlacklistReason", ( ( Int64 )( Debug_GetPlayerBlacklistReason() ) ) ) );
+		sink.PushString( "PLAYER AUTHORIZATION LEVEL: ", EnumValueToString( "ESecurityAccessLevel", ( ( Int64 )( GetUserAuthorizationLevel( GetPlayerEntityID() ) ) ) ) );
+		sink.PushString( "SEC SYS ATTITUDE GROUP: ", ( ( String )( GetSecuritySystemAttitudeGroupName() ) ) );
+		sink.PushString( "HIDDEN ON UI: ", BoolToString( m_hideAreasOnMinimap ) );
+		sink.EndCategory();
+	}
+
+	public const function Debug_GetReprimandID() : Int32
+	{
+		return m_currentReprimandID;
+	}
+
+	public const function Debug_GetPlayerBlacklistReason() : BlacklistReason
+	{
+		var i : Int32;
+		var localPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject();
+		for( i = 0; i < m_blacklist.Size(); i += 1 )
+		{
+			if( m_blacklist[ i ].GetEntityID() == localPlayer.GetEntityID() )
+			{
+				return m_blacklist[ i ].GetReason();
+			}
+		}
+		return BlacklistReason.UNINITIALIZED;
+	}
+
+	public const function Debug_GetPlayerWarningCount() : Int32
+	{
+		var i : Int32;
+		var localPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject();
+		for( i = 0; i < m_blacklist.Size(); i += 1 )
+		{
+			if( m_blacklist[ i ].GetEntityID() == localPlayer.GetEntityID() )
+			{
+				return m_blacklist[ i ].GetWarningsCount();
+			}
+		}
+		return 0;
+	}
+
+	public const override function GetDebugTags() : String
+	{
+		var tags : String;
+		tags = super.GetDebugTags();
+		if( m_isUnderStrictQuestControl )
+		{
+			tags += "QUEST CONTROL ";
+		}
+		if( IsReprimandOngoing() )
+		{
+			tags += "IN REPRIMAND ";
+		}
+		tags += ( ( "#P INSIDE: " + BoolToString( IsUserInsideSystem( GetPlayerEntityID() ) ) ) + " " );
+		tags += ( ( "#P BLACKLISTED: " + BoolToString( IsUserInsideSystem( GetPlayerEntityID() ) ) ) + " " );
+		return tags;
+	}
+
+	public const function IsUnderStrictQuestControl() : Bool
+	{
+		return m_isUnderStrictQuestControl;
+	}
+
+	private const function SecuritySystemLog( message : String )
+	{
+		GameInstance.GetActivityLogSystem( GetGameInstance() ).AddLog( "Security System: " + message );
+	}
+
+	private const function SecuritySystemLog( evt : ReprimandUpdate )
+	{
+		var currentPerformer : String;
+		var message : String;
+		message = "[REPRIMAND] ";
+		currentPerformer = "Undefined";
+		if( ( ( ScriptedPuppet )( evt.currentPerformer ) ) )
+		{
+			currentPerformer = "NPC: ";
+		}
+		else if( ( ( SecurityTurret )( evt.currentPerformer ) ) )
+		{
+			currentPerformer = "TURRET: ";
+		}
+		switch( evt.reprimandInstructions )
+		{
+			case EReprimandInstructions.INITIATE_FIRST:
+				message += ( currentPerformer + "INITIATE REPRIMAND!" );
+			break;
+			case EReprimandInstructions.INITIATE_SUCCESSIVE:
+				message += ( currentPerformer + "INITIATE SUCCESSIVE REPRIMAND!" );
+			break;
+			case EReprimandInstructions.TAKEOVER:
+				message += ( currentPerformer + "TAKEOVER REPRIMAND!" );
+			break;
+			case EReprimandInstructions.CONCLUDE_SUCCESSFUL:
+				message += ( currentPerformer + "RERPIMAND SUCCESSFUL!" );
+			break;
+			case EReprimandInstructions.CONCLUDE_FAILED:
+				message += ( currentPerformer + "RERPIMAND FAILED!" );
+			break;
+			default:
+				return;
+		}
+		SecuritySystemLog( message );
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceIcon";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceBackground";
+	}
+
+	protected override function ActionThumbnailUI() : ThumbnailUI
+	{
+		var action : ThumbnailUI;
+		action = super.ActionThumbnailUI();
+		action.CreateThumbnailWidgetPackage( T"DevicesUIDefinitions.SystemDeviceThumnbnailWidget", "LocKey#42210" );
+		return action;
+	}
+
+}
+

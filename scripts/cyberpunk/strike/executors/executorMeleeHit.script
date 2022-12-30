@@ -1,0 +1,276 @@
+class MeleeHitAnimEventExecutor extends EffectExecutor_Scripted
+{
+	private editable var m_ignoreWaterImpacts : Bool;
+	default m_ignoreWaterImpacts = false;
+	hint m_ignoreWaterImpacts = "Do nothing if target is a WaterPatchNodeInstance";
+
+	public export function Process( ctx : EffectScriptContext, applierCtx : EffectExecutionScriptContext ) : Bool
+	{
+		var target : Entity;
+		var targetPuppet : ScriptedPuppet;
+		var instigatorEntity : Entity;
+		var instigatorEntityID : EntityID;
+		var meleeHitEvent : MeleeHitEvent;
+		var game : GameInstance;
+		var aiComponent : AIHumanComponent;
+		var hitComponent : HitReactionComponent;
+		var resetBlockEvent : ResetAttackBlockedBlackBoardValue;
+		var targetWeapon : weak< WeaponObject >;
+		var instigatorWeapon : weak< WeaponObject >;
+		var isCleavingHit : Bool;
+		var isNPCOrDeviceHit : Bool;
+		var shouldSendEvents : Bool;
+		var canAttackGuardBreak : Bool;
+		isNPCOrDeviceHit = false;
+		shouldSendEvents = true;
+		target = EffectExecutionScriptContext.GetTarget( applierCtx );
+		instigatorEntity = EffectScriptContext.GetInstigator( ctx );
+		instigatorEntityID = instigatorEntity.GetEntityID();
+		EffectData.GetBool( EffectScriptContext.GetSharedData( ctx ), GetAllBlackboardDefs().EffectSharedData.meleeCleave, isCleavingHit );
+		meleeHitEvent = new MeleeHitEvent;
+		meleeHitEvent.instigator = ( ( GameObject )( instigatorEntity ) );
+		meleeHitEvent.target = ( ( GameObject )( target ) );
+		meleeHitEvent.isStrongAttack = isCleavingHit;
+		if( ( ( WeakspotObject )( target ) ) )
+		{
+			target = ( ( WeakspotObject )( target ) ).GetOwner();
+		}
+		targetPuppet = ( ( ScriptedPuppet )( target ) );
+		instigatorWeapon = ( ( WeaponObject )( EffectScriptContext.GetWeapon( ctx ) ) );
+		targetWeapon = ( ( WeaponObject )( GetTargetWeapon( targetPuppet ) ) );
+		if( targetPuppet )
+		{
+			aiComponent = targetPuppet.GetAIControllerComponent();
+			hitComponent = targetPuppet.GetHitReactionComponent();
+			game = ( ( GameObject )( target ) ).GetGameInstance();
+			if( CanAttackGuardBreak( instigatorEntity, target, instigatorWeapon, targetWeapon, isCleavingHit ) )
+			{
+				canAttackGuardBreak = true;
+				AIActionHelper.StartCooldown( targetPuppet, 'ParryStateCooldown', 2.0 );
+			}
+			if( !( canAttackGuardBreak ) )
+			{
+				if( ( GameInstance.GetStatsSystem( game ).GetStatValue( target.GetEntityID(), gamedataStatType.IsDeflecting ) == 1.0 ) && aiComponent.CheckTweakCondition( "MeleeParryCondition" ) )
+				{
+					aiComponent.GetActionBlackboard().SetBool( GetAllBlackboardDefs().AIAction.attackParried, true );
+					resetBlockEvent = new ResetAttackBlockedBlackBoardValue;
+					GameInstance.GetDelaySystem( game ).DelayEvent( target, resetBlockEvent, 0.1 );
+					WeaponObject.TriggerWeaponEffects( targetWeapon, gamedataFxAction.MeleeBlock );
+					meleeHitEvent.hitBlocked = true;
+				}
+				else if( !( hitComponent.GetHitAnimationInProgress() ) && aiComponent.CheckTweakCondition( "MeleeBlockCondition" ) )
+				{
+					aiComponent.GetActionBlackboard().SetBool( GetAllBlackboardDefs().AIAction.attackBlocked, true );
+					resetBlockEvent = new ResetAttackBlockedBlackBoardValue;
+					GameInstance.GetDelaySystem( game ).DelayEvent( target, resetBlockEvent, 0.1 );
+					if( !( hitComponent.GetShouldEvade() ) && hitComponent.GetCanBlock() )
+					{
+						WeaponObject.TriggerWeaponEffects( targetWeapon, gamedataFxAction.MeleeBlock );
+						meleeHitEvent.hitBlocked = true;
+					}
+					else
+					{
+						return true;
+					}
+				}
+				else
+				{
+					isNPCOrDeviceHit = true;
+				}
+			}
+			else
+			{
+				isNPCOrDeviceHit = true;
+			}
+		}
+		else if( ( ( SensorDevice )( target ) ) )
+		{
+			isNPCOrDeviceHit = true;
+		}
+		else if( m_ignoreWaterImpacts )
+		{
+			shouldSendEvents = !( EffectExecutionScriptContext.IsTargetWater( applierCtx ) );
+		}
+		if( shouldSendEvents )
+		{
+			if( isNPCOrDeviceHit )
+			{
+				AnimationControllerComponent.PushEvent( ( ( GameObject )( EffectScriptContext.GetInstigator( ctx ) ) ), 'MeleeHitNPC' );
+				AnimationControllerComponent.PushEvent( instigatorWeapon, 'MeleeHitNPC' );
+			}
+			else
+			{
+				AnimationControllerComponent.PushEvent( ( ( GameObject )( EffectScriptContext.GetInstigator( ctx ) ) ), 'MeleeHitStatic' );
+				AnimationControllerComponent.PushEvent( instigatorWeapon, 'MeleeHitStatic' );
+			}
+			instigatorEntity.QueueEventForEntityID( instigatorEntityID, meleeHitEvent );
+			instigatorEntity.QueueEventForEntityID( instigatorWeapon.GetEntityID(), meleeHitEvent );
+			TriggerSingleStimuliOnHit( ctx, applierCtx, gamedataStimType.SoundDistraction );
+		}
+		return true;
+	}
+
+	private function GetTargetWeapon( target : weak< ScriptedPuppet > ) : weak< WeaponObject >
+	{
+		var transactionSystem : TransactionSystem;
+		var item : weak< ItemObject >;
+		transactionSystem = GameInstance.GetTransactionSystem( target.GetGame() );
+		item = transactionSystem.GetItemInSlot( target, T"AttachmentSlots.WeaponRight" );
+		if( !( item ) )
+		{
+			item = transactionSystem.GetItemInSlot( target, T"AttachmentSlots.WeaponLeft" );
+		}
+		return ( ( WeaponObject )( item ) );
+	}
+
+	private final function CanAttackGuardBreak( instigator : weak< Entity >, target : weak< Entity >, instigatorWeapon : weak< WeaponObject >, targetWeapon : weak< WeaponObject >, strongAttack : Bool ) : Bool
+	{
+		var instigatorGuardBreakImpulse : Float;
+		var instigatorEvadeBreakImpulse : Float;
+		var instigatorEvadeImpulseCumulation : Float;
+		var instigatorEvadeImpulse : Float;
+		var targetEvadeImpulse : Float;
+		var statsSystem : StatsSystem;
+		var instigatorWeaponType : gamedataItemType;
+		var attackSpeed : Float;
+		var stamina : Float;
+		var canBlock : Bool;
+		var hasKerenzikov : Bool;
+		statsSystem = GameInstance.GetStatsSystem( ( ( ScriptedPuppet )( instigator ) ).GetGame() );
+		instigatorGuardBreakImpulse = statsSystem.GetStatValue( instigatorWeapon.GetEntityID(), gamedataStatType.KnockdownImpulse );
+		if( strongAttack )
+		{
+			instigatorGuardBreakImpulse *= 1.66999996;
+		}
+		instigatorEvadeImpulse = statsSystem.GetStatValue( instigatorWeapon.GetEntityID(), gamedataStatType.BaseKnockdownImpulse );
+		attackSpeed = statsSystem.GetStatValue( instigatorWeapon.GetEntityID(), gamedataStatType.AttackSpeed );
+		if( attackSpeed == 0.0 )
+		{
+			attackSpeed = 1.0;
+		}
+		instigatorEvadeImpulseCumulation = statsSystem.GetStatValue( instigatorWeapon.GetEntityID(), gamedataStatType.EvadeImpulse );
+		instigatorEvadeImpulseCumulation *= ( 1.0 / attackSpeed );
+		instigatorEvadeBreakImpulse = 100.0 / instigatorEvadeImpulseCumulation;
+		targetEvadeImpulse = statsSystem.GetStatValue( targetWeapon.GetEntityID(), gamedataStatType.BaseKnockdownImpulse );
+		instigatorWeaponType = instigatorWeapon.GetWeaponRecord().ItemType().Type();
+		canBlock = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.CanBlock ) >= 1.0;
+		hasKerenzikov = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.HasKerenzikov ) >= 1.0;
+		stamina = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.Stamina );
+		if( ( instigatorEvadeImpulse > targetEvadeImpulse ) || ( ( targetWeapon.GetWeaponRecord().ItemType().Type() == gamedataItemType.Wea_Fists && instigatorWeaponType != gamedataItemType.Wea_Fists ) && instigatorWeaponType != gamedataItemType.Cyb_StrongArms ) )
+		{
+			if( hasKerenzikov )
+			{
+				if( instigatorEvadeBreakImpulse >= ( stamina / 2.0 ) )
+				{
+					return true;
+				}
+				else
+				{
+					return false;
+				}
+			}
+			else
+			{
+				return true;
+			}
+		}
+		if( !( canBlock ) && hasKerenzikov )
+		{
+			if( instigatorEvadeBreakImpulse >= ( stamina / 2.0 ) )
+			{
+				return true;
+			}
+			else
+			{
+				return false;
+			}
+		}
+		else
+		{
+			if( instigatorGuardBreakImpulse >= stamina )
+			{
+				if( hasKerenzikov )
+				{
+					if( instigatorEvadeBreakImpulse >= ( stamina / 2.0 ) )
+					{
+						return true;
+					}
+					else
+					{
+						return false;
+					}
+				}
+				return true;
+			}
+			return false;
+		}
+	}
+
+	private function TriggerSingleStimuliOnHit( ctx : EffectScriptContext, applierCtx : EffectExecutionScriptContext, stimToSend : gamedataStimType )
+	{
+		var position : Vector4;
+		var effect : EffectInstance;
+		var stimuliEvent : StimuliEvent;
+		position = EffectExecutionScriptContext.GetHitPosition( applierCtx );
+		if( !( Vector4.IsZero( position ) ) && !( IsMuted( ctx, applierCtx ) ) )
+		{
+			stimuliEvent = new StimuliEvent;
+			stimuliEvent.sourcePosition = position;
+			stimuliEvent.sourceObject = ( ( GameObject )( EffectScriptContext.GetInstigator( ctx ) ) );
+			stimuliEvent.SetStimType( stimToSend );
+			GetStimuliData( ( "stims." + EnumValueToString( "gamedataStimType", ( ( Int32 )( stimToSend ) ) ) ) + "Stimuli", stimuliEvent );
+			effect = GameInstance.GetGameEffectSystem( GetGameInstance() ).CreateEffectStatic( 'stimuli', 'stimuli_range', EffectScriptContext.GetSource( ctx ) );
+			EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.stimuliEvent, stimuliEvent );
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position );
+			EffectData.SetBool( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.stimuliRaycastTest, false );
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, stimuliEvent.radius );
+			GameInstance.GetStimuliSystem( GetGameInstance() ).BroadcastStimuli( effect );
+		}
+	}
+
+	private function GetStimuliData( path : String, out stimToProcess : StimuliEvent )
+	{
+		var stimRecord : Stim_Record;
+		var sid : TweakDBID;
+		sid = TDBID.Create( path );
+		stimRecord = TweakDBInterface.GetStimRecord( sid );
+		stimToProcess.stimRecord = stimRecord;
+		stimToProcess.radius = stimRecord.Radius();
+		stimToProcess.stimPropagation = stimRecord.Propagation().Type();
+	}
+
+	private function IsMuted( ctx : EffectScriptContext, applierCtx : EffectExecutionScriptContext ) : Bool
+	{
+		var sourceMuted : Bool;
+		sourceMuted = GameInstance.GetStatusEffectSystem( EffectScriptContext.GetGameInstance( ctx ) ).HasStatusEffect( EffectScriptContext.GetSource( ctx ).GetEntityID(), T"BaseStatusEffect.MuteAudioStims" );
+		return sourceMuted;
+	}
+
+}
+
+class MeleeHitTerminateGameEffectExecutor extends EffectExecutor_Scripted
+{
+	private editable var m_ignoreWaterImpacts : Bool;
+	default m_ignoreWaterImpacts = false;
+	hint m_ignoreWaterImpacts = "Don't terminate if target is a WaterPatchNodeInstance or if target is underwater";
+
+	public export function Process( ctx : EffectScriptContext, applierCtx : EffectExecutionScriptContext ) : Bool
+	{
+		var isCleavingHit : Bool;
+		var continueProcessing : Bool;
+		isCleavingHit = false;
+		continueProcessing = true;
+		if( ( ( PlayerPuppet )( EffectScriptContext.GetInstigator( ctx ) ) ) )
+		{
+			if( m_ignoreWaterImpacts && ( EffectExecutionScriptContext.IsTargetWater( applierCtx ) || EffectExecutionScriptContext.GetHitThroughWaterSurface( applierCtx ) ) )
+			{
+				return continueProcessing;
+			}
+			EffectData.GetBool( EffectScriptContext.GetSharedData( ctx ), GetAllBlackboardDefs().EffectSharedData.meleeCleave, isCleavingHit );
+			continueProcessing = isCleavingHit;
+		}
+		return continueProcessing;
+	}
+
+}
+

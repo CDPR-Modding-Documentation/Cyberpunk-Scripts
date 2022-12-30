@@ -1,0 +1,248 @@
+class DroneComponent extends ScriptableComponent
+{
+	private var m_senseComponent : SenseComponent;
+	private var m_npcCollisionComponent : SimpleColliderComponent;
+	private var m_playerOnlyCollisionComponent : SimpleColliderComponent;
+	private var m_highLevelCb : Uint32;
+	private var m_currentScanType : MechanicalScanType;
+	private var m_currentScanEffect : EffectInstance;
+	private var m_currentScanAnimation : CName;
+	private var m_isDetectionScanning : Bool;
+	private var m_trackedTarget : weak< GameObject >;
+	private var m_currentLocomotionWrapper : CName;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		EntityRequestComponentsInterface.RequestComponent( ri, 'playerOnlyCollision', 'SimpleColliderComponent', false );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_senseComponent = ( ( SenseComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'Senses' ) ) );
+		m_npcCollisionComponent = ( ( SimpleColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'npcCollision' ) ) );
+		m_playerOnlyCollisionComponent = ( ( SimpleColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'playerOnlyCollision' ) ) );
+	}
+
+	protected export function OnGameAttach()
+	{
+		var puppet : ScriptedPuppet;
+		SendStaticDataToAnimgraph();
+		m_currentScanType = MechanicalScanType.None;
+		ApplyLocomotionWrappers( 'Walk' );
+		puppet = ( ( ScriptedPuppet )( GetOwner() ) );
+		if( puppet.IsDead() )
+		{
+			GameObject.PlaySound( puppet, 'drone_disable' );
+		}
+		else
+		{
+			GameObject.PlaySound( puppet, 'drone_enable' );
+		}
+		if( m_playerOnlyCollisionComponent )
+		{
+			m_playerOnlyCollisionComponent.Toggle( false );
+		}
+	}
+
+	protected event OnHighLevelStateDataEvent( evt : gameHighLevelStateDataEvent )
+	{
+		if( evt.currentHighLevelState == gamedataNPCHighLevelState.Alerted )
+		{
+			SetLocomotionWrappers( ( ( ScriptedPuppet )( GetOwner() ) ), 'Walk' );
+		}
+		if( evt.currentHighLevelState == gamedataNPCHighLevelState.Combat || evt.currentHighLevelState == gamedataNPCHighLevelState.Alerted )
+		{
+			ApplyPose( DronePose.Combat );
+		}
+		else
+		{
+			ApplyPose( DronePose.Relaxed );
+		}
+	}
+
+	protected event OnAIEvent( aiEvent : AIEvent )
+	{
+		switch( aiEvent.name )
+		{
+			case 'CombatPose':
+				ApplyPose( DronePose.Combat );
+			break;
+			case 'RelaxedPose':
+				ApplyPose( DronePose.Relaxed );
+			break;
+			default:
+				break;
+		}
+	}
+
+	private function ApplyPose( desiredPose : DronePose )
+	{
+		var stateAnimationDataFeature : AnimFeature_DroneStateAnimationData;
+		stateAnimationDataFeature = new AnimFeature_DroneStateAnimationData;
+		stateAnimationDataFeature.statePose = ( ( Int32 )( desiredPose ) );
+		AnimationControllerComponent.ApplyFeature( GetOwner(), 'DroneStateAnimationData', stateAnimationDataFeature );
+	}
+
+	protected event OnRagdollEnabledEvent( evt : RagdollNotifyEnabledEvent )
+	{
+		if( m_playerOnlyCollisionComponent && TweakDBInterface.GetBool( ( ( ScriptedPuppet )( GetOwner() ) ).GetRecordID() + T".keepColliderOnDeath", false ) )
+		{
+			m_playerOnlyCollisionComponent.Toggle( true );
+		}
+	}
+
+	protected event OnDefeated( evt : DefeatedEvent )
+	{
+		GameObject.PlaySound( GetOwner(), 'drone_defeated' );
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		var reenableColliderEvent : ReenableColliderEvent;
+		var uncontrolledMovementEvent : UncontrolledMovementStartEvent;
+		var owner : NPCPuppet;
+		owner = ( ( NPCPuppet )( GetOwner() ) );
+		GameObject.PlaySound( owner, 'drone_destroyed' );
+		if( StatusEffectSystem.ObjectHasStatusEffect( owner, T"BaseStatusEffect.SystemCollapse" ) )
+		{
+			GameObject.StartReplicatedEffectEvent( owner, 'hacks_system_collapse' );
+			RemoveSpawnGLPs( owner );
+		}
+		else if( StatusEffectSystem.ObjectHasStatusEffectOfType( owner, gamedataStatusEffectType.BrainMelt ) )
+		{
+			GameObject.StartReplicatedEffectEvent( owner, 'hacks_brain_bolt_kill' );
+			RemoveSpawnGLPs( owner );
+		}
+		else
+		{
+			GameObject.StartReplicatedEffectEvent( owner, 'destruction' );
+		}
+		if( TweakDBInterface.GetBool( owner.GetRecordID() + T".keepColliderOnDeath", false ) )
+		{
+			reenableColliderEvent = new ReenableColliderEvent;
+			GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( owner, reenableColliderEvent, 0.2 );
+		}
+		uncontrolledMovementEvent = new UncontrolledMovementStartEvent;
+		uncontrolledMovementEvent.ragdollOnCollision = true;
+		uncontrolledMovementEvent.ragdollNoGroundThreshold = -1.0;
+		uncontrolledMovementEvent.DebugSetSourceName( 'DroneComponent - the drone died so we started uncontrolled movement to ragdoll on collision' );
+		owner.QueueEvent( uncontrolledMovementEvent );
+	}
+
+	private function RemoveSpawnGLPs( owner : NPCPuppet )
+	{
+		var glp : GameplayLogicPackageSystem;
+		var i : Int32;
+		glp = GameInstance.GetGameplayLogicPackageSystem( owner.GetGame() );
+		for( i = 0; i < owner.GetRecord().GetOnSpawnGLPsCount(); i += 1 )
+		{
+			glp.RemovePackage( owner, owner.GetRecord().GetOnSpawnGLPsItem( i ).GetID() );
+		}
+	}
+
+	protected event OnReenableCollider( evt : ReenableColliderEvent )
+	{
+		var puppet : NPCPuppet;
+		puppet = ( ( NPCPuppet )( GetOwner() ) );
+		if( !( puppet.IsRagdollEnabled() ) )
+		{
+			m_npcCollisionComponent.Toggle( true );
+			if( m_playerOnlyCollisionComponent )
+			{
+				m_playerOnlyCollisionComponent.Toggle( false );
+			}
+		}
+	}
+
+	private function SendStaticDataToAnimgraph()
+	{
+		var owner : ScriptedPuppet;
+		var ownerID : TweakDBID;
+		var proceduralAnimationFeature : AnimFeature_DroneProcedural;
+		var appleFeatureEvent : ApplyDroneProceduralAnimFeatureEvent;
+		owner = ( ( ScriptedPuppet )( GetOwner() ) );
+		if( owner )
+		{
+			ownerID = owner.GetRecordID();
+			proceduralAnimationFeature = new AnimFeature_DroneProcedural;
+			proceduralAnimationFeature.mass = TweakDBInterface.GetFloat( ownerID + T".mass", 0.0 );
+			proceduralAnimationFeature.size_front = TweakDBInterface.GetFloat( ownerID + T".sizeFront", 0.0 );
+			proceduralAnimationFeature.size_back = TweakDBInterface.GetFloat( ownerID + T".sizeBack", 0.0 );
+			proceduralAnimationFeature.size_left = TweakDBInterface.GetFloat( ownerID + T".sizeLeft", 0.0 );
+			proceduralAnimationFeature.size_right = TweakDBInterface.GetFloat( ownerID + T".sizeRight", 0.0 );
+			proceduralAnimationFeature.walk_tilt_coef = TweakDBInterface.GetFloat( ownerID + T".walkTiltCoefficient", 0.0 );
+			proceduralAnimationFeature.mass_normalized_coef = TweakDBInterface.GetFloat( ownerID + T".massNormalizedCoefficient", 0.0 );
+			proceduralAnimationFeature.tilt_angle_on_speed = TweakDBInterface.GetFloat( ownerID + T".tiltAngleOnSpeed", 0.0 );
+			proceduralAnimationFeature.speed_idle_threshold = TweakDBInterface.GetFloat( ownerID + T".speedIdleThreshold", 0.0 );
+			proceduralAnimationFeature.starting_recovery_ballance = TweakDBInterface.GetFloat( ownerID + T".startingRecoveryBalance", 0.0 );
+			proceduralAnimationFeature.pseudo_acceleration = TweakDBInterface.GetFloat( ownerID + T".pseudoAcceleration", 0.0 );
+			proceduralAnimationFeature.turn_inertia_damping = TweakDBInterface.GetFloat( ownerID + T".turnInertiaDamping", 0.0 );
+			proceduralAnimationFeature.combat_default_z_offset = TweakDBInterface.GetFloat( ownerID + T".combatDefaultZOffset", 0.0 );
+			appleFeatureEvent = new ApplyDroneProceduralAnimFeatureEvent;
+			appleFeatureEvent.feature = proceduralAnimationFeature;
+			GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( owner, appleFeatureEvent, 0.2, false );
+		}
+	}
+
+	protected event OnApplyProceduralAnimFeatureEvent( evt : ApplyDroneProceduralAnimFeatureEvent )
+	{
+		AnimationControllerComponent.ApplyFeature( GetOwner(), 'DroneProcedural', evt.feature );
+	}
+
+	protected event OnApplyDroneLocomotionWrapperEvent( evt : ApplyDroneLocomotionWrapperEvent )
+	{
+		ApplyLocomotionWrappers( evt.movementType );
+	}
+
+	private function ApplyLocomotionWrappers( movementType : CName )
+	{
+		var owner : GameObject;
+		if( movementType != m_currentLocomotionWrapper )
+		{
+			owner = GetOwner();
+			AnimationControllerComponent.SetAnimWrapperWeight( owner, 'DroneLocomotion_Walk', 0.0 );
+			AnimationControllerComponent.SetAnimWrapperWeight( owner, 'DroneLocomotion_Run', 0.0 );
+			AnimationControllerComponent.SetAnimWrapperWeight( owner, 'DroneLocomotion_Sprint', 0.0 );
+			AnimationControllerComponent.SetAnimWrapperWeight( owner, 'DroneLocomotion_' + movementType, 1.0 );
+			m_currentLocomotionWrapper = movementType;
+		}
+	}
+
+	public static function SetLocomotionWrappers( owner : ScriptedPuppet, movementType : CName )
+	{
+		var applyWrapperEvent : ApplyDroneLocomotionWrapperEvent;
+		applyWrapperEvent = new ApplyDroneLocomotionWrapperEvent;
+		applyWrapperEvent.movementType = movementType;
+		owner.QueueEvent( applyWrapperEvent );
+	}
+
+}
+
+class ApplyDroneProceduralAnimFeatureEvent extends Event
+{
+	var feature : AnimFeature_DroneProcedural;
+}
+
+class ReenableColliderEvent extends Event
+{
+}
+
+class ApplyDroneLocomotionWrapperEvent extends Event
+{
+	var movementType : CName;
+}
+
+enum MechanicalScanType
+{
+	None = 0,
+	Short = 1,
+	Long = 2,
+	Danger = 3,
+}
+
+enum DronePose
+{
+	Relaxed = 0,
+	Combat = 1,
+}
+

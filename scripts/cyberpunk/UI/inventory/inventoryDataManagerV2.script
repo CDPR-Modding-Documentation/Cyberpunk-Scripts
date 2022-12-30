@@ -1,0 +1,5068 @@
+struct InventoryPartsData
+{
+	var SlotID : TweakDBID;
+	var ItemData : array< InventoryItemData >;
+	var ToRebuild : Bool;
+}
+
+class InventoryDataManagerV2
+{
+	private var m_owner : weak< inkHUDGameController >;
+	private var m_Player : weak< PlayerPuppet >;
+	private var m_TransactionSystem : weak< TransactionSystem >;
+	private var m_EquipmentSystem : weak< EquipmentSystem >;
+	private var m_StatsSystem : weak< StatsSystem >;
+	private var m_ItemModificationSystem : weak< ItemModificationSystem >;
+	private var m_LocMgr : UILocalizationMap;
+	private var m_InventoryItemsData : array< InventoryItemData >;
+	private var m_EquipmentAreaInventoryItemsData : array< array< InventoryItemData > >;
+	private var m_InventoryItemsDataWithoutEquipment : array< InventoryItemData >;
+	private var m_EquipmentItemsData : array< InventoryItemData >;
+	private var m_WeaponItemsData : array< InventoryItemData >;
+	private var m_QuickSlotsData : array< InventoryItemData >;
+	private var m_ConsumablesSlotsData : array< InventoryItemData >;
+	private var m_PartsData : array< InventoryPartsData >;
+	private var m_ToRebuild : Bool;
+	default m_ToRebuild = true;
+	private var m_ToRebuildEquipmentArea : array< Bool >;
+	private var m_ToRebuildItemsWithEquipped : Bool;
+	default m_ToRebuildItemsWithEquipped = true;
+	private var m_ToRebuildWeapons : Bool;
+	default m_ToRebuildWeapons = true;
+	private var m_ToRebuildEquipment : Bool;
+	default m_ToRebuildEquipment = true;
+	private var m_ToRebuildQuickSlots : Bool;
+	default m_ToRebuildQuickSlots = true;
+	private var m_ToRebuildConsumables : Bool;
+	default m_ToRebuildConsumables = true;
+	private var m_ActiveWeapon : ItemID;
+	private var m_EquipRecords : array< EquipmentArea_Record >;
+	private var m_ItemIconGender : ItemIconGender;
+	private var m_WeaponUIBlackboard : weak< IBlackboard >;
+	private var m_UIBBEquipmentBlackboard : weak< IBlackboard >;
+	private var m_UIBBItemModBlackbord : weak< IBlackboard >;
+	private var m_UIBBEquipment : UI_EquipmentDef;
+	private var m_UIBBItemMod : UI_ItemModSystemDef;
+	private var m_InventoryBBID : CallbackHandle;
+	private var m_EquipmentBBID : CallbackHandle;
+	private var m_SubEquipmentBBID : CallbackHandle;
+	private var m_ItemModBBID : CallbackHandle;
+	private var m_BBWeaponList : CallbackHandle;
+	private var m_InventoryItemDataWrappers : array< InventoryItemDataWrapper >;
+	private var m_HashMapCache : inkWeakHashMap;
+
+	public function Initialize( player : PlayerPuppet, optional owner : inkHUDGameController )
+	{
+		var gameInstance : GameInstance;
+		var i, limit : Int32;
+		if( player )
+		{
+			m_Player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( player.GetGame() ).GetLocalPlayerMainGameObject() ) );
+			m_ItemIconGender = UIGenderHelper.GetIconGender( m_Player );
+			gameInstance = m_Player.GetGame();
+			m_TransactionSystem = GameInstance.GetTransactionSystem( gameInstance );
+			m_StatsSystem = GameInstance.GetStatsSystem( gameInstance );
+			m_EquipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'EquipmentSystem' ) ) );
+			m_ItemModificationSystem = ( ( ItemModificationSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'ItemModificationSystem' ) ) );
+		}
+		m_HashMapCache = new inkWeakHashMap;
+		m_LocMgr = new UILocalizationMap;
+		m_LocMgr.Init();
+		m_EquipmentAreaInventoryItemsData.Resize( ( ( Int32 )( gamedataEquipmentArea.Count ) ) );
+		m_ToRebuildEquipmentArea.Resize( ( ( Int32 )( gamedataEquipmentArea.Count ) ) );
+		for( i = 0, limit = m_ToRebuildEquipmentArea.Size(); i < limit; i += 1 )
+		{
+			m_ToRebuildEquipmentArea[ i ] = true;
+		}
+		RegisterToBB();
+		if( owner )
+		{
+			m_owner = owner;
+		}
+	}
+
+	public function UnInitialize()
+	{
+		UnregisterFromBB();
+	}
+
+	private function RegisterToBB()
+	{
+		if( m_Player )
+		{
+			m_WeaponUIBlackboard = GameInstance.GetBlackboardSystem( m_Player.GetGame() ).Get( GetAllBlackboardDefs().UI_EquipmentData );
+			if( m_WeaponUIBlackboard )
+			{
+				m_BBWeaponList = m_WeaponUIBlackboard.RegisterListenerVariant( GetAllBlackboardDefs().UI_EquipmentData.EquipmentData, this, 'OnWeaponDataChanged' );
+				m_WeaponUIBlackboard.Signal( GetAllBlackboardDefs().UI_EquipmentData.EquipmentData );
+			}
+			m_UIBBEquipment = GetAllBlackboardDefs().UI_Equipment;
+			m_UIBBEquipmentBlackboard = GameInstance.GetBlackboardSystem( m_Player.GetGame() ).Get( m_UIBBEquipment );
+			m_UIBBItemMod = GetAllBlackboardDefs().UI_ItemModSystem;
+			m_UIBBItemModBlackbord = GameInstance.GetBlackboardSystem( m_Player.GetGame() ).Get( m_UIBBItemMod );
+			if( m_UIBBEquipmentBlackboard )
+			{
+				m_EquipmentBBID = m_UIBBEquipmentBlackboard.RegisterListenerVariant( m_UIBBEquipment.itemEquipped, this, 'OnMarkForRebuild' );
+			}
+			if( m_UIBBItemModBlackbord )
+			{
+				m_ItemModBBID = m_UIBBItemModBlackbord.RegisterListenerVariant( m_UIBBItemMod.ItemModSystemUpdated, this, 'OnMarkForRebuild' );
+			}
+		}
+	}
+
+	private function UnregisterFromBB()
+	{
+		if( m_WeaponUIBlackboard )
+		{
+			m_WeaponUIBlackboard.UnregisterListenerVariant( GetAllBlackboardDefs().UI_EquipmentData.EquipmentData, m_BBWeaponList );
+		}
+		if( m_UIBBEquipmentBlackboard )
+		{
+			m_UIBBEquipmentBlackboard.UnregisterListenerVariant( m_UIBBEquipment.itemEquipped, m_EquipmentBBID );
+		}
+		if( m_UIBBItemModBlackbord )
+		{
+			m_UIBBItemModBlackbord.UnregisterListenerVariant( m_UIBBItemMod.ItemModSystemUpdated, m_ItemModBBID );
+		}
+		m_UIBBEquipmentBlackboard = NULL;
+		m_WeaponUIBlackboard = NULL;
+		m_UIBBItemModBlackbord = NULL;
+	}
+
+	protected event OnMarkForRebuild( value : Variant )
+	{
+		MarkToRebuild();
+	}
+
+	protected event OnWeaponDataChanged( value : Variant )
+	{
+		var currentData : SlotDataHolder;
+		currentData = ( ( SlotDataHolder )value );
+		SetActiveWeapon( currentData.weapon.weaponID );
+		MarkToRebuild();
+		if( m_owner )
+		{
+			m_owner.UpdateRequired();
+		}
+	}
+
+	public function IsTransmogEnabled() : Int32
+	{
+		return GetFact( m_Player.GetGame(), 'transmog_enabled' );
+	}
+
+	private function GetPlayerItems() : array< weak< gameItemData > >
+	{
+		var items : array< weak< gameItemData > >;
+		m_TransactionSystem.GetItemList( m_Player, items );
+		return items;
+	}
+
+	public function GetTransactionSystem() : weak< TransactionSystem >
+	{
+		return m_TransactionSystem;
+	}
+
+	public function GetPlayerItemData( itemId : ItemID ) : weak< gameItemData >
+	{
+		var itemData : weak< gameItemData >;
+		var localPlayer : GameObject;
+		if( !( m_Player ) )
+		{
+			return NULL;
+		}
+		localPlayer = GameInstance.GetPlayerSystem( m_Player.GetGame() ).GetLocalPlayerControlledGameObject();
+		if( ItemID.IsValid( itemId ) )
+		{
+			if( localPlayer )
+			{
+				itemData = m_TransactionSystem.GetItemData( localPlayer, itemId );
+			}
+			else
+			{
+				itemData = m_TransactionSystem.GetItemData( m_Player, itemId );
+			}
+		}
+		return itemData;
+	}
+
+	public function GetIconGender() : ItemIconGender
+	{
+		return m_ItemIconGender;
+	}
+
+	private function GetPlayerInventoryItems( optional additionalTagFilters : array< CName > ) : array< weak< gameItemData > >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< weak< gameItemData > >;
+		items = GetPlayerItems();
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			if( !( IsItemBlacklisted( items[ i ], , , additionalTagFilters ) ) )
+			{
+				inventoryItems.PushBack( items[ i ] );
+			}
+		}
+		return inventoryItems;
+	}
+
+	private function GetPlayerInventoryItemsExcludingLoadout() : array< weak< gameItemData > >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< weak< gameItemData > >;
+		items = GetPlayerItems();
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			if( !( m_EquipmentSystem.IsEquipped( m_Player, items[ i ].GetID() ) ) && !( IsItemBlacklisted( items[ i ] ) ) )
+			{
+				inventoryItems.PushBack( items[ i ] );
+			}
+		}
+		return inventoryItems;
+	}
+
+	private function GetPlayerInventoryItemsExcludingCraftingMaterials() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< InventoryItemData >;
+		items = GetPlayerInventoryItems();
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			if( items[ i ] && !( IsItemCraftingMaterial( items[ i ] ) ) )
+			{
+				inventoryItems.PushBack( GetInventoryItemData( items[ i ] ) );
+			}
+		}
+		return inventoryItems;
+	}
+
+	public function GetPlayerInventoryDataExcludingLoadout() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< InventoryItemData >;
+		if( m_ToRebuildItemsWithEquipped )
+		{
+			m_ToRebuildItemsWithEquipped = false;
+			items = GetPlayerInventoryItemsExcludingLoadout();
+			for( i = 0, limit = items.Size(); i < limit; i += 1 )
+			{
+				if( items[ i ] )
+				{
+					inventoryItems.PushBack( GetInventoryItemData( items[ i ] ) );
+				}
+			}
+			m_InventoryItemsDataWithoutEquipment.Clear();
+			m_InventoryItemsDataWithoutEquipment = inventoryItems;
+		}
+		return m_InventoryItemsDataWithoutEquipment;
+	}
+
+	private function GetPlayerInventoryData( optional additionalTagFilters : array< CName > ) : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< InventoryItemData >;
+		if( m_ToRebuild )
+		{
+			m_ToRebuild = false;
+			items = GetPlayerInventoryItems( additionalTagFilters );
+			for( i = 0, limit = items.Size(); i < limit; i += 1 )
+			{
+				if( items[ i ] )
+				{
+					inventoryItems.PushBack( GetCachedInventoryItemData( items[ i ] ) );
+				}
+			}
+			m_InventoryItemsData.Clear();
+			m_InventoryItemsData = inventoryItems;
+		}
+		return m_InventoryItemsData;
+	}
+
+	private function GetPlayerEquipmentAreaInventoryData( equipArea : gamedataEquipmentArea ) : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< InventoryItemData >;
+		var itemData : InventoryItemData;
+		var ID : ItemID;
+		var itemRecord : weak< Item_Record >;
+		var equipRecord : weak< EquipmentArea_Record >;
+		if( m_ToRebuildEquipmentArea[ ( ( Int32 )( equipArea ) ) ] )
+		{
+			m_ToRebuildEquipmentArea[ ( ( Int32 )( equipArea ) ) ] = false;
+			items = GetPlayerItems();
+			for( i = 0, limit = items.Size(); i < limit; i += 1 )
+			{
+				if( items[ i ] )
+				{
+					if( !( IsItemBlacklisted( items[ i ] ) ) )
+					{
+						ID = items[ i ].GetID();
+						itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( ID ) );
+						equipRecord = itemRecord.EquipArea();
+						if( equipRecord && equipRecord.Type() == equipArea )
+						{
+							GetCachedInventoryItemDataInternal( items[ i ], ID, itemRecord, itemData );
+							inventoryItems.PushBack( itemData );
+						}
+					}
+				}
+			}
+			m_EquipmentAreaInventoryItemsData[ ( ( Int32 )( equipArea ) ) ].Clear();
+			m_EquipmentAreaInventoryItemsData[ ( ( Int32 )( equipArea ) ) ] = inventoryItems;
+		}
+		return m_EquipmentAreaInventoryItemsData[ ( ( Int32 )( equipArea ) ) ];
+	}
+
+	private function GetPlayerPartsInventoryData( slotID : TweakDBID ) : array< InventoryItemData >
+	{
+		var partsDataIndex, i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var itemData : InventoryItemData;
+		var ID : ItemID;
+		var itemRecord : weak< Item_Record >;
+		partsDataIndex = -1;
+		for( i = 0, limit = m_PartsData.Size(); i < limit; i += 1 )
+		{
+			if( m_PartsData[ i ].SlotID == slotID )
+			{
+				partsDataIndex = i;
+				break;
+			}
+		}
+		if( partsDataIndex == -1 )
+		{
+			partsDataIndex = m_PartsData.Size();
+			m_PartsData.PushBack( InventoryPartsData() );
+			m_PartsData[ i ].SlotID = slotID;
+			m_PartsData[ i ].ToRebuild = true;
+		}
+		if( m_PartsData[ partsDataIndex ].ToRebuild )
+		{
+			m_PartsData[ partsDataIndex ].ToRebuild = false;
+			m_PartsData[ partsDataIndex ].ItemData.Clear();
+			items = GetPlayerItems();
+			for( i = 0, limit = items.Size(); i < limit; i += 1 )
+			{
+				if( items[ i ] )
+				{
+					if( !( IsItemBlacklisted( items[ i ] ) ) )
+					{
+						ID = items[ i ].GetID();
+						itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( ID ) );
+						if( itemRecord.IsPart() )
+						{
+							if( PlacementSlotsContains( itemRecord, slotID ) )
+							{
+								GetCachedInventoryItemDataInternal( items[ i ], ID, itemRecord, itemData );
+								m_PartsData[ partsDataIndex ].ItemData.PushBack( itemData );
+							}
+						}
+					}
+				}
+			}
+		}
+		return m_PartsData[ partsDataIndex ].ItemData;
+	}
+
+	private function GetPlayerPartsInventoryData( slotIDs : array< TweakDBID > ) : array< InventoryItemData >
+	{
+		var itemData : array< InventoryItemData >;
+		var tempItemData : array< InventoryItemData >;
+		var i, j, limit, slotIdx, slotCnt : Int32;
+		var duplicate : Bool;
+		slotCnt = slotIDs.Size();
+		if( slotCnt == 0 )
+		{
+			return itemData;
+		}
+		if( slotCnt == 1 )
+		{
+			return GetPlayerPartsInventoryData( slotIDs[ 0 ] );
+		}
+		tempItemData = GetPlayerPartsInventoryData( slotIDs[ 0 ] );
+		for( i = 0, limit = tempItemData.Size(); i < limit; i += 1 )
+		{
+			itemData.PushBack( tempItemData[ i ] );
+		}
+		for( slotIdx = 1; slotIdx < slotCnt; slotIdx += 1 )
+		{
+			tempItemData = GetPlayerPartsInventoryData( slotIDs[ slotIdx ] );
+			for( i = 0, limit = tempItemData.Size(); i < limit; i += 1 )
+			{
+				duplicate = false;
+				for( j = 0; j < slotIdx; j += 1 )
+				{
+					if( InventoryItemData.PlacementSlotsContains( tempItemData[ i ], slotIDs[ j ] ) )
+					{
+						duplicate = true;
+						break;
+					}
+				}
+				if( !( duplicate ) )
+				{
+					itemData.PushBack( tempItemData[ i ] );
+				}
+			}
+		}
+		return itemData;
+	}
+
+	public function GetPlayerInventoryData( equipArea : gamedataEquipmentArea, optional skipEquipped : Bool, optional filteredItems : array< ItemModParams > ) : array< InventoryItemData >
+	{
+		var i, limit, quantityToFilterOut : Int32;
+		var items : array< InventoryItemData >;
+		var inventoryItems : array< InventoryItemData >;
+		var currentItemData : InventoryItemData;
+		var quantity : Int32;
+		items = GetPlayerEquipmentAreaInventoryData( equipArea );
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			currentItemData = items[ i ];
+			if( !( InventoryItemData.IsEmpty( currentItemData ) ) )
+			{
+				if( ( skipEquipped && InventoryItemData.IsEquipped( currentItemData ) ) || InventoryItemData.IsBroken( currentItemData ) )
+				{
+					continue;
+				}
+				quantityToFilterOut = GetQunatityToFilterOut( InventoryItemData.GetID( currentItemData ), filteredItems );
+				quantity = InventoryItemData.GetQuantity( currentItemData ) - quantityToFilterOut;
+				InventoryItemData.SetQuantity( currentItemData, quantity );
+				if( quantity > 0 )
+				{
+					inventoryItems.PushBack( currentItemData );
+				}
+			}
+		}
+		return inventoryItems;
+	}
+
+	public function GetPlayerInventoryData( equipAreas : array< gamedataEquipmentArea >, optional skipEquipped : Bool, optional filteredItems : array< ItemModParams > ) : array< InventoryItemData >
+	{
+		var result : array< InventoryItemData >;
+		GetPlayerInventoryDataRef( equipAreas, skipEquipped, filteredItems, result );
+		return result;
+	}
+
+	public function GetEquippedItemIDs( owner : weak< GameObject > ) : array< ItemID >
+	{
+		var ids : array< ItemID >;
+		var equipmentSystem : EquipmentSystem;
+		var playerData : EquipmentSystemPlayerData;
+		equipmentSystem = EquipmentSystem.GetInstance( owner );
+		playerData = equipmentSystem.GetPlayerData( owner );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Head, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Face, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.OuterChest, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.InnerChest, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Legs, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Feet, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Outfit, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Weapon, 0 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Weapon, 1 ) );
+		ids.PushBack( playerData.GetItemInEquipSlot( gamedataEquipmentArea.Weapon, 2 ) );
+		return ids;
+	}
+
+	public function GetPlayerInventoryDataRef( equipAreas : array< gamedataEquipmentArea >, optional skipEquipped : Bool, optional filteredItems : array< ItemModParams >, outputItems : ref< array< InventoryItemData > > )
+	{
+		var i, j, limit, quantityToFilterOut : Int32;
+		var items : array< InventoryItemData >;
+		var currentItemData : InventoryItemData;
+		var quantity : Int32;
+		var equippedItems : array< ItemID >;
+		equippedItems = GetEquippedItemIDs( m_Player );
+		for( i = 0; i < equipAreas.Size(); i += 1 )
+		{
+			items = GetPlayerEquipmentAreaInventoryData( equipAreas[ i ] );
+			for( j = 0, limit = items.Size(); j < limit; j += 1 )
+			{
+				currentItemData = items[ j ];
+				if( !( InventoryItemData.IsEmpty( currentItemData ) ) )
+				{
+					if( ( skipEquipped && equippedItems.Contains( InventoryItemData.GetID( currentItemData ) ) ) || InventoryItemData.IsBroken( currentItemData ) )
+					{
+						continue;
+					}
+					quantityToFilterOut = GetQunatityToFilterOut( InventoryItemData.GetID( currentItemData ), filteredItems );
+					quantity = InventoryItemData.GetQuantity( currentItemData ) - quantityToFilterOut;
+					InventoryItemData.SetQuantity( currentItemData, quantity );
+					if( quantity > 0 )
+					{
+						outputItems.PushBack( currentItemData );
+					}
+				}
+			}
+		}
+	}
+
+	public function GetPlayerInventoryParts( slotId : TweakDBID ) : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< InventoryItemData >;
+		var inventoryItems : array< InventoryItemData >;
+		var currentItemData : InventoryItemData;
+		items = GetPlayerInventoryData();
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			currentItemData = items[ i ];
+			if( ( !( InventoryItemData.IsEmpty( currentItemData ) ) && InventoryItemData.IsPart( currentItemData ) ) && InventoryItemData.PlacementSlotsContains( currentItemData, slotId ) )
+			{
+				inventoryItems.PushBack( currentItemData );
+			}
+		}
+		return inventoryItems;
+	}
+
+	public function GetPlayerInventoryPartsForItem( item : ItemID, slotID : TweakDBID ) : array< InventoryItemData >
+	{
+		var result : array< InventoryItemData >;
+		GetPlayerInventoryPartsForItemRef( item, slotID, result );
+		return result;
+	}
+
+	public function GetPlayerInventoryPartsForItem( item : ItemID, slotIDs : array< TweakDBID > ) : array< InventoryItemData >
+	{
+		var result : array< InventoryItemData >;
+		GetPlayerInventoryPartsForItemRef( item, slotIDs, result );
+		return result;
+	}
+
+	public function GetPlayerInventoryPartsForItemRef( item : ItemID, slotID : TweakDBID, outputItems : ref< array< InventoryItemData > > )
+	{
+		var slotIDs : array< TweakDBID >;
+		slotIDs.PushBack( slotID );
+		GetPlayerInventoryPartsForItemRef( item, slotIDs, outputItems );
+	}
+
+	public function GetItemSlotsIDs( gameObject : GameObject, itemID : ItemID ) : array< TweakDBID >
+	{
+		var itemData : weak< gameItemData >;
+		var parts : array< InnerItemData >;
+		var result : array< TweakDBID >;
+		var i : Int32;
+		itemData = GameInstance.GetTransactionSystem( gameObject.GetGame() ).GetItemData( gameObject, itemID );
+		itemData.GetItemParts( parts );
+		for( i = 0; i < parts.Size(); i += 1 )
+		{
+			result.PushBack( InnerItemData.GetSlotID( parts[ i ] ) );
+		}
+		return result;
+	}
+
+	public function GetPlayerInventoryPartsForItemRef( item : ItemID, slotIDs : array< TweakDBID >, outputItems : ref< array< InventoryItemData > > )
+	{
+		var i, j : Int32;
+		var inventoryItems : array< InventoryItemData >;
+		var shardType : CName;
+		var shardData : array< InventoryItemData >;
+		var shouldAdd, canBeInstalled : Bool;
+		var slotPartList : array< weak< SlotItemPartListElement_Record > >;
+		var availableScopes, availableMuzzles : array< weak< ItemPartListElement_Record > >;
+		var slotID : TweakDBID;
+		var weaponRecord : weak< WeaponItem_Record >;
+		var itemQuality : gamedataQuality;
+		var partQuality : gamedataQuality;
+		var itemData : weak< gameItemData >;
+		inventoryItems = GetPlayerPartsInventoryData( slotIDs );
+		if( RPGManager.GetItemCategory( item ) == gamedataItemCategory.Weapon )
+		{
+			weaponRecord = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( item ) );
+			if( GameInstance.GetTransactionSystem( m_Player.GetGame() ).UseAlternativeCyberware() && ( weaponRecord.GetSlotPartList2Count() > 0 ) )
+			{
+				weaponRecord.SlotPartList2( slotPartList );
+			}
+			else
+			{
+				weaponRecord.SlotPartList( slotPartList );
+			}
+			for( i = 0; i < slotPartList.Size(); i += 1 )
+			{
+				slotID = slotPartList[ i ].Slot().GetID();
+				if( slotID == T"AttachmentSlots.PowerModule" )
+				{
+					slotPartList[ i ].ItemPartList( availableMuzzles );
+				}
+				else if( slotID == T"AttachmentSlots.Scope" )
+				{
+					slotPartList[ i ].ItemPartList( availableScopes );
+				}
+			}
+			for( i = inventoryItems.Size() - 1; i >= 0; i -= 1 )
+			{
+				if( ( ( InventoryItemData.GetItemType( inventoryItems[ i ] ) == gamedataItemType.Prt_Scope || InventoryItemData.GetItemType( inventoryItems[ i ] ) == gamedataItemType.Prt_Muzzle ) || InventoryItemData.GetItemType( inventoryItems[ i ] ) == gamedataItemType.Prt_HandgunMuzzle ) || InventoryItemData.GetItemType( inventoryItems[ i ] ) == gamedataItemType.Prt_RifleMuzzle )
+				{
+					canBeInstalled = false;
+					for( j = 0; j < availableMuzzles.Size(); j += 1 )
+					{
+						if( ItemID.GetTDBID( InventoryItemData.GetID( inventoryItems[ i ] ) ) == availableMuzzles[ j ].Item().GetID() )
+						{
+							canBeInstalled = true;
+						}
+					}
+					for( j = 0; j < availableScopes.Size(); j += 1 )
+					{
+						if( ItemID.GetTDBID( InventoryItemData.GetID( inventoryItems[ i ] ) ) == availableScopes[ j ].Item().GetID() )
+						{
+							canBeInstalled = true;
+						}
+					}
+					if( !( canBeInstalled ) )
+					{
+						inventoryItems.Remove( inventoryItems[ i ] );
+					}
+				}
+			}
+		}
+		if( RPGManager.IsItemClothing( item ) )
+		{
+			itemData = m_TransactionSystem.GetItemData( m_Player, item );
+			itemQuality = RPGManager.GetItemDataQuality( itemData );
+			for( j = 0; j < inventoryItems.Size(); j += 1 )
+			{
+				partQuality = InventoryItemData.GetComparedQuality( inventoryItems[ j ] );
+				if( partQuality > itemQuality )
+				{
+					InventoryItemData.SetIsRequirementMet( inventoryItems[ j ], false );
+				}
+				else
+				{
+					InventoryItemData.SetIsRequirementMet( inventoryItems[ j ], true );
+				}
+			}
+		}
+		if( GameInstance.GetTransactionSystem( m_Player.GetGame() ).HasTag( m_Player, 'Cyberdeck', item ) )
+		{
+			for( i = 0; i < inventoryItems.Size(); i += 1 )
+			{
+				shouldAdd = true;
+				shardType = TweakDBInterface.GetCName( ItemID.GetTDBID( InventoryItemData.GetID( inventoryItems[ i ] ) ) + T".shardType", '' );
+				if( shardType != '' )
+				{
+					if( ItemModificationSystem.HasBetterShardInstalled( m_Player, item, InventoryItemData.GetID( inventoryItems[ i ] ) ) )
+					{
+						continue;
+					}
+					for( j = 0; j < shardData.Size(); j += 1 )
+					{
+						if( shardType == TweakDBInterface.GetCName( ItemID.GetTDBID( InventoryItemData.GetID( shardData[ j ] ) ) + T".shardType", '' ) )
+						{
+							if( InventoryItemData.GetComparedQuality( shardData[ j ] ) < InventoryItemData.GetComparedQuality( inventoryItems[ i ] ) )
+							{
+								shardData[ j ] = inventoryItems[ i ];
+							}
+							shouldAdd = false;
+							break;
+						}
+					}
+				}
+				if( shouldAdd )
+				{
+					shardData.PushBack( inventoryItems[ i ] );
+				}
+			}
+			inventoryItems = shardData;
+		}
+		for( i = 0; i < inventoryItems.Size(); i += 1 )
+		{
+			outputItems.PushBack( inventoryItems[ i ] );
+		}
+	}
+
+	private function PlacementSlotsContains( staticData : weak< Item_Record >, slotID : TweakDBID ) : Bool
+	{
+		var i : Int32;
+		var placementSlots : array< weak< AttachmentSlot_Record > >;
+		staticData.PlacementSlots( placementSlots );
+		for( i = 0; i < placementSlots.Size(); i += 1 )
+		{
+			if( placementSlots[ i ].GetID() == slotID )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function GetPlayerInventoryPartsDataForItem( item : ItemID, slotIDs : array< TweakDBID > ) : array< weak< gameItemData > >
+	{
+		var i, j : Int32;
+		var tempItems : array< weak< gameItemData > >;
+		var inventoryItems : array< weak< gameItemData > >;
+		var currentItemRecord : weak< Item_Record >;
+		var shardType : CName;
+		var shardData : array< weak< gameItemData > >;
+		var shouldAdd, matchAnySlot, canBeInstalled : Bool;
+		var slotPartList : array< weak< SlotItemPartListElement_Record > >;
+		var availableScopes, availableMuzzles : array< weak< ItemPartListElement_Record > >;
+		var slotID : TweakDBID;
+		var innerItemData : InnerItemData;
+		var currentPartStaticData : weak< Item_Record >;
+		var outputItems : array< weak< gameItemData > >;
+		var itemType : gamedataItemType;
+		var itemQuality : gamedataQuality;
+		var currentShardQuality : gamedataQuality;
+		var parts : array< InnerItemData >;
+		var weaponRecord : weak< WeaponItem_Record >;
+		tempItems = GetPlayerInventoryItems();
+		for( i = 0; i < tempItems.Size(); i += 1 )
+		{
+			currentItemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( tempItems[ i ].GetID() ) );
+			if( currentItemRecord && currentItemRecord.IsPart() )
+			{
+				matchAnySlot = false;
+				parts.Clear();
+				tempItems[ i ].GetItemParts( parts );
+				if( parts.Size() > 0 )
+				{
+					parts;
+				}
+				innerItemData = parts[ 0 ];
+				currentPartStaticData = InnerItemData.GetStaticData( innerItemData );
+				for( j = 0; j < slotIDs.Size(); j += 1 )
+				{
+					if( PlacementSlotsContains( currentPartStaticData, slotIDs[ j ] ) )
+					{
+						matchAnySlot = true;
+						break;
+					}
+				}
+				if( matchAnySlot )
+				{
+					inventoryItems.PushBack( tempItems[ i ] );
+				}
+			}
+		}
+		if( RPGManager.GetItemCategory( item ) == gamedataItemCategory.Weapon )
+		{
+			weaponRecord = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( item ) );
+			if( GameInstance.GetTransactionSystem( m_Player.GetGame() ).UseAlternativeCyberware() && ( weaponRecord.GetSlotPartList2Count() > 0 ) )
+			{
+				weaponRecord.SlotPartList2( slotPartList );
+			}
+			else
+			{
+				weaponRecord.SlotPartList( slotPartList );
+			}
+			for( i = 0; i < slotPartList.Size(); i += 1 )
+			{
+				slotID = slotPartList[ i ].Slot().GetID();
+				if( slotID == T"AttachmentSlots.PowerModule" )
+				{
+					slotPartList[ i ].ItemPartList( availableMuzzles );
+				}
+				else if( slotID == T"AttachmentSlots.Scope" )
+				{
+					slotPartList[ i ].ItemPartList( availableScopes );
+				}
+			}
+			for( i = inventoryItems.Size() - 1; i >= 0; i -= 1 )
+			{
+				itemType = inventoryItems[ i ].GetItemType();
+				if( ( ( itemType == gamedataItemType.Prt_Scope || itemType == gamedataItemType.Prt_Muzzle ) || itemType == gamedataItemType.Prt_HandgunMuzzle ) || itemType == gamedataItemType.Prt_RifleMuzzle )
+				{
+					canBeInstalled = false;
+					for( j = 0; j < availableMuzzles.Size(); j += 1 )
+					{
+						if( inventoryItems[ i ].GetID() == availableMuzzles[ j ].Item().GetID() )
+						{
+							canBeInstalled = true;
+						}
+					}
+					for( j = 0; j < availableScopes.Size(); j += 1 )
+					{
+						if( inventoryItems[ i ].GetID() == availableScopes[ j ].Item().GetID() )
+						{
+							canBeInstalled = true;
+						}
+					}
+					if( !( canBeInstalled ) )
+					{
+						inventoryItems.Remove( inventoryItems[ i ] );
+					}
+				}
+			}
+		}
+		if( GameInstance.GetTransactionSystem( m_Player.GetGame() ).HasTag( m_Player, 'Cyberdeck', item ) )
+		{
+			for( i = 0; i < inventoryItems.Size(); i += 1 )
+			{
+				shouldAdd = true;
+				itemQuality = RPGManager.GetItemDataQuality( inventoryItems[ i ] );
+				shardType = TweakDBInterface.GetCName( ItemID.GetTDBID( inventoryItems[ i ].GetID() ) + T".shardType", '' );
+				if( shardType != '' )
+				{
+					if( ItemModificationSystem.HasBetterShardInstalled( m_Player, item, inventoryItems[ i ].GetID() ) )
+					{
+						continue;
+					}
+					for( j = 0; j < shardData.Size(); j += 1 )
+					{
+						if( shardType == TweakDBInterface.GetCName( ItemID.GetTDBID( shardData[ j ].GetID() ) + T".shardType", '' ) )
+						{
+							currentShardQuality = RPGManager.GetItemDataQuality( shardData[ j ] );
+							if( currentShardQuality < itemQuality )
+							{
+								shardData[ j ] = inventoryItems[ i ];
+							}
+							shouldAdd = false;
+							break;
+						}
+					}
+				}
+				if( shouldAdd )
+				{
+					shardData.PushBack( inventoryItems[ i ] );
+				}
+			}
+			inventoryItems = shardData;
+		}
+		for( i = 0; i < inventoryItems.Size(); i += 1 )
+		{
+			outputItems.PushBack( inventoryItems[ i ] );
+		}
+		return outputItems;
+	}
+
+	public function GetEquippedItemIdInArea( equipArea : gamedataEquipmentArea, optional slot : Int32 ) : ItemID
+	{
+		var localPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( m_Player.GetGame() ).GetLocalPlayerControlledGameObject();
+		if( localPlayer )
+		{
+			if( equipArea == gamedataEquipmentArea.Consumable )
+			{
+				return m_EquipmentSystem.GetItemIDFromHotkey( localPlayer, EHotkey.DPAD_UP );
+			}
+			else if( equipArea == gamedataEquipmentArea.QuickSlot )
+			{
+				return m_EquipmentSystem.GetItemIDFromHotkey( localPlayer, EHotkey.RB );
+			}
+		}
+		return m_EquipmentSystem.GetItemInEquipSlot( m_Player, equipArea, slot );
+	}
+
+	public function GetItemDataFromIDInLoadout( id : ItemID ) : InventoryItemData
+	{
+		var inventoryItemData : InventoryItemData;
+		if( ItemID.IsValid( id ) )
+		{
+			inventoryItemData = GetInventoryItemData( GetPlayerItemData( id ) );
+		}
+		return inventoryItemData;
+	}
+
+	public function GetItemDataEquippedInArea( equipArea : gamedataEquipmentArea, optional slot : Int32 ) : InventoryItemData
+	{
+		var id : ItemID;
+		id = GetEquippedItemIdInArea( equipArea, slot );
+		return GetItemDataFromIDInLoadout( id );
+	}
+
+	private function GetEquipment() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var currentItem : InventoryItemData;
+		var items : array< InventoryItemData >;
+		var equipAreas : array< gamedataEquipmentArea >;
+		if( m_ToRebuildEquipment )
+		{
+			m_ToRebuildEquipment = false;
+			equipAreas = GetInventoryEquipmentAreas();
+			for( i = 0, limit = equipAreas.Size(); i < limit; i += 1 )
+			{
+				currentItem = GetItemDataEquippedInArea( equipAreas[ i ] );
+				if( !( InventoryItemData.IsEmpty( currentItem ) ) )
+				{
+					items.PushBack( currentItem );
+				}
+			}
+			m_EquipmentItemsData.Clear();
+			m_EquipmentItemsData = items;
+		}
+		return m_EquipmentItemsData;
+	}
+
+	public function GetInventoryCyberware() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var currentItem : InventoryItemData;
+		var items : array< InventoryItemData >;
+		var cyberAreas : array< gamedataEquipmentArea >;
+		cyberAreas = GetInventoryCyberwareAreas();
+		for( i = 0, limit = cyberAreas.Size(); i < limit; i += 1 )
+		{
+			currentItem = GetItemDataEquippedInArea( cyberAreas[ i ] );
+			if( !( InventoryItemData.IsEmpty( currentItem ) ) )
+			{
+				items.PushBack( currentItem );
+			}
+		}
+		return items;
+	}
+
+	public function GetInventoryCyberwareSize() : Int32
+	{
+		var i, limit, result : Int32;
+		var currentItem : InventoryItemData;
+		var cyberAreas : array< gamedataEquipmentArea >;
+		cyberAreas = GetInventoryCyberwareAreas();
+		for( i = 0, limit = cyberAreas.Size(); i < limit; i += 1 )
+		{
+			currentItem = GetItemDataEquippedInArea( cyberAreas[ i ] );
+			if( !( InventoryItemData.IsEmpty( currentItem ) ) )
+			{
+				result += 1;
+			}
+		}
+		return result;
+	}
+
+	public function GetWeaponEquippedInSlot( slot : Int32 ) : InventoryItemData
+	{
+		return GetItemDataEquippedInArea( gamedataEquipmentArea.Weapon, slot );
+	}
+
+	public function GetEquippedWeapons() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< InventoryItemData >;
+		if( m_ToRebuildWeapons )
+		{
+			m_ToRebuildWeapons = false;
+			limit = GetWeaponSlotsNum();
+			for( i = 0; i < limit; i += 1 )
+			{
+				items.PushBack( GetWeaponEquippedInSlot( i ) );
+			}
+			m_WeaponItemsData.Clear();
+			m_WeaponItemsData = items;
+		}
+		return m_WeaponItemsData;
+	}
+
+	public function GetEquippedWeaponsIDs() : array< ItemID >
+	{
+		var i, limit : Int32;
+		var items : array< ItemID >;
+		limit = GetWeaponSlotsNum();
+		for( i = 0; i < limit; i += 1 )
+		{
+			items.PushBack( GetEquippedItemIdInArea( gamedataEquipmentArea.Weapon, i ) );
+		}
+		return items;
+	}
+
+	public function GetEquippedQuickSlots() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< InventoryItemData >;
+		var tempItemData : InventoryItemData;
+		if( m_ToRebuildQuickSlots )
+		{
+			m_ToRebuildQuickSlots = false;
+			limit = GetQuickSlotsNum();
+			for( i = 0; i < limit; i += 1 )
+			{
+				tempItemData = GetItemDataEquippedInArea( gamedataEquipmentArea.QuickSlot, i );
+				items.PushBack( tempItemData );
+			}
+			m_QuickSlotsData.Clear();
+			m_QuickSlotsData = items;
+		}
+		return m_QuickSlotsData;
+	}
+
+	public function GetEquippedConsumables() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< InventoryItemData >;
+		if( m_ToRebuildConsumables )
+		{
+			m_ToRebuildConsumables = false;
+			limit = GetConsumablesNum();
+			for( i = 0; i < limit; i += 1 )
+			{
+				items.PushBack( GetItemDataEquippedInArea( gamedataEquipmentArea.Consumable, i ) );
+			}
+			m_ConsumablesSlotsData.Clear();
+			m_ConsumablesSlotsData = items;
+		}
+		return m_ConsumablesSlotsData;
+	}
+
+	private function GetPlayerCraftingMaterials() : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< InventoryItemData >;
+		var inventoryItems : array< InventoryItemData >;
+		var currentItemData : InventoryItemData;
+		items = GetPlayerInventoryData();
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			currentItemData = items[ i ];
+			if( !( InventoryItemData.IsEmpty( currentItemData ) ) && InventoryItemData.IsCraftingMaterial( currentItemData ) )
+			{
+				inventoryItems.PushBack( currentItemData );
+			}
+		}
+		return inventoryItems;
+	}
+
+	public function GetPlayerItemsByType( type : gamedataItemType, optional skipEquippedItems : Bool, optional additionalTagFilters : array< CName >, optional filteredItems : array< ItemModParams > ) : array< InventoryItemData >
+	{
+		var i, limit : Int32;
+		var items : array< InventoryItemData >;
+		var inventoryItems : array< InventoryItemData >;
+		var currentItemData : InventoryItemData;
+		var quantityToFilterOut : Int32;
+		var quantity : Int32;
+		items = GetPlayerInventoryData( additionalTagFilters );
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			currentItemData = items[ i ];
+			quantityToFilterOut = GetQunatityToFilterOut( InventoryItemData.GetID( currentItemData ), filteredItems );
+			if( !( InventoryItemData.IsEmpty( currentItemData ) ) && InventoryItemData.GetItemType( currentItemData ) == type )
+			{
+				if( skipEquippedItems )
+				{
+					if( !( InventoryItemData.IsEquipped( currentItemData ) ) )
+					{
+						quantity = InventoryItemData.GetQuantity( currentItemData ) - quantityToFilterOut;
+						InventoryItemData.SetQuantity( currentItemData, quantity );
+						if( quantity > 0 )
+						{
+							inventoryItems.PushBack( currentItemData );
+						}
+					}
+				}
+				else
+				{
+					quantity = InventoryItemData.GetQuantity( currentItemData ) - quantityToFilterOut;
+					InventoryItemData.SetQuantity( currentItemData, quantity );
+					if( quantity > 0 )
+					{
+						inventoryItems.PushBack( currentItemData );
+					}
+				}
+			}
+		}
+		return inventoryItems;
+	}
+
+	public function GetPlayerItemsIDsByType( type : gamedataItemType, out items : array< ItemID > )
+	{
+		var i, limit : Int32;
+		var unfilteredItems : array< weak< gameItemData > >;
+		unfilteredItems = GetPlayerInventoryItems();
+		for( i = 0, limit = unfilteredItems.Size(); i < limit; i += 1 )
+		{
+			if( unfilteredItems[ i ].GetItemType() == type )
+			{
+				items.PushBack( unfilteredItems[ i ].GetID() );
+			}
+		}
+	}
+
+	public function GetPlayerInventory( optional additionalTagFilters : array< CName > ) : array< weak< gameItemData > >
+	{
+		var i, limit : Int32;
+		var items : array< weak< gameItemData > >;
+		var inventoryItems : array< weak< gameItemData > >;
+		items = GetPlayerItems();
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			if( !( IsItemBlacklisted( items[ i ], , , additionalTagFilters ) ) )
+			{
+				inventoryItems.PushBack( items[ i ] );
+			}
+		}
+		return inventoryItems;
+	}
+
+	public function EquipmentAreaToItemTypes( area : gamedataEquipmentArea ) : array< gamedataItemType >
+	{
+		var result : array< gamedataItemType >;
+		switch( area )
+		{
+			case gamedataEquipmentArea.Face:
+				result.PushBack( gamedataItemType.Clo_Face );
+			break;
+			case gamedataEquipmentArea.Feet:
+				result.PushBack( gamedataItemType.Clo_Feet );
+			break;
+			case gamedataEquipmentArea.Head:
+				result.PushBack( gamedataItemType.Clo_Head );
+			break;
+			case gamedataEquipmentArea.InnerChest:
+				result.PushBack( gamedataItemType.Clo_InnerChest );
+			break;
+			case gamedataEquipmentArea.Legs:
+				result.PushBack( gamedataItemType.Clo_Legs );
+			break;
+			case gamedataEquipmentArea.OuterChest:
+				result.PushBack( gamedataItemType.Clo_OuterChest );
+			break;
+			case gamedataEquipmentArea.Consumable:
+				result.PushBack( gamedataItemType.Con_Edible );
+			result.PushBack( gamedataItemType.Con_Inhaler );
+			result.PushBack( gamedataItemType.Con_Injector );
+			result.PushBack( gamedataItemType.Con_LongLasting );
+			break;
+			case gamedataEquipmentArea.Gadget:
+				result.PushBack( gamedataItemType.Gad_Grenade );
+			break;
+			case gamedataEquipmentArea.Weapon:
+				result.PushBack( gamedataItemType.Wea_AssaultRifle );
+			result.PushBack( gamedataItemType.Wea_Axe );
+			result.PushBack( gamedataItemType.Wea_Chainsword );
+			result.PushBack( gamedataItemType.Wea_Fists );
+			result.PushBack( gamedataItemType.Wea_Hammer );
+			result.PushBack( gamedataItemType.Wea_Handgun );
+			result.PushBack( gamedataItemType.Wea_HeavyMachineGun );
+			result.PushBack( gamedataItemType.Wea_Katana );
+			result.PushBack( gamedataItemType.Wea_Knife );
+			result.PushBack( gamedataItemType.Wea_LightMachineGun );
+			result.PushBack( gamedataItemType.Wea_LongBlade );
+			result.PushBack( gamedataItemType.Wea_Machete );
+			result.PushBack( gamedataItemType.Wea_Melee );
+			result.PushBack( gamedataItemType.Wea_OneHandedClub );
+			result.PushBack( gamedataItemType.Wea_PrecisionRifle );
+			result.PushBack( gamedataItemType.Wea_Revolver );
+			result.PushBack( gamedataItemType.Wea_Rifle );
+			result.PushBack( gamedataItemType.Wea_ShortBlade );
+			result.PushBack( gamedataItemType.Wea_Shotgun );
+			result.PushBack( gamedataItemType.Wea_ShotgunDual );
+			result.PushBack( gamedataItemType.Wea_SniperRifle );
+			result.PushBack( gamedataItemType.Wea_SubmachineGun );
+			result.PushBack( gamedataItemType.Wea_TwoHandedClub );
+			break;
+		}
+		return result;
+	}
+
+	public function GetPlayerItemsIDsByTypes( types : array< gamedataItemType >, out items : array< ItemID > )
+	{
+		var i, limit : Int32;
+		var unfilteredItems : array< weak< gameItemData > >;
+		unfilteredItems = GetPlayerInventoryItems();
+		for( i = 0, limit = unfilteredItems.Size(); i < limit; i += 1 )
+		{
+			if( types.Contains( unfilteredItems[ i ].GetItemType() ) )
+			{
+				items.PushBack( unfilteredItems[ i ].GetID() );
+			}
+		}
+	}
+
+	public function GetPlayerItemsIDs( optional item : InventoryItemData, optional slotID : TweakDBID, optional itemType : gamedataItemType, optional equipmentArea : gamedataEquipmentArea, optional skipEquipped : Bool, out items : array< ItemID > )
+	{
+		var localEquipmentArea : gamedataEquipmentArea;
+		var i, limit : Int32;
+		var unfilteredItems : array< weak< gameItemData > >;
+		var itemID : ItemID;
+		var inventoryItems : array< InventoryItemData >;
+		if( TDBID.IsValid( slotID ) )
+		{
+			inventoryItems = GetPlayerInventoryPartsForItem( InventoryItemData.GetID( item ), slotID );
+			for( i = 0, limit = inventoryItems.Size(); i < limit; i += 1 )
+			{
+				if( skipEquipped )
+				{
+					if( InventoryItemData.IsEquipped( inventoryItems[ i ] ) )
+					{
+						continue;
+					}
+				}
+				items.PushBack( InventoryItemData.GetID( inventoryItems[ i ] ) );
+			}
+		}
+		else if( itemType != gamedataItemType.Invalid )
+		{
+			unfilteredItems = GetPlayerInventoryItems();
+			for( i = 0, limit = unfilteredItems.Size(); i < limit; i += 1 )
+			{
+				itemID = unfilteredItems[ i ].GetID();
+				if( unfilteredItems[ i ].GetItemType() == itemType )
+				{
+					if( skipEquipped )
+					{
+						localEquipmentArea = EquipmentSystem.GetEquipAreaType( itemID );
+						if( m_EquipmentSystem.IsEquipped( m_Player, itemID, localEquipmentArea ) )
+						{
+							continue;
+						}
+					}
+					items.PushBack( itemID );
+				}
+			}
+		}
+		else if( equipmentArea != gamedataEquipmentArea.Invalid )
+		{
+			unfilteredItems = GetPlayerInventoryItems();
+			for( i = 0, limit = unfilteredItems.Size(); i < limit; i += 1 )
+			{
+				itemID = unfilteredItems[ i ].GetID();
+				localEquipmentArea = EquipmentSystem.GetEquipAreaType( itemID );
+				if( localEquipmentArea == equipmentArea )
+				{
+					if( skipEquipped )
+					{
+						if( m_EquipmentSystem.IsEquipped( m_Player, itemID, localEquipmentArea ) )
+						{
+							continue;
+						}
+					}
+					items.PushBack( itemID );
+				}
+			}
+		}
+	}
+
+	public function GetPlayerItemsIDsFast( optional item : ItemID, optional slotID : TweakDBID, optional itemType : gamedataItemType, optional equipmentArea : gamedataEquipmentArea, optional skipEquipped : Bool, out items : array< ItemID > )
+	{
+		var slots : array< TweakDBID >;
+		var localEquipmentArea : gamedataEquipmentArea;
+		var i, limit : Int32;
+		var unfilteredItems : array< weak< gameItemData > >;
+		var itemID : ItemID;
+		var inventoryItems : array< weak< gameItemData > >;
+		if( TDBID.IsValid( slotID ) )
+		{
+			slots.PushBack( slotID );
+			inventoryItems = GetPlayerInventoryPartsDataForItem( item, slots );
+			for( i = 0, limit = inventoryItems.Size(); i < limit; i += 1 )
+			{
+				if( skipEquipped )
+				{
+					if( m_EquipmentSystem.IsEquipped( m_Player, inventoryItems[ i ].GetID() ) )
+					{
+						continue;
+					}
+				}
+				items.PushBack( inventoryItems[ i ].GetID() );
+			}
+			return;
+		}
+		unfilteredItems = GetPlayerInventoryItems();
+		if( itemType != gamedataItemType.Invalid )
+		{
+			for( i = 0, limit = unfilteredItems.Size(); i < limit; i += 1 )
+			{
+				itemID = unfilteredItems[ i ].GetID();
+				localEquipmentArea = EquipmentSystem.GetEquipAreaType( itemID );
+				if( unfilteredItems[ i ].GetItemType() == itemType )
+				{
+					if( skipEquipped )
+					{
+						if( m_EquipmentSystem.IsEquipped( m_Player, itemID, localEquipmentArea ) )
+						{
+							continue;
+						}
+					}
+					items.PushBack( itemID );
+				}
+			}
+		}
+		else if( equipmentArea != gamedataEquipmentArea.Invalid )
+		{
+			for( i = 0, limit = unfilteredItems.Size(); i < limit; i += 1 )
+			{
+				itemID = unfilteredItems[ i ].GetID();
+				localEquipmentArea = EquipmentSystem.GetEquipAreaType( itemID );
+				if( localEquipmentArea == equipmentArea )
+				{
+					if( skipEquipped )
+					{
+						if( m_EquipmentSystem.IsEquipped( m_Player, itemID, localEquipmentArea ) )
+						{
+							continue;
+						}
+					}
+					items.PushBack( itemID );
+				}
+			}
+		}
+	}
+
+	public function GetCachedInventoryItemData( itemData : weak< gameItemData > ) : InventoryItemData
+	{
+		var ID : ItemID;
+		var itemRecord : weak< Item_Record >;
+		var inventoryItemData : InventoryItemData;
+		if( itemData )
+		{
+			if( !( IsItemBlacklisted( itemData ) ) )
+			{
+				ID = itemData.GetID();
+				itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( ID ) );
+				GetCachedInventoryItemDataInternal( itemData, ID, itemRecord, inventoryItemData );
+			}
+		}
+		return inventoryItemData;
+	}
+
+	public function GetCachedInventoryItemData( itemData : weak< gameItemData >, out inventoryItemData : InventoryItemData, optional forceShowCurrencyOnHUDTooltip : Bool, optional isRadialQuerying : Bool )
+	{
+		var ID : ItemID;
+		var itemRecord : weak< Item_Record >;
+		if( itemData )
+		{
+			if( !( IsItemBlacklisted( itemData, forceShowCurrencyOnHUDTooltip, isRadialQuerying ) ) )
+			{
+				ID = itemData.GetID();
+				itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( ID ) );
+				GetCachedInventoryItemDataInternal( itemData, ID, itemRecord, inventoryItemData );
+			}
+		}
+	}
+
+	private function GetCachedInventoryItemDataInternal( itemData : weak< gameItemData >, ID : ItemID, itemRecord : weak< Item_Record >, out inventoryItemData : InventoryItemData )
+	{
+		var wrapper : InventoryItemDataWrapper;
+		var key : Uint64;
+		var itemCategoryRecord : weak< ItemCategory_Record >;
+		var isEquipped : Bool;
+		var isVisualsEquipped : Bool;
+		var equipRecord : weak< EquipmentArea_Record >;
+		key = ItemID.GetCombinedHash( ID );
+		if( m_HashMapCache.KeyExist( key ) )
+		{
+			wrapper = ( ( InventoryItemDataWrapper )( m_HashMapCache.Get( key ) ) );
+			if( wrapper != NULL )
+			{
+				inventoryItemData = wrapper.ItemData;
+				InventoryItemData.SetQuantity( inventoryItemData, itemData.GetQuantity() );
+				InventoryItemData.SetAmmo( inventoryItemData, GetPlayerAmmoCount( ItemID.GetTDBID( ID ) ) );
+				itemCategoryRecord = itemRecord.ItemCategory();
+				if( itemCategoryRecord.Type() == gamedataItemCategory.Gadget || itemCategoryRecord.Type() == gamedataItemCategory.Consumable )
+				{
+					isEquipped = ( ID == m_EquipmentSystem.GetItemIDFromHotkey( m_Player, EHotkey.DPAD_UP ) ) || ( ID == m_EquipmentSystem.GetItemIDFromHotkey( m_Player, EHotkey.RB ) );
+				}
+				else
+				{
+					isEquipped = m_EquipmentSystem.IsEquipped( m_Player, InventoryItemData.GetID( inventoryItemData ) );
+				}
+				InventoryItemData.SetIsEquipped( inventoryItemData, isEquipped );
+				equipRecord = itemRecord.EquipArea();
+				if( equipRecord )
+				{
+					InventoryItemData.SetEquipmentArea( inventoryItemData, equipRecord.Type() );
+					if( ( IsAreaClothing( equipRecord.Type() ) && IsSlotOverriden( equipRecord.Type() ) ) && ( GetVisualItemInSlot( equipRecord.Type() ) == ID ) )
+					{
+						isVisualsEquipped = true;
+					}
+				}
+				InventoryItemData.SetIsVisualsEquipped( inventoryItemData, isVisualsEquipped );
+				wrapper.ItemData = inventoryItemData;
+				return;
+			}
+			else
+			{
+				m_HashMapCache.Remove( key );
+			}
+		}
+		inventoryItemData = GetInventoryItemDataInternal( m_Player, itemData, itemRecord );
+		wrapper = new InventoryItemDataWrapper;
+		wrapper.ItemData = inventoryItemData;
+		m_HashMapCache.Insert( key, wrapper );
+		m_InventoryItemDataWrappers.PushBack( wrapper );
+	}
+
+	public function GetOrCreateInventoryItemSortData( out inventoryItemData : InventoryItemData, scriptableSystem : weak< UIScriptableSystem > )
+	{
+		var wrapper : InventoryItemDataWrapper;
+		var inventoryItemID : ItemID;
+		var key : Uint64;
+		inventoryItemID = InventoryItemData.GetID( inventoryItemData );
+		key = ItemID.GetCombinedHash( inventoryItemID );
+		if( m_HashMapCache.KeyExist( key ) )
+		{
+			wrapper = ( ( InventoryItemDataWrapper )( m_HashMapCache.Get( key ) ) );
+			LogAssert( wrapper == NULL, "InventoryDataManagerV2.script - GetOrCreateInventoryItemSortData: Invalid Inventory Item Data Wrapper." );
+		}
+		else
+		{
+			wrapper = new InventoryItemDataWrapper;
+			wrapper.ItemData = inventoryItemData;
+			wrapper.SortData = ItemCompareBuilder.BuildInventoryItemSortData( wrapper.ItemData, scriptableSystem );
+			wrapper.HasSortDataBuilt = true;
+			m_HashMapCache.Insert( key, wrapper );
+			m_InventoryItemDataWrappers.PushBack( wrapper );
+		}
+		InventoryItemData.SetSortData( inventoryItemData, wrapper.SortData );
+	}
+
+	public function ClearInventoryItemDataCache()
+	{
+		m_HashMapCache.Clear();
+	}
+
+	public function GetHotkeyItemData( hotkey : EHotkey ) : InventoryItemData
+	{
+		var localPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( m_Player.GetGame() ).GetLocalPlayerControlledGameObject();
+		return GetItemDataFromIDInLoadout( m_EquipmentSystem.GetItemIDFromHotkey( localPlayer, hotkey ) );
+	}
+
+	public function GetHotkeyTypeForItemID( itemID : ItemID, out hotkey : EHotkey ) : Bool
+	{
+		var localPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( m_Player.GetGame() ).GetLocalPlayerControlledGameObject();
+		hotkey = m_EquipmentSystem.GetHotkeyTypeForItemID( localPlayer, itemID );
+		return hotkey != EHotkey.INVALID;
+	}
+
+	public function GetHotkeyTypeFromItemID( itemID : ItemID, out hotkey : EHotkey ) : Bool
+	{
+		var localPlayer : GameObject;
+		localPlayer = GameInstance.GetPlayerSystem( m_Player.GetGame() ).GetLocalPlayerControlledGameObject();
+		hotkey = m_EquipmentSystem.GetHotkeyTypeFromItemID( localPlayer, itemID );
+		return hotkey != EHotkey.INVALID;
+	}
+
+	public function GetInventoryItemData( itemData : weak< gameItemData > ) : InventoryItemData
+	{
+		return GetInventoryItemData( m_Player, itemData );
+	}
+
+	public function GetInventoryItemDataForDryItem( itemData : weak< gameItemData > ) : InventoryItemData
+	{
+		var inventoryItemData : InventoryItemData;
+		var attachments : array< InventoryItemAttachments >;
+		var abilities : array< InventoryItemAbility >;
+		var itemRecord : weak< Item_Record >;
+		var innerItemData : InnerItemData;
+		var parts : array< InnerItemData >;
+		inventoryItemData = GetInventoryItemData( m_Player, itemData );
+		InventoryItemData.SetPrice( inventoryItemData, ( ( Float )( RPGManager.CalculateSellPriceItemData( m_Player.GetGame(), m_Player, itemData ) ) ) );
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemData.GetID() ) );
+		if( itemRecord.IsPart() )
+		{
+			itemData.GetItemParts( parts );
+			innerItemData = parts[ 0 ];
+			return GetPartInventoryItemData( m_Player, itemData.GetID(), innerItemData, itemData, itemRecord );
+		}
+		FillSpecialAbilities( itemRecord, abilities, itemData );
+		GetAttachements( m_Player, itemData, attachments, abilities );
+		InventoryItemData.SetAttachments( inventoryItemData, attachments );
+		InventoryItemData.SetAbilities( inventoryItemData, abilities );
+		return inventoryItemData;
+	}
+
+	public function ShouldItemBeFiltered( item : ItemID, filteredItems : array< ItemModParams > ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < filteredItems.Size(); i += 1 )
+		{
+			if( filteredItems[ i ].itemID == item )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function GetQunatityToFilterOut( item : ItemID, filteredItems : array< ItemModParams > ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < filteredItems.Size(); i += 1 )
+		{
+			if( filteredItems[ i ].itemID == item )
+			{
+				return filteredItems[ i ].quantity;
+			}
+		}
+		return 0;
+	}
+
+	public function GetInventoryItemData( owner : weak< GameObject >, itemData : weak< gameItemData >, optional forceShowCurrencyOnHUDTooltip : Bool, optional isRadialQuerying : Bool ) : InventoryItemData
+	{
+		var inventoryItemData : InventoryItemData;
+		var itemRecord : weak< Item_Record >;
+		if( itemData && !( IsItemBlacklisted( itemData, forceShowCurrencyOnHUDTooltip, isRadialQuerying ) ) )
+		{
+			itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemData.GetID() ) );
+			inventoryItemData = GetInventoryItemDataInternal( owner, itemData, itemRecord );
+		}
+		return inventoryItemData;
+	}
+
+	private function GetInventoryItemDataInternal( owner : weak< GameObject >, itemData : weak< gameItemData >, itemRecord : weak< Item_Record > ) : InventoryItemData
+	{
+		var qualityName : CName;
+		var statsMapName : String;
+		var itemCategoryRecord : weak< ItemCategory_Record >;
+		var equipRecord : weak< EquipmentArea_Record >;
+		var inventoryItemData : InventoryItemData;
+		var tempItemType : weak< ItemType_Record >;
+		var attachments : array< InventoryItemAttachments >;
+		var abilities : array< InventoryItemAbility >;
+		var primaryStats : array< StatViewData >;
+		var secondaryStats : array< StatViewData >;
+		var isEquipped : Bool;
+		var isEquippable : Bool;
+		var isVisualsEquipped : Bool;
+		InventoryItemData.SetEmpty( inventoryItemData, false );
+		InventoryItemData.SetGameItemData( inventoryItemData, itemData );
+		InventoryItemData.SetID( inventoryItemData, itemData.GetID() );
+		if( itemRecord.IsPart() )
+		{
+			return GetPartInventoryItemData( owner, itemData );
+		}
+		tempItemType = itemRecord.ItemType();
+		if( tempItemType )
+		{
+			InventoryItemData.SetItemType( inventoryItemData, tempItemType.Type() );
+			InventoryItemData.SetLocalizedItemType( inventoryItemData, LocKeyToString( tempItemType.LocalizedType() ) );
+		}
+		InventoryItemData.SetIsCraftingMaterial( inventoryItemData, IsItemCraftingMaterial( itemData ) );
+		itemCategoryRecord = itemRecord.ItemCategory();
+		if( itemCategoryRecord )
+		{
+			InventoryItemData.SetCategoryName( inventoryItemData, m_LocMgr.Localize( itemCategoryRecord.Name() ) );
+		}
+		if( itemCategoryRecord.Type() == gamedataItemCategory.Gadget || itemCategoryRecord.Type() == gamedataItemCategory.Consumable )
+		{
+			isEquipped = ( itemData.GetID() == m_EquipmentSystem.GetItemIDFromHotkey( m_Player, EHotkey.DPAD_UP ) ) || ( itemData.GetID() == m_EquipmentSystem.GetItemIDFromHotkey( m_Player, EHotkey.RB ) );
+		}
+		else
+		{
+			isEquipped = m_EquipmentSystem.IsEquipped( m_Player, InventoryItemData.GetID( inventoryItemData ) );
+			if( RPGManager.IsItemCrafted( itemData ) )
+			{
+				isEquippable = m_EquipmentSystem.IsEquippable( m_Player, itemData );
+				InventoryItemData.SetIsEquippable( inventoryItemData, isEquippable );
+			}
+		}
+		InventoryItemData.SetIsEquipped( inventoryItemData, isEquipped );
+		InventoryItemData.SetDescription( inventoryItemData, LocKeyToString( itemRecord.LocalizedDescription() ) );
+		InventoryItemData.SetName( inventoryItemData, LocKeyToString( itemRecord.DisplayName() ) );
+		InventoryItemData.SetQuantity( inventoryItemData, itemData.GetQuantity() );
+		InventoryItemData.SetAmmo( inventoryItemData, GetPlayerAmmoCount( ItemID.GetTDBID( itemData.GetID() ) ) );
+		qualityName = UIItemsHelper.QualityEnumToName( RPGManager.GetItemDataQuality( itemData ) );
+		InventoryItemData.SetQuality( inventoryItemData, qualityName );
+		InventoryItemData.SetComparedQuality( inventoryItemData, RPGManager.GetItemDataQuality( itemData ) );
+		InventoryItemData.SetShape( inventoryItemData, ( ( itemData.HasTag( 'inventoryDoubleSlot' ) ) ? ( EInventoryItemShape.DoubleSlot ) : ( EInventoryItemShape.SingleSlot ) ) );
+		if( itemData.HasStatData( gamedataStatType.Level ) )
+		{
+			InventoryItemData.SetRequiredLevel( inventoryItemData, FloorF( itemData.GetStatValueByType( gamedataStatType.Level ) ) );
+		}
+		else
+		{
+			InventoryItemData.SetRequiredLevel( inventoryItemData, 0 );
+		}
+		if( itemData.HasStatData( gamedataStatType.ItemLevel ) )
+		{
+			InventoryItemData.SetItemLevel( inventoryItemData, FloorF( itemData.GetStatValueByType( gamedataStatType.ItemLevel ) ) );
+		}
+		else
+		{
+			InventoryItemData.SetItemLevel( inventoryItemData, 0 );
+		}
+		InventoryItemData.SetIconPath( inventoryItemData, itemRecord.IconPath() );
+		InventoryItemData.SetIconGender( inventoryItemData, m_ItemIconGender );
+		equipRecord = itemRecord.EquipArea();
+		if( equipRecord )
+		{
+			InventoryItemData.SetEquipmentArea( inventoryItemData, equipRecord.Type() );
+			if( ( IsAreaClothing( equipRecord.Type() ) && IsSlotOverriden( equipRecord.Type() ) ) && ( GetVisualItemInSlot( equipRecord.Type() ) == itemData.GetID() ) )
+			{
+				isVisualsEquipped = true;
+			}
+		}
+		InventoryItemData.SetIsVisualsEquipped( inventoryItemData, isVisualsEquipped );
+		FillSpecialAbilities( itemRecord, abilities, itemData );
+		GetAttachements( owner, InventoryItemData.GetID( inventoryItemData ), itemData, attachments, abilities );
+		InventoryItemData.SetAttachments( inventoryItemData, attachments );
+		InventoryItemData.SetAbilities( inventoryItemData, abilities );
+		statsMapName = GetStatsUIMapName( InventoryItemData.GetID( inventoryItemData ) );
+		if( IsStringValid( statsMapName ) )
+		{
+			GetStatsList( TDBID.Create( statsMapName ), itemData, primaryStats, secondaryStats );
+			InventoryItemData.SetPrimaryStats( inventoryItemData, primaryStats );
+			InventoryItemData.SetSecondaryStats( inventoryItemData, secondaryStats );
+		}
+		InventoryItemData.SetDamageType( inventoryItemData, GetWeaponDamageType( InventoryItemData.GetSecondaryStats( inventoryItemData ) ) );
+		InventoryItemData.SetPrice( inventoryItemData, ( ( Float )( RPGManager.CalculateSellPrice( owner.GetGame(), owner, itemData.GetID() ) ) ) );
+		InventoryItemData.SetBuyPrice( inventoryItemData, ( ( Float )( MarketSystem.GetBuyPrice( owner, itemData.GetID() ) ) ) );
+		InventoryItemData.SetIsBroken( inventoryItemData, RPGManager.IsItemBroken( itemData ) );
+		InventoryItemData.SetSlotIndex( inventoryItemData, m_EquipmentSystem.GetItemSlotIndex( owner, itemData.GetID() ) );
+		SetPlayerStats( inventoryItemData );
+		SetRequiredPerk( inventoryItemData );
+		return inventoryItemData;
+	}
+
+	public function GetInventoryItemDataFromItemID( itemID : ItemID ) : InventoryItemData
+	{
+		var wrapper : InventoryItemDataWrapper;
+		var itemRecord : Item_Record;
+		var inventoryItemData : InventoryItemData;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		inventoryItemData = GetInventoryItemDataFromItemRecordInternal( itemRecord );
+		InventoryItemData.SetID( inventoryItemData, itemID );
+		wrapper = new InventoryItemDataWrapper;
+		wrapper.ItemData = inventoryItemData;
+		m_InventoryItemDataWrappers.PushBack( wrapper );
+		return inventoryItemData;
+	}
+
+	public function GetInventoryItemDataFromItemRecord( itemRecord : Item_Record ) : InventoryItemData
+	{
+		var wrapper : InventoryItemDataWrapper;
+		var inventoryItemData : InventoryItemData;
+		inventoryItemData = GetInventoryItemDataFromItemRecordInternal( itemRecord );
+		wrapper = new InventoryItemDataWrapper;
+		wrapper.ItemData = inventoryItemData;
+		m_InventoryItemDataWrappers.PushBack( wrapper );
+		return inventoryItemData;
+	}
+
+	private function GetInventoryItemDataFromItemRecordInternal( itemRecord : Item_Record ) : InventoryItemData
+	{
+		var i : Int32;
+		var itemRecordTags : array< CName >;
+		var inventoryItemData : InventoryItemData;
+		var tempItemType : weak< ItemType_Record >;
+		var equipRecord : weak< EquipmentArea_Record >;
+		var itemCategoryRecord : weak< ItemCategory_Record >;
+		InventoryItemData.SetEmpty( inventoryItemData, false );
+		tempItemType = itemRecord.ItemType();
+		if( tempItemType )
+		{
+			InventoryItemData.SetItemType( inventoryItemData, tempItemType.Type() );
+			InventoryItemData.SetLocalizedItemType( inventoryItemData, LocKeyToString( tempItemType.LocalizedType() ) );
+		}
+		InventoryItemData.SetDescription( inventoryItemData, LocKeyToString( itemRecord.LocalizedDescription() ) );
+		InventoryItemData.SetName( inventoryItemData, LocKeyToString( itemRecord.DisplayName() ) );
+		InventoryItemData.SetIconPath( inventoryItemData, itemRecord.IconPath() );
+		InventoryItemData.SetIconGender( inventoryItemData, m_ItemIconGender );
+		equipRecord = itemRecord.EquipArea();
+		if( equipRecord )
+		{
+			InventoryItemData.SetEquipmentArea( inventoryItemData, equipRecord.Type() );
+		}
+		InventoryItemData.SetID( inventoryItemData, ItemID.CreateQuery( itemRecord.GetID() ) );
+		InventoryItemData.SetQuality( inventoryItemData, StringToName( itemRecord.Quality().Name() ) );
+		InventoryItemData.SetQuantity( inventoryItemData, m_TransactionSystem.GetItemQuantity( m_Player, InventoryItemData.GetID( inventoryItemData ) ) );
+		InventoryItemData.SetAmmo( inventoryItemData, GetPlayerAmmoCount( ItemID.GetTDBID( InventoryItemData.GetID( inventoryItemData ) ) ) );
+		InventoryItemData.SetShape( inventoryItemData, EInventoryItemShape.SingleSlot );
+		InventoryItemData.SetGameItemData( inventoryItemData, RPGManager.GetItemData( m_Player.GetGame(), m_Player, InventoryItemData.GetID( inventoryItemData ) ) );
+		itemCategoryRecord = itemRecord.ItemCategory();
+		if( itemCategoryRecord )
+		{
+			InventoryItemData.SetCategoryName( inventoryItemData, m_LocMgr.Localize( itemCategoryRecord.Name() ) );
+		}
+		itemRecordTags = itemRecord.Tags();
+		for( i = 0; i < itemRecordTags.Size(); i += 1 )
+		{
+			if( itemRecordTags[ i ] == 'inventoryDoubleSlot' )
+			{
+				InventoryItemData.SetShape( inventoryItemData, EInventoryItemShape.DoubleSlot );
+				break;
+			}
+		}
+		SetPlayerStats( inventoryItemData );
+		SetRequiredPerk( inventoryItemData );
+		return inventoryItemData;
+	}
+
+	private function GetPartInventoryItemData( owner : weak< GameObject >, itemData : weak< gameItemData > ) : InventoryItemData
+	{
+		var parts : array< InnerItemData >;
+		var innerItemData : InnerItemData;
+		itemData.GetItemParts( parts );
+		innerItemData = parts[ 0 ];
+		return GetPartInventoryItemData( owner, InnerItemData.GetItemID( innerItemData ), innerItemData, itemData );
+	}
+
+	private function GetPartInventoryItemData( owner : weak< GameObject >, slotData : SPartSlots, itemData : weak< gameItemData > ) : InventoryItemData
+	{
+		return GetPartInventoryItemData( owner, slotData.installedPart, slotData.innerItemData, itemData );
+	}
+
+	public function GetPlayerAmmoCount( targetItem : TweakDBID ) : Int32
+	{
+		var itemRecord : Item_Record;
+		var ammoQuery : ItemID;
+		var weaponRecord : WeaponItem_Record;
+		var category : gamedataItemCategory;
+		if( m_Player != NULL )
+		{
+			itemRecord = TweakDBInterface.GetItemRecord( targetItem );
+			category = itemRecord.ItemCategory().Type();
+			if( category == gamedataItemCategory.Weapon )
+			{
+				weaponRecord = ( ( WeaponItem_Record )( itemRecord ) );
+				ammoQuery = ItemID.CreateQuery( weaponRecord.Ammo().GetID() );
+				return m_TransactionSystem.GetItemQuantity( m_Player, ammoQuery );
+			}
+		}
+		return -1;
+	}
+
+	public function GetPlayerAmmoCount( itemRecord : weak< Item_Record > ) : Int32
+	{
+		var ammoQuery : ItemID;
+		var weaponRecord : WeaponItem_Record;
+		var category : gamedataItemCategory;
+		if( m_Player != NULL )
+		{
+			category = itemRecord.ItemCategory().Type();
+			if( category == gamedataItemCategory.Weapon )
+			{
+				weaponRecord = ( ( WeaponItem_Record )( itemRecord ) );
+				ammoQuery = ItemID.CreateQuery( weaponRecord.Ammo().GetID() );
+				return m_TransactionSystem.GetItemQuantity( m_Player, ammoQuery );
+			}
+		}
+		return -1;
+	}
+
+	public function GetAmmoTypeForWeapon( targetItem : TweakDBID ) : TweakDBID
+	{
+		var itemRecord : Item_Record;
+		var weaponRecord : WeaponItem_Record;
+		var category : gamedataItemCategory;
+		if( m_Player != NULL )
+		{
+			itemRecord = TweakDBInterface.GetItemRecord( targetItem );
+			category = itemRecord.ItemCategory().Type();
+			if( category == gamedataItemCategory.Weapon )
+			{
+				weaponRecord = ( ( WeaponItem_Record )( itemRecord ) );
+				return weaponRecord.Ammo().GetID();
+			}
+		}
+		return TDBID.None();
+	}
+
+	private function GetPartInventoryItemData( owner : weak< GameObject >, itemId : ItemID, innerItemData : InnerItemData, optional itemData : weak< gameItemData >, optional record : weak< Item_Record > ) : InventoryItemData
+	{
+		var qualityName : CName;
+		var itemRecord : weak< Item_Record >;
+		var itemCategoryRecord : weak< ItemCategory_Record >;
+		var inventoryItemData : InventoryItemData;
+		var statsMapName : String;
+		var tempItemType : weak< ItemType_Record >;
+		var placementSlots : array< weak< AttachmentSlot_Record > >;
+		var i : Int32;
+		var abilities : array< InventoryItemAbility >;
+		var primaryStats : array< StatViewData >;
+		var secondaryStats : array< StatViewData >;
+		if( ItemID.IsValid( itemId ) )
+		{
+			InventoryItemData.SetEmpty( inventoryItemData, false );
+			InventoryItemData.SetGameItemData( inventoryItemData, itemData );
+			InventoryItemData.SetID( inventoryItemData, itemId );
+			InventoryItemData.SetSlotID( inventoryItemData, InnerItemData.GetSlotID( innerItemData ) );
+			itemRecord = InnerItemData.GetStaticData( innerItemData );
+			if( !( itemRecord ) )
+			{
+				if( record )
+				{
+					itemRecord = record;
+				}
+				else
+				{
+					itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemId ) );
+				}
+			}
+			itemCategoryRecord = itemRecord.ItemCategory();
+			if( itemCategoryRecord )
+			{
+				InventoryItemData.SetCategoryName( inventoryItemData, m_LocMgr.Localize( itemCategoryRecord.Name() ) );
+			}
+			tempItemType = itemRecord.ItemType();
+			if( tempItemType )
+			{
+				InventoryItemData.SetItemType( inventoryItemData, tempItemType.Type() );
+				InventoryItemData.SetLocalizedItemType( inventoryItemData, LocKeyToString( tempItemType.LocalizedType() ) );
+			}
+			InventoryItemData.SetDescription( inventoryItemData, LocKeyToString( itemRecord.LocalizedDescription() ) );
+			InventoryItemData.SetName( inventoryItemData, LocKeyToString( itemRecord.DisplayName() ) );
+			InventoryItemData.SetQuantity( inventoryItemData, 1 );
+			if( InnerItemData.HasStatData( innerItemData, gamedataStatType.Quality ) )
+			{
+				qualityName = UIItemsHelper.QualityEnumToName( RPGManager.GetInnerItemDataQuality( innerItemData ) );
+				InventoryItemData.SetQuality( inventoryItemData, qualityName );
+				InventoryItemData.SetComparedQuality( inventoryItemData, RPGManager.GetInnerItemDataQuality( innerItemData ) );
+			}
+			else if( itemData )
+			{
+				qualityName = UIItemsHelper.QualityEnumToName( RPGManager.GetItemDataQuality( itemData ) );
+				InventoryItemData.SetQuality( inventoryItemData, qualityName );
+				InventoryItemData.SetComparedQuality( inventoryItemData, RPGManager.GetItemDataQuality( itemData ) );
+			}
+			if( itemData )
+			{
+				InventoryItemData.SetShape( inventoryItemData, ( ( itemData.HasTag( 'inventoryDoubleSlot' ) ) ? ( EInventoryItemShape.DoubleSlot ) : ( EInventoryItemShape.SingleSlot ) ) );
+			}
+			if( InnerItemData.HasStatData( innerItemData, gamedataStatType.Level ) )
+			{
+				InventoryItemData.SetRequiredLevel( inventoryItemData, RoundMath( InnerItemData.GetStatValueByType( innerItemData, gamedataStatType.Level ) ) );
+			}
+			else
+			{
+				InventoryItemData.SetRequiredLevel( inventoryItemData, 0 );
+			}
+			if( itemData && itemData.HasStatData( gamedataStatType.ItemLevel ) )
+			{
+				InventoryItemData.SetItemLevel( inventoryItemData, FloorF( itemData.GetStatValueByType( gamedataStatType.ItemLevel ) ) );
+			}
+			else
+			{
+				InventoryItemData.SetItemLevel( inventoryItemData, 0 );
+			}
+			InventoryItemData.SetIconPath( inventoryItemData, itemRecord.IconPath() );
+			InventoryItemData.SetIconGender( inventoryItemData, m_ItemIconGender );
+			if( !( itemData.HasTag( 'DummyPart' ) ) )
+			{
+				FillSpecialAbilities( itemRecord, abilities, itemData, innerItemData );
+				InventoryItemData.SetAbilities( inventoryItemData, abilities );
+			}
+			statsMapName = GetStatsUIMapName( itemId );
+			if( IsStringValid( statsMapName ) )
+			{
+				GetStatsList( TDBID.Create( statsMapName ), innerItemData, primaryStats, secondaryStats );
+				InventoryItemData.SetPrimaryStats( inventoryItemData, primaryStats );
+				InventoryItemData.SetSecondaryStats( inventoryItemData, secondaryStats );
+			}
+			InventoryItemData.SetDamageType( inventoryItemData, GetWeaponDamageType( InventoryItemData.GetSecondaryStats( inventoryItemData ) ) );
+			InventoryItemData.SetPrice( inventoryItemData, ( ( Float )( RPGManager.CalculateSellPrice( owner.GetGame(), owner, itemId ) ) ) );
+			InventoryItemData.SetBuyPrice( inventoryItemData, ( ( Float )( MarketSystem.GetBuyPrice( owner, itemId ) ) ) );
+			InventoryItemData.SetIsPart( inventoryItemData, true );
+			InnerItemData.GetStaticData( innerItemData ).PlacementSlots( placementSlots );
+			for( i = 0; i < placementSlots.Size(); i += 1 )
+			{
+				InventoryItemData.AddPlacementSlot( inventoryItemData, placementSlots[ i ].GetID() );
+			}
+			SetPlayerStats( inventoryItemData );
+			SetRequiredPerk( inventoryItemData );
+		}
+		return inventoryItemData;
+	}
+
+	public function GetTooltipDataForInventoryItem( tooltipItemData : InventoryItemData, equipped : Bool, iconErrorInfo : DEBUG_IconErrorInfo, optional vendorItem : Bool, optional overrideRarity : Bool ) : InventoryTooltipData
+	{
+		var result : InventoryTooltipData;
+		result = GetTooltipDataForInventoryItem( tooltipItemData, equipped, vendorItem, overrideRarity );
+		result.DEBUG_iconErrorInfo = iconErrorInfo;
+		return result;
+	}
+
+	public function GetTooltipDataForInventoryItem( tooltipItemData : InventoryItemData, equipped : Bool, optional vendorItem : Bool, optional overrideRarity : Bool ) : InventoryTooltipData
+	{
+		var tooltipData : InventoryTooltipData;
+		tooltipData = InventoryTooltipData.FromInventoryItemData( tooltipItemData );
+		if( equipped )
+		{
+			tooltipData.isEquipped = true;
+		}
+		tooltipData.isVendorItem = vendorItem;
+		tooltipData.quickhackData = GetQuickhackTooltipData( tooltipItemData );
+		tooltipData.grenadeData = GetGrenadeTooltipData( tooltipItemData );
+		tooltipData.overrideRarity = overrideRarity;
+		return tooltipData;
+	}
+
+	public function GetTooltipDataForVisualItem( tooltipItemData : InventoryItemData, equipped : Bool ) : MinimalItemTooltipData
+	{
+		var mintooltipData : MinimalItemTooltipData;
+		var tooltipData : InventoryTooltipData;
+		tooltipData = InventoryTooltipData.FromInventoryItemData( tooltipItemData );
+		if( equipped )
+		{
+			tooltipData.isEquipped = true;
+		}
+		mintooltipData = MinimalItemTooltipData.FromInventoryTooltipData( tooltipData );
+		mintooltipData.hasRarity = false;
+		return mintooltipData;
+	}
+
+	public function GetGrenadeTooltipData( tooltipItemData : InventoryItemData ) : InventoryTooltiData_GrenadeData
+	{
+		return GetGrenadeTooltipData( ItemID.GetTDBID( InventoryItemData.GetID( tooltipItemData ) ), InventoryItemData.GetGameItemData( tooltipItemData ) );
+	}
+
+	public function GetGrenadeTooltipData( itemID : TweakDBID, itemData : weak< gameItemData > ) : InventoryTooltiData_GrenadeData
+	{
+		var grenadeRecord : weak< Grenade_Record >;
+		var continousEffector : weak< ContinuousAttackEffector_Record >;
+		var result : InventoryTooltiData_GrenadeData;
+		var deliveryRecord : weak< GrenadeDeliveryMethod_Record >;
+		grenadeRecord = TweakDBInterface.GetGrenadeRecord( itemID );
+		if( grenadeRecord )
+		{
+			result = new InventoryTooltiData_GrenadeData;
+			continousEffector = GetGrenadeContinousEffector( grenadeRecord.Attack() );
+			result.range = GetGrenadeRange( grenadeRecord );
+			deliveryRecord = grenadeRecord.DeliveryMethod();
+			result.deliveryMethod = deliveryRecord.Type().Type();
+			result.detonationTimer = deliveryRecord.DetonationTimer();
+			if( continousEffector )
+			{
+				result.duration = GetGrenadeDuration( grenadeRecord.Attack() );
+				result.delay = GetGrenadeDelay( continousEffector );
+				result.damagePerTick = GetGrenadeDoTTickDamage( continousEffector );
+				result.type = GrenadeDamageType.DoT;
+				result.totalDamage = result.damagePerTick * ( result.duration / result.delay );
+			}
+			else
+			{
+				result.type = GrenadeDamageType.Normal;
+				result.totalDamage = GetGrenadeTotalDamageFromStats( itemData );
+			}
+		}
+		return result;
+	}
+
+	private function GetGrenadeContinousEffector( attackRecord : weak< Attack_Record > ) : weak< ContinuousAttackEffector_Record >
+	{
+		var i, j, k : Int32;
+		var statusEffects : array< weak< StatusEffectAttackData_Record > >;
+		var statusEffectPackages : array< weak< GameplayLogicPackage_Record > >;
+		var statusEffectEffectors : array< weak< Effector_Record > >;
+		var continuousAttackEffector : weak< ContinuousAttackEffector_Record >;
+		attackRecord.StatusEffects( statusEffects );
+		for( i = 0; i < statusEffects.Size(); i += 1 )
+		{
+			statusEffects[ i ].StatusEffect().Packages( statusEffectPackages );
+			for( j = 0; j < statusEffectPackages.Size(); j += 1 )
+			{
+				statusEffectPackages[ j ].Effectors( statusEffectEffectors );
+				for( k = 0; k < statusEffectEffectors.Size(); k += 1 )
+				{
+					if( statusEffectEffectors[ k ].EffectorClassName() == 'TriggerContinuousAttackEffector' )
+					{
+						continuousAttackEffector = ( ( weak< weak< ContinuousAttackEffector_Record > > )( statusEffectEffectors[ k ] ) );
+						if( continuousAttackEffector )
+						{
+							return continuousAttackEffector;
+						}
+					}
+				}
+			}
+		}
+		return NULL;
+	}
+
+	private function GetGrenadeTotalDamageFromStats( itemData : weak< gameItemData > ) : Float
+	{
+		var i : Int32;
+		var result : Float;
+		var damageData : array< InventoryTooltiData_GrenadeDamageData >;
+		GetGrenadeDamageStats( itemData, damageData );
+		for( i = 0; i < damageData.Size(); i += 1 )
+		{
+			result += damageData[ i ].value;
+		}
+		return result;
+	}
+
+	private function GetGrenadeDamageStats( itemData : weak< gameItemData >, outputArray : ref< array< InventoryTooltiData_GrenadeDamageData > > )
+	{
+		var value : Float;
+		var damageData : InventoryTooltiData_GrenadeDamageData;
+		value = itemData.GetStatValueByType( gamedataStatType.BaseDamage );
+		if( value > 0.0001 )
+		{
+			damageData = new InventoryTooltiData_GrenadeDamageData;
+			damageData.statType = gamedataStatType.BaseDamage;
+			damageData.value = value;
+			outputArray.PushBack( damageData );
+		}
+		value = itemData.GetStatValueByType( gamedataStatType.PhysicalDamage );
+		if( value > 0.0001 )
+		{
+			damageData = new InventoryTooltiData_GrenadeDamageData;
+			damageData.statType = gamedataStatType.PhysicalDamage;
+			damageData.value = value;
+			outputArray.PushBack( damageData );
+		}
+		value = itemData.GetStatValueByType( gamedataStatType.ChemicalDamage );
+		if( value > 0.0001 )
+		{
+			damageData = new InventoryTooltiData_GrenadeDamageData;
+			damageData.statType = gamedataStatType.ChemicalDamage;
+			damageData.value = value;
+			outputArray.PushBack( damageData );
+		}
+		value = itemData.GetStatValueByType( gamedataStatType.ElectricDamage );
+		if( value > 0.0001 )
+		{
+			damageData = new InventoryTooltiData_GrenadeDamageData;
+			damageData.statType = gamedataStatType.ElectricDamage;
+			damageData.value = value;
+			outputArray.PushBack( damageData );
+		}
+		value = itemData.GetStatValueByType( gamedataStatType.ThermalDamage );
+		if( value > 0.0001 )
+		{
+			damageData = new InventoryTooltiData_GrenadeDamageData;
+			damageData.statType = gamedataStatType.ThermalDamage;
+			damageData.value = value;
+			outputArray.PushBack( damageData );
+		}
+	}
+
+	private function GetGrenadeDoTTickDamage( continuousAttackEffector : weak< ContinuousAttackEffector_Record > ) : Float
+	{
+		var continuousAttackRecord : weak< Attack_Record >;
+		var continuousAttackStatModifiers : array< weak< StatModifier_Record > >;
+		if( continuousAttackEffector )
+		{
+			continuousAttackRecord = continuousAttackEffector.AttackRecord();
+			continuousAttackRecord.StatModifiers( continuousAttackStatModifiers );
+			return RPGManager.CalculateStatModifiers( continuousAttackStatModifiers, m_Player.GetGame(), m_Player, m_Player.GetEntityID() );
+		}
+		return 0.0;
+	}
+
+	private function GetGrenadeRange( grenadeRecord : weak< Grenade_Record > ) : Float
+	{
+		var i : Int32;
+		var result : Float;
+		var statModifier : array< weak< StatModifier_Record > >;
+		var rangeStatModifier : array< weak< StatModifier_Record > >;
+		result = grenadeRecord.AttackRadius();
+		grenadeRecord.StatModifiers( statModifier );
+		for( i = statModifier.Size() - 1; i > 0; i -= 1 )
+		{
+			if( statModifier[ i ].StatType().StatType() == gamedataStatType.Range )
+			{
+				if( ( ( CombinedStatModifier_Record )( statModifier[ i ] ) ) || ( ( ConstantStatModifier_Record )( statModifier[ i ] ) ) )
+				{
+					rangeStatModifier.PushBack( statModifier[ i ] );
+				}
+			}
+		}
+		result = RPGManager.CalculateStatModifiers( rangeStatModifier, m_Player.GetGame(), m_Player, m_Player.GetEntityID() );
+		return result;
+	}
+
+	private function GetGrenadeDuration( attackRecord : weak< Attack_Record > ) : Float
+	{
+		var i : Int32;
+		var statusEffects : array< weak< StatusEffectAttackData_Record > >;
+		var durationModifiersRecord : weak< StatModifierGroup_Record >;
+		var durationStatModifiers : array< weak< StatModifier_Record > >;
+		attackRecord.StatusEffects( statusEffects );
+		for( i = 0; i < statusEffects.Size(); i += 1 )
+		{
+			durationModifiersRecord = statusEffects[ i ].StatusEffect().Duration();
+			if( durationModifiersRecord )
+			{
+				durationModifiersRecord.StatModifiers( durationStatModifiers );
+				return RPGManager.CalculateStatModifiers( durationStatModifiers, m_Player.GetGame(), m_Player, m_Player.GetEntityID() );
+			}
+		}
+		return 0.0;
+	}
+
+	private function GetGrenadeDelay( continuousAttackEffector : weak< ContinuousAttackEffector_Record > ) : Float
+	{
+		if( continuousAttackEffector )
+		{
+			return continuousAttackEffector.DelayTime();
+		}
+		return 0.0;
+	}
+
+	private function GetIgnoredDurationStats() : array< weak< StatusEffect_Record > >
+	{
+		var result : array< weak< StatusEffect_Record > >;
+		result.PushBack( TweakDBInterface.GetStatusEffectRecord( T"BaseStatusEffect.WasQuickHacked" ) );
+		result.PushBack( TweakDBInterface.GetStatusEffectRecord( T"BaseStatusEffect.QuickHackUploaded" ) );
+		return result;
+	}
+
+	private function GetQuickhackTooltipData( tooltipItemData : InventoryItemData ) : InventoryTooltipData_QuickhackData
+	{
+		return GetQuickhackTooltipData( ItemID.GetTDBID( InventoryItemData.GetID( tooltipItemData ) ) );
+	}
+
+	public function GetQuickhackTooltipData( itemID : TweakDBID ) : InventoryTooltipData_QuickhackData
+	{
+		var tweakRecord : weak< Item_Record >;
+		var statModifiers : array< weak< StatModifier_Record > >;
+		var baseStatModifiers : array< weak< StatModifier_Record > >;
+		var actionStartEffects : array< weak< ObjectActionEffect_Record > >;
+		var actionRecord : weak< ObjectAction_Record >;
+		var baseActionRecord : weak< ObjectAction_Record >;
+		var baseCooldownRecord : weak< StatModifierGroup_Record >;
+		var actions : array< weak< ObjectAction_Record > >;
+		var durationMods : array< weak< ObjectActionEffect_Record > >;
+		var duration : weak< StatModifierGroup_Record >;
+		var effectToCast : weak< StatusEffect_Record >;
+		var lastMatchingEffect : weak< StatusEffect_Record >;
+		var emptyObject : GameObject;
+		var dummyEntityID : EntityID;
+		var shouldHideCooldown, shouldHideDuration : Bool;
+		var gameInstance : GameInstance;
+		var quickhackData : InventoryTooltipData_QuickhackData;
+		var i, j : Int32;
+		var effects : array< DamageEffectUIEntry >;
+		var ignoredDurationStats : array< weak< StatusEffect_Record > >;
+		tweakRecord = TDB.GetItemRecord( itemID );
+		baseActionRecord = GetQuickhackBaseObjectActionRecord();
+		baseCooldownRecord = GetBaseQuickhackCooldownRecord();
+		if( tweakRecord.ItemType().Type() != gamedataItemType.Prt_Program )
+		{
+			return quickhackData;
+		}
+		ignoredDurationStats = GetIgnoredDurationStats();
+		gameInstance = m_Player.GetGame();
+		tweakRecord.ObjectActions( actions );
+		actionRecord = actions[ 0 ];
+		shouldHideCooldown = TweakDBInterface.GetBool( actionRecord.GetID() + T".hideCooldownUI", false );
+		shouldHideDuration = TweakDBInterface.GetBool( actionRecord.GetID() + T".hideDurationUI", false );
+		quickhackData.baseCost = BaseScriptableAction.GetBaseCostStatic( m_Player, actionRecord );
+		quickhackData.memorycost = quickhackData.baseCost;
+		statModifiers.Clear();
+		if( !( shouldHideDuration ) )
+		{
+			durationMods.Clear();
+			actionRecord.CompletionEffects( durationMods );
+			for( i = 0; i < durationMods.Size(); i += 1 )
+			{
+				if( !( InventoryDataManagerV2.ProcessQuickhackEffects( m_Player, durationMods[ i ].StatusEffect(), effects ) ) )
+				{
+					continue;
+				}
+				for( j = 0; j < effects.Size(); j += 1 )
+				{
+					quickhackData.attackEffects.PushBack( effects[ j ] );
+				}
+			}
+			if( durationMods.Size() > 0 )
+			{
+				for( i = 0; i < durationMods.Size(); i += 1 )
+				{
+					effectToCast = durationMods[ i ].StatusEffect();
+					if( effectToCast )
+					{
+						if( !( ignoredDurationStats.Contains( effectToCast ) ) )
+						{
+							lastMatchingEffect = effectToCast;
+						}
+					}
+				}
+				effectToCast = lastMatchingEffect;
+				duration = effectToCast.Duration();
+				duration.StatModifiers( statModifiers );
+				quickhackData.duration = RPGManager.CalculateStatModifiers( statModifiers, gameInstance, emptyObject, dummyEntityID, m_Player.GetEntityID() );
+			}
+		}
+		statModifiers.Clear();
+		baseStatModifiers.Clear();
+		actionRecord.ActivationTime( statModifiers );
+		baseActionRecord.ActivationTime( baseStatModifiers );
+		statModifiers = StatModifiersExcept( statModifiers, baseStatModifiers );
+		quickhackData.uploadTime = RPGManager.CalculateStatModifiers( statModifiers, gameInstance, m_Player, dummyEntityID, m_Player.GetEntityID() );
+		if( !( shouldHideCooldown ) )
+		{
+			actionStartEffects.Clear();
+			actionRecord.StartEffects( actionStartEffects );
+			for( i = 0; i < actionStartEffects.Size(); i += 1 )
+			{
+				if( actionStartEffects[ i ].StatusEffect().StatusEffectType().Type() == gamedataStatusEffectType.PlayerCooldown )
+				{
+					statModifiers.Clear();
+					baseStatModifiers.Clear();
+					actionStartEffects[ i ].StatusEffect().Duration().StatModifiers( statModifiers );
+					baseCooldownRecord.StatModifiers( baseStatModifiers );
+					statModifiers = StatModifiersExcept( statModifiers, baseStatModifiers );
+					quickhackData.cooldown = RPGManager.CalculateStatModifiers( statModifiers, gameInstance, m_Player, dummyEntityID, m_Player.GetEntityID() );
+				}
+				if( quickhackData.cooldown != 0.0 )
+				{
+					break;
+				}
+			}
+		}
+		return quickhackData;
+	}
+
+	public function GetQuickhackBaseObjectActionRecord() : weak< ObjectAction_Record >
+	{
+		return TweakDBInterface.GetObjectActionRecord( T"QuickHack.QuickHack" );
+	}
+
+	public function GetBaseQuickhackCooldownRecord() : weak< StatModifierGroup_Record >
+	{
+		return TweakDBInterface.GetStatModifierGroupRecord( T"BaseStatusEffect.QuickHackCooldownDuration" );
+	}
+
+	public function StatModifiersExcept( statModifiers : array< weak< StatModifier_Record > >, except : array< weak< StatModifier_Record > > ) : array< weak< StatModifier_Record > >
+	{
+		var result : array< weak< StatModifier_Record > >;
+		var i : Int32;
+		for( i = 0; i < statModifiers.Size(); i += 1 )
+		{
+			if( !( except.Contains( statModifiers[ i ] ) ) )
+			{
+				result.PushBack( statModifiers[ i ] );
+			}
+		}
+		return result;
+	}
+
+	public static function ProcessQuickhackEffects( player : GameObject, statusEffectRecord : weak< StatusEffect_Record >, out result : array< DamageEffectUIEntry > ) : Bool
+	{
+		var i, j : Int32;
+		var statusEffectPackages : array< weak< GameplayLogicPackage_Record > >;
+		var effectors : array< weak< Effector_Record > >;
+		var effector : weak< Effector_Record >;
+		var effectorAsTriggerAttack : weak< TriggerAttackEffector_Record >;
+		var effectorAsContinousAttack : weak< ContinuousAttackEffector_Record >;
+		var attackRecord : weak< Attack_Record >;
+		var attackRecordStatModifiers : array< weak< StatModifier_Record > >;
+		var durationRecordStatModifiers : array< weak< StatModifier_Record > >;
+		var mult : Float;
+		var resultEntry : DamageEffectUIEntry;
+		var isContinuous : Bool;
+		if( !( statusEffectRecord ) )
+		{
+			return false;
+		}
+		if( statusEffectRecord.GetPackagesCount() <= 0 )
+		{
+			return false;
+		}
+		if( statusEffectRecord.Duration().GetStatModifiersCount() > 0 )
+		{
+			durationRecordStatModifiers.Clear();
+			statusEffectRecord.Duration().StatModifiers( durationRecordStatModifiers );
+		}
+		statusEffectPackages.Clear();
+		statusEffectRecord.Packages( statusEffectPackages );
+		for( i = 0; i < statusEffectPackages.Size(); i += 1 )
+		{
+			if( statusEffectPackages[ i ].GetEffectorsCount() <= 0 )
+			{
+				continue;
+			}
+			effectors.Clear();
+			statusEffectPackages[ i ].Effectors( effectors );
+			for( j = 0; j < effectors.Size(); j += 1 )
+			{
+				effector = effectors[ j ];
+				effectorAsTriggerAttack = ( ( weak< weak< TriggerAttackEffector_Record > > )( effector ) );
+				attackRecord = NULL;
+				if( effectorAsTriggerAttack )
+				{
+					attackRecord = effectorAsTriggerAttack.AttackRecord();
+				}
+				else
+				{
+					effectorAsContinousAttack = ( ( weak< weak< ContinuousAttackEffector_Record > > )( effector ) );
+					if( effectorAsContinousAttack )
+					{
+						attackRecord = effectorAsContinousAttack.AttackRecord();
+						isContinuous = true;
+						mult = effectorAsContinousAttack.DelayTime();
+						if( mult > 0.0 )
+						{
+							mult = 1.0 / mult;
+						}
+					}
+				}
+				if( !( attackRecord ) )
+				{
+					continue;
+				}
+				if( attackRecord.GetStatModifiersCount() <= 0 )
+				{
+					continue;
+				}
+				attackRecordStatModifiers.Clear();
+				attackRecord.StatModifiers( attackRecordStatModifiers );
+				resultEntry = new DamageEffectUIEntry;
+				resultEntry.valueToDisplay = RPGManager.CalculateStatModifiers( attackRecordStatModifiers, player.GetGame(), player, player.GetEntityID(), player.GetEntityID() );
+				resultEntry.valueToDisplay = ( ( resultEntry.valueToDisplay <= 1.0 ) ? ( 1.0 ) : ( resultEntry.valueToDisplay ) );
+				if( mult > 0.0 )
+				{
+					resultEntry.valueToDisplay = resultEntry.valueToDisplay * mult;
+				}
+				resultEntry.valueStat = attackRecordStatModifiers[ 0 ].StatType().StatType();
+				resultEntry.targetStat = gamedataStatType.Invalid;
+				resultEntry.displayType = ( ( isContinuous ) ? ( DamageEffectDisplayType.Invalid ) : ( DamageEffectDisplayType.Flat ) );
+				resultEntry.effectorDuration = RPGManager.CalculateStatModifiers( durationRecordStatModifiers, player.GetGame(), player, player.GetEntityID(), player.GetEntityID() );
+				resultEntry.effectorDuration = ( ( resultEntry.effectorDuration <= 1.0 ) ? ( 0.0 ) : ( resultEntry.effectorDuration ) );
+				resultEntry.isContinuous = isContinuous;
+				if( isContinuous )
+				{
+					result.Insert( 0, resultEntry );
+				}
+				else
+				{
+					result.PushBack( resultEntry );
+				}
+			}
+		}
+		if( result.Size() > 0 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public function GetTooltipForEmptySlot( slot : String ) : MessageTooltipData
+	{
+		var toolTipData : MessageTooltipData;
+		toolTipData = new MessageTooltipData;
+		toolTipData.Title = slot;
+		return toolTipData;
+	}
+
+	public function GetTransmogTooltipForEmptySlot( slot : String, transmogItem : ItemID, iconPath : CName, noIcon : Bool ) : TransmogMessageTooltipData
+	{
+		var toolTipData : TransmogMessageTooltipData;
+		toolTipData = new TransmogMessageTooltipData;
+		toolTipData.Title = slot;
+		toolTipData.TransmogItem = transmogItem;
+		toolTipData.IconPath = iconPath;
+		toolTipData.NoIcon = noIcon;
+		return toolTipData;
+	}
+
+	public function GetPlayerItemStats( itemId : ItemID, optional compareItemId : ItemID ) : ItemViewData
+	{
+		var itemData : weak< gameItemData >;
+		var compareItemData : weak< gameItemData >;
+		if( ItemID.IsValid( compareItemId ) )
+		{
+			compareItemData = m_TransactionSystem.GetItemData( m_Player, compareItemId );
+		}
+		itemData = m_TransactionSystem.GetItemData( m_Player, itemId );
+		return GetItemStatsByData( itemData, compareItemData );
+	}
+
+	public function GetItemStatsByData( itemData : weak< gameItemData >, optional compareWithData : weak< gameItemData > ) : ItemViewData
+	{
+		var itemId : ItemID;
+		var itemRecord : weak< Item_Record >;
+		var itemCategoryRecord : weak< ItemCategory_Record >;
+		var viewData : ItemViewData;
+		var statsMapName : String;
+		var quality : gamedataQuality;
+		itemId = itemData.GetID();
+		itemRecord = TDB.GetItemRecord( ItemID.GetTDBID( itemId ) );
+		itemCategoryRecord = itemRecord.ItemCategory();
+		viewData.id = itemId;
+		viewData.itemName = LocKeyToString( itemRecord.DisplayName() );
+		viewData.categoryName = m_LocMgr.Localize( itemCategoryRecord.Name() );
+		viewData.description = LocKeyToString( itemRecord.LocalizedDescription() );
+		if( itemData.HasStatData( gamedataStatType.Quality ) )
+		{
+			quality = RPGManager.GetItemDataQuality( itemData );
+			viewData.quality = NameToString( UIItemsHelper.QualityEnumToName( quality ) );
+		}
+		else
+		{
+			viewData.quality = itemRecord.Quality().Name();
+		}
+		statsMapName = GetStatsUIMapName( itemId );
+		if( IsStringValid( statsMapName ) )
+		{
+			GetStatsList( TDBID.Create( statsMapName ), itemData, viewData.primaryStats, viewData.secondaryStats, compareWithData );
+		}
+		if( compareWithData.HasStatData( gamedataStatType.Quality ) )
+		{
+			viewData.comparedQuality = RPGManager.GetItemDataQuality( compareWithData );
+		}
+		viewData.isBroken = RPGManager.IsItemBroken( itemData );
+		viewData.price = ( ( Float )( RPGManager.CalculateSellPrice( m_Player.GetGame(), m_Player, itemData.GetID() ) ) );
+		return viewData;
+	}
+
+	public function GetSellPrice( owner : weak< GameObject >, itemID : ItemID ) : Float
+	{
+		return ( ( Float )( RPGManager.CalculateSellPrice( m_Player.GetGame(), m_Player, itemID ) ) );
+	}
+
+	public function GetSellPrice( owner : weak< GameObject >, itemData : weak< gameItemData > ) : Float
+	{
+		return ( ( Float )( RPGManager.CalculateSellPriceItemData( m_Player.GetGame(), m_Player, itemData ) ) );
+	}
+
+	public function GetSellPrice( itemID : ItemID ) : Float
+	{
+		return GetSellPrice( m_Player, itemID );
+	}
+
+	public function GetSellPrice( itemData : weak< gameItemData > ) : Float
+	{
+		return GetSellPrice( m_Player, itemData );
+	}
+
+	public function GetBuyPrice( owner : weak< GameObject >, itemID : ItemID ) : Float
+	{
+		return ( ( Float )( MarketSystem.GetBuyPrice( m_Player, itemID ) ) );
+	}
+
+	public function GetBuyPrice( itemID : ItemID ) : Float
+	{
+		return GetBuyPrice( m_Player, itemID );
+	}
+
+	public function GetPlayerStats( out statsList : array< StatViewData > )
+	{
+		GetPlayerStatsFromMap( statsList, "UIMaps.Player" );
+	}
+
+	public function GetPlayerInventoryStats( out statsList : array< StatViewData > )
+	{
+		GetPlayerStatsFromMap( statsList, "UIMaps.Player_Inventory" );
+	}
+
+	public function GetPlayerDPSStats( out statsList : array< StatViewData > )
+	{
+		GetPlayerStatsFromMap( statsList, "UIMaps.Player_Stat_Panel_DPS" );
+	}
+
+	public function GetPlayerArmorStats( out statsList : array< StatViewData > )
+	{
+		GetPlayerStatsFromMap( statsList, "UIMaps.Player_Stat_Panel_Armor" );
+	}
+
+	public function GetPlayerHealthStats( out statsList : array< StatViewData > )
+	{
+		GetPlayerStatsFromMap( statsList, "UIMaps.Player_Stat_Panel_Health" );
+	}
+
+	public function GetPlayerOtherStats( out statsList : array< StatViewData > )
+	{
+		GetPlayerStatsFromMap( statsList, "UIMaps.Player_Stat_Panel_Other" );
+	}
+
+	private function GetPlayerStatsFromMap( out statsList : array< StatViewData >, uiMap : String )
+	{
+		var i, count : Int32;
+		var statMap : UIStatsMap_Record;
+		var statRecords : array< weak< Stat_Record > >;
+		var curRecords : weak< Stat_Record >;
+		var playerID : StatsObjectID;
+		var curData : StatViewData;
+		var val : Int32;
+		playerID = m_Player.GetEntityID();
+		statMap = TDB.GetUIStatsMapRecord( TDBID.Create( uiMap ) );
+		statMap.PrimaryStats( statRecords );
+		count = statRecords.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			curRecords = statRecords[ i ];
+			if( curRecords )
+			{
+				curData.type = curRecords.StatType();
+				curData.valueF = m_StatsSystem.GetStatValue( playerID, curData.type );
+				if( TweakDBInterface.GetBool( statRecords[ i ].GetID() + T".multByHundred", false ) )
+				{
+					val = ( ( Int32 )( m_StatsSystem.GetStatValue( playerID, curData.type ) * 100.0 ) );
+				}
+				else
+				{
+					val = RoundMath( m_StatsSystem.GetStatValue( playerID, curData.type ) );
+				}
+				curData.value = val;
+				curData.statName = GetLocalizedStatName( curRecords );
+				statsList.PushBack( curData );
+			}
+		}
+	}
+
+	private const function GetLocalizedStatName( statRecord : weak< Stat_Record > ) : String
+	{
+		var localizedName : String;
+		localizedName = statRecord.LocalizedName();
+		if( !( IsStringValid( localizedName ) ) )
+		{
+			localizedName = m_LocMgr.Localize( EnumValueToName( 'gamedataStatType', ( ( Int64 )( statRecord.StatType() ) ) ) );
+		}
+		return localizedName;
+	}
+
+	private function SetActiveWeapon( activeWeapon : ItemID )
+	{
+		m_ActiveWeapon = activeWeapon;
+	}
+
+	public function MarkToRebuild()
+	{
+		var i, limit : Int32;
+		m_ToRebuild = true;
+		m_ToRebuildItemsWithEquipped = true;
+		m_ToRebuildEquipment = true;
+		m_ToRebuildWeapons = true;
+		m_ToRebuildQuickSlots = true;
+		m_ToRebuildConsumables = true;
+		for( i = 0, limit = m_PartsData.Size(); i < limit; i += 1 )
+		{
+			m_PartsData[ i ].ToRebuild = true;
+		}
+		for( i = 0, limit = m_ToRebuildEquipmentArea.Size(); i < limit; i += 1 )
+		{
+			m_ToRebuildEquipmentArea[ i ] = true;
+		}
+	}
+
+	public function IsSlotOverriden( area : gamedataEquipmentArea ) : Bool
+	{
+		return m_EquipmentSystem.GetPlayerData( m_Player ).IsSlotOverriden( area );
+	}
+
+	public function GetVisualItemInSlot( area : gamedataEquipmentArea ) : ItemID
+	{
+		return m_EquipmentSystem.GetPlayerData( m_Player ).GetVisualItemInSlot( area );
+	}
+
+	public function IsWardrobeEnabled() : Bool
+	{
+		return m_EquipmentSystem.GetPlayerData( m_Player ).IsWardrobeEnabled();
+	}
+
+	public function EquipVisuals( itemId : ItemID )
+	{
+		var request : EquipVisualsRequest;
+		if( ItemID.IsValid( itemId ) )
+		{
+			request = new EquipVisualsRequest;
+			request.itemID = itemId;
+			request.owner = m_Player;
+			m_EquipmentSystem.QueueRequest( request );
+		}
+	}
+
+	public function UnequipVisuals( area : gamedataEquipmentArea )
+	{
+		var request : UnequipVisualsRequest;
+		request = new UnequipVisualsRequest;
+		request.area = area;
+		request.owner = m_Player;
+		m_EquipmentSystem.QueueRequest( request );
+	}
+
+	public function EquipItem( itemId : ItemID, slot : Int32 )
+	{
+		var equipRequest : GameplayEquipRequest;
+		if( ItemID.IsValid( itemId ) )
+		{
+			equipRequest = new GameplayEquipRequest;
+			equipRequest.itemID = itemId;
+			equipRequest.owner = m_Player;
+			equipRequest.slotIndex = slot;
+			equipRequest.forceEquipWeapon = true;
+			m_EquipmentSystem.QueueRequest( equipRequest );
+		}
+	}
+
+	public function UnequipItem( equipArea : gamedataEquipmentArea, slot : Int32 )
+	{
+		var unequipRequest : UnequipRequest;
+		if( equipArea != gamedataEquipmentArea.Invalid )
+		{
+			unequipRequest = new UnequipRequest;
+			unequipRequest.areaType = equipArea;
+			unequipRequest.owner = m_Player;
+			unequipRequest.slotIndex = slot;
+			m_EquipmentSystem.QueueRequest( unequipRequest );
+		}
+	}
+
+	public function InstallPart( itemData : InventoryItemData, partID : ItemID, slotID : TweakDBID )
+	{
+		InstallPart( InventoryItemData.GetID( itemData ), partID, slotID );
+	}
+
+	public function CanInstallPart( itemData : InventoryItemData ) : Bool
+	{
+		if( ( InventoryItemData.IsEmpty( itemData ) || InventoryItemData.IsEquipped( itemData ) ) || !( InventoryItemData.IsRequirementMet( itemData ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public function InstallPart( itemId : ItemID, partId : ItemID, slotID : TweakDBID )
+	{
+		var installPartRequest : InstallItemPart;
+		installPartRequest = new InstallItemPart;
+		installPartRequest.Set( m_Player, itemId, partId, slotID );
+		m_ItemModificationSystem.QueueRequest( installPartRequest );
+	}
+
+	private function RemovePart( itemId : ItemID, slotId : TweakDBID )
+	{
+		var removeRequest : RemoveItemPart;
+		removeRequest = new RemoveItemPart;
+		removeRequest.Set( m_Player, itemId, slotId );
+		m_ItemModificationSystem.QueueRequest( removeRequest );
+	}
+
+	private function SwapPart( itemId : ItemID, partId : ItemID, slotId : TweakDBID )
+	{
+		var swapRequest : SwapItemPart;
+		swapRequest = new SwapItemPart;
+		swapRequest.Set( m_Player, itemId, partId, slotId );
+		m_ItemModificationSystem.QueueRequest( swapRequest );
+	}
+
+	private function IsAttachmentDedicated( slotID : TweakDBID ) : Bool
+	{
+		return ( ( ( ( ( ( ( ( ( ( ( ( slotID == T"AttachmentSlots.SmartWeaponModRare" ) || ( slotID == T"AttachmentSlots.TechWeaponModRare" ) ) || ( slotID == T"AttachmentSlots.PowerWeaponModRare" ) ) || ( slotID == T"AttachmentSlots.SmartWeaponModEpic" ) ) || ( slotID == T"AttachmentSlots.TechWeaponModEpic" ) ) || ( slotID == T"AttachmentSlots.PowerWeaponModEpic" ) ) || ( slotID == T"AttachmentSlots.SmartWeaponModLegendary" ) ) || ( slotID == T"AttachmentSlots.TechWeaponModLegendary" ) ) || ( slotID == T"AttachmentSlots.PowerWeaponModLegendary" ) ) || ( slotID == T"AttachmentSlots.IconicMeleeWeaponMod1" ) ) || ( slotID == T"AttachmentSlots.IconicWeaponModLegendary" ) ) || ( slotID == T"AttachmentSlots.InnerChestFabricEnhancer4" ) ) || ( slotID == T"AttachmentSlots.OuterChestFabricEnhancer4" );
+	}
+
+	private function IsFilledWithDummyPart( innerItemData : InnerItemData ) : Bool
+	{
+		var result : Bool;
+		result = InnerItemData.GetStaticData( innerItemData ).TagsContains( 'DummyPart' );
+		return result;
+	}
+
+	private function GetAttachements( owner : weak< GameObject >, itemIData : gameItemData, out attachments : array< InventoryItemAttachments >, abilities : ref< array< InventoryItemAbility > > )
+	{
+		var itemSlots : array< SPartSlots >;
+		var i, limit : Int32;
+		var j, limitJ : Int32;
+		var attachementType : InventoryItemAttachmentType;
+		var attachmentSlotRecord : weak< AttachmentSlot_Record >;
+		var attachment : InventoryItemAttachments;
+		var inventorySlots : array< TweakDBID >;
+		var once : Bool;
+		var shouldBeAvailable : Bool;
+		var itemId : ItemID;
+		var attachmentItemRecord : weak< Item_Record >;
+		itemId = itemIData.GetID();
+		itemSlots = ItemModificationSystem.GetAllSlots( itemIData );
+		inventorySlots = GetAttachmentSlotsForInventory();
+		for( i = 0, limit = inventorySlots.Size(); i < limit; i += 1 )
+		{
+			for( j = 0, limitJ = itemSlots.Size(); j < limitJ; j += 1 )
+			{
+				if( inventorySlots[ i ] == itemSlots[ j ].slotID )
+				{
+					attachmentSlotRecord = TweakDBInterface.GetAttachmentSlotRecord( itemSlots[ j ].slotID );
+					shouldBeAvailable = RPGManager.ShouldSlotBeAvailable( owner, itemId, attachmentSlotRecord );
+					if( attachmentSlotRecord && shouldBeAvailable )
+					{
+						if( IsFilledWithDummyPart( itemSlots[ j ].innerItemData ) )
+						{
+							continue;
+						}
+						attachementType = ( ( IsAttachmentDedicated( itemSlots[ j ].slotID ) ) ? ( InventoryItemAttachmentType.Dedicated ) : ( InventoryItemAttachmentType.Generic ) );
+						attachment = new InventoryItemAttachments;
+						attachment.SlotID = itemSlots[ j ].slotID;
+						attachment.ItemData = GetPartInventoryItemData( owner, itemSlots[ j ], itemIData );
+						attachment.SlotName = attachmentSlotRecord.LocalizedName();
+						attachment.SlotType = attachementType;
+						attachments.PushBack( attachment );
+					}
+				}
+				if( once )
+				{
+					if( ItemID.IsValid( itemSlots[ j ].installedPart ) )
+					{
+						attachmentItemRecord = InnerItemData.GetStaticData( itemSlots[ j ].innerItemData );
+						if( attachmentItemRecord )
+						{
+							FillSpecialAbilities( attachmentItemRecord, abilities, itemIData, itemSlots[ j ].innerItemData );
+						}
+					}
+				}
+			}
+			once = false;
+		}
+	}
+
+	public function GetAttachements( owner : weak< GameObject >, itemId : ItemID, itemData : weak< gameItemData >, out attachments : array< InventoryItemAttachments >, abilities : ref< array< InventoryItemAbility > > )
+	{
+		var i, limit : Int32;
+		var j, limitJ : Int32;
+		var itemSlots : array< SPartSlots >;
+		var inventorySlots : array< TweakDBID >;
+		var attachment : InventoryItemAttachments;
+		var attachmentSlotRecord : weak< AttachmentSlot_Record >;
+		var attachmentItemRecord : weak< Item_Record >;
+		var once : Bool;
+		var shouldBeAvailable : Bool;
+		var attachementType : InventoryItemAttachmentType;
+		once = true;
+		itemSlots = ItemModificationSystem.GetAllSlots( owner, itemId );
+		inventorySlots = GetAttachmentSlotsForInventory();
+		for( i = 0, limit = inventorySlots.Size(); i < limit; i += 1 )
+		{
+			for( j = 0, limitJ = itemSlots.Size(); j < limitJ; j += 1 )
+			{
+				if( inventorySlots[ i ] == itemSlots[ j ].slotID )
+				{
+					attachmentSlotRecord = TweakDBInterface.GetAttachmentSlotRecord( itemSlots[ j ].slotID );
+					shouldBeAvailable = RPGManager.ShouldSlotBeAvailable( owner, itemId, attachmentSlotRecord );
+					if( attachmentSlotRecord && shouldBeAvailable )
+					{
+						if( itemSlots[ j ].status == ESlotState.Taken )
+						{
+							if( IsFilledWithDummyPart( itemSlots[ j ].innerItemData ) )
+							{
+								continue;
+							}
+						}
+						attachementType = ( ( IsAttachmentDedicated( itemSlots[ j ].slotID ) ) ? ( InventoryItemAttachmentType.Dedicated ) : ( InventoryItemAttachmentType.Generic ) );
+						attachment = new InventoryItemAttachments;
+						attachment.SlotID = itemSlots[ j ].slotID;
+						attachment.ItemData = GetPartInventoryItemData( owner, itemSlots[ j ], itemData );
+						attachment.SlotName = attachmentSlotRecord.LocalizedName();
+						attachment.SlotType = attachementType;
+						attachments.PushBack( attachment );
+					}
+				}
+				if( once )
+				{
+					if( ItemID.IsValid( itemSlots[ j ].installedPart ) )
+					{
+						attachmentItemRecord = InnerItemData.GetStaticData( itemSlots[ j ].innerItemData );
+						if( attachmentItemRecord )
+						{
+							FillSpecialAbilities( attachmentItemRecord, abilities, itemData, itemSlots[ j ].innerItemData );
+						}
+					}
+				}
+			}
+			once = false;
+		}
+	}
+
+	public function GetAttachements( owner : weak< GameObject >, itemData : weak< gameItemData >, usedSlots : array< TweakDBID >, emptySlots : array< TweakDBID >, out mods : array< MinimalItemTooltipModData >, out dedicatedMods : array< MinimalItemTooltipModAttachmentData > )
+	{
+		var i, limit : Int32;
+		var inventorySlots : array< TweakDBID >;
+		var attachmentSlotRecord : weak< AttachmentSlot_Record >;
+		var attachmentType : InventoryItemAttachmentType;
+		var attachmentData : MinimalItemTooltipModAttachmentData;
+		var slotsData : array< AttachmentSlotCacheData >;
+		var itemId : ItemID;
+		var partData : InnerItemData;
+		var staticData : weak< Item_Record >;
+		var emptySlotsSize, usedSlotsSize : Int32;
+		emptySlotsSize = emptySlots.Size();
+		usedSlotsSize = usedSlots.Size();
+		if( ( emptySlotsSize < 1 ) && ( usedSlotsSize < 1 ) )
+		{
+			return;
+		}
+		itemId = itemData.GetID();
+		inventorySlots = GetAttachmentSlotsForInventory();
+		for( i = 0, limit = inventorySlots.Size(); i < limit; i += 1 )
+		{
+			if( ( emptySlotsSize > 0 ) && emptySlots.Contains( inventorySlots[ i ] ) )
+			{
+				attachmentSlotRecord = TweakDBInterface.GetAttachmentSlotRecord( inventorySlots[ i ] );
+				slotsData.PushBack( AttachmentSlotCacheData( true, attachmentSlotRecord, RPGManager.ShouldSlotBeAvailable( owner, itemId, attachmentSlotRecord ), inventorySlots[ i ] ) );
+				emptySlotsSize -= 1;
+				emptySlots.Remove( inventorySlots[ i ] );
+			}
+			if( ( usedSlotsSize > 0 ) && usedSlots.Contains( inventorySlots[ i ] ) )
+			{
+				attachmentSlotRecord = TweakDBInterface.GetAttachmentSlotRecord( inventorySlots[ i ] );
+				slotsData.PushBack( AttachmentSlotCacheData( false, attachmentSlotRecord, RPGManager.ShouldSlotBeAvailable( owner, itemId, attachmentSlotRecord ), inventorySlots[ i ] ) );
+				usedSlotsSize -= 1;
+				usedSlots.Remove( inventorySlots[ i ] );
+			}
+		}
+		for( i = 0, limit = slotsData.Size(); i < limit; i += 1 )
+		{
+			staticData = NULL;
+			if( slotsData[ i ].attachmentSlotRecord && slotsData[ i ].shouldBeAvailable )
+			{
+				if( !( slotsData[ i ].empty ) )
+				{
+					itemData.GetItemPart( partData, slotsData[ i ].slotId );
+					staticData = InnerItemData.GetStaticData( partData );
+					if( staticData.TagsContains( 'DummyPart' ) )
+					{
+						continue;
+					}
+				}
+				attachmentType = ( ( IsAttachmentDedicated( slotsData[ i ].slotId ) ) ? ( InventoryItemAttachmentType.Dedicated ) : ( InventoryItemAttachmentType.Generic ) );
+				if( attachmentType == InventoryItemAttachmentType.Dedicated && ( staticData == NULL ) )
+				{
+					continue;
+				}
+				attachmentData = new MinimalItemTooltipModAttachmentData;
+				attachmentData.isEmpty = slotsData[ i ].empty;
+				if( staticData != NULL )
+				{
+					if( InnerItemData.HasStatData( partData, gamedataStatType.Quality ) )
+					{
+						attachmentData.qualityName = UIItemsHelper.QualityEnumToName( RPGManager.GetInnerItemDataQuality( partData ) );
+					}
+					FillSpecialAbilities( staticData, attachmentData.abilities, itemData, partData );
+					attachmentData.abilitiesSize = attachmentData.abilities.Size();
+					attachmentData.slotName = LocKeyToString( staticData.DisplayName() );
+				}
+				else
+				{
+					attachmentData.slotName = GetLocalizedText( UIItemsHelper.GetEmptySlotName( slotsData[ i ].slotId ) );
+				}
+				if( attachmentType == InventoryItemAttachmentType.Dedicated )
+				{
+					dedicatedMods.PushBack( attachmentData );
+				}
+				else
+				{
+					mods.PushBack( attachmentData );
+				}
+			}
+		}
+	}
+
+	private const function FillSpecialAbilities( itemRecord : Item_Record, abilities : ref< array< InventoryItemAbility > >, optional itemData : weak< gameItemData >, optional partItemData : InnerItemData )
+	{
+		var GLPAbilities : array< weak< GameplayLogicPackage_Record > >;
+		var i, limit : Int32;
+		var ability : InventoryItemAbility;
+		var uiData : weak< GameplayLogicPackageUIData_Record >;
+		itemRecord.OnAttach( GLPAbilities );
+		for( i = 0, limit = GLPAbilities.Size(); i < limit; i += 1 )
+		{
+			if( GLPAbilities[ i ] )
+			{
+				uiData = GLPAbilities[ i ].UIData();
+				if( uiData )
+				{
+					ability = InventoryItemAbility( uiData.IconPath(), uiData.LocalizedName(), uiData.LocalizedDescription(), UILocalizationDataPackage.FromLogicUIDataPackage( uiData, , partItemData ) );
+					abilities.PushBack( ability );
+				}
+			}
+		}
+		GLPAbilities.Clear();
+		itemRecord.OnEquip( GLPAbilities );
+		for( i = 0, limit = GLPAbilities.Size(); i < limit; i += 1 )
+		{
+			if( GLPAbilities[ i ] )
+			{
+				uiData = GLPAbilities[ i ].UIData();
+				if( uiData )
+				{
+					ability = InventoryItemAbility( uiData.IconPath(), uiData.LocalizedName(), uiData.LocalizedDescription(), UILocalizationDataPackage.FromLogicUIDataPackage( uiData ) );
+					abilities.PushBack( ability );
+				}
+			}
+		}
+	}
+
+	private const function GetStatsUIMapName( itemData : weak< gameItemData > ) : String
+	{
+		var statsMapName : String;
+		if( itemData )
+		{
+			statsMapName = GetStatsUIMapName( itemData.GetID() );
+		}
+		return statsMapName;
+	}
+
+	public const function GetStatsUIMapName( itemId : ItemID ) : String
+	{
+		var statsMapName : String;
+		var itemRecord : weak< Item_Record >;
+		var itemType : weak< ItemType_Record >;
+		if( ItemID.IsValid( itemId ) )
+		{
+			itemRecord = TDB.GetItemRecord( ItemID.GetTDBID( itemId ) );
+			if( itemRecord )
+			{
+				itemType = itemRecord.ItemType();
+				if( itemType )
+				{
+					statsMapName = "UIMaps." + EnumValueToString( "gamedataItemType", ( ( Int32 )( itemType.Type() ) ) );
+				}
+			}
+		}
+		return statsMapName;
+	}
+
+	private const function GetStatsList( mapPath : TweakDBID, itemData : InnerItemData, out primeStatsList : array< StatViewData >, out secondStatsList : array< StatViewData >, optional compareWithData : weak< gameItemData > )
+	{
+		var statProvider, compareDataProvider : StatProvider;
+		statProvider = new StatProvider;
+		statProvider.Setup( itemData );
+		compareDataProvider = new StatProvider;
+		compareDataProvider.Setup( compareWithData );
+		GetStatsList( mapPath, statProvider, primeStatsList, secondStatsList, compareDataProvider );
+	}
+
+	private const function GetStatsList( mapPath : TweakDBID, itemData : weak< gameItemData >, out primeStatsList : array< StatViewData >, out secondStatsList : array< StatViewData >, optional compareWithData : weak< gameItemData > )
+	{
+		var statProvider, compareDataProvider : StatProvider;
+		statProvider = new StatProvider;
+		statProvider.Setup( itemData );
+		compareDataProvider = new StatProvider;
+		compareDataProvider.Setup( compareWithData );
+		GetStatsList( mapPath, statProvider, primeStatsList, secondStatsList, compareDataProvider );
+	}
+
+	private const function GetStatsList( mapPath : TweakDBID, itemData : InventoryItemData, out primeStatsList : array< StatViewData >, out secondStatsList : array< StatViewData >, compareWithData : InventoryItemData )
+	{
+		var statProvider, compareDataProvider : StatProvider;
+		statProvider = new StatProvider;
+		statProvider.Setup( itemData );
+		compareDataProvider = new StatProvider;
+		compareDataProvider.Setup( compareWithData );
+		GetStatsList( mapPath, statProvider, primeStatsList, secondStatsList, compareDataProvider );
+	}
+
+	private const function GetStatsList( mapPath : TweakDBID, statProvider : StatProvider, out primeStatsList : array< StatViewData >, out secondStatsList : array< StatViewData >, optional compareWithData : StatProvider )
+	{
+		var stats : weak< UIStatsMap_Record >;
+		var statRecords : array< weak< Stat_Record > >;
+		var compareStatRecords : array< weak< Stat_Record > >;
+		stats = TDB.GetUIStatsMapRecord( mapPath );
+		primeStatsList.Clear();
+		secondStatsList.Clear();
+		if( stats )
+		{
+			stats.StatsToCompare( compareStatRecords );
+			stats.PrimaryStats( statRecords );
+			FillStatsList( statProvider, statRecords, primeStatsList, compareStatRecords, compareWithData );
+			statRecords.Clear();
+			stats.SecondaryStats( statRecords );
+			FillStatsList( statProvider, statRecords, secondStatsList, compareStatRecords, compareWithData );
+		}
+	}
+
+	private const function FillStatsList( statProvider : StatProvider, statRecords : array< weak< Stat_Record > >, out statList : array< StatViewData >, compareStatRecords : array< weak< Stat_Record > >, optional compareWithData : StatProvider )
+	{
+		var i, count : Int32;
+		var currStatRecord : weak< Stat_Record >;
+		var currentStatViewData : StatViewData;
+		var currentType : gamedataStatType;
+		var maxValue, compareValue : Int32;
+		var compareValueF : Float;
+		count = statRecords.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			currStatRecord = statRecords[ i ];
+			currentType = currStatRecord.StatType();
+			if( statProvider.HasStatData( currentType ) )
+			{
+				currentStatViewData.type = currentType;
+				currentStatViewData.statName = GetLocalizedStatName( currStatRecord );
+				currentStatViewData.value = statProvider.GetStatValueByType( currentType );
+				currentStatViewData.valueF = statProvider.GetStatValueFByType( currentType );
+				currentStatViewData.canBeCompared = compareStatRecords.Contains( currStatRecord );
+				currentStatViewData.isCompared = compareWithData.HasStatData( currentType );
+				if( currentStatViewData.isCompared )
+				{
+					compareValue = compareWithData.GetStatValueByType( currentType );
+					compareValueF = compareWithData.GetStatValueFByType( currentType );
+					currentStatViewData.diffValue = currentStatViewData.value - compareValue;
+					currentStatViewData.diffValueF = currentStatViewData.valueF - compareValueF;
+				}
+				else
+				{
+					currentStatViewData.diffValue = 0;
+					currentStatViewData.diffValueF = 0.0;
+				}
+				if( currentStatViewData.value > maxValue )
+				{
+					maxValue = currentStatViewData.value;
+				}
+				currentStatViewData.statMaxValue = RoundMath( currStatRecord.Max() );
+				currentStatViewData.statMinValue = RoundMath( currStatRecord.Min() );
+				currentStatViewData.statMaxValueF = currStatRecord.Max();
+				currentStatViewData.statMinValueF = currStatRecord.Min();
+				statList.PushBack( currentStatViewData );
+			}
+		}
+	}
+
+	public function PushComparisonTooltipsData( out tooltipsData : array< ATooltipData >, equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool )
+	{
+		tooltipsData.PushBack( GetComparisonTooltipsData( equippedItem, inspectedItemData, false, iconErrorInfo, overrideRarity ) );
+		tooltipsData.PushBack( GetComparisonTooltipsData( inspectedItemData, equippedItem, true, , overrideRarity ) );
+	}
+
+	public function PushIdentifiedComparisonTooltipsData( out tooltipsData : array< ATooltipData >, name1 : CName, name2 : CName, equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool )
+	{
+		var identifiedInspectedData, identifiedEquippedData : IdentifiedWrappedTooltipData;
+		identifiedInspectedData = new IdentifiedWrappedTooltipData;
+		identifiedEquippedData = new IdentifiedWrappedTooltipData;
+		identifiedInspectedData.m_identifier = name1;
+		identifiedInspectedData.m_data = GetComparisonTooltipsData( equippedItem, inspectedItemData, false, iconErrorInfo, overrideRarity );
+		identifiedEquippedData.m_identifier = name2;
+		identifiedEquippedData.m_data = GetComparisonTooltipsData( inspectedItemData, equippedItem, true, , overrideRarity );
+		tooltipsData.PushBack( identifiedInspectedData );
+		tooltipsData.PushBack( identifiedEquippedData );
+	}
+
+	public function PushIdentifiedComparisonTooltipsData( out tooltipsData : array< ATooltipData >, name1 : CName, name2 : CName, equippedItem : weak< UIInventoryItem >, inspectedItem : weak< UIInventoryItem >, displayContext : weak< ItemDisplayContextData >, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool )
+	{
+		var identifiedInspectedData, identifiedEquippedData : IdentifiedWrappedTooltipData;
+		var inspectedData, equippedData : UIInventoryItemTooltipWrapper;
+		identifiedInspectedData = new IdentifiedWrappedTooltipData;
+		identifiedEquippedData = new IdentifiedWrappedTooltipData;
+		inspectedData = new UIInventoryItemTooltipWrapper;
+		equippedData = new UIInventoryItemTooltipWrapper;
+		inspectedData.m_data = inspectedItem;
+		inspectedData.m_displayContext = displayContext;
+		inspectedData.m_comparisonData = UIInventoryItemComparisonManager.Make( inspectedItem, equippedItem );
+		equippedData.m_data = equippedItem;
+		equippedData.m_displayContext = displayContext;
+		identifiedInspectedData.m_identifier = name1;
+		identifiedInspectedData.m_data = inspectedData;
+		identifiedEquippedData.m_identifier = name2;
+		identifiedEquippedData.m_data = equippedData;
+		tooltipsData.PushBack( identifiedInspectedData );
+		tooltipsData.PushBack( identifiedEquippedData );
+	}
+
+	public function PushIdentifiedProgramComparisionTooltipsData( out tooltipsData : array< ATooltipData >, name1 : CName, name2 : CName, equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool )
+	{
+		var identifiedInspectedData, identifiedEquippedData : IdentifiedWrappedTooltipData;
+		identifiedInspectedData = new IdentifiedWrappedTooltipData;
+		identifiedEquippedData = new IdentifiedWrappedTooltipData;
+		identifiedInspectedData.m_identifier = name1;
+		identifiedInspectedData.m_data = GetProgramComparisionTooltipsData( equippedItem, inspectedItemData, false, iconErrorInfo, overrideRarity );
+		identifiedEquippedData.m_identifier = name2;
+		identifiedEquippedData.m_data = GetProgramComparisionTooltipsData( inspectedItemData, equippedItem, true, , overrideRarity );
+		tooltipsData.PushBack( identifiedInspectedData );
+		tooltipsData.PushBack( identifiedEquippedData );
+	}
+
+	public function PushIdentifiedProgramComparisionTooltipsData( out tooltipsData : array< ATooltipData >, equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool )
+	{
+		var identifiedInspectedData, identifiedEquippedData : IdentifiedWrappedTooltipData;
+		identifiedInspectedData = new IdentifiedWrappedTooltipData;
+		identifiedEquippedData = new IdentifiedWrappedTooltipData;
+		identifiedInspectedData.m_identifier = 'programTooltip';
+		identifiedInspectedData.m_data = GetProgramComparisionTooltipsData( equippedItem, inspectedItemData, false, iconErrorInfo, overrideRarity );
+		identifiedEquippedData.m_identifier = 'programTooltipComparision';
+		identifiedEquippedData.m_data = GetProgramComparisionTooltipsData( inspectedItemData, equippedItem, true, , overrideRarity );
+		tooltipsData.PushBack( identifiedInspectedData );
+		tooltipsData.PushBack( identifiedEquippedData );
+	}
+
+	public function PushProgramComparisionTooltipsData( out tooltipsData : array< ATooltipData >, equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool )
+	{
+		tooltipsData.PushBack( GetProgramComparisionTooltipsData( equippedItem, inspectedItemData, false, iconErrorInfo, overrideRarity ) );
+		tooltipsData.PushBack( GetProgramComparisionTooltipsData( inspectedItemData, equippedItem, true, , overrideRarity ) );
+	}
+
+	public function GetProgramComparisionTooltipsData( equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional equipped : Bool, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool ) : InventoryTooltipData
+	{
+		var tooltipData : InventoryItemData;
+		var result : InventoryTooltipData;
+		var isEquippedEmpty : Bool;
+		var comparedQuickhackData : InventoryTooltipData_QuickhackData;
+		isEquippedEmpty = InventoryItemData.IsEmpty( equippedItem );
+		tooltipData = inspectedItemData;
+		if( !( isEquippedEmpty ) )
+		{
+			InventoryItemData.SetComparedQuality( tooltipData, UIItemsHelper.QualityNameToEnum( InventoryItemData.GetQuality( equippedItem ) ) );
+		}
+		result = GetTooltipDataForInventoryItem( tooltipData, equipped, iconErrorInfo, InventoryItemData.IsVendorItem( inspectedItemData ), overrideRarity );
+		if( !( isEquippedEmpty ) )
+		{
+			comparedQuickhackData = GetQuickhackTooltipData( equippedItem );
+			result.quickhackData.uploadTimeDiff = result.quickhackData.uploadTime - comparedQuickhackData.uploadTime;
+			result.quickhackData.durationDiff = result.quickhackData.duration - comparedQuickhackData.duration;
+			result.quickhackData.cooldownDiff = result.quickhackData.cooldown - comparedQuickhackData.cooldown;
+		}
+		return result;
+	}
+
+	public function GetComparisonTooltipsData( equippedItem : InventoryItemData, inspectedItemData : InventoryItemData, optional equipped : Bool, optional iconErrorInfo : DEBUG_IconErrorInfo, optional overrideRarity : Bool ) : InventoryTooltipData
+	{
+		var statsMapName : String;
+		var tooltipData : InventoryItemData;
+		var primaryStats : array< StatViewData >;
+		var secondaryStats : array< StatViewData >;
+		tooltipData = inspectedItemData;
+		if( !( InventoryItemData.IsEmpty( equippedItem ) ) )
+		{
+			statsMapName = GetStatsUIMapName( InventoryItemData.GetID( inspectedItemData ) );
+			if( IsStringValid( statsMapName ) )
+			{
+				GetStatsList( TDBID.Create( statsMapName ), inspectedItemData, primaryStats, secondaryStats, equippedItem );
+				InventoryItemData.SetPrimaryStats( tooltipData, primaryStats );
+				InventoryItemData.SetSecondaryStats( tooltipData, secondaryStats );
+			}
+			InventoryItemData.SetComparedQuality( tooltipData, UIItemsHelper.QualityNameToEnum( InventoryItemData.GetQuality( equippedItem ) ) );
+		}
+		return GetTooltipDataForInventoryItem( tooltipData, equipped, iconErrorInfo, InventoryItemData.IsVendorItem( inspectedItemData ), overrideRarity );
+	}
+
+	public function GetMinimalComparisionLootingData() {}
+
+	public const function CanCompareItems( itemId : ItemID, compareItemId : ItemID ) : Bool
+	{
+		var compareItemType : weak< ItemType_Record >;
+		var compareItemRecord : Item_Record;
+		var statsMapName : String;
+		var stats : UIStatsMap_Record;
+		var typesToCompare : array< weak< ItemType_Record > >;
+		if( !( ItemID.IsValid( itemId ) ) || !( ItemID.IsValid( compareItemId ) ) )
+		{
+			return false;
+		}
+		compareItemRecord = TDB.GetItemRecord( ItemID.GetTDBID( compareItemId ) );
+		compareItemType = compareItemRecord.ItemType();
+		statsMapName = GetStatsUIMapName( itemId );
+		if( !( IsStringValid( statsMapName ) ) )
+		{
+			return false;
+		}
+		stats = TDB.GetUIStatsMapRecord( TDBID.Create( statsMapName ) );
+		stats.TypesToCompareWith( typesToCompare );
+		return typesToCompare.Contains( compareItemType );
+	}
+
+	private virtual function GetDPS( data : InventoryItemData ) : Int32
+	{
+		var i, limit : Int32;
+		var size : Int32;
+		var stat : StatViewData;
+		if( !( InventoryItemData.IsEmpty( data ) ) )
+		{
+			size = InventoryItemData.GetPrimaryStatsSize( data );
+			for( i = 0, limit = size; i < limit; i += 1 )
+			{
+				stat = InventoryItemData.GetPrimaryStat( data, i );
+				if( stat.type == gamedataStatType.DPS )
+				{
+					return stat.value;
+				}
+			}
+		}
+		return 0;
+	}
+
+	public function GetItemsToCompare( equipmentArea : gamedataEquipmentArea ) : array< InventoryItemData >
+	{
+		var result : array< InventoryItemData >;
+		var comparableItem : InventoryItemData;
+		if( equipmentArea == gamedataEquipmentArea.Weapon )
+		{
+			return GetEquippedWeapons();
+		}
+		comparableItem = GetItemToCompare( equipmentArea );
+		if( !( InventoryItemData.IsEmpty( comparableItem ) ) )
+		{
+			result.PushBack( comparableItem );
+		}
+		return result;
+	}
+
+	public function GetItemsIDsToCompare( equipmentArea : gamedataEquipmentArea ) : array< ItemID >
+	{
+		var result : array< ItemID >;
+		var comparableItem : ItemID;
+		if( equipmentArea == gamedataEquipmentArea.Weapon )
+		{
+			return GetEquippedWeaponsIDs();
+		}
+		comparableItem = GetItemIDToCompare( equipmentArea );
+		if( ItemID.IsValid( comparableItem ) )
+		{
+			result.PushBack( comparableItem );
+		}
+		return result;
+	}
+
+	public static function IsAreaHead( equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		return gamedataEquipmentArea.Face == equipmentArea || gamedataEquipmentArea.Head == equipmentArea;
+	}
+
+	public static function IsAreaClothing( equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		return ( ( ( ( ( gamedataEquipmentArea.Face == equipmentArea || gamedataEquipmentArea.Feet == equipmentArea ) || gamedataEquipmentArea.Head == equipmentArea ) || gamedataEquipmentArea.InnerChest == equipmentArea ) || gamedataEquipmentArea.Legs == equipmentArea ) || gamedataEquipmentArea.OuterChest == equipmentArea ) || gamedataEquipmentArea.Outfit == equipmentArea;
+	}
+
+	public static function IsAreaSelfComparable( equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		return InventoryDataManagerV2.IsAreaClothing( equipmentArea );
+	}
+
+	public static function IsEquipmentAreaComparable( equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		if( InventoryDataManagerV2.IsAreaSelfComparable( equipmentArea ) )
+		{
+			return true;
+		}
+		return equipmentArea == gamedataEquipmentArea.Weapon;
+	}
+
+	public function GetItemsToCompare( item : InventoryItemData ) : array< InventoryItemData >
+	{
+		var result : array< InventoryItemData >;
+		if( !( InventoryItemData.IsEmpty( item ) ) )
+		{
+			return GetItemsToCompare( InventoryItemData.GetEquipmentArea( item ) );
+		}
+		return result;
+	}
+
+	public function GetItemToCompare( equipmentArea : gamedataEquipmentArea ) : InventoryItemData
+	{
+		var emptyItem : InventoryItemData;
+		if( IsAreaSelfComparable( equipmentArea ) )
+		{
+			return GetItemDataEquippedInArea( equipmentArea, 0 );
+		}
+		return emptyItem;
+	}
+
+	public function GetItemIDToCompare( equipmentArea : gamedataEquipmentArea ) : ItemID
+	{
+		if( IsAreaSelfComparable( equipmentArea ) )
+		{
+			return GetEquippedItemIdInArea( equipmentArea, 0 );
+		}
+		return ItemID.None();
+	}
+
+	public function GetPrefferedEquipedItemToCompare( item : InventoryItemData ) : Int32
+	{
+		return GetPrefferedEquipedItemToCompare( item, GetItemsToCompare( item ) );
+	}
+
+	public function GetPrefferedEquipedItemToCompare( item : InventoryItemData, itemsToCompare : array< InventoryItemData > ) : Int32
+	{
+		return GetPrefferedEquipedItemToCompareRef( item, itemsToCompare );
+	}
+
+	public function GetPrefferedEquipedItemToCompareRef( item : InventoryItemData, itemsToCompare : ref< array< InventoryItemData > > ) : Int32
+	{
+		var i : Int32;
+		var result : Int32;
+		if( !( InventoryItemData.IsEmpty( item ) ) )
+		{
+			if( InventoryItemData.GetEquipmentArea( item ) == gamedataEquipmentArea.Weapon )
+			{
+				for( i = 0; i < itemsToCompare.Size(); i += 1 )
+				{
+					if( InventoryItemData.GetName( itemsToCompare[ i ] ) == InventoryItemData.GetName( item ) )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < itemsToCompare.Size(); i += 1 )
+				{
+					if( InventoryItemData.GetItemType( itemsToCompare[ i ] ) == InventoryItemData.GetItemType( item ) )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < itemsToCompare.Size(); i += 1 )
+				{
+					if( GetDPS( itemsToCompare[ i ] ) > GetDPS( itemsToCompare[ result ] ) )
+					{
+						result = i;
+					}
+				}
+				return result;
+			}
+			else
+			{
+				return result;
+			}
+		}
+		return result;
+	}
+
+	public function GetPrefferedEquipedItemIDToCompare( item : InventoryItemData, itemsToCompare : ref< array< InventoryItemData > > ) : Int32
+	{
+		var i : Int32;
+		var result : Int32;
+		if( !( InventoryItemData.IsEmpty( item ) ) )
+		{
+			if( InventoryItemData.GetEquipmentArea( item ) == gamedataEquipmentArea.Weapon )
+			{
+				for( i = 0; i < itemsToCompare.Size(); i += 1 )
+				{
+					if( InventoryItemData.GetName( itemsToCompare[ i ] ) == InventoryItemData.GetName( item ) )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < itemsToCompare.Size(); i += 1 )
+				{
+					if( InventoryItemData.GetItemType( itemsToCompare[ i ] ) == InventoryItemData.GetItemType( item ) )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < itemsToCompare.Size(); i += 1 )
+				{
+					if( GetDPS( itemsToCompare[ i ] ) > GetDPS( itemsToCompare[ result ] ) )
+					{
+						result = i;
+					}
+				}
+				return result;
+			}
+			else
+			{
+				return result;
+			}
+		}
+		return result;
+	}
+
+	public function GetPrefferedEquipedItemIDToCompare( item : weak< gameItemData >, itemRecord : weak< Item_Record >, equipmentArea : gamedataEquipmentArea, idsToCompare : ref< array< ItemID > > ) : Int32
+	{
+		var i, comparedRecordsSize : Int32;
+		var result : Int32;
+		var targetType : gamedataItemType;
+		var comparedRecord : weak< Item_Record >;
+		var comparedRecords : array< weak< Item_Record > >;
+		var comparedItemData : weak< gameItemData >;
+		var bestDPS, localDPS : Float;
+		targetType = item.GetItemType();
+		if( item )
+		{
+			if( equipmentArea == gamedataEquipmentArea.Weapon )
+			{
+				for( i = 0; i < idsToCompare.Size(); i += 1 )
+				{
+					comparedRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( idsToCompare[ i ] ) );
+					if( comparedRecord.DisplayName() == itemRecord.DisplayName() )
+					{
+						return i;
+					}
+					comparedRecords.PushBack( comparedRecord );
+				}
+				comparedRecordsSize = comparedRecords.Size();
+				for( i = 0; i < comparedRecordsSize; i += 1 )
+				{
+					if( comparedRecords[ i ].ItemType().Type() == targetType )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < comparedRecordsSize; i += 1 )
+				{
+					comparedItemData = GetPlayerItemData( idsToCompare[ i ] );
+					localDPS = comparedItemData.GetStatValueByType( gamedataStatType.EffectiveDPS );
+					if( localDPS > bestDPS )
+					{
+						bestDPS = localDPS;
+						result = i;
+					}
+				}
+				return result;
+			}
+			else
+			{
+				return 0;
+			}
+		}
+		return 0;
+	}
+
+	public function GetEquippedCounterpartForInventroyItem( inspectedItemData : InventoryItemData ) : InventoryItemData
+	{
+		var equippedItem : InventoryItemData;
+		var weapons : array< InventoryItemData >;
+		var equipAreas : array< gamedataEquipmentArea >;
+		var i, limit : Int32;
+		if( !( InventoryItemData.IsEmpty( inspectedItemData ) ) )
+		{
+			if( InventoryItemData.GetEquipmentArea( inspectedItemData ) == gamedataEquipmentArea.Weapon )
+			{
+				weapons = GetEquippedWeapons();
+				for( i = 0, limit = weapons.Size(); i < limit; i += 1 )
+				{
+					if( !( InventoryItemData.IsEmpty( weapons[ i ] ) ) )
+					{
+						if( InventoryItemData.GetID( weapons[ i ] ) == m_ActiveWeapon )
+						{
+							equippedItem = weapons[ i ];
+						}
+					}
+					else
+					{
+						return weapons[ i ];
+					}
+				}
+			}
+			else
+			{
+				equipAreas = GetInventoryEquipmentAreas();
+				if( !( equipAreas.Contains( InventoryItemData.GetEquipmentArea( inspectedItemData ) ) ) )
+				{
+					equipAreas = GetInventoryCyberwareAreas();
+					if( !( equipAreas.Contains( InventoryItemData.GetEquipmentArea( inspectedItemData ) ) ) )
+					{
+						return equippedItem;
+					}
+				}
+				return GetItemDataEquippedInArea( InventoryItemData.GetEquipmentArea( inspectedItemData ) );
+			}
+		}
+		return equippedItem;
+	}
+
+	public function GetAmmoForWeaponType( itemData : InventoryItemData ) : Int32
+	{
+		return m_TransactionSystem.GetItemQuantity( m_Player, ItemID.CreateQuery( TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( InventoryItemData.GetID( itemData ) ) ).Ammo().GetID() ) );
+	}
+
+	public function GetPrefferedComparisonItem( item : InventoryItemData, comparableItems : array< InventoryItemData > ) : InventoryItemData
+	{
+		var prefferedItemIndex : Int32;
+		var result : InventoryItemData;
+		prefferedItemIndex = GetPrefferedEquipedItemToCompare( item, comparableItems );
+		if( prefferedItemIndex < comparableItems.Size() )
+		{
+			result = comparableItems[ prefferedItemIndex ];
+		}
+		return result;
+	}
+
+	public function GetPrefferedComparisonItemID( item : weak< gameItemData >, itemRecord : weak< Item_Record >, equipmentArea : gamedataEquipmentArea, comparableItems : array< ItemID > ) : ItemID
+	{
+		var prefferedItemIndex : Int32;
+		var result : ItemID;
+		prefferedItemIndex = GetPrefferedEquipedItemIDToCompare( item, itemRecord, equipmentArea, comparableItems );
+		if( prefferedItemIndex < comparableItems.Size() )
+		{
+			result = comparableItems[ prefferedItemIndex ];
+		}
+		return result;
+	}
+
+	public function GetComparisonItems( item : InventoryItemData ) : array< InventoryItemData >
+	{
+		var inventoryItems, comparableItems : array< InventoryItemData >;
+		inventoryItems = FilterOutEmptyItems( GetItemsToCompare( item ) );
+		if( !( IsAreaSelfComparable( InventoryItemData.GetEquipmentArea( item ) ) ) )
+		{
+			comparableItems = FilterComparableItems( InventoryItemData.GetID( item ), inventoryItems );
+			return comparableItems;
+		}
+		return inventoryItems;
+	}
+
+	public function GetComparisonItemsIDs( itemID : ItemID, equipmentArea : gamedataEquipmentArea ) : array< ItemID >
+	{
+		var inventoryIDs : array< ItemID >;
+		inventoryIDs = FilterOutInvalidIDs( GetItemsIDsToCompare( equipmentArea ) );
+		if( !( IsAreaSelfComparable( equipmentArea ) ) )
+		{
+			return FilterComparableItemsIDs( itemID, inventoryIDs );
+		}
+		return inventoryIDs;
+	}
+
+	public function GetAllComparisonItems( equipmentArea : gamedataEquipmentArea ) : array< InventoryItemData >
+	{
+		return FilterOutEmptyItems( GetItemsToCompare( equipmentArea ) );
+	}
+
+	public function GetPrefferedComparableItem( item : InventoryItemData, comparableItems : array< InventoryItemData > ) : InventoryItemData
+	{
+		var prefferedItemIndex : Int32;
+		prefferedItemIndex = GetPrefferedEquipedItemToCompare( item, FilterComparableItems( InventoryItemData.GetID( item ), comparableItems ) );
+		return comparableItems[ prefferedItemIndex ];
+	}
+
+	public function FilterOutEmptyItems( items : array< InventoryItemData > ) : array< InventoryItemData >
+	{
+		var i : Int32;
+		var result : array< InventoryItemData >;
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			if( !( InventoryItemData.IsEmpty( items[ i ] ) ) )
+			{
+				result.PushBack( items[ i ] );
+			}
+		}
+		return result;
+	}
+
+	public function FilterOutInvalidIDs( ids : array< ItemID > ) : array< ItemID >
+	{
+		var i, idsSize : Int32;
+		var result : array< ItemID >;
+		for( i = 0, idsSize = ids.Size(); i < idsSize; i += 1 )
+		{
+			if( ItemID.IsValid( ids[ i ] ) )
+			{
+				result.PushBack( ids[ i ] );
+			}
+		}
+		return result;
+	}
+
+	public function FilterComparableItems( itemToCompare : ItemID, items : array< InventoryItemData > ) : array< InventoryItemData >
+	{
+		var i : Int32;
+		var result : array< InventoryItemData >;
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			if( CanCompareItems( itemToCompare, InventoryItemData.GetID( items[ i ] ) ) )
+			{
+				result.PushBack( items[ i ] );
+			}
+		}
+		return result;
+	}
+
+	public function FilterComparableItemsIDs( itemToCompare : ItemID, ids : ref< array< ItemID > > ) : array< ItemID >
+	{
+		var i : Int32;
+		var result : array< ItemID >;
+		for( i = 0; i < ids.Size(); i += 1 )
+		{
+			if( CanCompareItems( itemToCompare, ids[ i ] ) )
+			{
+				result.PushBack( ids[ i ] );
+			}
+		}
+		return result;
+	}
+
+	public function GetAmmoCountForAllAmmoTypes() : array< InventoryItemData >
+	{
+		var ammoList : array< InventoryItemData >;
+		ammoList.PushBack( GetItemFromRecord( "Ammo.Standard" ) );
+		ammoList.PushBack( GetItemFromRecord( "Ammo.Handgun" ) );
+		ammoList.PushBack( GetItemFromRecord( "Ammo.Tech_Rifle" ) );
+		ammoList.PushBack( GetItemFromRecord( "Ammo.Smart_Rifle" ) );
+		ammoList.PushBack( GetItemFromRecord( "Ammo.Power_Rifle" ) );
+		ammoList.PushBack( GetItemFromRecord( "Ammo.Shotgun" ) );
+		return ammoList;
+	}
+
+	public function GetCraftingCountForAllCraftingMaterialTypes() : array< InventoryItemData >
+	{
+		var craftingMaterials : array< InventoryItemData >;
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.CommonMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.UncommonMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.QuickHackUncommonMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.RareMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.RareMaterial2" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.EpicMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.EpicMaterial2" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.QuickHackEpicMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.LegendaryMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.LegendaryMaterial2" ) );
+		return craftingMaterials;
+	}
+
+	public function GetCommonsCraftingMaterialTypes() : array< InventoryItemData >
+	{
+		var craftingMaterials : array< InventoryItemData >;
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.CommonMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.UncommonMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.RareMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.RareMaterial2" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.EpicMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.EpicMaterial2" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.LegendaryMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.LegendaryMaterial2" ) );
+		return craftingMaterials;
+	}
+
+	public function GetHackingCraftingMaterialTypes() : array< InventoryItemData >
+	{
+		var craftingMaterials : array< InventoryItemData >;
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.QuickHackUncommonMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.QuickHackRareMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.QuickHackEpicMaterial1" ) );
+		craftingMaterials.PushBack( GetItemFromRecord( "Items.QuickHackLegendaryMaterial1" ) );
+		return craftingMaterials;
+	}
+
+	public function GetItemFromRecord( tweakPath : String ) : InventoryItemData
+	{
+		var record : Item_Record;
+		var inventoryItemData : InventoryItemData;
+		record = TweakDBInterface.GetItemRecord( TDBID.Create( tweakPath ) );
+		inventoryItemData = GetInventoryItemDataFromItemRecord( record );
+		return inventoryItemData;
+	}
+
+	public function GetItemFromRecord( id : TweakDBID ) : InventoryItemData
+	{
+		var record : Item_Record;
+		var inventoryItemData : InventoryItemData;
+		record = TweakDBInterface.GetItemRecord( id );
+		inventoryItemData = GetInventoryItemDataFromItemRecord( record );
+		return inventoryItemData;
+	}
+
+	public function GetAllCyberwareAbilities() : array< AbilityData >
+	{
+		var cyberwareAbilities : array< AbilityData >;
+		var data : array< SEquipSlot >;
+		var tempData : SEquipSlot;
+		var i : Int32;
+		data = m_EquipmentSystem.GetAllInstalledCyberwareAbilities( m_Player );
+		for( i = 0; i < data.Size(); i += 1 )
+		{
+			tempData = data[ i ];
+			cyberwareAbilities.PushBack( GetAbilityData( tempData.itemID ) );
+		}
+		return cyberwareAbilities;
+	}
+
+	public function GetAbilityData( itemId : ItemID ) : AbilityData
+	{
+		var abilityData : AbilityData;
+		var itemRecord : weak< Item_Record >;
+		if( ItemID.IsValid( itemId ) )
+		{
+			abilityData.Empty = false;
+			itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemId ) );
+			abilityData.ID = itemId;
+			abilityData.Name = LocKeyToString( itemRecord.DisplayName() );
+			abilityData.Description = LocKeyToString( itemRecord.LocalizedDescription() );
+		}
+		return abilityData;
+	}
+
+	public function GetExternalGameItemData( ownerId : EntityID, externalItemId : ItemID ) : weak< gameItemData >
+	{
+		var itemData : weak< gameItemData >;
+		if( ItemID.IsValid( externalItemId ) && m_TransactionSystem )
+		{
+			itemData = m_TransactionSystem.GetItemDataByOwnerEntityId( ownerId, externalItemId );
+		}
+		return itemData;
+	}
+
+	public function GetExternalGameObject( entityId : EntityID ) : weak< GameObject >
+	{
+		if( m_Player )
+		{
+			return ( ( GameObject )( GameInstance.FindEntityByID( m_Player.GetGame(), entityId ) ) );
+		}
+		return NULL;
+	}
+
+	public function GetExternalItemData( ownerId : EntityID, externalItemId : ItemID, optional forceShowCurrencyOnHUDTooltip : Bool ) : InventoryItemData
+	{
+		var itemData : weak< gameItemData >;
+		var owner : weak< GameObject >;
+		itemData = GetExternalGameItemData( ownerId, externalItemId );
+		if( m_Player )
+		{
+			owner = ( ( GameObject )( GameInstance.FindEntityByID( m_Player.GetGame(), ownerId ) ) );
+		}
+		return GetInventoryItemData( owner, itemData, forceShowCurrencyOnHUDTooltip );
+	}
+
+	public function GetExternalItemData( ownerId : EntityID, externalItem : weak< gameItemData >, optional forceShowCurrencyOnHUDTooltip : Bool ) : InventoryItemData
+	{
+		var owner : weak< GameObject >;
+		if( m_Player )
+		{
+			owner = ( ( GameObject )( GameInstance.FindEntityByID( m_Player.GetGame(), ownerId ) ) );
+		}
+		return GetInventoryItemData( owner, externalItem, forceShowCurrencyOnHUDTooltip );
+	}
+
+	private function GetEquipmentAreaLocalizedName( equipmentArea : gamedataEquipmentArea ) : String
+	{
+		var i, limit : Int32;
+		if( m_EquipRecords.Size() < 1 )
+		{
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.Weapon" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.HeadArmor" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.FaceArmor" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.InnerChest" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.ChestArmor" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.LegArmor" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.Feet" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.BrainCW" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.ArmsCW" ) );
+			m_EquipRecords.PushBack( TweakDBInterface.GetEquipmentAreaRecord( T"EquipmentArea.HandsCW" ) );
+		}
+		for( i = 0, limit = m_EquipRecords.Size(); i < limit; i += 1 )
+		{
+			if( m_EquipRecords[ i ].Type() == equipmentArea )
+			{
+				return m_EquipRecords[ i ].LocalizedName();
+			}
+		}
+		return "";
+	}
+
+	public function GetNumberOfSlots( equipmentArea : gamedataEquipmentArea ) : Int32
+	{
+		return m_EquipmentSystem.GetPlayerData( m_Player ).GetNumberOfSlots( equipmentArea );
+	}
+
+	public function SortDataByRarity( items : array< InventoryItemData > ) : array< InventoryItemData >
+	{
+		var i : Int32;
+		var j : Int32;
+		var returnedArray : array< InventoryItemData >;
+		var rarities : array< gamedataQuality >;
+		var tempItem : InventoryItemData;
+		var tempRarity : gamedataQuality;
+		rarities = GetRarityTypesForSorting();
+		for( i = 0; i < rarities.Size(); i += 1 )
+		{
+			tempRarity = rarities[ i ];
+			for( j = 0; j < items.Size(); j += 1 )
+			{
+				tempItem = items[ j ];
+				if( InventoryItemData.GetQuality( tempItem ) == UIItemsHelper.QualityEnumToName( tempRarity ) )
+				{
+					returnedArray.PushBack( tempItem );
+				}
+			}
+		}
+		return returnedArray;
+	}
+
+	public function GetExternalItemStats( ownerId : EntityID, externalItemId : ItemID, optional compareItemId : ItemID ) : ItemViewData
+	{
+		var itemData : weak< gameItemData >;
+		var compareItemData : weak< gameItemData >;
+		if( ItemID.IsValid( compareItemId ) )
+		{
+			compareItemData = m_TransactionSystem.GetItemData( m_Player, compareItemId );
+		}
+		itemData = m_TransactionSystem.GetItemDataByOwnerEntityId( ownerId, externalItemId );
+		return GetItemStatsByData( itemData, compareItemData );
+	}
+
+	public static function GetInventoryEquipmentAreas() : array< gamedataEquipmentArea >
+	{
+		var areas : array< gamedataEquipmentArea >;
+		areas.PushBack( gamedataEquipmentArea.Head );
+		areas.PushBack( gamedataEquipmentArea.Face );
+		areas.PushBack( gamedataEquipmentArea.InnerChest );
+		areas.PushBack( gamedataEquipmentArea.OuterChest );
+		areas.PushBack( gamedataEquipmentArea.Legs );
+		areas.PushBack( gamedataEquipmentArea.Feet );
+		return areas;
+	}
+
+	public static function GetInventoryCyberwareAreas() : array< gamedataEquipmentArea >
+	{
+		var areas : array< gamedataEquipmentArea >;
+		areas.PushBack( gamedataEquipmentArea.SystemReplacementCW );
+		areas.PushBack( gamedataEquipmentArea.ArmsCW );
+		areas.PushBack( gamedataEquipmentArea.HandsCW );
+		areas.PushBack( gamedataEquipmentArea.EyesCW );
+		return areas;
+	}
+
+	public static function GetInventoryWeaponTypes() : array< gamedataItemType >
+	{
+		var areas : array< gamedataItemType >;
+		areas.PushBack( gamedataItemType.Wea_AssaultRifle );
+		areas.PushBack( gamedataItemType.Wea_Axe );
+		areas.PushBack( gamedataItemType.Wea_Chainsword );
+		areas.PushBack( gamedataItemType.Wea_Hammer );
+		areas.PushBack( gamedataItemType.Wea_Handgun );
+		areas.PushBack( gamedataItemType.Wea_Katana );
+		areas.PushBack( gamedataItemType.Wea_Knife );
+		areas.PushBack( gamedataItemType.Wea_LightMachineGun );
+		areas.PushBack( gamedataItemType.Wea_LongBlade );
+		areas.PushBack( gamedataItemType.Wea_Machete );
+		areas.PushBack( gamedataItemType.Wea_Melee );
+		areas.PushBack( gamedataItemType.Wea_OneHandedClub );
+		areas.PushBack( gamedataItemType.Wea_PrecisionRifle );
+		areas.PushBack( gamedataItemType.Wea_Revolver );
+		areas.PushBack( gamedataItemType.Wea_Rifle );
+		areas.PushBack( gamedataItemType.Wea_ShortBlade );
+		areas.PushBack( gamedataItemType.Wea_Shotgun );
+		areas.PushBack( gamedataItemType.Wea_ShotgunDual );
+		areas.PushBack( gamedataItemType.Wea_SniperRifle );
+		areas.PushBack( gamedataItemType.Wea_SubmachineGun );
+		areas.PushBack( gamedataItemType.Wea_TwoHandedClub );
+		return areas;
+	}
+
+	public static function GetAttachmentsTypes() : array< gamedataItemType >
+	{
+		var types : array< gamedataItemType >;
+		types.PushBack( gamedataItemType.Prt_Capacitor );
+		types.PushBack( gamedataItemType.Prt_FabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_TorsoFabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_HeadFabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_FaceFabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_OuterTorsoFabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_PantsFabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_BootsFabricEnhancer );
+		types.PushBack( gamedataItemType.Prt_Fragment );
+		types.PushBack( gamedataItemType.Prt_Magazine );
+		types.PushBack( gamedataItemType.Prt_Mod );
+		types.PushBack( gamedataItemType.Prt_Muzzle );
+		types.PushBack( gamedataItemType.Prt_HandgunMuzzle );
+		types.PushBack( gamedataItemType.Prt_RifleMuzzle );
+		types.PushBack( gamedataItemType.Prt_Receiver );
+		types.PushBack( gamedataItemType.Prt_Scope );
+		types.PushBack( gamedataItemType.Prt_ScopeRail );
+		types.PushBack( gamedataItemType.Prt_Stock );
+		types.PushBack( gamedataItemType.Prt_TargetingSystem );
+		return types;
+	}
+
+	public static function IsAttachmentType( type : gamedataItemType ) : Bool
+	{
+		return ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( type == gamedataItemType.Prt_Capacitor || type == gamedataItemType.Prt_FabricEnhancer ) || type == gamedataItemType.Prt_TorsoFabricEnhancer ) || type == gamedataItemType.Prt_HeadFabricEnhancer ) || type == gamedataItemType.Prt_FaceFabricEnhancer ) || type == gamedataItemType.Prt_OuterTorsoFabricEnhancer ) || type == gamedataItemType.Prt_PantsFabricEnhancer ) || type == gamedataItemType.Prt_BootsFabricEnhancer ) || type == gamedataItemType.Prt_Fragment ) || type == gamedataItemType.Prt_Magazine ) || type == gamedataItemType.Prt_Mod ) || type == gamedataItemType.Prt_Muzzle ) || type == gamedataItemType.Prt_HandgunMuzzle ) || type == gamedataItemType.Prt_RifleMuzzle ) || type == gamedataItemType.Prt_Receiver ) || type == gamedataItemType.Prt_Scope ) || type == gamedataItemType.Prt_ScopeRail ) || type == gamedataItemType.Prt_Stock ) || type == gamedataItemType.Prt_TargetingSystem;
+	}
+
+	public static function GetInventoryPocketAreas() : array< gamedataEquipmentArea >
+	{
+		var areas : array< gamedataEquipmentArea >;
+		areas.PushBack( gamedataEquipmentArea.QuickSlot );
+		areas.PushBack( gamedataEquipmentArea.ArmsCW );
+		return areas;
+	}
+
+	public static function IsEquipmentAreaCyberware( areaType : gamedataEquipmentArea ) : Bool
+	{
+		switch( areaType )
+		{
+			case gamedataEquipmentArea.SystemReplacementCW:
+			case gamedataEquipmentArea.ArmsCW:
+			case gamedataEquipmentArea.HandsCW:
+			case gamedataEquipmentArea.CardiovascularSystemCW:
+			case gamedataEquipmentArea.EyesCW:
+			case gamedataEquipmentArea.LegsCW:
+			case gamedataEquipmentArea.ImmuneSystemCW:
+			case gamedataEquipmentArea.IntegumentarySystemCW:
+			case gamedataEquipmentArea.MusculoskeletalSystemCW:
+			case gamedataEquipmentArea.NervousSystemCW:
+			case gamedataEquipmentArea.AbilityCW:
+				return true;
+		}
+		return false;
+	}
+
+	public static function IsEquipmentAreaCyberware( areaTypes : array< gamedataEquipmentArea > ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < areaTypes.Size(); i += 1 )
+		{
+			if( IsEquipmentAreaCyberware( areaTypes[ i ] ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static function GetAllCyberwareAreas() : array< gamedataEquipmentArea >
+	{
+		var areas : array< gamedataEquipmentArea >;
+		areas.PushBack( gamedataEquipmentArea.SystemReplacementCW );
+		areas.PushBack( gamedataEquipmentArea.ArmsCW );
+		areas.PushBack( gamedataEquipmentArea.HandsCW );
+		areas.PushBack( gamedataEquipmentArea.CardiovascularSystemCW );
+		areas.PushBack( gamedataEquipmentArea.EyesCW );
+		areas.PushBack( gamedataEquipmentArea.LegsCW );
+		areas.PushBack( gamedataEquipmentArea.ImmuneSystemCW );
+		areas.PushBack( gamedataEquipmentArea.IntegumentarySystemCW );
+		areas.PushBack( gamedataEquipmentArea.MusculoskeletalSystemCW );
+		areas.PushBack( gamedataEquipmentArea.NervousSystemCW );
+		return areas;
+	}
+
+	public static function GetItemTypesForSorting() : array< gamedataItemType >
+	{
+		var areas : array< gamedataItemType >;
+		areas.PushBack( gamedataItemType.Wea_AssaultRifle );
+		areas.PushBack( gamedataItemType.Wea_LightMachineGun );
+		areas.PushBack( gamedataItemType.Wea_SubmachineGun );
+		areas.PushBack( gamedataItemType.Wea_Rifle );
+		areas.PushBack( gamedataItemType.Wea_PrecisionRifle );
+		areas.PushBack( gamedataItemType.Wea_SniperRifle );
+		areas.PushBack( gamedataItemType.Wea_Handgun );
+		areas.PushBack( gamedataItemType.Wea_Revolver );
+		areas.PushBack( gamedataItemType.Wea_Shotgun );
+		areas.PushBack( gamedataItemType.Wea_ShotgunDual );
+		areas.PushBack( gamedataItemType.Wea_Katana );
+		areas.PushBack( gamedataItemType.Wea_LongBlade );
+		areas.PushBack( gamedataItemType.Wea_ShortBlade );
+		areas.PushBack( gamedataItemType.Wea_Knife );
+		areas.PushBack( gamedataItemType.Wea_Melee );
+		areas.PushBack( gamedataItemType.Wea_OneHandedClub );
+		areas.PushBack( gamedataItemType.Wea_TwoHandedClub );
+		areas.PushBack( gamedataItemType.Wea_Hammer );
+		areas.PushBack( gamedataItemType.Wea_Axe );
+		areas.PushBack( gamedataItemType.Wea_Chainsword );
+		areas.PushBack( gamedataItemType.Wea_Machete );
+		areas.PushBack( gamedataItemType.Prt_Magazine );
+		areas.PushBack( gamedataItemType.Prt_Muzzle );
+		areas.PushBack( gamedataItemType.Prt_HandgunMuzzle );
+		areas.PushBack( gamedataItemType.Prt_RifleMuzzle );
+		areas.PushBack( gamedataItemType.Prt_Scope );
+		areas.PushBack( gamedataItemType.Prt_Stock );
+		areas.PushBack( gamedataItemType.Prt_Mod );
+		areas.PushBack( gamedataItemType.Cyb_Launcher );
+		areas.PushBack( gamedataItemType.Cyb_MantisBlades );
+		areas.PushBack( gamedataItemType.Cyb_NanoWires );
+		areas.PushBack( gamedataItemType.Cyb_StrongArms );
+		areas.PushBack( gamedataItemType.Prt_Fragment );
+		areas.PushBack( gamedataItemType.Prt_Program );
+		areas.PushBack( gamedataItemType.Fla_Rifle );
+		areas.PushBack( gamedataItemType.Fla_Launcher );
+		areas.PushBack( gamedataItemType.Fla_Shock );
+		areas.PushBack( gamedataItemType.Fla_Support );
+		areas.PushBack( gamedataItemType.Clo_Head );
+		areas.PushBack( gamedataItemType.Clo_Face );
+		areas.PushBack( gamedataItemType.Clo_OuterChest );
+		areas.PushBack( gamedataItemType.Clo_InnerChest );
+		areas.PushBack( gamedataItemType.Clo_Legs );
+		areas.PushBack( gamedataItemType.Clo_Feet );
+		areas.PushBack( gamedataItemType.Prt_FabricEnhancer );
+		areas.PushBack( gamedataItemType.Prt_TorsoFabricEnhancer );
+		areas.PushBack( gamedataItemType.Prt_HeadFabricEnhancer );
+		areas.PushBack( gamedataItemType.Prt_FaceFabricEnhancer );
+		areas.PushBack( gamedataItemType.Prt_OuterTorsoFabricEnhancer );
+		areas.PushBack( gamedataItemType.Prt_PantsFabricEnhancer );
+		areas.PushBack( gamedataItemType.Prt_BootsFabricEnhancer );
+		areas.PushBack( gamedataItemType.Gad_Grenade );
+		areas.PushBack( gamedataItemType.Con_Injector );
+		areas.PushBack( gamedataItemType.Con_Skillbook );
+		areas.PushBack( gamedataItemType.Con_Inhaler );
+		areas.PushBack( gamedataItemType.Con_Edible );
+		areas.PushBack( gamedataItemType.Con_LongLasting );
+		areas.PushBack( gamedataItemType.Gen_Readable );
+		areas.PushBack( gamedataItemType.Gen_Junk );
+		areas.PushBack( gamedataItemType.Gen_Jewellery );
+		areas.PushBack( gamedataItemType.Gen_Misc );
+		areas.PushBack( gamedataItemType.Gen_Keycard );
+		return areas;
+	}
+
+	private static function GetRarityTypesForSorting() : array< gamedataQuality >
+	{
+		var areas : array< gamedataQuality >;
+		areas.PushBack( gamedataQuality.Legendary );
+		areas.PushBack( gamedataQuality.Epic );
+		areas.PushBack( gamedataQuality.Rare );
+		areas.PushBack( gamedataQuality.Uncommon );
+		areas.PushBack( gamedataQuality.Common );
+		return areas;
+	}
+
+	public constexpr static function GetWeaponSlotsNum() : Int32
+	{
+		return 3;
+	}
+
+	private constexpr static function GetQuickSlotsNum() : Int32
+	{
+		return 3;
+	}
+
+	private constexpr static function GetConsumablesNum() : Int32
+	{
+		return 3;
+	}
+
+	public static function GetAttachmentSlotsForInventory() : array< TweakDBID >
+	{
+		var slots : array< TweakDBID >;
+		slots.PushBack( T"AttachmentSlots.Scope" );
+		slots.PushBack( T"AttachmentSlots.PowerModule" );
+		slots.PushBack( T"AttachmentSlots.Gem" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram1" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram2" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram3" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram4" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram5" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram6" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram7" );
+		slots.PushBack( T"AttachmentSlots.CyberdeckProgram8" );
+		slots.PushBack( T"AttachmentSlots.HeadFabricEnhancer1" );
+		slots.PushBack( T"AttachmentSlots.HeadFabricEnhancer2" );
+		slots.PushBack( T"AttachmentSlots.HeadFabricEnhancer3" );
+		slots.PushBack( T"AttachmentSlots.FaceFabricEnhancer1" );
+		slots.PushBack( T"AttachmentSlots.FaceFabricEnhancer2" );
+		slots.PushBack( T"AttachmentSlots.FaceFabricEnhancer3" );
+		slots.PushBack( T"AttachmentSlots.KiroshiOpticsSlot1" );
+		slots.PushBack( T"AttachmentSlots.KiroshiOpticsSlot2" );
+		slots.PushBack( T"AttachmentSlots.KiroshiOpticsSlot3" );
+		slots.PushBack( T"AttachmentSlots.SandevistanSlot1" );
+		slots.PushBack( T"AttachmentSlots.SandevistanSlot2" );
+		slots.PushBack( T"AttachmentSlots.SandevistanSlot3" );
+		slots.PushBack( T"AttachmentSlots.BerserkSlot1" );
+		slots.PushBack( T"AttachmentSlots.BerserkSlot2" );
+		slots.PushBack( T"AttachmentSlots.BerserkSlot3" );
+		slots.PushBack( T"AttachmentSlots.InnerChestFabricEnhancer1" );
+		slots.PushBack( T"AttachmentSlots.InnerChestFabricEnhancer2" );
+		slots.PushBack( T"AttachmentSlots.InnerChestFabricEnhancer3" );
+		slots.PushBack( T"AttachmentSlots.InnerChestFabricEnhancer4" );
+		slots.PushBack( T"AttachmentSlots.OuterChestFabricEnhancer1" );
+		slots.PushBack( T"AttachmentSlots.OuterChestFabricEnhancer2" );
+		slots.PushBack( T"AttachmentSlots.OuterChestFabricEnhancer3" );
+		slots.PushBack( T"AttachmentSlots.OuterChestFabricEnhancer4" );
+		slots.PushBack( T"AttachmentSlots.LegsFabricEnhancer1" );
+		slots.PushBack( T"AttachmentSlots.LegsFabricEnhancer2" );
+		slots.PushBack( T"AttachmentSlots.LegsFabricEnhancer3" );
+		slots.PushBack( T"AttachmentSlots.FootFabricEnhancer1" );
+		slots.PushBack( T"AttachmentSlots.FootFabricEnhancer2" );
+		slots.PushBack( T"AttachmentSlots.FootFabricEnhancer3" );
+		slots.PushBack( T"AttachmentSlots.StrongArmsKnuckles" );
+		slots.PushBack( T"AttachmentSlots.StrongArmsBattery" );
+		slots.PushBack( T"AttachmentSlots.MantisBladesEdge" );
+		slots.PushBack( T"AttachmentSlots.MantisBladesRotor" );
+		slots.PushBack( T"AttachmentSlots.NanoWiresCable" );
+		slots.PushBack( T"AttachmentSlots.NanoWiresBattery" );
+		slots.PushBack( T"AttachmentSlots.ProjectileLauncherRound" );
+		slots.PushBack( T"AttachmentSlots.ProjectileLauncherWiring" );
+		slots.PushBack( T"AttachmentSlots.ArmsCyberwareGeneralSlot" );
+		slots.PushBack( T"AttachmentSlots.GenericWeaponMod1" );
+		slots.PushBack( T"AttachmentSlots.GenericWeaponMod2" );
+		slots.PushBack( T"AttachmentSlots.GenericWeaponMod3" );
+		slots.PushBack( T"AttachmentSlots.GenericWeaponMod4" );
+		slots.PushBack( T"AttachmentSlots.PowerWeaponModRare" );
+		slots.PushBack( T"AttachmentSlots.TechWeaponModRare" );
+		slots.PushBack( T"AttachmentSlots.SmartWeaponModRare" );
+		slots.PushBack( T"AttachmentSlots.PowerWeaponModEpic" );
+		slots.PushBack( T"AttachmentSlots.TechWeaponModEpic" );
+		slots.PushBack( T"AttachmentSlots.SmartWeaponModEpic" );
+		slots.PushBack( T"AttachmentSlots.PowerWeaponModLegendary" );
+		slots.PushBack( T"AttachmentSlots.TechWeaponModLegendary" );
+		slots.PushBack( T"AttachmentSlots.SmartWeaponModLegendary" );
+		slots.PushBack( T"AttachmentSlots.IconicWeaponModLegendary" );
+		slots.PushBack( T"AttachmentSlots.MeleeWeaponMod1" );
+		slots.PushBack( T"AttachmentSlots.MeleeWeaponMod2" );
+		slots.PushBack( T"AttachmentSlots.MeleeWeaponMod3" );
+		slots.PushBack( T"AttachmentSlots.IconicMeleeWeaponMod1" );
+		return slots;
+	}
+
+	public static function IsProgramSlot( slotID : TweakDBID ) : Bool
+	{
+		return ( ( ( ( ( ( ( slotID == T"AttachmentSlots.CyberdeckProgram1" ) || ( slotID == T"AttachmentSlots.CyberdeckProgram2" ) ) || ( slotID == T"AttachmentSlots.CyberdeckProgram3" ) ) || ( slotID == T"AttachmentSlots.CyberdeckProgram4" ) ) || ( slotID == T"AttachmentSlots.CyberdeckProgram5" ) ) || ( slotID == T"AttachmentSlots.CyberdeckProgram6" ) ) || ( slotID == T"AttachmentSlots.CyberdeckProgram7" ) ) || ( slotID == T"AttachmentSlots.CyberdeckProgram8" );
+	}
+
+	public function FilterOutWorsePrograms( items : array< ItemID > ) : array< ItemID >
+	{
+		var i : Int32;
+		var cyberdeckId : ItemID;
+		var result : array< ItemID >;
+		cyberdeckId = GetEquippedItemIdInArea( gamedataEquipmentArea.SystemReplacementCW );
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			if( !( ItemModificationSystem.HasBetterShardInstalled( m_Player, cyberdeckId, items[ i ] ) ) )
+			{
+				result.PushBack( items[ i ] );
+			}
+		}
+		return result;
+	}
+
+	public function DistinctPrograms( items : array< ItemID > ) : array< ItemID >
+	{
+		var i : Int32;
+		var alreadyContains : array< CName >;
+		var shardType : CName;
+		var result : array< ItemID >;
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			shardType = TweakDBInterface.GetCName( ItemID.GetTDBID( items[ i ] ) + T".shardType", '' );
+			if( IsNameValid( shardType ) )
+			{
+				if( !( alreadyContains.Contains( shardType ) ) )
+				{
+					alreadyContains.PushBack( shardType );
+					result.PushBack( items[ i ] );
+				}
+			}
+		}
+		return result;
+	}
+
+	public function FilterHotkeyConsumables( items : array< ItemID > ) : array< ItemID >
+	{
+		var i, j, limit, scopesLimit : Int32;
+		var result : array< ItemID >;
+		var scopes : array< gamedataItemType >;
+		var itemType : gamedataItemType;
+		scopes = Hotkey.GetScope( EHotkey.DPAD_UP );
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			itemType = RPGManager.GetItemType( items[ i ] );
+			if( itemType != gamedataItemType.Invalid )
+			{
+				for( j = 0, scopesLimit = scopes.Size(); j < scopesLimit; j += 1 )
+				{
+					if( scopes[ j ] == itemType )
+					{
+						result.PushBack( items[ i ] );
+						break;
+					}
+				}
+			}
+		}
+		return result;
+	}
+
+	public static function IsItemBlacklisted( itemData : weak< gameItemData >, optional forceShowCurrencyOnHUDTooltip : Bool, optional isRadialQuerying : Bool, optional additionalTags : array< CName > ) : Bool
+	{
+		var i : Int32;
+		if( ItemID.HasFlag( itemData.GetID(), gameEItemIDFlag.Preview ) )
+		{
+			return true;
+		}
+		if( itemData )
+		{
+			for( i = 0; i < additionalTags.Size(); i += 1 )
+			{
+				if( itemData.HasTag( additionalTags[ i ] ) )
+				{
+					return true;
+				}
+			}
+			if( itemData.HasTag( 'TppHead' ) || itemData.HasTag( 'HideInUI' ) )
+			{
+				return true;
+			}
+			if( isRadialQuerying )
+			{
+				if( itemData.HasTag( 'Currency' ) || itemData.HasTag( 'Ammo' ) )
+				{
+					return true;
+				}
+			}
+			else if( !( forceShowCurrencyOnHUDTooltip ) )
+			{
+				if( itemData.HasTag( 'Currency' ) || itemData.HasTag( 'base_fists' ) )
+				{
+					return true;
+				}
+			}
+			else
+			{
+				if( itemData.HasTag( 'base_fists' ) )
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+		return true;
+	}
+
+	private static function IsItemCraftingMaterial( itemData : weak< gameItemData > ) : Bool
+	{
+		if( itemData )
+		{
+			return itemData.HasTag( 'CraftingPart' );
+		}
+		return true;
+	}
+
+	private static function GetWeaponDamageType( statList : array< StatViewData > ) : gamedataDamageType
+	{
+		var i, limit : Int32;
+		var maxValue : Int32;
+		var type : gamedataDamageType;
+		type = gamedataDamageType.Invalid;
+		maxValue = 0;
+		for( i = 0, limit = statList.Size(); i < limit; i += 1 )
+		{
+			if( ( ( statList[ i ].type == gamedataStatType.PhysicalDamage || statList[ i ].type == gamedataStatType.ThermalDamage ) || statList[ i ].type == gamedataStatType.ChemicalDamage ) || statList[ i ].type == gamedataStatType.ElectricDamage )
+			{
+				if( statList[ i ].value > maxValue )
+				{
+					switch( statList[ i ].type )
+					{
+						case gamedataStatType.PhysicalDamage:
+							type = gamedataDamageType.Physical;
+						break;
+						case gamedataStatType.ThermalDamage:
+							type = gamedataDamageType.Thermal;
+						break;
+						case gamedataStatType.ChemicalDamage:
+							type = gamedataDamageType.Chemical;
+						break;
+						case gamedataStatType.ElectricDamage:
+							type = gamedataDamageType.Electric;
+						break;
+					}
+					maxValue = statList[ i ].value;
+				}
+			}
+		}
+		return type;
+	}
+
+	private function SetPlayerStats( out inventoryItemData : InventoryItemData )
+	{
+		var statsystem : StatsSystem;
+		statsystem = GameInstance.GetStatsSystem( m_Player.GetGame() );
+		InventoryItemData.SetHasPlayerSmartGunLink( inventoryItemData, HasPlayerSmartGunLink( m_Player, statsystem ) );
+		InventoryItemData.SetPlayerLevel( inventoryItemData, PlayerLevel( m_Player, statsystem ) );
+		InventoryItemData.SetPlayerStrength( inventoryItemData, PlayerStrength( m_Player, statsystem ) );
+		InventoryItemData.SetPlayerReflexes( inventoryItemData, PlayerReflexes( m_Player, statsystem ) );
+		InventoryItemData.SetPlayerStreetCred( inventoryItemData, PlayerStreetCred( m_Player, statsystem ) );
+	}
+
+	public function SetRequiredPerk( out inventoryItemData : InventoryItemData )
+	{
+		var perkRequiredName : String;
+		if( RPGManager.CheckCraftedItemPerkPrereq( InventoryItemData.GetGameItemData( inventoryItemData ), GameInstance.GetPlayerSystem( m_Player.GetGame() ).GetLocalPlayerMainGameObject(), perkRequiredName ) )
+		{
+			InventoryItemData.SetIsPerkRequired( inventoryItemData, true );
+			InventoryItemData.SetPerkRequiredName( inventoryItemData, perkRequiredName );
+		}
+	}
+
+	public function HasPlayerSmartGunLink() : Bool
+	{
+		return ( ( Bool )( m_StatsSystem.GetStatValue( m_Player.GetEntityID(), gamedataStatType.HasSmartLink ) ) );
+	}
+
+	public function GetPlayerLevel() : Int32
+	{
+		return RoundF( m_StatsSystem.GetStatValue( m_Player.GetEntityID(), gamedataStatType.Level ) );
+	}
+
+	public function GetPlayerStrength() : Int32
+	{
+		return RoundF( m_StatsSystem.GetStatValue( m_Player.GetEntityID(), gamedataStatType.Strength ) );
+	}
+
+	public function GetPlayerReflex() : Int32
+	{
+		return RoundF( m_StatsSystem.GetStatValue( m_Player.GetEntityID(), gamedataStatType.Reflexes ) );
+	}
+
+	public function GetPlayerStreetCred() : Int32
+	{
+		return RoundF( m_StatsSystem.GetStatValue( m_Player.GetEntityID(), gamedataStatType.StreetCred ) );
+	}
+
+	private static function HasPlayerSmartGunLink( player : weak< PlayerPuppet >, statsystem : StatsSystem ) : Bool
+	{
+		return ( ( Bool )( statsystem.GetStatValue( player.GetEntityID(), gamedataStatType.HasSmartLink ) ) );
+	}
+
+	private static function PlayerLevel( player : weak< PlayerPuppet >, statsystem : StatsSystem ) : Int32
+	{
+		return RoundF( statsystem.GetStatValue( player.GetEntityID(), gamedataStatType.Level ) );
+	}
+
+	private static function PlayerStrength( player : weak< PlayerPuppet >, statsystem : StatsSystem ) : Int32
+	{
+		return RoundF( statsystem.GetStatValue( player.GetEntityID(), gamedataStatType.Strength ) );
+	}
+
+	private static function PlayerReflexes( player : weak< PlayerPuppet >, statsystem : StatsSystem ) : Int32
+	{
+		return RoundF( statsystem.GetStatValue( player.GetEntityID(), gamedataStatType.Reflexes ) );
+	}
+
+	private static function PlayerStreetCred( player : weak< PlayerPuppet >, statsSystem : StatsSystem ) : Int32
+	{
+		return RoundF( statsSystem.GetStatValue( player.GetEntityID(), gamedataStatType.StreetCred ) );
+	}
+
+	public function CanUninstallMod( itemType : gamedataItemType, slot : TweakDBID ) : Bool
+	{
+		if( ( ( ( itemType == gamedataItemType.Prt_Scope || itemType == gamedataItemType.Prt_Muzzle ) || itemType == gamedataItemType.Prt_HandgunMuzzle ) || itemType == gamedataItemType.Prt_RifleMuzzle ) || itemType == gamedataItemType.Prt_Program )
+		{
+			return true;
+		}
+		else if( itemType == gamedataItemType.Prt_Fragment && !( IsNonModifableSlot( slot ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function IsNonModifableSlot( slot : TweakDBID ) : Bool
+	{
+		return ( ( ( slot == T"AttachmentSlots.StrongArmsKnuckles" ) || ( slot == T"AttachmentSlots.MantisBladesEdge" ) ) || ( slot == T"AttachmentSlots.NanoWiresCable" ) ) || ( slot == T"AttachmentSlots.ProjectileLauncherRound" );
+	}
+
+	public function GetGame() : GameInstance
+	{
+		return m_Player.GetGame();
+	}
+
+	public static function GetAttachmentSlotByItemID( itemData : InventoryItemData, attachmentID : ItemID ) : TweakDBID
+	{
+		var attachments : array< InventoryItemAttachments >;
+		var i : Int32;
+		attachments = InventoryItemData.GetAttachments( itemData );
+		for( i = 0; i < attachments.Size(); i += 1 )
+		{
+			if( InventoryItemData.GetID( attachments[ i ].ItemData ) == attachmentID )
+			{
+				return attachments[ i ].SlotID;
+			}
+		}
+		return TDBID.None();
+	}
+
+}
+
+class StatProvider extends IScriptable
+{
+	private var m_GameItemData : weak< gameItemData >;
+	private var m_PartData : InnerItemData;
+	private var m_InventoryItemData : InventoryItemData;
+	private var dataSource : EStatProviderDataSource;
+	default dataSource = EStatProviderDataSource.Invalid;
+
+	public function Setup( gameItemData : weak< gameItemData > )
+	{
+		dataSource = EStatProviderDataSource.gameItemData;
+		m_GameItemData = gameItemData;
+	}
+
+	public function Setup( inventoryItemData : InventoryItemData )
+	{
+		dataSource = EStatProviderDataSource.InventoryItemData;
+		m_InventoryItemData = inventoryItemData;
+	}
+
+	public function Setup( partData : InnerItemData )
+	{
+		dataSource = EStatProviderDataSource.InnerItemData;
+		m_PartData = partData;
+	}
+
+	public function HasStatData( type : gamedataStatType ) : Bool
+	{
+		var i, limit : Int32;
+		var stat : StatViewData;
+		switch( dataSource )
+		{
+			case EStatProviderDataSource.gameItemData:
+				if( m_GameItemData )
+				{
+					return m_GameItemData.HasStatData( type );
+				}
+			break;
+			case EStatProviderDataSource.InventoryItemData:
+				if( !( InventoryItemData.IsEmpty( m_InventoryItemData ) ) )
+				{
+					for( i = 0, limit = InventoryItemData.GetPrimaryStatsSize( m_InventoryItemData ); i < limit; i += 1 )
+					{
+						stat = InventoryItemData.GetPrimaryStat( m_InventoryItemData, i );
+						if( stat.type == type )
+						{
+							return true;
+						}
+					}
+					for( i = 0, limit = InventoryItemData.GetSecondaryStatsSize( m_InventoryItemData ); i < limit; i += 1 )
+					{
+						stat = InventoryItemData.GetSecondaryStat( m_InventoryItemData, i );
+						if( stat.type == type )
+						{
+							return true;
+						}
+					}
+				}
+			break;
+			case EStatProviderDataSource.InnerItemData:
+				return InnerItemData.HasStatData( m_PartData, type );
+			break;
+		}
+		return false;
+	}
+
+	public function GetStatValueByType( type : gamedataStatType ) : Int32
+	{
+		var i, limit : Int32;
+		var stat : StatViewData;
+		switch( dataSource )
+		{
+			case EStatProviderDataSource.gameItemData:
+				if( m_GameItemData )
+				{
+					return RoundMath( m_GameItemData.GetStatValueByType( type ) );
+				}
+			break;
+			case EStatProviderDataSource.InventoryItemData:
+				if( !( InventoryItemData.IsEmpty( m_InventoryItemData ) ) )
+				{
+					for( i = 0, limit = InventoryItemData.GetPrimaryStatsSize( m_InventoryItemData ); i < limit; i += 1 )
+					{
+						stat = InventoryItemData.GetPrimaryStat( m_InventoryItemData, i );
+						if( stat.type == type )
+						{
+							return stat.value;
+						}
+					}
+					for( i = 0, limit = InventoryItemData.GetSecondaryStatsSize( m_InventoryItemData ); i < limit; i += 1 )
+					{
+						stat = InventoryItemData.GetSecondaryStat( m_InventoryItemData, i );
+						if( stat.type == type )
+						{
+							return stat.value;
+						}
+					}
+				}
+			break;
+			case EStatProviderDataSource.InnerItemData:
+				return RoundMath( InnerItemData.GetStatValueByType( m_PartData, type ) );
+			break;
+		}
+		return 0;
+	}
+
+	public function GetStatValueFByType( type : gamedataStatType ) : Float
+	{
+		var i, limit : Int32;
+		var stat : StatViewData;
+		switch( dataSource )
+		{
+			case EStatProviderDataSource.gameItemData:
+				if( m_GameItemData )
+				{
+					return m_GameItemData.GetStatValueByType( type );
+				}
+			break;
+			case EStatProviderDataSource.InventoryItemData:
+				if( !( InventoryItemData.IsEmpty( m_InventoryItemData ) ) )
+				{
+					for( i = 0, limit = InventoryItemData.GetPrimaryStatsSize( m_InventoryItemData ); i < limit; i += 1 )
+					{
+						stat = InventoryItemData.GetPrimaryStat( m_InventoryItemData, i );
+						if( stat.type == type )
+						{
+							return stat.valueF;
+						}
+					}
+					for( i = 0, limit = InventoryItemData.GetSecondaryStatsSize( m_InventoryItemData ); i < limit; i += 1 )
+					{
+						stat = InventoryItemData.GetSecondaryStat( m_InventoryItemData, i );
+						if( stat.type == type )
+						{
+							return stat.valueF;
+						}
+					}
+				}
+			break;
+			case EStatProviderDataSource.InnerItemData:
+				return InnerItemData.GetStatValueByType( m_PartData, type );
+			break;
+		}
+		return 0.0;
+	}
+
+}
+
+class DamageEffectUIEntry
+{
+	var valueStat : gamedataStatType;
+	var targetStat : gamedataStatType;
+	var displayType : DamageEffectDisplayType;
+	var valueToDisplay : Float;
+	var effectorDuration : Float;
+	var effectorDelay : Float;
+	var isContinuous : Bool;
+}
+
+class ItemPreferredAreaItems
+{
+	var equipmentArea : gamedataEquipmentArea;
+	var items : array< InventoryItemData >;
+}
+
+class ItemComparableTypesCache
+{
+	var itemTypeRecord : weak< ItemType_Record >;
+	var comparableTypes : array< gamedataItemType >;
+	var comparableRecordTypes : array< weak< ItemType_Record > >;
+}
+
+class TypeComparableItemsCache
+{
+	var cache : ItemComparableTypesCache;
+	var items : array< InventoryItemData >;
+}
+
+class InventoryItemPreferredAreaItems
+{
+	var equipmentArea : gamedataEquipmentArea;
+	var items : array< weak< UIInventoryItem > >;
+}
+
+class InventoryItemComparableTypesCache
+{
+	var itemType : gamedataItemType;
+	var itemTypeRecord : weak< ItemType_Record >;
+	var comparableTypes : array< gamedataItemType >;
+	var comparableRecordTypes : array< weak< ItemType_Record > >;
+}
+
+class InventoryTypeComparableItemsCache
+{
+	var itemType : gamedataItemType;
+	var cache : InventoryItemComparableTypesCache;
+	var items : array< weak< UIInventoryItem > >;
+}
+
+class ItemPreferredComparisonResolver
+{
+	private var m_cacheadAreaItems : array< ItemPreferredAreaItems >;
+	private var m_cachedComparableTypes : array< ItemComparableTypesCache >;
+	private var m_typeComparableItemsCache : array< TypeComparableItemsCache >;
+	private var m_dataManager : InventoryDataManagerV2;
+	private var m_forcedCompareItem : InventoryItemData;
+	private var m_useForceCompare : Bool;
+
+	public static function Make( inventoryDataManager : InventoryDataManagerV2 ) : ItemPreferredComparisonResolver
+	{
+		var instance : ItemPreferredComparisonResolver;
+		instance = new ItemPreferredComparisonResolver;
+		instance.m_dataManager = inventoryDataManager;
+		instance.m_cachedComparableTypes.Resize( ( ( Int32 )( gamedataItemType.Count ) ) );
+		instance.m_typeComparableItemsCache.Resize( ( ( Int32 )( gamedataItemType.Count ) ) );
+		return instance;
+	}
+
+	private function GetAreaItems( equipmentArea : gamedataEquipmentArea ) : ItemPreferredAreaItems
+	{
+		var i : Int32;
+		var areaItems : ItemPreferredAreaItems;
+		for( i = 0; i < m_cacheadAreaItems.Size(); i += 1 )
+		{
+			if( m_cacheadAreaItems[ i ].equipmentArea == equipmentArea )
+			{
+				return m_cacheadAreaItems[ i ];
+			}
+		}
+		areaItems = new ItemPreferredAreaItems;
+		areaItems.equipmentArea = equipmentArea;
+		areaItems.items = m_dataManager.GetAllComparisonItems( equipmentArea );
+		m_cacheadAreaItems.PushBack( areaItems );
+		return areaItems;
+	}
+
+	private function IsAreaSelfComparable( item : InventoryItemData ) : Bool
+	{
+		return InventoryDataManagerV2.IsAreaSelfComparable( InventoryItemData.GetEquipmentArea( item ) );
+	}
+
+	private function CacheComparableType( item : InventoryItemData ) : ItemComparableTypesCache
+	{
+		var i : Int32;
+		var statsMapName : String;
+		var comparableTypes : ItemComparableTypesCache;
+		var itemRecord : Item_Record;
+		var stats : UIStatsMap_Record;
+		var typesToCompare : array< weak< ItemType_Record > >;
+		var itemType : gamedataItemType;
+		itemRecord = TDB.GetItemRecord( ItemID.GetTDBID( InventoryItemData.GetID( item ) ) );
+		statsMapName = m_dataManager.GetStatsUIMapName( InventoryItemData.GetID( item ) );
+		itemType = InventoryItemData.GetItemType( item );
+		if( !( IsStringValid( statsMapName ) ) )
+		{
+			return NULL;
+		}
+		stats = TDB.GetUIStatsMapRecord( TDBID.Create( statsMapName ) );
+		stats.TypesToCompareWith( typesToCompare );
+		comparableTypes = new ItemComparableTypesCache;
+		comparableTypes.itemTypeRecord = itemRecord.ItemType();
+		comparableTypes.comparableRecordTypes = typesToCompare;
+		for( i = 0; i < typesToCompare.Size(); i += 1 )
+		{
+			comparableTypes.comparableTypes.PushBack( typesToCompare[ i ].Type() );
+		}
+		if( IsAreaSelfComparable( item ) )
+		{
+			if( !( comparableTypes.comparableTypes.Contains( itemType ) ) )
+			{
+				comparableTypes.comparableRecordTypes.PushBack( comparableTypes.itemTypeRecord );
+				comparableTypes.comparableTypes.PushBack( itemType );
+			}
+		}
+		m_cachedComparableTypes[ ( ( Int32 )( itemType ) ) ] = comparableTypes;
+		return comparableTypes;
+	}
+
+	private function GetComparableTypes( item : InventoryItemData ) : ItemComparableTypesCache
+	{
+		var itemType : gamedataItemType;
+		if( InventoryItemData.IsEmpty( item ) )
+		{
+			return NULL;
+		}
+		itemType = InventoryItemData.GetItemType( item );
+		if( m_cachedComparableTypes[ ( ( Int32 )( itemType ) ) ] != NULL )
+		{
+			return m_cachedComparableTypes[ ( ( Int32 )( itemType ) ) ];
+		}
+		return CacheComparableType( item );
+	}
+
+	private function GetTypeComparableItems( item : InventoryItemData ) : TypeComparableItemsCache
+	{
+		var i : Int32;
+		var comparableItemsCache : TypeComparableItemsCache;
+		var comparableTypes : ItemComparableTypesCache;
+		var areaItems : array< InventoryItemData >;
+		var itemType : gamedataItemType;
+		if( InventoryItemData.IsEmpty( item ) )
+		{
+			return NULL;
+		}
+		itemType = InventoryItemData.GetItemType( item );
+		if( m_typeComparableItemsCache[ ( ( Int32 )( itemType ) ) ] != NULL )
+		{
+			return m_typeComparableItemsCache[ ( ( Int32 )( itemType ) ) ];
+		}
+		comparableTypes = GetComparableTypes( item );
+		if( comparableTypes.comparableTypes.Size() == 0 )
+		{
+			return NULL;
+		}
+		areaItems = GetAreaItems( InventoryItemData.GetEquipmentArea( item ) ).items;
+		comparableItemsCache = new TypeComparableItemsCache;
+		comparableItemsCache.cache = comparableTypes;
+		for( i = 0; i < areaItems.Size(); i += 1 )
+		{
+			if( comparableTypes.comparableTypes.Contains( InventoryItemData.GetItemType( areaItems[ i ] ) ) )
+			{
+				comparableItemsCache.items.PushBack( areaItems[ i ] );
+			}
+		}
+		m_typeComparableItemsCache[ ( ( Int32 )( itemType ) ) ] = comparableItemsCache;
+		return comparableItemsCache;
+	}
+
+	public function GetComparableItems( item : InventoryItemData ) : array< InventoryItemData >
+	{
+		return GetTypeComparableItems( item ).items;
+	}
+
+	public function IsBetterComparableNewItem( uiScriptableSystem : weak< UIScriptableSystem >, item : InventoryItemData ) : Bool
+	{
+		var i : Int32;
+		var comparedDPS : Float;
+		var comparableItemsCache : TypeComparableItemsCache;
+		comparableItemsCache = GetTypeComparableItems( item );
+		for( i = 0; i < comparableItemsCache.items.Size(); i += 1 )
+		{
+			if( uiScriptableSystem.IsInventoryItemNew( InventoryItemData.GetID( comparableItemsCache.items[ i ] ) ) )
+			{
+				comparedDPS = InventoryItemData.GetDPSF( comparableItemsCache.items[ i ] ) - InventoryItemData.GetDPSF( item );
+				if( comparedDPS > 0.01 )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public function GetPreferredComparisonItem( item : InventoryItemData ) : InventoryItemData
+	{
+		var comparableItemsCache : TypeComparableItemsCache;
+		var emptyResult : InventoryItemData;
+		var items : array< InventoryItemData >;
+		var resultIndex : Int32;
+		comparableItemsCache = GetTypeComparableItems( item );
+		items = comparableItemsCache.items;
+		if( items.Size() == 0 )
+		{
+			return emptyResult;
+		}
+		resultIndex = m_dataManager.GetPrefferedEquipedItemToCompareRef( item, items );
+		if( ( resultIndex >= 0 ) && ( resultIndex < items.Size() ) )
+		{
+			if( InventoryItemData.GetID( items[ resultIndex ] ) != InventoryItemData.GetID( item ) )
+			{
+				return items[ resultIndex ];
+			}
+		}
+		return emptyResult;
+	}
+
+	public function GetItemComparisonState( item : InventoryItemData ) : ItemComparisonState
+	{
+		var itemToCompare : InventoryItemData;
+		if( m_useForceCompare )
+		{
+			itemToCompare = m_forcedCompareItem;
+			if( !( IsTypeComparable( item, InventoryItemData.GetItemType( m_forcedCompareItem ) ) ) )
+			{
+				return ItemComparisonState.Default;
+			}
+		}
+		else
+		{
+			itemToCompare = GetPreferredComparisonItem( item );
+		}
+		if( InventoryItemData.IsEmpty( itemToCompare ) )
+		{
+			return ItemComparisonState.Default;
+		}
+		return CompareItems( itemToCompare, item );
+	}
+
+	public function IsComparable( item : InventoryItemData ) : Bool
+	{
+		return InventoryItemData.GetEquipmentArea( item ) == gamedataEquipmentArea.Weapon || IsAreaSelfComparable( item );
+	}
+
+	public function IsTypeComparable( baseItem : InventoryItemData, comparedType : gamedataItemType ) : Bool
+	{
+		var comparableTypesCache : ItemComparableTypesCache;
+		comparableTypesCache = GetComparableTypes( baseItem );
+		return comparableTypesCache.comparableTypes.Contains( comparedType );
+	}
+
+	public function DisableForceComparedItem()
+	{
+		m_useForceCompare = false;
+	}
+
+	public function ForceComparedItem( item : InventoryItemData )
+	{
+		m_useForceCompare = true;
+		m_forcedCompareItem = item;
+	}
+
+	public function CompareItems( lhs : InventoryItemData, rhs : InventoryItemData ) : ItemComparisonState
+	{
+		var area : gamedataEquipmentArea;
+		var comparedValue : Float;
+		area = InventoryItemData.GetEquipmentArea( lhs );
+		if( area != InventoryItemData.GetEquipmentArea( rhs ) )
+		{
+			return ItemComparisonState.Default;
+		}
+		if( area == gamedataEquipmentArea.Weapon )
+		{
+			comparedValue = InventoryItemData.GetDPSF( lhs ) - InventoryItemData.GetDPSF( rhs );
+		}
+		else if( InventoryDataManagerV2.IsAreaClothing( area ) )
+		{
+			comparedValue = InventoryItemData.GetArmorF( lhs ) - InventoryItemData.GetArmorF( rhs );
+		}
+		else
+		{
+			return ItemComparisonState.Default;
+		}
+		return ( ( AbsF( comparedValue ) < 0.01 ) ? ( ItemComparisonState.NoChange ) : ( ( ( comparedValue > 0.0 ) ? ( ItemComparisonState.Worse ) : ( ItemComparisonState.Better ) ) ) );
+	}
+
+}
+
+class InventoryItemPreferredComparisonResolver
+{
+	private var m_cacheadAreaItems : array< InventoryItemPreferredAreaItems >;
+	private var m_cachedComparableTypes : array< InventoryItemComparableTypesCache >;
+	private var m_typeComparableItemsCache : array< InventoryTypeComparableItemsCache >;
+	private var m_inventoryScriptableSystem : UIInventoryScriptableSystem;
+	private var m_forcedCompareItem : weak< UIInventoryItem >;
+	private var m_useForceCompare : Bool;
+
+	public static function Make( inventoryScriptableSystem : UIInventoryScriptableSystem ) : InventoryItemPreferredComparisonResolver
+	{
+		var instance : InventoryItemPreferredComparisonResolver;
+		instance = new InventoryItemPreferredComparisonResolver;
+		instance.m_inventoryScriptableSystem = inventoryScriptableSystem;
+		return instance;
+	}
+
+	private function GetAreaItems( equipmentArea : gamedataEquipmentArea ) : InventoryItemPreferredAreaItems
+	{
+		var i : Int32;
+		var areaItems : InventoryItemPreferredAreaItems;
+		for( i = 0; i < m_cacheadAreaItems.Size(); i += 1 )
+		{
+			if( m_cacheadAreaItems[ i ].equipmentArea == equipmentArea )
+			{
+				return m_cacheadAreaItems[ i ];
+			}
+		}
+		areaItems = new InventoryItemPreferredAreaItems;
+		areaItems.equipmentArea = equipmentArea;
+		areaItems.items = m_inventoryScriptableSystem.GetPlayerAreaItems( equipmentArea );
+		m_cacheadAreaItems.PushBack( areaItems );
+		return areaItems;
+	}
+
+	private function CacheComparableType( item : weak< UIInventoryItem > ) : InventoryItemComparableTypesCache
+	{
+		var i : Int32;
+		var statsMapName : String;
+		var comparableTypes : InventoryItemComparableTypesCache;
+		var stats : UIStatsMap_Record;
+		var typesToCompare : array< weak< ItemType_Record > >;
+		statsMapName = "UIMaps." + EnumValueToString( "gamedataItemType", ( ( Int32 )( item.GetItemType() ) ) );
+		if( !( IsStringValid( statsMapName ) ) )
+		{
+			return NULL;
+		}
+		stats = TDB.GetUIStatsMapRecord( TDBID.Create( statsMapName ) );
+		stats.TypesToCompareWith( typesToCompare );
+		comparableTypes = new InventoryItemComparableTypesCache;
+		comparableTypes.itemType = item.GetItemType();
+		comparableTypes.itemTypeRecord = item.GetItemRecord().ItemType();
+		comparableTypes.comparableRecordTypes = typesToCompare;
+		for( i = 0; i < typesToCompare.Size(); i += 1 )
+		{
+			comparableTypes.comparableTypes.PushBack( typesToCompare[ i ].Type() );
+		}
+		if( item.IsWeapon() || item.IsClothing() )
+		{
+			if( !( comparableTypes.comparableTypes.Contains( item.GetItemType() ) ) )
+			{
+				comparableTypes.comparableRecordTypes.PushBack( comparableTypes.itemTypeRecord );
+				comparableTypes.comparableTypes.PushBack( comparableTypes.itemType );
+			}
+		}
+		m_cachedComparableTypes.PushBack( comparableTypes );
+		return comparableTypes;
+	}
+
+	private function GetComparableTypes( item : weak< UIInventoryItem > ) : InventoryItemComparableTypesCache
+	{
+		var i : Int32;
+		if( !( item ) )
+		{
+			return NULL;
+		}
+		for( i = 0; i < m_cachedComparableTypes.Size(); i += 1 )
+		{
+			if( m_cachedComparableTypes[ i ].itemType == item.GetItemType() )
+			{
+				return m_cachedComparableTypes[ i ];
+			}
+		}
+		return CacheComparableType( item );
+	}
+
+	private function GetTypeComparableItems( item : weak< UIInventoryItem > ) : InventoryTypeComparableItemsCache
+	{
+		var i : Int32;
+		var comparableItemsCache : InventoryTypeComparableItemsCache;
+		var comparableTypes : InventoryItemComparableTypesCache;
+		var areaItems : array< weak< UIInventoryItem > >;
+		if( !( item ) )
+		{
+			return NULL;
+		}
+		for( i = 0; i < m_typeComparableItemsCache.Size(); i += 1 )
+		{
+			if( m_typeComparableItemsCache[ i ].itemType == item.GetItemType() )
+			{
+				return m_typeComparableItemsCache[ i ];
+			}
+		}
+		comparableTypes = GetComparableTypes( item );
+		if( comparableTypes.comparableTypes.Size() == 0 )
+		{
+			return NULL;
+		}
+		areaItems = GetAreaItems( item.GetEquipmentArea() ).items;
+		comparableItemsCache = new InventoryTypeComparableItemsCache;
+		comparableItemsCache.itemType = item.GetItemType();
+		comparableItemsCache.cache = comparableTypes;
+		for( i = 0; i < areaItems.Size(); i += 1 )
+		{
+			if( comparableTypes.comparableTypes.Contains( areaItems[ i ].GetItemType() ) )
+			{
+				comparableItemsCache.items.PushBack( areaItems[ i ] );
+			}
+		}
+		m_typeComparableItemsCache.PushBack( comparableItemsCache );
+		return comparableItemsCache;
+	}
+
+	public function GetComparableItems( item : weak< UIInventoryItem > ) : array< weak< UIInventoryItem > >
+	{
+		return GetTypeComparableItems( item ).items;
+	}
+
+	public function IsBetterComparableNewItem( uiScriptableSystem : weak< UIScriptableSystem >, item : weak< UIInventoryItem > ) : Bool
+	{
+		var i : Int32;
+		var comparedDPS : Float;
+		var comparableItemsCache : InventoryTypeComparableItemsCache;
+		comparableItemsCache = GetTypeComparableItems( item );
+		for( i = 0; i < comparableItemsCache.items.Size(); i += 1 )
+		{
+			if( uiScriptableSystem.IsInventoryItemNew( comparableItemsCache.items[ i ].ID ) )
+			{
+				if( comparableItemsCache.items[ i ].IsWeapon() && item.IsWeapon() )
+				{
+					comparedDPS = comparableItemsCache.items[ i ].GetPrimaryStat().Value - item.GetPrimaryStat().Value;
+				}
+				if( comparedDPS > 0.01 )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public function GetPrefferedEquipedItemToCompare( item : weak< UIInventoryItem >, itemsToCompare : array< weak< UIInventoryItem > > ) : Int32
+	{
+		var i, limit, result : Int32;
+		if( item )
+		{
+			limit = itemsToCompare.Size();
+			if( item.GetEquipmentArea() == gamedataEquipmentArea.Weapon )
+			{
+				for( i = 0; i < limit; i += 1 )
+				{
+					if( itemsToCompare[ i ].GetName() == item.GetName() )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < limit; i += 1 )
+				{
+					if( itemsToCompare[ i ].GetItemType() == item.GetItemType() )
+					{
+						return i;
+					}
+				}
+				for( i = 0; i < limit; i += 1 )
+				{
+					if( itemsToCompare[ i ].GetPrimaryStat().Value > itemsToCompare[ result ].GetPrimaryStat().Value )
+					{
+						result = i;
+					}
+				}
+			}
+		}
+		return result;
+	}
+
+	public function GetPreferredComparisonItem( item : weak< UIInventoryItem > ) : weak< UIInventoryItem >
+	{
+		var comparableItemsCache : InventoryTypeComparableItemsCache;
+		var items : array< weak< UIInventoryItem > >;
+		var resultIndex : Int32;
+		comparableItemsCache = GetTypeComparableItems( item );
+		items = comparableItemsCache.items;
+		if( items.Size() == 0 )
+		{
+			return NULL;
+		}
+		resultIndex = GetPrefferedEquipedItemToCompare( item, items );
+		if( ( resultIndex >= 0 ) && ( resultIndex < items.Size() ) )
+		{
+			if( items[ resultIndex ].ID != item.ID )
+			{
+				return items[ resultIndex ];
+			}
+		}
+		return NULL;
+	}
+
+	public function GetItemComparisonState( item : weak< UIInventoryItem > ) : ItemComparisonState
+	{
+		var itemToCompare : weak< UIInventoryItem >;
+		if( m_useForceCompare )
+		{
+			itemToCompare = m_forcedCompareItem;
+			if( !( IsTypeComparable( item, m_forcedCompareItem.GetItemType() ) ) )
+			{
+				return ItemComparisonState.Default;
+			}
+		}
+		else
+		{
+			itemToCompare = GetPreferredComparisonItem( item );
+		}
+		if( !( itemToCompare ) )
+		{
+			return ItemComparisonState.Default;
+		}
+		return CompareItems( itemToCompare, item );
+	}
+
+	public function IsComparable( item : weak< UIInventoryItem > ) : Bool
+	{
+		return item.IsWeapon() || item.IsClothing();
+	}
+
+	public function IsTypeComparable( baseItem : weak< UIInventoryItem >, comparedType : gamedataItemType ) : Bool
+	{
+		var comparableTypesCache : InventoryItemComparableTypesCache;
+		comparableTypesCache = GetComparableTypes( baseItem );
+		return comparableTypesCache.comparableTypes.Contains( comparedType );
+	}
+
+	public function DisableForceComparedItem()
+	{
+		m_useForceCompare = false;
+	}
+
+	public function ForceComparedItem( item : weak< UIInventoryItem > )
+	{
+		m_useForceCompare = true;
+		m_forcedCompareItem = item;
+	}
+
+	public function CompareItems( lhs : weak< UIInventoryItem >, rhs : weak< UIInventoryItem > ) : ItemComparisonState
+	{
+		var area : gamedataEquipmentArea;
+		var comparedValue : Float;
+		area = lhs.GetEquipmentArea();
+		if( area != rhs.GetEquipmentArea() )
+		{
+			return ItemComparisonState.Default;
+		}
+		if( lhs.IsWeapon() || lhs.IsClothing() )
+		{
+			comparedValue = lhs.GetPrimaryStat().Value - rhs.GetPrimaryStat().Value;
+		}
+		else
+		{
+			return ItemComparisonState.Default;
+		}
+		return ( ( AbsF( comparedValue ) < 0.01 ) ? ( ItemComparisonState.NoChange ) : ( ( ( comparedValue > 0.0 ) ? ( ItemComparisonState.Worse ) : ( ItemComparisonState.Better ) ) ) );
+	}
+
+}
+
+struct AttachmentSlotCacheData
+{
+	var empty : Bool;
+	var attachmentSlotRecord : weak< AttachmentSlot_Record >;
+	var shouldBeAvailable : Bool;
+	var slotId : TweakDBID;
+}
+
+import enum EStatProviderDataSource
+{
+	gameItemData,
+	InventoryItemData,
+	InnerItemData,
+	Invalid,
+}
+
+enum DamageEffectDisplayType
+{
+	Flat = 0,
+	TargetHealth = 1,
+	Invalid = -1,
+}
+
+import enum ItemComparisonState
+{
+	Default,
+	NoChange,
+	Better,
+	Worse,
+}
+
+exec function EnableTransmog( gi : GameInstance )
+{
+	SetFactValue( gi, 'transmog_enabled', 1 );
+}
+

@@ -1,0 +1,332 @@
+import class MinimapContainerController extends MappinsContainerController
+{
+	protected editable var m_rootZoneSafety : weak< inkWidget >;
+	protected editable var m_locationTextWidget : inkTextRef;
+	protected editable var m_fluffText1 : inkTextRef;
+	protected editable var m_securityAreaVignetteWidget : inkWidgetRef;
+	protected editable var m_securityAreaText : inkTextRef;
+	protected editable var m_combatModeHighlight : inkWidgetRef;
+	private var m_rootWidget : weak< inkWidget >;
+	private var m_zoneVignetteAnimProxy : inkAnimProxy;
+	private var m_inPublicOrRestrictedZone : Bool;
+	private var m_fluffTextCount : Int32;
+	default m_fluffTextCount = 0;
+	private var m_mapBlackboard : weak< IBlackboard >;
+	private var m_mapDefinition : UI_MapDef;
+	private var m_locationDataCallback : CallbackHandle;
+	private var m_securityBlackBoardID : CallbackHandle;
+	private var m_combatAnimation : inkAnimProxy;
+	private var m_playerInCombat : Bool;
+	private var m_zoneNeedsUpdate : Bool;
+	private var m_lastZoneType : ESecurityAreaType;
+	private var m_messageCounterController : weak< inkCompoundWidget >;
+
+	protected event OnInitialize()
+	{
+		m_rootWidget = GetRootWidget();
+		inkWidgetRef.SetOpacity( m_securityAreaVignetteWidget, 0.0 );
+		m_mapDefinition = GetAllBlackboardDefs().UI_Map;
+		m_mapBlackboard = GetBlackboardSystem().Get( m_mapDefinition );
+		m_locationDataCallback = m_mapBlackboard.RegisterListenerString( m_mapDefinition.currentLocation, this, 'OnLocationUpdated' );
+		OnLocationUpdated( m_mapBlackboard.GetString( m_mapDefinition.currentLocation ) );
+	}
+
+	protected event OnUnitialize()
+	{
+		m_mapBlackboard.UnregisterListenerString( m_mapDefinition.currentLocation, m_locationDataCallback );
+	}
+
+	protected event OnPlayerAttach( playerGameObject : GameObject )
+	{
+		InitializePlayer( playerGameObject );
+	}
+
+	protected function InitializePlayer( playerPuppet : GameObject )
+	{
+		var playerSMDef : PlayerStateMachineDef;
+		var psmBlackboard : IBlackboard;
+		var securityData : SecurityAreaData;
+		var variantData : Variant;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			psmBlackboard = GetPSMBlackboard( playerPuppet );
+			if( psmBlackboard )
+			{
+				m_playerInCombat = ( ( gamePSMCombat )( psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) ) ) == gamePSMCombat.InCombat;
+				m_securityBlackBoardID = psmBlackboard.RegisterListenerVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, this, 'OnSecurityDataChange' );
+				variantData = psmBlackboard.GetVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData );
+				if( variantData.IsValid() )
+				{
+					securityData = ( ( SecurityAreaData )variantData );
+					m_lastZoneType = securityData.securityAreaType;
+				}
+				else
+				{
+					m_lastZoneType = ESecurityAreaType.DISABLED;
+				}
+				m_zoneNeedsUpdate = true;
+				m_inPublicOrRestrictedZone = false;
+				SecurityZoneUpdate( m_lastZoneType );
+			}
+		}
+	}
+
+	protected event OnPlayerDetach( playerGameObject : GameObject )
+	{
+		var psmBlackboard : IBlackboard;
+		psmBlackboard = GetPSMBlackboard( playerGameObject );
+		if( psmBlackboard )
+		{
+			if( m_securityBlackBoardID )
+			{
+				psmBlackboard.UnregisterListenerVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, m_securityBlackBoardID );
+			}
+		}
+	}
+
+	protected event OnLocationUpdated( value : String )
+	{
+		inkTextRef.SetText( m_locationTextWidget, ( ( StrLen( value ) == 0 ) ? ( "Story-base-journal-contacts-unknown-Unknown_name" ) : ( value ) ) );
+	}
+
+	protected event OnPSMCombatChanged( psmCombatArg : gamePSMCombat )
+	{
+		var playbackOptions : inkAnimOptions;
+		var inCombat : Bool;
+		inCombat = psmCombatArg == gamePSMCombat.InCombat;
+		if( m_playerInCombat != inCombat )
+		{
+			m_playerInCombat = inCombat;
+			if( m_playerInCombat )
+			{
+				inkWidgetRef.SetVisible( m_combatModeHighlight, true );
+				if( !( m_combatAnimation ) || !( m_combatAnimation.IsPlaying() ) )
+				{
+					playbackOptions.loopInfinite = true;
+					playbackOptions.loopType = inkanimLoopType.Cycle;
+					m_combatAnimation = PlayLibraryAnimation( 'CombatMode', playbackOptions );
+				}
+				inkWidgetRef.SetState( m_securityAreaVignetteWidget, 'Combat' );
+				inkTextRef.SetVisible( m_securityAreaText, true );
+				inkTextRef.SetLocalizationKey( m_securityAreaText, 'Story-base-gameplay-gui-widgets-minimap-zones-Combat' );
+			}
+			else
+			{
+				inkWidgetRef.SetVisible( m_combatModeHighlight, false );
+				if( m_combatAnimation.IsPlaying() )
+				{
+					m_combatAnimation.Stop();
+				}
+				if( m_zoneVignetteAnimProxy && m_zoneVignetteAnimProxy.IsPlaying() )
+				{
+					m_zoneVignetteAnimProxy.Stop();
+				}
+				m_zoneVignetteAnimProxy = PlayLibraryAnimation( 'FadeInZoneSafety' );
+				inkWidgetRef.SetState( m_securityAreaVignetteWidget, ZoneToState( m_lastZoneType ) );
+				if( m_inPublicOrRestrictedZone )
+				{
+					inkTextRef.SetVisible( m_securityAreaText, false );
+				}
+				else
+				{
+					inkTextRef.SetVisible( m_securityAreaText, true );
+					inkTextRef.SetLocalizationKey( m_securityAreaText, ZoneToTextKey( m_lastZoneType ) );
+				}
+			}
+		}
+	}
+
+	protected event OnSecurityDataChange( value : Variant )
+	{
+		var securityData : SecurityAreaData;
+		var zoneType : ESecurityAreaType;
+		if( value.IsValid() )
+		{
+			securityData = ( ( SecurityAreaData )value );
+		}
+		zoneType = securityData.securityAreaType;
+		if( zoneType != m_lastZoneType )
+		{
+			m_lastZoneType = zoneType;
+			m_zoneNeedsUpdate = true;
+		}
+		SecurityZoneUpdate( zoneType );
+	}
+
+	private function SecurityZoneUpdate( zone : ESecurityAreaType )
+	{
+		if( m_zoneNeedsUpdate && !( m_playerInCombat ) )
+		{
+			if( m_zoneVignetteAnimProxy && m_zoneVignetteAnimProxy.IsPlaying() )
+			{
+				m_zoneVignetteAnimProxy.Stop();
+			}
+			switch( zone )
+			{
+				case ESecurityAreaType.RESTRICTED:
+					if( !( m_inPublicOrRestrictedZone ) )
+					{
+						m_zoneVignetteAnimProxy = PlayLibraryAnimation( 'FadeInZoneSafety' );
+					}
+				m_inPublicOrRestrictedZone = true;
+				break;
+				case ESecurityAreaType.DANGEROUS:
+					m_zoneVignetteAnimProxy = PlayLibraryAnimation( 'FadeInZoneDanger' );
+				m_inPublicOrRestrictedZone = false;
+				break;
+				case ESecurityAreaType.SAFE:
+					m_zoneVignetteAnimProxy = PlayLibraryAnimation( 'FadeInZoneSafety' );
+				m_inPublicOrRestrictedZone = false;
+				break;
+				default:
+					if( !( m_inPublicOrRestrictedZone ) )
+					{
+						m_zoneVignetteAnimProxy = PlayLibraryAnimation( 'FadeInZoneSafety' );
+					}
+				m_inPublicOrRestrictedZone = true;
+				break;
+			}
+			inkWidgetRef.SetState( m_securityAreaVignetteWidget, ZoneToState( zone ) );
+			if( m_inPublicOrRestrictedZone )
+			{
+				inkTextRef.SetVisible( m_securityAreaText, false );
+			}
+			else
+			{
+				inkTextRef.SetVisible( m_securityAreaText, true );
+				inkTextRef.SetLocalizationKey( m_securityAreaText, ZoneToTextKey( zone ) );
+			}
+			m_fluffTextCount = m_fluffTextCount + 1;
+			if( m_fluffTextCount > 10 )
+			{
+				m_fluffTextCount = 0;
+				inkTextRef.SetTextFromParts( m_fluffText1, "UI-Cyberpunk-Widgets-FRMWARE_2077V", IntToString( RandRange( 10, 99 ) ), "" );
+			}
+		}
+		m_zoneNeedsUpdate = false;
+	}
+
+	protected event OnPlayerEnterArea( controller : weak< MinimapSecurityAreaMappinController > ) {}
+
+	protected event OnPlayerExitArea( controller : weak< MinimapSecurityAreaMappinController > ) {}
+
+	public export override function CreateMappinUIProfile( mappin : weak< IMappin >, mappinVariant : gamedataMappinVariant, customData : MappinControllerCustomData ) : MappinUIProfile
+	{
+		var defaultRuntimeProfile : TweakDBID;
+		var questMappin : weak< QuestMappin >;
+		var roleData : GameplayRoleMappinData;
+		defaultRuntimeProfile = T"MinimapMappinUIProfile.Default";
+		if( ( customData != NULL ) && ( ( ( MinimapQuestAreaInitData )( customData ) ) != NULL ) )
+		{
+			return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_quest_area_mappin.inkwidget", T"MappinUISpawnProfile.Always", defaultRuntimeProfile );
+		}
+		if( mappin.IsExactlyA( 'gamemappinsPointOfInterestMappin' ) )
+		{
+			return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.ShortRange", defaultRuntimeProfile );
+		}
+		roleData = ( ( GameplayRoleMappinData )( mappin.GetScriptData() ) );
+		if( roleData != NULL )
+		{
+			return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_device_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.GameplayRole" );
+		}
+		switch( mappinVariant )
+		{
+			case gamedataMappinVariant.FastTravelVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.ShortRange", T"MinimapMappinUIProfile.FastTravel" );
+			case gamedataMappinVariant.ServicePointDropPointVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.ShortRange", T"MinimapMappinUIProfile.DropPoint" );
+			case gamedataMappinVariant.VehicleVariant:
+			case gamedataMappinVariant.Zzz03_MotorcycleVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.Vehicle" );
+			case gamedataMappinVariant.Zzz04_PreventionVehicleVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.PreventionVehicle" );
+			case gamedataMappinVariant.CustomPositionVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", defaultRuntimeProfile );
+			case gamedataMappinVariant.ExclamationMarkVariant:
+				if( mappin.IsQuestMappin() )
+				{
+					questMappin = ( ( QuestMappin )( mappin ) );
+					if( questMappin && questMappin.IsUIAnimation() )
+					{
+						break;
+					}
+					else if( mappin.IsQuestEntityMappin() || mappin.IsQuestNPCMappin() )
+					{
+						return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_quest_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.Quest" );
+					}
+				}
+				else
+				{
+					if( ( customData != NULL ) && ( ( ( TrackedMappinControllerCustomData )( customData ) ) != NULL ) )
+					{
+						return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", defaultRuntimeProfile );
+					}
+				}
+			break;
+			case gamedataMappinVariant.DefaultQuestVariant:
+				if( mappin.IsQuestMappin() )
+				{
+					questMappin = ( ( QuestMappin )( mappin ) );
+					if( questMappin && questMappin.IsUIAnimation() )
+					{
+						break;
+					}
+					else if( mappin.IsQuestEntityMappin() || mappin.IsQuestNPCMappin() )
+					{
+						return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_quest_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.Quest" );
+					}
+				}
+			break;
+			case gamedataMappinVariant.HazardWarningVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_hazard_warning_mappin.inkwidget", T"MappinUISpawnProfile.ShortRange", defaultRuntimeProfile );
+			case gamedataMappinVariant.DynamicEventVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_dynamic_event_mappin.inkwidget", T"MappinUISpawnProfile.MediumRange", defaultRuntimeProfile );
+			case gamedataMappinVariant.CPO_RemotePlayerVariant:
+				return MappinUIProfile.Create( R"multi\gameplay\gui\widgets\minimap\minimap_remote_player_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.CPORemote" );
+			case gamedataMappinVariant.CPO_PingGoHereVariant:
+				return MappinUIProfile.Create( R"multi\gameplay\gui\widgets\minimap\minimap_pingsystem_mapping.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.CPORemote" );
+			default:
+				if( mappin.IsExactlyA( 'gamemappinsStealthMappin' ) )
+				{
+					return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_stealth_mappin.inkwidget", T"MappinUISpawnProfile.Stealth", T"MinimapMappinUIProfile.Stealth" );
+				}
+			if( ( customData != NULL ) && ( ( ( TrackedMappinControllerCustomData )( customData ) ) != NULL ) )
+			{
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", defaultRuntimeProfile );
+			}
+			break;
+		}
+		return MappinUIProfile.None();
+	}
+
+	private function ZoneToState( zone : ESecurityAreaType ) : CName
+	{
+		switch( zone )
+		{
+			case ESecurityAreaType.SAFE:
+				return 'Safe';
+			case ESecurityAreaType.RESTRICTED:
+				return 'Default';
+			case ESecurityAreaType.DANGEROUS:
+				return 'Dangerous';
+		}
+		return 'Default';
+	}
+
+	private function ZoneToTextKey( zone : ESecurityAreaType ) : CName
+	{
+		switch( zone )
+		{
+			case ESecurityAreaType.SAFE:
+				return 'Story-base-gameplay-gui-widgets-minimap-zones-Safe';
+			case ESecurityAreaType.RESTRICTED:
+				return 'Story-base-gameplay-gui-widgets-minimap-zones-Restricted';
+			case ESecurityAreaType.DANGEROUS:
+				return 'Story-base-gameplay-gui-widgets-minimap-zones-Hostile';
+		}
+		return 'Story-base-gameplay-gui-widgets-minimap-zones-Public';
+	}
+
+}
+

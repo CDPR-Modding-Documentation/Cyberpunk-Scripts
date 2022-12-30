@@ -1,0 +1,389 @@
+class AOEArea extends InteractiveMasterDevice
+{
+	default m_controllerTypeName = 'AOEAreaController';
+	protected instanceeditable var m_areaComponent : TriggerComponent;
+	private var m_gameEffect : EffectInstance;
+	private var m_highLightActive : Bool;
+	private var m_visionBlockerComponent : IComponent;
+	private var m_obstacleComponent : InfluenceObstacleComponent;
+	private var m_activeStatusEffects : array< weak< StatusEffect_Record > >;
+	private var m_extendPercentAABB : Float;
+	default m_extendPercentAABB = 1.3f;
+	private var m_isAABBExtended : Bool;
+	default m_isAABBExtended = false;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'area', 'TriggerComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'vision_blocker', 'entColliderComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'obstacle_component', 'InfluenceObstacleComponent', false );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_areaComponent = ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'area' ) ) );
+		m_visionBlockerComponent = EntityResolveComponentsInterface.GetComponent( ri, 'vision_blocker' );
+		m_obstacleComponent = ( ( InfluenceObstacleComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'obstacle_component' ) ) );
+		m_controller = ( ( AOEAreaController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		if( ( ( AOEAreaControllerPS )( GetDevicePS() ) ).IsAreaActive() )
+		{
+			ActivateEffect();
+		}
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		StopGameEffect();
+	}
+
+	public const override function IsGameplayRelevant() : Bool
+	{
+		return true;
+	}
+
+	private const override function GetController() : AOEAreaController
+	{
+		return ( ( AOEAreaController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : AOEAreaControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	public function GetObstacleComponent() : IComponent
+	{
+		return m_obstacleComponent;
+	}
+
+	public function GetVisionBlockerComponent() : IComponent
+	{
+		return m_visionBlockerComponent;
+	}
+
+	protected event OnActivateDevice( evt : ActivateDevice )
+	{
+		ActivateArea();
+	}
+
+	protected event OnDeactivateDevice( evt : DeactivateDevice )
+	{
+		DeactivateArea();
+	}
+
+	protected event OnRevealDeviceRequest( evt : RevealDeviceRequest )
+	{
+		super.OnRevealDeviceRequest( evt );
+		if( !( GetDevicePS().ShouldRevealDevicesGrid() ) )
+		{
+			return true;
+		}
+		ToggleHighlightOnTargets( evt.shouldReveal );
+	}
+
+	private function ToggleHighlightOnTargets( toggle : Bool )
+	{
+		var i : Int32;
+		var entities : array< Entity >;
+		entities = GetEntitiesInArea();
+		m_highLightActive = toggle;
+		for( i = 0; i < entities.Size(); i += 1 )
+		{
+			if( ( ( NPCPuppet )( entities[ i ] ) ) != NULL )
+			{
+				ToggleHighlightOnSingleTarget( toggle, entities[ i ].GetEntityID() );
+			}
+		}
+	}
+
+	private function ToggleHighlightOnSingleTarget( toggle : Bool, id : EntityID )
+	{
+		var evt : ForceVisionApperanceEvent;
+		var highlight : FocusForcedHighlightData;
+		highlight = CreateHighlight( EFocusForcedHighlightType.DISTRACTION );
+		evt = new ForceVisionApperanceEvent;
+		evt.apply = toggle;
+		evt.forcedHighlight = highlight;
+		QueueEventForEntityID( id, evt );
+	}
+
+	private function CreateHighlight( highlightType : EFocusForcedHighlightType ) : FocusForcedHighlightData
+	{
+		var highlight : FocusForcedHighlightData;
+		highlight = new FocusForcedHighlightData;
+		highlight.sourceID = GetEntityID();
+		highlight.sourceName = GetClassName();
+		highlight.highlightType = highlightType;
+		highlight.inTransitionTime = 0.0;
+		highlight.outTransitionTime = 0.0;
+		highlight.priority = EPriority.VeryHigh;
+		return highlight;
+	}
+
+	private function ActivateArea()
+	{
+		ActivateEffect();
+		if( GetDevicePS().IsDangerous() && m_obstacleComponent )
+		{
+			m_visionBlockerComponent.Toggle( true );
+			m_obstacleComponent.Toggle( true );
+			m_visionBlockerComponent.Toggle( false );
+			if( !( m_isAABBExtended ) )
+			{
+				ExtendBoundingBox();
+			}
+		}
+		if( GetDevicePS().BlocksVisibility() && m_visionBlockerComponent )
+		{
+			m_visionBlockerComponent.Toggle( true );
+		}
+	}
+
+	private function DeactivateArea()
+	{
+		StopGameEffect();
+		if( m_visionBlockerComponent )
+		{
+			m_visionBlockerComponent.Toggle( false );
+		}
+		if( m_obstacleComponent )
+		{
+			m_obstacleComponent.Toggle( false );
+		}
+	}
+
+	private function ActivateEffect()
+	{
+		var attack : Attack_GameEffect;
+		var attackContext : AttackInitContext;
+		var statusEffectRecords : array< weak< StatusEffectAttackData_Record > >;
+		var i : Int32;
+		if( !( m_gameEffect ) )
+		{
+			attackContext.record = TweakDBInterface.GetAttackRecord( GetDevicePS().GetAreaEffect() );
+			attackContext.instigator = GetPlayer( GetGame() );
+			attackContext.source = this;
+			attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+			m_gameEffect = attack.PrepareAttack( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() );
+			EffectData.SetVector( m_gameEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, this.GetWorldPosition() );
+			EffectData.SetVariant( m_gameEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+			attack.StartAttack();
+			TweakDBInterface.GetAttackRecord( GetDevicePS().GetAreaEffect() ).StatusEffects( statusEffectRecords );
+			for( i = 0; i < statusEffectRecords.Size(); i += 1 )
+			{
+				m_activeStatusEffects.PushBack( statusEffectRecords[ i ].StatusEffect() );
+			}
+		}
+	}
+
+	private function StopGameEffect()
+	{
+		var currentlyOverlappingEntities : array< Entity >;
+		var i : Int32;
+		if( m_gameEffect )
+		{
+			m_gameEffect.Terminate();
+			m_gameEffect = NULL;
+			if( GetDevicePS().EffectsOnlyActiveInArea() )
+			{
+				currentlyOverlappingEntities = GetEntitiesInArea();
+				for( i = 0; i < currentlyOverlappingEntities.Size(); i += 1 )
+				{
+					RemoveActiveStatusEffectsFromEntity( currentlyOverlappingEntities[ i ].GetEntityID() );
+				}
+			}
+			m_activeStatusEffects.Clear();
+		}
+	}
+
+	public const function GetEntitiesInArea() : array< Entity >
+	{
+		return m_areaComponent.GetOverlappingEntities();
+	}
+
+	protected event OnAreaEnter( evt : AreaEnteredEvent )
+	{
+		var activator : weak< NPCPuppet >;
+		super.OnAreaEnter( evt );
+		activator = ( ( NPCPuppet )( EntityGameInterface.GetEntity( evt.activator ) ) );
+		if( ( activator != NULL ) && m_highLightActive )
+		{
+			ToggleHighlightOnSingleTarget( true, activator.GetEntityID() );
+		}
+		if( GetDevicePS().EffectsOnlyActiveInArea() )
+		{
+			ApplyActiveStatusEffectsToEntity( EntityGameInterface.GetEntity( evt.activator ).GetEntityID() );
+		}
+		if( activator )
+		{
+			UpdateWillingInvestigator();
+		}
+	}
+
+	protected event OnAreaExit( evt : AreaExitedEvent )
+	{
+		var activator : weak< NPCPuppet >;
+		super.OnAreaExit( evt );
+		activator = ( ( NPCPuppet )( EntityGameInterface.GetEntity( evt.activator ) ) );
+		if( ( activator != NULL ) && m_highLightActive )
+		{
+			ToggleHighlightOnSingleTarget( false, activator.GetEntityID() );
+		}
+		if( GetDevicePS().EffectsOnlyActiveInArea() )
+		{
+			RemoveActiveStatusEffectsFromEntity( EntityGameInterface.GetEntity( evt.activator ).GetEntityID() );
+		}
+		if( activator )
+		{
+			UpdateWillingInvestigator();
+		}
+	}
+
+	protected function UpdateWillingInvestigator()
+	{
+		var i : Int32;
+		var j : Int32;
+		var target : Entity;
+		var lastDistance : Float;
+		var newDistance : Float;
+		var targetPos : Vector4;
+		var sourcePos : Vector4;
+		var path : NavigationPath;
+		var posSources : array< Vector4 >;
+		var navDistance : Float;
+		var closestNavDist : Float;
+		var targets : array< Entity >;
+		posSources = GetNodePosition();
+		targets = GetEntitiesInArea();
+		for( i = 0; i < targets.Size(); i += 1 )
+		{
+			if( ( ( GameObject )( targets[ i ] ) ).IsPlayer() )
+			{
+				continue;
+			}
+			targetPos = targets[ i ].GetWorldPosition();
+			for( j = 0; j < posSources.Size(); j += 1 )
+			{
+				navDistance = Vector4.DistanceSquared( posSources[ j ], targetPos );
+				path = GameInstance.GetNavigationSystem( GetGame() ).CalculatePathOnlyHumanNavmesh( targetPos, posSources[ j ], NavGenAgentSize.Human, 0.0 );
+				if( !( path ) )
+				{
+					continue;
+				}
+				if( ( navDistance < closestNavDist ) || ( closestNavDist == 0.0 ) )
+				{
+					closestNavDist = navDistance;
+					sourcePos = posSources[ j ];
+				}
+			}
+			path = GameInstance.GetNavigationSystem( GetGame() ).CalculatePathOnlyHumanNavmesh( targetPos, sourcePos, NavGenAgentSize.Human, 0.0 );
+			newDistance = path.CalculateLength();
+			if( ( ( lastDistance == 0.0 ) || ( lastDistance > newDistance ) ) && ( newDistance != 0.0 ) )
+			{
+				target = targets[ i ];
+				lastDistance = newDistance;
+			}
+		}
+		if( target )
+		{
+			GetDevicePS().AddWillingInvestigator( target.GetEntityID() );
+		}
+		else
+		{
+			GetDevicePS().ClearWillingInvestigators();
+		}
+	}
+
+	protected function ApplyActiveStatusEffectsToEntity( entityID : EntityID )
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeStatusEffects.Size(); i += 1 )
+		{
+			GameInstance.GetStatusEffectSystem( GetGame() ).ApplyStatusEffect( entityID, m_activeStatusEffects[ i ].GetID() );
+		}
+	}
+
+	protected function RemoveActiveStatusEffectsFromEntity( entityID : EntityID )
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeStatusEffects.Size(); i += 1 )
+		{
+			GameInstance.GetStatusEffectSystem( GetGame() ).RemoveStatusEffect( entityID, m_activeStatusEffects[ i ].GetID() );
+		}
+	}
+
+	public const override function GetDefaultHighlight() : FocusForcedHighlightData
+	{
+		return NULL;
+	}
+
+	public override function GetStimTarget() : GameObject
+	{
+		return this;
+	}
+
+	public override function GetDistractionControllerSource( optional effectData : AreaEffectData ) : Entity
+	{
+		var ancestors : array< DeviceComponentPS >;
+		var controller : Entity;
+		var i : Int32;
+		if( effectData )
+		{
+			controller = this.GetEntityFromNode( effectData.controllerSource );
+		}
+		if( controller )
+		{
+			return controller;
+		}
+		GetDevicePS().GetAncestors( ancestors );
+		for( i = 0; i <= ancestors.Size(); i += 1 )
+		{
+			if( ancestors[ i ].GetDeviceName() == "Activator" )
+			{
+				return ancestors[ i ].GetOwnerEntityWeak();
+			}
+		}
+		return this;
+	}
+
+	public override function GetDistractionStimLifetime( defaultValue : Float ) : Float
+	{
+		return ( ( AOEAreaControllerPS )( GetDevicePS() ) ).GetEffectDuration();
+	}
+
+	private function ExtendBoundingBox()
+	{
+		var aabb : Box;
+		aabb = m_obstacleComponent.GetBoundingBox();
+		aabb.Min *= m_extendPercentAABB;
+		aabb.Max *= m_extendPercentAABB;
+		m_obstacleComponent.SetBoundingBox( aabb );
+		m_isAABBExtended = true;
+	}
+
+}
+
+class EffectObjectProvider_AOEAreaEntities extends EffectObjectProvider_Scripted
+{
+
+	public export function Process( ctx : EffectScriptContext, providerCtx : EffectProviderScriptContext )
+	{
+		var i : Int32;
+		var entities : array< Entity >;
+		entities = ( ( AOEArea )( EffectScriptContext.GetSource( ctx ) ) ).GetEntitiesInArea();
+		for( i = 0; i < entities.Size(); i += 1 )
+		{
+			EffectProviderScriptContext.AddTarget( ctx, providerCtx, entities[ i ] );
+		}
+	}
+
+}
+

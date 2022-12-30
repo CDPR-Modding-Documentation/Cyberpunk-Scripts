@@ -1,0 +1,1778 @@
+class ChangeHalfLights extends Event
+{
+	var m_isAuthorization : Bool;
+}
+
+class AnimFeatureDoor extends AnimFeature
+{
+	editable var m_progress : Float;
+	editable var m_openingSpeed : Float;
+	editable var m_openingType : Int32;
+	editable var m_doorSide : Int32;
+}
+
+struct LedColors
+{
+	var off : ScriptLightSettings;
+	var red : ScriptLightSettings;
+	var green : ScriptLightSettings;
+}
+
+struct DoorPersistentData
+{
+	var m_doorType : EDoorType;
+	var m_canPlayerToggleLockState : Bool;
+	var m_canPlayerToggleSealState : Bool;
+	var m_initialStatus : EDoorStatus;
+	var m_keycardName : TweakDBID;
+	var m_passcode : CName;
+}
+
+struct DoorResaveData
+{
+	var m_doorType : EDoorType;
+	var m_canPlayerToggleLockState : Bool;
+	var m_canPlayerToggleSealState : Bool;
+	var m_initialStatus : EDoorStatus;
+	var m_keycardName : TweakDBID;
+	var m_passcode : CName;
+}
+
+class DoorReplicatedState extends DeviceReplicatedState
+{
+	var m_isOpen : Bool;
+	var m_wasImmediateChange : Bool;
+}
+
+class Door extends InteractiveDevice
+{
+	default m_controllerTypeName = 'DoorController';
+	protected var m_animationController : AnimationControllerComponent;
+	protected var m_triggerComponent : TriggerComponent;
+	protected var m_triggerSideOne : TriggerComponent;
+	protected var m_triggerSideTwo : TriggerComponent;
+	protected var m_offMeshConnectionComponent : OffMeshConnectionComponent;
+	protected var m_strongSoloFrame : MeshComponent;
+	protected var m_terminalNetrunner1 : MeshComponent;
+	protected var m_terminalNetrunner2 : MeshComponent;
+	protected var m_terminalTechie1 : MeshComponent;
+	protected var m_terminalTechie2 : MeshComponent;
+	protected var m_ledTechie1 : gameLightComponent;
+	protected var m_ledTechie2 : gameLightComponent;
+	protected var m_ledNetrunner1 : gameLightComponent;
+	protected var m_ledNetrunner2 : gameLightComponent;
+	protected var m_led1 : gameLightComponent;
+	protected var m_led2 : gameLightComponent;
+	protected var m_ledHandle1 : gameLightComponent;
+	protected var m_ledHandle2 : gameLightComponent;
+	protected var m_ledHandle1a : gameLightComponent;
+	protected var m_ledHandle2a : gameLightComponent;
+	protected var m_occluder : IPlacedComponent;
+	protected var m_portalLight1 : gameLightComponent;
+	protected var m_portalLight2 : gameLightComponent;
+	protected var m_portalLight3 : gameLightComponent;
+	protected var m_portalLight4 : gameLightComponent;
+	protected var m_playerBlocker : ColliderComponent;
+	private var m_animFeatureDoor : AnimFeatureDoor;
+	private var m_isVisuallyOpened : Bool;
+	private var m_lastDoorSide : Int32;
+	private editable var m_bankToLoad_TEMP : String;
+	default m_bankToLoad_TEMP = "dev_door_sliding_generic";
+	protected var m_colors : LedColors;
+	protected var m_activeSkillcheckLights : array< gameLightComponent >;
+	protected var m_allActiveLights : array< gameLightComponent >;
+	private instanceeditable var m_closingAnimationLength : Float;
+	default m_closingAnimationLength = 1.1f;
+	private instanceeditable var m_automaticCloseDelay : Float;
+	default m_automaticCloseDelay = 3.0f;
+	protected instanceeditable var m_doorOpeningType : EDoorOpeningType;
+	private instanceeditable var m_forceOpeningAudioStimRange : Float;
+	default m_forceOpeningAudioStimRange = 6.0f;
+	private instanceeditable var m_openingAudioStimRange : Float;
+	default m_openingAudioStimRange = 0.0f;
+	protected editable var m_animationType : EAnimationType;
+	private var m_doorTriggerSide : EDoorTriggerSide;
+	private var m_whoOpened : weak< GameObject >;
+	private var m_openedUsingForce : Bool;
+	private var m_illegalOpen : Bool;
+	private var m_audioForceOpen : Bool;
+	private var m_componentName : CName;
+	private var m_playerInWorkspot : weak< PlayerPuppet >;
+
+	protected function UpdateLightByTask()
+	{
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'UpdateLightTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function UpdateLightTask( data : ScriptTaskData )
+	{
+		UpdateLight();
+	}
+
+	protected virtual function SetAppearance()
+	{
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'SetAppearanceTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function SetAppearanceTask( data : ScriptTaskData )
+	{
+		SetSoloAppearance();
+		SetTechieAppearance();
+		SetNetrunnerAppearance();
+		InitializeLight();
+		UpdateLight();
+	}
+
+	private function EvaluateOffMeshLinks()
+	{
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'EvaluateOffMeshLinksTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function EvaluateOffMeshLinksTask( data : ScriptTaskData )
+	{
+		var ps : DoorControllerPS;
+		if( m_offMeshConnectionComponent == NULL )
+		{
+			return;
+		}
+		ps = GetDevicePS();
+		if( ps.IsOpen() )
+		{
+			EnableOffMeshConnections( true, true );
+		}
+		else if( ( ps.IsDisabled() || ps.IsSealed() ) || ps.IsUnpowered() )
+		{
+			DisableOffMeshConnections( true, true );
+		}
+		else if( ps.IsClosed() )
+		{
+			if( !( ps.IsLocked() ) && ps.IsON() )
+			{
+				EnableOffMeshConnections( false, true );
+			}
+			else
+			{
+				DisableOffMeshConnections( false, true );
+			}
+			if( ( HasAnySkillCheckActive() && CanPassAnySkillCheck() ) || CanPassAnySkillCheckOnParentTerminal() )
+			{
+				EnableOffMeshConnections( true, false );
+			}
+			else if( ps.IsDeviceSecured() && ps.IsPlayerAuthorized() )
+			{
+				EnableOffMeshConnections( true, false );
+			}
+			else if( ps.IsLocked() && ps.canPlayerToggleLockState() )
+			{
+				EnableOffMeshConnections( true, false );
+			}
+			else if( ( ( !( ps.IsLocked() ) && !( ps.IsDeviceSecured() ) ) && !( HasAnySkillCheckActive() ) ) && ps.IsON() )
+			{
+				EnableOffMeshConnections( true, false );
+			}
+			else
+			{
+				DisableOffMeshConnections( true, false );
+			}
+		}
+	}
+
+	public export const override function GetDeviceStateClass() : CName
+	{
+		return 'DoorReplicatedState';
+	}
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'animController', 'AnimationControllerComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'trigger', 'gameStaticTriggerAreaComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'SideOne', 'gameStaticTriggerAreaComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'SideTwo', 'gameStaticTriggerAreaComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'offMeshConnection', 'OffMeshConnectionComponent', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'solo_frame', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'top_netrunner_side1', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'top_netrunner_side2', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'bottom_techie_side1', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'bottom_techie_side2', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_techie_side1', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_techie_side2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_netrunner_side1', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_netrunner_side2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_side1', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_side2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_handle_side1', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_handle_side2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_handle_2_side1', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'led_handle_2_side2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'occluder', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'portal_light', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'portal_light_2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'portal_light_gi', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'portal_light_gi_2', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'player_blocker', 'ColliderComponent', false );
+	}
+
+	public override function OnMaraudersMapDeviceDebug( sink : MaraudersMapDevicesSink )
+	{
+		var ps : DoorControllerPS;
+		super.OnMaraudersMapDeviceDebug( sink );
+		sink.BeginCategory( "Door specific" );
+		ps = GetDevicePS();
+		sink.EndCategory();
+		if( ps.IsOpen() )
+		{
+			sink.PushBool( "Are Open", ps.IsOpen() );
+		}
+		if( ps.IsLogicallyClosed() )
+		{
+			sink.PushBool( "Are Logically Closed", ps.IsLogicallyClosed() );
+		}
+		if( ps.IsLocked() )
+		{
+			sink.PushBool( "Are Locked", ps.IsLocked() );
+		}
+		if( ps.IsSealed() )
+		{
+			sink.PushBool( "Are Sealed", ps.IsSealed() );
+		}
+		sink.PushString( "Door Type", EnumValueToString( "EDoorType", ( ( Int32 )( ps.GetDoorType() ) ) ) );
+		sink.PushString( "Door Side One", EnumValueToString( "EDoorType", ( ( Int32 )( ps.GetDoorTypeSideOne() ) ) ) );
+		sink.PushString( "Door Side Two", EnumValueToString( "EDoorType", ( ( Int32 )( ps.GetDoorTypeSideTwo() ) ) ) );
+		sink.PushString( "Skillcheck Side", EnumValueToString( "EDoorSkillcheckSide", ( ( Int32 )( ps.GetDoorSkillcheckSide() ) ) ) );
+		sink.PushBool( "Are Closing Automatically", ps.IsClosingAutomatically() );
+		sink.PushBool( "Can Player Toggle Locked State", ps.canPlayerToggleLockState() );
+		sink.PushBool( "IS LIFT DOOR?", ps.IsLiftDoor() );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_animationController = ( ( AnimationControllerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'animController' ) ) );
+		m_triggerComponent = ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'trigger' ) ) );
+		m_triggerSideOne = ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'SideOne' ) ) );
+		m_triggerSideTwo = ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'SideTwo' ) ) );
+		m_offMeshConnectionComponent = ( ( OffMeshConnectionComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'offMeshConnection' ) ) );
+		m_strongSoloFrame = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'solo_frame' ) ) );
+		m_terminalNetrunner1 = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'top_netrunner_side1' ) ) );
+		m_terminalNetrunner2 = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'top_netrunner_side2' ) ) );
+		m_terminalTechie1 = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'bottom_techie_side1' ) ) );
+		m_terminalTechie2 = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'bottom_techie_side2' ) ) );
+		m_ledTechie1 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_techie_side1' ) ) );
+		m_ledTechie2 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_techie_side2' ) ) );
+		m_ledNetrunner1 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_netrunner_side1' ) ) );
+		m_ledNetrunner2 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_netrunner_side2' ) ) );
+		m_led1 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_side1' ) ) );
+		m_led2 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_side2' ) ) );
+		m_ledHandle1 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_handle_side1' ) ) );
+		m_ledHandle2 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_handle_side2' ) ) );
+		m_ledHandle1a = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_handle_2_side1' ) ) );
+		m_ledHandle2a = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'led_handle_2_side2' ) ) );
+		m_occluder = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'occluder' ) ) );
+		m_portalLight1 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'portal_light' ) ) );
+		m_portalLight2 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'portal_light_2' ) ) );
+		m_portalLight3 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'portal_light_gi' ) ) );
+		m_portalLight4 = ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'portal_light_gi_2' ) ) );
+		m_playerBlocker = ( ( ColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'player_blocker' ) ) );
+		if( m_offMeshConnectionComponent == NULL )
+		{
+			LogError( "OffMeshConnectionComponent is missing from a door entity." );
+		}
+		super.OnTakeControl( ri );
+		m_controller = ( ( DoorController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		CreateLightSettings();
+		UpdateDeviceState();
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		m_animFeatureDoor = new AnimFeatureDoor;
+		m_animFeatureDoor.m_openingType = ( ( Int32 )( m_doorOpeningType ) );
+		super.ResolveGameplayState();
+	}
+
+	protected override function ResolveIllegalAction( executor : GameObject, duration : Float )
+	{
+		super.ResolveIllegalAction( executor, duration );
+		if( IsConnectedToSecuritySystem() )
+		{
+			GetDevicePS().TriggerSecuritySystemNotification( executor, GetWorldPosition(), ESecurityNotificationType.ILLEGAL_ACTION );
+		}
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		GameInstance.GetAudioSystem( GetGame() ).UnloadBank( m_bankToLoad_TEMP );
+	}
+
+	public const override function GetDevicePS() : DoorControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	private const override function GetController() : DoorController
+	{
+		return ( ( DoorController )( m_controller ) );
+	}
+
+	protected event OnPersitentStateInitialized( evt : GameAttachedEvent )
+	{
+		super.OnPersitentStateInitialized( evt );
+		SetAppearance();
+	}
+
+	private function UpdateLight()
+	{
+		var ps : DoorControllerPS;
+		ps = GetDevicePS();
+		if( ps.IsSealed() || ps.IsDisabled() )
+		{
+			TurnLightsOff();
+		}
+		else if( RedLightCondition() )
+		{
+			SetColor( m_colors.red );
+		}
+		else
+		{
+			SetColor( m_colors.green );
+		}
+		if( ps.GetDoorAuthorizationSide() != EDoorSkillcheckSide.BOTH && ( GetDoorTriggerSide( GetPlayerEntity() ) == EDoorTriggerSide.OUTSIDE || !( ps.IsUserAuthorized( ps.GetPlayerEntityID() ) ) ) )
+		{
+			ChangeHalfLights();
+		}
+		else if( ps.IsSkillCheckActive() && ps.GetDoorSkillcheckSide() != EDoorSkillcheckSide.BOTH )
+		{
+			ChangeHalfLights();
+		}
+	}
+
+	private function RedLightCondition() : Bool
+	{
+		var ps : DoorControllerPS;
+		ps = GetDevicePS();
+		if( ps.IsLocked() )
+		{
+			return true;
+		}
+		else if( !( ps.IsUserAuthorized( ps.GetPlayerEntityID() ) ) && ps.GetDoorAuthorizationSide() == EDoorSkillcheckSide.BOTH )
+		{
+			return true;
+		}
+		else if( ps.IsSkillCheckActive() && ps.GetDoorSkillcheckSide() == EDoorSkillcheckSide.BOTH )
+		{
+			return true;
+		}
+		else if( ps.IsUnpowered() || ps.IsOFF() )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function TurnLightsOff()
+	{
+		gameLightComponent.ChangeLightSettingByRefs( m_allActiveLights, m_colors.off, 2.0, 'glitch' );
+	}
+
+	private function SetColor( lightSettings : ScriptLightSettings )
+	{
+		gameLightComponent.ChangeLightSettingByRefs( m_allActiveLights, lightSettings );
+	}
+
+	protected event OnChangeHalfLights( evt : ChangeHalfLights )
+	{
+		gameLightComponent.ChangeLightSettingByRefs( m_activeSkillcheckLights, m_colors.red );
+	}
+
+	private function ChangeHalfLights()
+	{
+		var evt : ChangeHalfLights;
+		evt = new ChangeHalfLights;
+		QueueEvent( evt );
+	}
+
+	protected override function UpdateDeviceState( optional isDelayed : Bool ) : Bool
+	{
+		if( super.UpdateDeviceState( isDelayed ) )
+		{
+			if( IsInitialized() )
+			{
+				if( m_isVisuallyOpened != GetDevicePS().IsOpen() )
+				{
+					MoveDoor( GetDevicePS().IsOpen(), false );
+				}
+				UpdateLightByTask();
+				RefreshUI( isDelayed );
+				EvaluateOffMeshLinks();
+			}
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected override function RestoreDeviceState()
+	{
+		MoveDoor( GetDevicePS().IsOpen(), true );
+		super.RestoreDeviceState();
+	}
+
+	protected override function ApplyReplicatedState( const state : DeviceReplicatedState )
+	{
+		const var doorState : DoorReplicatedState;
+		super.ApplyReplicatedState( state );
+		doorState = ( ( DoorReplicatedState )( state ) );
+		if( doorState.m_isOpen != m_isVisuallyOpened )
+		{
+			MoveDoor( doorState.m_isOpen, doorState.m_wasImmediateChange );
+		}
+	}
+
+	protected function AccessGrantedNotification()
+	{
+		var notification : AuthorisationNotificationEvent;
+		var player : PlayerPuppet;
+		notification = new AuthorisationNotificationEvent;
+		notification.type = gameuiAuthorisationNotificationType.AccessGranted;
+		player = ( ( PlayerPuppet )( GetPlayerMainObject() ) );
+		player.QueueEvent( notification );
+	}
+
+	protected event OnPay( evt : Pay )
+	{
+		AccessGrantedNotification();
+	}
+
+	protected override function DeactivateDevice()
+	{
+		super.DeactivateDevice();
+		m_animationController.Toggle( false );
+	}
+
+	protected override function ActivateDevice()
+	{
+		super.ActivateDevice();
+		if( ShouldRegisterToHUD() )
+		{
+			RegisterToHUDManagerByTask( true );
+		}
+		if( m_animationController )
+		{
+			m_animationController.Toggle( true );
+		}
+	}
+
+	protected event OnAreaEnter( evt : AreaEnteredEvent )
+	{
+		var activator : GameObject;
+		var authorizedActivator : GameObject;
+		var npcActivator : NPCPuppet;
+		var approachingEvent : AIApproachingAreaEvent;
+		var oppositeArea : TriggerComponent;
+		var ps : DoorControllerPS;
+		if( IsClient() )
+		{
+			super.OnAreaEnter( evt );
+			return false;
+		}
+		activator = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
+		npcActivator = ( ( NPCPuppet )( activator ) );
+		ps = GetDevicePS();
+		super.OnAreaEnter( evt );
+		if( !( m_wasVisible ) )
+		{
+			ResolveGameplayState();
+			m_wasVisible = true;
+		}
+		if( activator.IsPlayer() )
+		{
+			if( evt.componentName == 'SideOne' )
+			{
+				SetNewDoorType( ps.GetDoorTypeSideOne() );
+				ps.SetTriggerSide( EDoorTriggerSide.ONE );
+			}
+			else if( evt.componentName == 'SideTwo' )
+			{
+				SetNewDoorType( ps.GetDoorTypeSideTwo() );
+				ps.SetTriggerSide( EDoorTriggerSide.TWO );
+			}
+			EvaluateOffMeshLinks();
+		}
+		if( ( evt.componentName != 'trigger' || ps.IsOpen() ) || ps.IsSealed() )
+		{
+			return false;
+		}
+		if( activator.IsPlayer() )
+		{
+			IsSomeoneAuthorizedNearby( authorizedActivator );
+			if( ps.GetDoorType() == EDoorType.REMOTELY_CONTROLLED && !( ps.IsLiftDoor() ) )
+			{
+				return false;
+			}
+			if( ps.IsDeviceSecured() && ps.IsTriggerValid( ps.GetDoorAuthorizationSide() ) )
+			{
+				if( ( authorizedActivator != NULL ) && authorizedActivator.IsPlayer() )
+				{
+					if( !( ps.WasPlayerAuthorized() ) )
+					{
+						AccessGrantedNotification();
+						ps.UpdatePlayerAuthorization();
+					}
+					if( ps.IsLocked() )
+					{
+						ToggleDoorLockState( authorizedActivator, ps.GetDoorType() == EDoorType.AUTOMATIC );
+					}
+					else if( ps.GetDoorType() == EDoorType.AUTOMATIC && ps.IsLogicallyClosed() )
+					{
+						ToggleDoorOpeningState( authorizedActivator );
+					}
+				}
+			}
+			else
+			{
+				if( ps.GetDoorType() == EDoorType.AUTOMATIC || ps.IsLiftDoor() )
+				{
+					if( ps.IsLogicallyClosed() || ( authorizedActivator != NULL ) )
+					{
+						if( ps.HasAnySkillCheckActive() )
+						{
+							if( !( ps.IsTriggerValid( ps.GetDoorSkillcheckSide() ) ) )
+							{
+								ToggleDoorOpeningState( activator );
+							}
+						}
+						else
+						{
+							ToggleDoorOpeningState( activator );
+						}
+					}
+				}
+			}
+		}
+		else if( npcActivator )
+		{
+			if( !( ScriptedPuppet.IsActive( activator ) ) )
+			{
+				return false;
+			}
+			switch( GetDoorTriggerSide( npcActivator ) )
+			{
+				case EDoorTriggerSide.ONE:
+					oppositeArea = m_triggerSideTwo;
+				break;
+				case EDoorTriggerSide.TWO:
+					oppositeArea = m_triggerSideOne;
+				break;
+				default:
+					oppositeArea = NULL;
+				break;
+			}
+			if( oppositeArea && ps.IsLogicallyClosed() )
+			{
+				if( !( m_wasVisible ) )
+				{
+					m_wasVisible = true;
+					ResolveGameplayState();
+				}
+				approachingEvent = new AIApproachingAreaEvent;
+				approachingEvent.areaComponent = oppositeArea;
+				approachingEvent.responseTarget = this;
+				npcActivator.QueueEvent( approachingEvent );
+				return true;
+			}
+		}
+		if( HasValidOpeningToken( EntityGameInterface.GetEntity( evt.activator ).GetEntityID() ) )
+		{
+			ToggleDoorOpeningState( activator );
+		}
+	}
+
+	protected event OnAreaExit( evt : AreaExitedEvent )
+	{
+		var e : DoorTriggerDelayedEvent;
+		var activator : GameObject;
+		var npcActivator : NPCPuppet;
+		var approachingEvent : AIApproachingAreaEvent;
+		var doorPS : DoorControllerPS;
+		doorPS = GetDevicePS();
+		if( doorPS.IsLiftDoor() )
+		{
+			if( IsPlayerInsideLift() )
+			{
+				return false;
+			}
+		}
+		doorPS.SetTriggerSide( GetDoorTriggerSide( GetPlayerEntity() ) );
+		if( evt.componentName == 'trigger' )
+		{
+			npcActivator = ( ( NPCPuppet )( EntityGameInterface.GetEntity( evt.activator ) ) );
+			if( npcActivator )
+			{
+				approachingEvent = new AIApproachingAreaEvent;
+				approachingEvent.responseTarget = this;
+				approachingEvent.isApproachCancellation = true;
+				npcActivator.QueueEvent( approachingEvent );
+			}
+		}
+		if( ( ( evt.componentName != 'trigger' || !( doorPS.IsOpen() ) ) || !( doorPS.IsClosingAutomatically() ) ) || !( doorPS.IsON() ) )
+		{
+			return false;
+		}
+		activator = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
+		e = new DoorTriggerDelayedEvent;
+		e.activator = activator;
+		if( ( ( ScriptedPuppet )( EntityGameInterface.GetEntity( evt.activator ) ) ) && !( IsSomeoneAuthorizedNearby() ) )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, e, m_automaticCloseDelay );
+		}
+	}
+
+	protected function IsPlayerInsideLift() : Bool
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		blackboardSystem = GameInstance.GetBlackboardSystem( GetGame() );
+		blackboard = blackboardSystem.GetLocalInstanced( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return blackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideElevator );
+	}
+
+	protected event OnApproachingAreaResponseEvent( evt : AIApproachingAreaResponseEvent )
+	{
+		var sender : GameObject;
+		if( evt.isPassingThrough && GetDevicePS().IsLogicallyClosed() )
+		{
+			sender = ( ( GameObject )( evt.sender ) );
+			if( sender )
+			{
+				ToggleDoorOpeningState( sender );
+			}
+		}
+	}
+
+	private function GenerateInternalContext( optional activator : GameObject ) : GetActionsContext
+	{
+		return GetDevicePS().GenerateContext( gamedeviceRequestType.Internal, GetInteractionClearance(), activator, GetEntityID() );
+	}
+
+	private function HasValidOpeningToken( id : EntityID ) : Bool
+	{
+		var i : Int32;
+		var tokensList : array< EntityID >;
+		tokensList = GetDevicePS().GetOpeningTokensList();
+		for( i = 0; i < tokensList.Size(); i += 1 )
+		{
+			if( tokensList[ i ] == id )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected event OnDoorTriggerDelayedEvent( evt : DoorTriggerDelayedEvent )
+	{
+		if( !( IsSomeoneAuthorizedNearby() ) && GetDevicePS().IsOpen() )
+		{
+			CloseDoor();
+		}
+	}
+
+	protected function AuthorizeUsers( usersToAuthorize : array< Entity > ) : Bool
+	{
+		var i : Int32;
+		var ps : DoorControllerPS;
+		ps = GetDevicePS();
+		for( i = 0; i < usersToAuthorize.Size(); i += 1 )
+		{
+			if( ps.IsUserAuthorized( usersToAuthorize[ i ].GetEntityID() ) )
+			{
+				if( ( ( ( PlayerPuppet )( usersToAuthorize[ i ] ) ) && ps.IsDeviceSecured() ) && ps.IsTriggerValid( ps.GetDoorAuthorizationSide() ) )
+				{
+					ps.ResolveSkillchecks();
+					UpdateDeviceState();
+				}
+				NotifyParents();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected function AuthorizeUsers( usersToAuthorize : array< Entity >, out firstAuthorized : GameObject ) : Bool
+	{
+		var i : Int32;
+		var ps : DoorControllerPS;
+		ps = GetDevicePS();
+		for( i = 0; i < usersToAuthorize.Size(); i += 1 )
+		{
+			if( ps.IsUserAuthorized( usersToAuthorize[ i ].GetEntityID() ) )
+			{
+				if( ( ( PlayerPuppet )( usersToAuthorize[ i ] ) ) && ps.IsDeviceSecured() )
+				{
+					RefreshInteraction( gamedeviceRequestType.Direct, GetPlayer( GetGame() ) );
+					if( ps.IsTriggerValid( ps.GetDoorAuthorizationSide() ) )
+					{
+						UpdateDeviceState();
+						ps.ResolveSkillchecks();
+					}
+				}
+				NotifyParents();
+				firstAuthorized = ( ( GameObject )( usersToAuthorize[ i ] ) );
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected function IsSomeoneAuthorizedNearby() : Bool
+	{
+		var listToAuthorize : array< Entity >;
+		listToAuthorize = m_triggerComponent.GetOverlappingEntities();
+		return AuthorizeUsers( listToAuthorize );
+	}
+
+	protected function IsSomeoneAuthorizedNearby( out firstAuthorized : GameObject ) : Bool
+	{
+		var listToAuthorize : array< Entity >;
+		listToAuthorize = m_triggerComponent.GetOverlappingEntities();
+		return AuthorizeUsers( listToAuthorize, firstAuthorized );
+	}
+
+	protected event OnAuthorizeUser( evt : AuthorizeUser )
+	{
+		if( GetDevicePS().UserAuthorizationAttempt( evt.GetExecutor().GetEntityID(), evt.GetEnteredPassword() ) )
+		{
+			AccessGrantedNotification();
+		}
+		UpdateDeviceState();
+	}
+
+	protected function IsSomeoneInTrigger() : Bool
+	{
+		if( m_triggerComponent.GetNumberOverlappingActivators() == 0 )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	protected event OnForceUnlockAndOpenElevator( evt : ForceUnlockAndOpenElevator )
+	{
+		if( IsSomeoneAuthorizedNearby() )
+		{
+			OpenDoor();
+		}
+	}
+
+	protected event OnToggleOpen( evt : ToggleOpen )
+	{
+		if( m_doorOpeningType == EDoorOpeningType.HINGED && GetDevicePS().GetDoorState() == EDoorStatus.OPENED )
+		{
+			m_doorTriggerSide = GetDoorTriggerSide( GetPlayerEntity() );
+		}
+		m_whoOpened = evt.GetExecutor();
+		if( evt.IsIllegal() )
+		{
+			m_illegalOpen = true;
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnActionDemolition( evt : ActionDemolition )
+	{
+		var playerPuppet : ScriptedPuppet;
+		if( evt.IsCompleted() )
+		{
+			return false;
+		}
+		m_whoOpened = evt.GetExecutor();
+		m_openedUsingForce = true;
+		m_audioForceOpen = true;
+		if( evt.IsIllegal() )
+		{
+			m_illegalOpen = true;
+		}
+		if( m_animationType != EAnimationType.REGULAR )
+		{
+			UpdateDeviceState();
+			return true;
+		}
+		playerPuppet = ( ( ScriptedPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		m_doorTriggerSide = GetDoorTriggerSide( GetPlayerEntity() );
+		DisableOccluder();
+		if( m_doorTriggerSide == EDoorTriggerSide.ONE )
+		{
+			EnterWorkspot( playerPuppet, false, 'playerWorkspot', 'deviceWorkspot' );
+		}
+		if( m_doorTriggerSide == EDoorTriggerSide.TWO )
+		{
+			EnterWorkspot( playerPuppet, false, 'playerWorkspotFlip', 'deviceWorkspotFlip' );
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnActionEngineering( evt : ActionEngineering )
+	{
+		if( !( evt.IsCompleted() ) )
+		{
+			return false;
+		}
+		m_whoOpened = evt.GetExecutor();
+		if( evt.IsIllegal() )
+		{
+			m_illegalOpen = true;
+		}
+		if( m_animationType != EAnimationType.REGULAR )
+		{
+			UpdateDeviceState();
+			return true;
+		}
+		m_doorTriggerSide = GetDoorTriggerSide( GetPlayerEntity() );
+		DisableOccluder();
+		if( m_doorTriggerSide == EDoorTriggerSide.ONE )
+		{
+		}
+		if( m_doorTriggerSide == EDoorTriggerSide.TWO )
+		{
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnToggleLock( evt : ToggleLock )
+	{
+		PlayLockSound( GetDevicePS().IsLocked() );
+		if( GetDevicePS().IsLocked() && GetDevicePS().IsOpen() )
+		{
+			CloseDoor();
+		}
+		else if( ( IsSomeoneAuthorizedNearby() && GetDevicePS().IsLogicallyClosed() ) && evt.ShouldOpen() )
+		{
+			OpenDoor();
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestForceUnlock( evt : QuestForceUnlock )
+	{
+		if( ( GetDevicePS().GetDoorType() == EDoorType.AUTOMATIC && IsSomeoneAuthorizedNearby() ) && GetDevicePS().IsLogicallyClosed() )
+		{
+			OpenDoor();
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestForceUnseal( evt : QuestForceUnseal )
+	{
+		if( ( GetDevicePS().GetDoorType() == EDoorType.AUTOMATIC && IsSomeoneAuthorizedNearby() ) && GetDevicePS().IsLogicallyClosed() )
+		{
+			OpenDoor();
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnSealDoor( evt : ToggleSeal )
+	{
+		UpdateDeviceState();
+		if( GetDevicePS().IsSealed() && GetDevicePS().IsOpen() )
+		{
+			CloseDoor();
+		}
+		else if( IsSomeoneAuthorizedNearby() && GetDevicePS().IsLogicallyClosed() )
+		{
+			OpenDoor();
+		}
+	}
+
+	protected event OnDoorOpeningToken( evt : DoorOpeningToken )
+	{
+		UpdateDeviceState();
+		if( IsSomeoneAuthorizedNearby() && GetDevicePS().IsLogicallyClosed() )
+		{
+			OpenDoor();
+		}
+	}
+
+	protected event OnSetAuthorizationModuleOFF( evt : SetAuthorizationModuleOFF )
+	{
+		UpdateDeviceState();
+		if( IsSomeoneAuthorizedNearby() && GetDevicePS().IsLogicallyClosed() )
+		{
+			OpenDoor();
+		}
+	}
+
+	protected event OnActivateDevice( evt : ActivateDevice )
+	{
+		UpdateDeviceState();
+	}
+
+	protected event OnForceOpen( evt : ForceOpen )
+	{
+		m_whoOpened = evt.GetExecutor();
+		if( evt.IsIllegal() )
+		{
+			m_illegalOpen = true;
+		}
+		m_openedUsingForce = true;
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestForceCloseImmediate( evt : QuestForceCloseImmediate )
+	{
+		if( !( m_playerBlocker.IsEnabled() ) )
+		{
+			m_playerBlocker.Toggle( true );
+		}
+		MoveDoor( GetDevicePS().IsOpen(), false );
+	}
+
+	protected event OnQuestForceOpenScene( evt : QuestForceOpenScene )
+	{
+		MoveDoor( GetDevicePS().IsOpen(), true );
+	}
+
+	protected event OnQuestForceCloseScene( evt : QuestForceCloseScene )
+	{
+		MoveDoor( GetDevicePS().IsOpen(), true );
+	}
+
+	protected event OnQuestForceEnabled( evt : QuestForceEnabled )
+	{
+		ActivateDevice();
+		UpdateDeviceState();
+	}
+
+	private function ToggleDoorOpeningState( optional forWhom : EntityID )
+	{
+		var action : DeviceAction;
+		var context : GetActionsContext;
+		context = GenerateInternalContext();
+		action = GetDevicePS().GetActionByName( 'ToggleOpen', context );
+		if( GetDevicePS().IsLogicallyClosed() )
+		{
+			GetDevicePS().DepleteToken( forWhom );
+		}
+		if( action )
+		{
+			ExecuteAction( action );
+		}
+	}
+
+	private function ToggleDoorOpeningState( activator : GameObject )
+	{
+		var action : DeviceAction;
+		m_whoOpened = activator;
+		action = GetDevicePS().ActionToggleOpen();
+		if( GetDevicePS().IsLogicallyClosed() )
+		{
+			GetDevicePS().DepleteToken( activator.GetEntityID() );
+		}
+		if( action )
+		{
+			ExecuteAction( action, activator );
+		}
+	}
+
+	private function OpenDoor()
+	{
+		var action : DeviceAction;
+		action = GetDevicePS().ActionSetOpened();
+		if( action )
+		{
+			ExecuteAction( action );
+		}
+	}
+
+	private function CloseDoor()
+	{
+		var action : DeviceAction;
+		action = GetDevicePS().ActionSetClosed();
+		if( action )
+		{
+			ExecuteAction( action );
+		}
+	}
+
+	private function ToggleDoorLockState( activator : GameObject, shouldOpen : Bool )
+	{
+		var action : ToggleLock;
+		var context : GetActionsContext;
+		context = GenerateInternalContext( activator );
+		m_whoOpened = context.processInitiatorObject;
+		action = ( ( ToggleLock )( GetDevicePS().GetActionByName( 'ToggleLock', context ) ) );
+		action.SetShouldOpen( shouldOpen );
+		if( action )
+		{
+			ExecuteAction( action );
+		}
+	}
+
+	protected event OnCollision( evt : HitCharacterControllerEvent )
+	{
+		GetDevicePS().OnDoorCollision();
+	}
+
+	private function MoveDoor( shouldBeOpened : Bool, immediate : Bool ) : Bool
+	{
+		var replicatedState : DoorReplicatedState;
+		var deviceBusy : SetBusyEvent;
+		var reactionData : stimInvestigateData;
+		var broadcaster : StimBroadcasterComponent;
+		var ps : DoorControllerPS;
+		ps = GetDevicePS();
+		ps.SetIsBusy( true );
+		deviceBusy = new SetBusyEvent;
+		if( m_animationType == EAnimationType.REGULAR )
+		{
+			RefreshAnimOpenDoor( shouldBeOpened, immediate );
+		}
+		else
+		{
+			RefreshTransformAnimOpenDoor( shouldBeOpened, immediate );
+		}
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, deviceBusy, ps.GetOpeningTime() );
+		if( !( immediate ) )
+		{
+			PlayDoorMovementSound( shouldBeOpened, m_audioForceOpen );
+		}
+		UpdatePortalLights( shouldBeOpened );
+		if( shouldBeOpened )
+		{
+			GameInstance.GetAudioSystem( GetGame() ).OpenAcousticPortal( this );
+			DisableOccluder();
+			if( m_playerBlocker && m_playerBlocker.IsEnabled() )
+			{
+				m_playerBlocker.Toggle( false );
+			}
+		}
+		else
+		{
+			GameInstance.GetAudioSystem( GetGame() ).CloseAcousticPortal( this );
+			EnableOccluder();
+			if( ( m_playerBlocker && ps.IsLocked() ) && !( m_playerBlocker.IsEnabled() ) )
+			{
+				m_playerBlocker.Toggle( true );
+			}
+		}
+		if( ( shouldBeOpened && m_whoOpened ) && m_whoOpened.IsPlayer() )
+		{
+			if( m_illegalOpen )
+			{
+				reactionData.illegalAction = true;
+				m_illegalOpen = false;
+			}
+			broadcaster = GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				if( m_openedUsingForce )
+				{
+					broadcaster.TriggerSingleBroadcast( this, gamedataStimType.OpeningDoor, m_forceOpeningAudioStimRange, reactionData );
+				}
+				else
+				{
+					broadcaster.AddActiveStimuli( this, gamedataStimType.OpeningDoor, 2.0, m_forceOpeningAudioStimRange, reactionData, true );
+					broadcaster.TriggerSingleBroadcast( this, gamedataStimType.OpeningDoor, m_openingAudioStimRange, reactionData );
+				}
+			}
+		}
+		m_openedUsingForce = false;
+		m_audioForceOpen = false;
+		m_isVisuallyOpened = shouldBeOpened;
+		replicatedState = ( ( DoorReplicatedState )( GetServerState() ) );
+		if( replicatedState )
+		{
+			replicatedState.m_isOpen = m_isVisuallyOpened;
+			replicatedState.m_wasImmediateChange = immediate;
+		}
+		UpdateDeviceState();
+		RefreshInteraction( gamedeviceRequestType.Direct, GetPlayer( GetGame() ) );
+		NotifyParents();
+		return true;
+	}
+
+	protected event OnSetBusyEvent( evt : SetBusyEvent )
+	{
+		GetDevicePS().SetIsBusy( false );
+		UpdateDeviceState();
+		RefreshInteraction( gamedeviceRequestType.Direct, GetPlayer( GetGame() ) );
+		NotifyParents();
+	}
+
+	protected function DisableOccluder()
+	{
+		if( m_occluder )
+		{
+			m_occluder.Toggle( false );
+		}
+	}
+
+	protected function EnableOccluder()
+	{
+		var e : OccluderEnableEvent;
+		e = new OccluderEnableEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, e, GetDevicePS().GetOpeningTime() );
+	}
+
+	protected event OnOccluderEnable( evt : OccluderEnableEvent )
+	{
+		if( GetDevicePS().IsClosed() )
+		{
+			if( m_occluder )
+			{
+				m_occluder.Toggle( true );
+			}
+			if( m_playerBlocker && m_playerBlocker.IsEnabled() )
+			{
+				m_playerBlocker.Toggle( false );
+			}
+		}
+	}
+
+	protected function UpdatePortalLights( on : Bool )
+	{
+		if( m_portalLight1 && m_portalLight1.IsEnabled() )
+		{
+			m_portalLight1.ToggleLight( on );
+		}
+		if( m_portalLight2 && m_portalLight2.IsEnabled() )
+		{
+			m_portalLight2.ToggleLight( on );
+		}
+		if( m_portalLight3 && m_portalLight3.IsEnabled() )
+		{
+			m_portalLight3.ToggleLight( on );
+		}
+		if( m_portalLight4 && m_portalLight4.IsEnabled() )
+		{
+			m_portalLight4.ToggleLight( on );
+		}
+	}
+
+	protected override function EnterWorkspot( activator : GameObject, optional freeCamera : Bool, optional componentName : CName, optional deviceData : CName )
+	{
+		var workspotSystem : WorkspotGameSystem;
+		workspotSystem = GameInstance.GetWorkspotSystem( activator.GetGame() );
+		if( workspotSystem && activator.IsPlayer() )
+		{
+			m_workspotActivator = activator;
+			m_componentName = componentName;
+			workspotSystem.PlayInDeviceSimple( this, activator, freeCamera, componentName, deviceData, '', 0.5, WorkspotSlidingBehaviour.DontPlayAtResourcePosition, this );
+		}
+	}
+
+	protected event OnPlayInDeviceCallbackEvent( evt : PlayInDeviceCallbackEvent )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		if( evt.wasPlayInDeviceSuccessful )
+		{
+			m_playerInWorkspot = ( ( PlayerPuppet )( m_workspotActivator ) );
+			playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( m_playerInWorkspot.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+			playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, true );
+			m_interaction.Toggle( false );
+			if( m_componentName == 'playerWorkspot' || m_componentName == 'playerWorkspotFlip' )
+			{
+				playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsForceOpeningDoor, true );
+			}
+		}
+	}
+
+	protected event OnWorkspotFinished( componentName : CName )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		super.OnWorkspotFinished( componentName );
+		m_interaction.Toggle( true );
+		if( m_playerInWorkspot )
+		{
+			playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( m_playerInWorkspot.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+			playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsForceOpeningDoor, false );
+			m_playerInWorkspot = NULL;
+		}
+	}
+
+	protected override function SetIsDoorInteractionActiveBB( evt : InteractionActivationEvent, isActive : Bool )
+	{
+		super.SetIsDoorInteractionActiveBB( evt, isActive );
+	}
+
+	protected function PlayLockSound( toLock : Bool ) {}
+
+	protected function PlayDoorSealSound( toSeal : Bool )
+	{
+		if( toSeal )
+		{
+		}
+	}
+
+	protected function PlayDoorMovementSound( shouldBeOpened : Bool, wasOpenedUsingForce : Bool )
+	{
+		if( shouldBeOpened )
+		{
+			if( wasOpenedUsingForce )
+			{
+				GameObject.PlayMetadataEvent( this, 'force_open' );
+			}
+			else
+			{
+				GameObject.PlayMetadataEvent( this, 'open' );
+			}
+		}
+		else
+		{
+			GameObject.PlayMetadataEvent( this, 'close' );
+		}
+	}
+
+	protected override function ExecuteDeviceStateOperation()
+	{
+		var state : EDoorStatus;
+		var ps : DoorControllerPS;
+		super.ExecuteDeviceStateOperation();
+		ps = GetDevicePS();
+		state = ps.GetDoorState();
+		if( ps.GetDeviceOperationsContainer() != NULL )
+		{
+			ps.GetDeviceOperationsContainer().EvaluateDoorStateTriggers( state, this );
+		}
+	}
+
+	private function RefreshAnimOpenDoor( shouldBeOpened : Bool, immediate : Bool )
+	{
+		if( !( m_animFeatureDoor ) )
+		{
+			m_animFeatureDoor = new AnimFeatureDoor;
+		}
+		if( shouldBeOpened && ( m_animFeatureDoor.m_progress == 0.0 ) )
+		{
+			m_animFeatureDoor.m_progress = 1.0;
+			m_lastDoorSide = ( ( Int32 )( GetDoorTriggerSide( GetPlayerEntity() ) ) );
+		}
+		else if( !( shouldBeOpened ) && ( m_animFeatureDoor.m_progress == 1.0 ) )
+		{
+			m_animFeatureDoor.m_progress = 0.0;
+		}
+		m_animFeatureDoor.m_openingSpeed = GetDevicePS().GetOpeningSpeed() * ( ( immediate ) ? ( 1000.0 ) : ( 1.0 ) );
+		m_animFeatureDoor.m_doorSide = m_lastDoorSide;
+		AnimationControllerComponent.ApplyFeature( this, 'door', m_animFeatureDoor );
+	}
+
+	private function RefreshTransformAnimOpenDoor( shouldBeOpened : Bool, immediate : Bool )
+	{
+		var playEvent : gameTransformAnimationPlayEvent;
+		var skipEvent : gameTransformAnimationSkipEvent;
+		var resetEvent : gameTransformAnimationResetEvent;
+		var openingSpeed : Float;
+		var animName : CName;
+		openingSpeed = ( ( GetDevicePS().GetOpeningSpeed() == 0.0 ) ? ( 1.0 ) : ( GetDevicePS().GetOpeningSpeed() ) );
+		animName = GetProperTransformAnimName();
+		if( !( immediate ) )
+		{
+			playEvent = new gameTransformAnimationPlayEvent;
+			playEvent.animationName = animName;
+			playEvent.looping = false;
+			playEvent.timesPlayed = 1;
+			playEvent.timeScale = openingSpeed;
+			if( shouldBeOpened && !( m_isVisuallyOpened ) )
+			{
+				QueueEvent( playEvent );
+			}
+			else if( !( shouldBeOpened ) && m_isVisuallyOpened )
+			{
+				if( m_animationType == EAnimationType.TRANSFORM )
+				{
+					playEvent.timeScale = openingSpeed * -1.0;
+				}
+				QueueEvent( playEvent );
+			}
+		}
+		else
+		{
+			if( shouldBeOpened )
+			{
+				skipEvent = new gameTransformAnimationSkipEvent;
+				skipEvent.animationName = animName;
+				skipEvent.skipToEnd = true;
+				skipEvent.forcePlay = true;
+				QueueEvent( skipEvent );
+			}
+			else
+			{
+				resetEvent = new gameTransformAnimationResetEvent;
+				resetEvent.animationName = animName;
+				QueueEvent( resetEvent );
+			}
+		}
+	}
+
+	private function GetProperTransformAnimName() : CName
+	{
+		switch( m_doorOpeningType )
+		{
+			case EDoorOpeningType.SLIDING_HORIZONTALLY:
+				return 'doorSlideHorizontally';
+			case EDoorOpeningType.SLIDING_VERTICALLY:
+				return 'doorSlideVertically';
+			case EDoorOpeningType.HINGED:
+			{
+				if( m_animationType == EAnimationType.TRANSFORM_TWO_SIDES && m_doorTriggerSide == EDoorTriggerSide.ONE )
+				{
+					return 'doorOpenHingedBack';
+				}
+				else
+				{
+					return 'doorOpenHinged';
+				}
+				break;
+			}
+		}
+		return '';
+	}
+
+	protected function SetNewDoorType( type : EDoorType )
+	{
+		GetDevicePS().SetNewDoorType( type );
+	}
+
+	protected event OnSetDoorType( evt : SetDoorType )
+	{
+		GetDevicePS().SetNewDoorType( evt );
+	}
+
+	protected event OnSetCloseItself( evt : SetCloseItself )
+	{
+		GetDevicePS().SetCloseItself( evt.automaticallyClosesItself );
+	}
+
+	protected event OnResetDoorState( evt : ResetDoorState )
+	{
+		GetDevicePS().ResetToDefault();
+	}
+
+	protected function GetDoorTriggerSide( forEntity : Entity ) : EDoorTriggerSide
+	{
+		if( !( forEntity ) )
+		{
+			return EDoorTriggerSide.OUTSIDE;
+		}
+		if( m_triggerSideOne.IsEntityOverlapping( forEntity ) )
+		{
+			return EDoorTriggerSide.ONE;
+		}
+		if( m_triggerSideTwo.IsEntityOverlapping( forEntity ) )
+		{
+			return EDoorTriggerSide.TWO;
+		}
+		return EDoorTriggerSide.OUTSIDE;
+	}
+
+	protected function GetPlayerEntity() : Entity
+	{
+		return EntityGameInterface.GetEntity( GetPlayerMainObject().GetEntity() );
+	}
+
+	protected function CreateLightSettings()
+	{
+		m_colors.off.strength = 0.0;
+		m_colors.off.color = Color( 0, 0, 0, 0 );
+		m_colors.red.strength = 1.0;
+		m_colors.red.color = Color( 130, 0, 0, 0 );
+		m_colors.green.strength = 1.0;
+		m_colors.green.color = Color( 25, 135, 0, 255 );
+	}
+
+	protected virtual function SetSoloAppearance()
+	{
+		if( m_strongSoloFrame )
+		{
+			if( GetDevicePS().WasDemolitionSkillCheckActive() )
+			{
+				if( m_strongSoloFrame.IsEnabled() )
+				{
+					m_strongSoloFrame.Toggle( false );
+				}
+			}
+			else
+			{
+				if( !( m_strongSoloFrame.IsEnabled() ) )
+				{
+					m_strongSoloFrame.Toggle( true );
+				}
+			}
+		}
+	}
+
+	private function SetTechieAppearance()
+	{
+		if( m_terminalTechie1 )
+		{
+			if( GetDevicePS().WasEngineeringSkillCheckActive() && GetDevicePS().IsSideOneActive() )
+			{
+				if( !( m_terminalTechie1.IsEnabled() ) )
+				{
+					m_terminalTechie1.Toggle( true );
+				}
+			}
+			else
+			{
+				if( m_terminalTechie1.IsEnabled() )
+				{
+					m_terminalTechie1.Toggle( false );
+				}
+				if( m_ledTechie1 )
+				{
+					m_ledTechie1.Toggle( false );
+				}
+			}
+		}
+		if( m_terminalTechie2 )
+		{
+			if( GetDevicePS().WasEngineeringSkillCheckActive() && GetDevicePS().IsSideTwoActive() )
+			{
+				if( !( m_terminalTechie2.IsEnabled() ) )
+				{
+					m_terminalTechie2.Toggle( true );
+				}
+			}
+			else
+			{
+				if( m_terminalTechie2.IsEnabled() )
+				{
+					m_terminalTechie2.Toggle( false );
+				}
+				if( m_ledTechie2 )
+				{
+					m_ledTechie2.Toggle( false );
+				}
+			}
+		}
+	}
+
+	private function SetNetrunnerAppearance()
+	{
+		if( m_terminalNetrunner1 )
+		{
+			if( IsConnectedToBackdoorDevice() && GetDevicePS().IsSideOneActive() )
+			{
+				if( !( m_terminalNetrunner1.IsEnabled() ) )
+				{
+					m_terminalNetrunner1.Toggle( true );
+				}
+			}
+			else
+			{
+				if( m_terminalNetrunner1.IsEnabled() )
+				{
+					m_terminalNetrunner1.Toggle( false );
+				}
+				if( m_ledNetrunner1 )
+				{
+					m_ledNetrunner1.Toggle( false );
+				}
+			}
+		}
+		if( m_terminalNetrunner2 )
+		{
+			if( IsConnectedToBackdoorDevice() && GetDevicePS().IsSideTwoActive() )
+			{
+				if( !( m_terminalNetrunner2.IsEnabled() ) )
+				{
+					m_terminalNetrunner2.Toggle( true );
+				}
+			}
+			else
+			{
+				if( m_terminalNetrunner2.IsEnabled() )
+				{
+					m_terminalNetrunner2.Toggle( false );
+				}
+				if( m_ledNetrunner2 )
+				{
+					m_ledNetrunner2.Toggle( false );
+				}
+			}
+		}
+	}
+
+	protected function InitializeLight()
+	{
+		if( GetDevicePS().GetDoorSkillcheckSide() == EDoorSkillcheckSide.ONE || GetDevicePS().GetDoorAuthorizationSide() == EDoorSkillcheckSide.ONE )
+		{
+			if( m_terminalTechie1 && m_terminalTechie1.IsEnabled() )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledTechie1 );
+			}
+			if( m_terminalNetrunner1 && m_terminalNetrunner1.IsEnabled() )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledNetrunner1 );
+			}
+			if( m_led1 )
+			{
+				m_activeSkillcheckLights.PushBack( m_led1 );
+			}
+			if( m_ledHandle1 )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledHandle1 );
+			}
+			if( m_ledHandle1a )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledHandle1a );
+			}
+		}
+		else if( GetDevicePS().GetDoorSkillcheckSide() == EDoorSkillcheckSide.TWO || GetDevicePS().GetDoorAuthorizationSide() == EDoorSkillcheckSide.TWO )
+		{
+			if( m_terminalTechie2 && m_terminalTechie2.IsEnabled() )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledTechie2 );
+			}
+			if( m_terminalNetrunner2 && m_terminalNetrunner2.IsEnabled() )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledNetrunner2 );
+			}
+			if( m_led2 )
+			{
+				m_activeSkillcheckLights.PushBack( m_led2 );
+			}
+			if( m_ledHandle2 )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledHandle2 );
+			}
+			if( m_ledHandle2a )
+			{
+				m_activeSkillcheckLights.PushBack( m_ledHandle2a );
+			}
+		}
+		GetAllActiveLights();
+	}
+
+	protected function GetAllActiveLights()
+	{
+		m_allActiveLights.PushBack( m_led1 );
+		m_allActiveLights.PushBack( m_led2 );
+		m_allActiveLights.PushBack( m_ledHandle1 );
+		m_allActiveLights.PushBack( m_ledHandle2 );
+		if( m_ledHandle1a )
+		{
+			m_allActiveLights.PushBack( m_ledHandle1a );
+		}
+		if( m_ledHandle2a )
+		{
+			m_allActiveLights.PushBack( m_ledHandle2a );
+		}
+		if( m_terminalTechie1 && m_terminalTechie1.IsEnabled() )
+		{
+			m_allActiveLights.PushBack( m_ledTechie1 );
+		}
+		if( m_terminalNetrunner1 && m_terminalNetrunner1.IsEnabled() )
+		{
+			m_allActiveLights.PushBack( m_ledNetrunner1 );
+		}
+		if( m_terminalTechie2 && m_terminalTechie2.IsEnabled() )
+		{
+			m_allActiveLights.PushBack( m_ledTechie2 );
+		}
+		if( m_terminalNetrunner2 && m_terminalNetrunner2.IsEnabled() )
+		{
+			m_allActiveLights.PushBack( m_ledNetrunner2 );
+		}
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.OpenPath;
+	}
+
+	public const override function DeterminGameplayRoleMappinVisuaState( data : SDeviceMappinData ) : EMappinVisualState
+	{
+		if( ( !( GetDevicePS().IsDisabled() ) && GetNetworkSystem().QuickHacksExposedByDefault() ) && HasAnyActiveQuickHackVulnerabilities() )
+		{
+			return EMappinVisualState.Available;
+		}
+		else if( !( HasAnySkillCheckActive() ) )
+		{
+			if( ( GetDevicePS().IsDeviceSecured() && !( GetDevicePS().IsPlayerAuthorized() ) ) || ( GetDevicePS().IsLocked() && !( GetDevicePS().canPlayerToggleLockState() ) ) )
+			{
+				if( CanPassAnySkillCheckOnParentTerminal() )
+				{
+					return EMappinVisualState.Available;
+				}
+				else
+				{
+					return EMappinVisualState.Unavailable;
+				}
+			}
+			else
+			{
+				return EMappinVisualState.Available;
+			}
+		}
+		else if( !( GetDevicePS().IsDisabled() ) && CanPassAnySkillCheckOnParentTerminal() )
+		{
+			return EMappinVisualState.Available;
+		}
+		else
+		{
+			return super.DeterminGameplayRoleMappinVisuaState( data );
+		}
+	}
+
+	public const override function IsActive() : Bool
+	{
+		if( GetDevicePS().IsSealed() )
+		{
+			return false;
+		}
+		else
+		{
+			return super.IsActive();
+		}
+	}
+
+	protected override function EnableOffMeshConnections( player : Bool, npc : Bool )
+	{
+		if( m_offMeshConnectionComponent != NULL )
+		{
+			if( player )
+			{
+				m_offMeshConnectionComponent.EnableForPlayer();
+			}
+			if( npc )
+			{
+				m_offMeshConnectionComponent.EnableOffMeshConnection();
+			}
+		}
+	}
+
+	protected override function DisableOffMeshConnections( player : Bool, npc : Bool )
+	{
+		if( m_offMeshConnectionComponent != NULL )
+		{
+			if( player )
+			{
+				m_offMeshConnectionComponent.DisableForPlayer();
+			}
+			if( npc )
+			{
+				m_offMeshConnectionComponent.DisableOffMeshConnection();
+			}
+		}
+	}
+
+	protected const function CanPassAnySkillCheckOnParentTerminal() : Bool
+	{
+		var requester : GameObject;
+		requester = ( ( GameObject )( EntityGameInterface.GetEntity( GetEntity() ) ) );
+		return GetDevicePS().CanPassAnySkillCheckOnParentTerminal( requester );
+	}
+
+	public const function GetClosingAnimationLength() : Float
+	{
+		return m_closingAnimationLength;
+	}
+
+	public const function GetAnimFeature() : AnimFeatureDoor
+	{
+		return m_animFeatureDoor;
+	}
+
+	public const override function IsNetrunner() : Bool
+	{
+		if( !( IsCyberdeckEquippedOnPlayer() ) )
+		{
+			return false;
+		}
+		return ( GetDevicePS().IsHackingSkillCheckActive() || ( ( ( IsQuickHacksExposed() && GetDevicePS().ExposeQuickHakcsIfNotConnnectedToAP() ) || IsConnectedToBackdoorDevice() ) && GetDevicePS().HasPlaystyle( EPlaystyle.NETRUNNER ) ) ) || IsActiveBackdoor();
+	}
+
+	protected const override function HasAnyDirectInteractionActive() : Bool
+	{
+		if( GetDevicePS().IsDisabled() || GetDevicePS().IsSealed() )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+}
+
+class DoorColliderEnableEvent extends Event
+{
+}
+
+class DoorTriggerDelayedEvent extends Event
+{
+	var activator : weak< GameObject >;
+}
+
+class OccluderEnableEvent extends Event
+{
+}
+
+class SetBusyEvent extends Event
+{
+}
+
+enum EDoorType
+{
+	NONE = 0,
+	INTERACTIVE = 1,
+	AUTOMATIC = 2,
+	PHYSICAL = 3,
+	REMOTELY_CONTROLLED = 4,
+}
+
+enum EDoorStatus
+{
+	SEALED = -2,
+	LOCKED = -1,
+	CLOSED = 0,
+	OPENED = 1,
+}
+
+enum EDoorOpeningType
+{
+	SLIDING_HORIZONTALLY = 0,
+	SLIDING_VERTICALLY = 1,
+	HINGED = 2,
+	GATE = 3,
+	HINGED_SIDE_ONE = 4,
+	HINGED_SIDE_TWO = 5,
+}
+
+enum EAnimationType
+{
+	REGULAR = 0,
+	TRANSFORM = 1,
+	TRANSFORM_TWO_SIDES = 2,
+	NONE = 3,
+}
+
+enum EDoorTriggerSide
+{
+	OUTSIDE = 0,
+	ONE = 1,
+	TWO = 2,
+}
+
+enum EDoorSkillcheckSide
+{
+	BOTH = 0,
+	ONE = 1,
+	TWO = 2,
+}
+

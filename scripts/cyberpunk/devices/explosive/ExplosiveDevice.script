@@ -1,0 +1,772 @@
+class ExplosiveDevice extends BasicDistractionDevice
+{
+	default m_controllerTypeName = 'ExplosiveDeviceController';
+	protected editable var m_numberOfComponentsToON : Int32;
+	default m_numberOfComponentsToON = 0;
+	protected editable var m_numberOfComponentsToOFF : Int32;
+	default m_numberOfComponentsToOFF = 0;
+	protected const editable var m_indexesOfComponentsToOFF : array< Int32 >;
+	protected editable var m_shouldDistractionEnableCollider : Bool;
+	protected editable var m_shouldDistractionVFXstay : Bool;
+	[ customEditor = "AudioEvent" ]
+	protected editable var m_loopAudioEvent : CName;
+	protected var m_spawnedFxInstancesToKill : array< FxInstance >;
+	var m_mesh : MeshComponent;
+	var m_collider : IPlacedComponent;
+	var m_distractionCollider : IPlacedComponent;
+	private var m_numberOfReceivedHits : Int32;
+	private var m_devicePenetrationHealth : Float;
+	private var m_killedByExplosion : Bool;
+	private var m_distractionTimeStart : Float;
+	private var m_isBroadcastingEnvironmentalHazardStim : Bool;
+	private var m_componentsON : array< IPlacedComponent >;
+	private var m_componentsOFF : array< IPlacedComponent >;
+
+	protected event OnPostInitialize( evt : entPostInitializeEvent )
+	{
+		var i : Int32;
+		var effectSystem : EffectSystem;
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		super.OnPostInitialize( evt );
+		effectSystem = GameInstance.GetGameEffectSystem( GetGame() );
+		dataArray = GetDevicePS().GetExplosionDefinitionArray();
+		for( i = 0; i < dataArray.Size(); i += 1 )
+		{
+			PreloadGameEffectAttackResources( ( ( Attack_GameEffect_Record )( TweakDBInterface.GetAttackRecord( dataArray[ i ].damageType ) ) ), effectSystem );
+		}
+	}
+
+	protected event OnPreUninitialize( evt : entPreUninitializeEvent )
+	{
+		var i : Int32;
+		var effectSystem : EffectSystem;
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		super.OnPreUninitialize( evt );
+		effectSystem = GameInstance.GetGameEffectSystem( GetGame() );
+		dataArray = GetDevicePS().GetExplosionDefinitionArray();
+		for( i = 0; i < dataArray.Size(); i += 1 )
+		{
+			ReleaseGameEffectAttackResources( ( ( Attack_GameEffect_Record )( TweakDBInterface.GetAttackRecord( dataArray[ i ].damageType ) ) ), effectSystem );
+		}
+	}
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		var i : Int32;
+		var componentName : String;
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'mesh', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'collider', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'distractionCollider', 'IPlacedComponent', false );
+		for( i = 0; i < m_numberOfComponentsToON; i += 1 )
+		{
+			componentName = "componentON_" + i;
+			EntityRequestComponentsInterface.RequestComponent( ri, StringToName( componentName ), 'IPlacedComponent', true );
+		}
+		for( i = 0; i < m_numberOfComponentsToOFF; i += 1 )
+		{
+			componentName = "componentOFF_" + i;
+			EntityRequestComponentsInterface.RequestComponent( ri, StringToName( componentName ), 'IPlacedComponent', true );
+		}
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		var i : Int32;
+		var componentName : String;
+		m_mesh = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'mesh' ) ) );
+		m_collider = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'collider' ) ) );
+		m_distractionCollider = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'distractionCollider' ) ) );
+		for( i = 0; i < m_numberOfComponentsToON; i += 1 )
+		{
+			componentName = "componentON_" + i;
+			m_componentsON.PushBack( ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, StringToName( componentName ) ) ) ) );
+		}
+		for( i = 0; i < m_numberOfComponentsToOFF; i += 1 )
+		{
+			componentName = "componentOFF_" + i;
+			m_componentsOFF.PushBack( ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, StringToName( componentName ) ) ) ) );
+		}
+		super.OnTakeControl( ri );
+		m_controller = ( ( ExplosiveDeviceController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		var i : Int32;
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		var lightEvent : ChangeLightEvent;
+		if( GetDevicePS().DoExplosiveResolveGameplayLogic() )
+		{
+			if( !( GetDevicePS().IsExploded() ) )
+			{
+				lightEvent = new ChangeLightEvent;
+				lightEvent.settings.strength = 1.0;
+				lightEvent.settings.color = Color( 255, 0, 0, 0 );
+				dataArray = GetDevicePS().GetExplosionDefinitionArray();
+				for( i = 0; i < dataArray.Size(); i += 1 )
+				{
+					m_fxResourceMapper.CreateEffectStructDataFromAttack( dataArray[ i ].damageType, i, 'inRange_explosive_device', dataArray[ i ].dontHighlightOnLookat );
+				}
+				m_devicePenetrationHealth = GameInstance.GetStatsSystem( GetDevicePS().GetGameInstance() ).GetStatValue( GetEntityID(), gamedataStatType.PenetrationHealth );
+				QueueEvent( lightEvent );
+			}
+			else
+			{
+				ToggleVisibility( false );
+			}
+		}
+		super.ResolveGameplayState();
+	}
+
+	private const override function GetController() : ExplosiveDeviceController
+	{
+		return ( ( ExplosiveDeviceController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : ExplosiveDeviceControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		super.OnDeath( evt );
+		HandleDeathByTask( evt.instigator );
+	}
+
+	protected override function HandleDeath( instigator : weak< GameObject > )
+	{
+		EffectsOnStartStop();
+		if( m_distractionCollider )
+		{
+			m_distractionCollider.Toggle( false );
+		}
+		if( m_killedByExplosion )
+		{
+			StartExplosionPipeline( instigator, 0.05 );
+		}
+		else
+		{
+			StartExplosionPipeline( instigator );
+		}
+		RemoveEnvironmentalHazardStimuli();
+	}
+
+	protected const function GetAttackRange( attackTDBID : TweakDBID ) : Float
+	{
+		return TweakDBInterface.GetAttackRecord( attackTDBID ).Range();
+	}
+
+	protected function StartExplosionPipeline( instigator : weak< GameObject >, optional additionalDelays : Float )
+	{
+		var i : Int32;
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		var evt : ExplosiveDeviceDelayedEvent;
+		var hideEvt : ExplosiveDeviceHideDeviceEvent;
+		var largestDelayTime : Float;
+		var lightEvent : ChangeLightEvent;
+		if( GetDevicePS().IsExploded() )
+		{
+			return;
+		}
+		lightEvent = new ChangeLightEvent;
+		lightEvent.settings.strength = 0.0;
+		lightEvent.settings.color = Color( 0, 0, 0, 0 );
+		dataArray = GetDevicePS().GetExplosionDefinitionArray();
+		for( i = 0; i < dataArray.Size(); i += 1 )
+		{
+			if( ( dataArray[ i ].executionDelay + additionalDelays ) > 0.0 )
+			{
+				evt = new ExplosiveDeviceDelayedEvent;
+				evt.arrayIndex = i;
+				evt.instigator = instigator;
+				if( ( dataArray[ i ].executionDelay + additionalDelays ) > largestDelayTime )
+				{
+					largestDelayTime = dataArray[ i ].executionDelay + additionalDelays;
+				}
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, dataArray[ i ].executionDelay + additionalDelays );
+			}
+			else
+			{
+				Explode( i, instigator );
+			}
+		}
+		if( largestDelayTime > 0.0 )
+		{
+			hideEvt = new ExplosiveDeviceHideDeviceEvent;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, hideEvt, largestDelayTime );
+		}
+		else
+		{
+			SendSwapMeshDelayedEvent( GetDevicePS().GetTimeToMeshSwap() );
+		}
+		QueueEvent( lightEvent );
+	}
+
+	protected event OnExplosiveDeviceDelayedEvent( evt : ExplosiveDeviceDelayedEvent )
+	{
+		Explode( evt.arrayIndex, evt.instigator );
+	}
+
+	private function Explode( index : Int32, instigator : weak< GameObject > )
+	{
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		dataArray = GetDevicePS().GetExplosionDefinitionArray();
+		DoAttack( dataArray[ index ].damageType, instigator );
+		DoPhysicsPulse( dataArray[ index ].damageType );
+		KillAllFxInstances();
+		EffectsOnStartStop( true );
+		if( !( SpawnVFXs( dataArray[ index ].vfxEventNamesOnExplosion ) ) )
+		{
+			SpawnVFXs( dataArray[ index ].vfxResource );
+		}
+		if( m_loopAudioEvent != '' )
+		{
+			StopSoundEvent( this, m_loopAudioEvent );
+		}
+		Explosion( index );
+		DoAdditionalGameEffect( dataArray[ index ].additionalGameEffectType );
+		GetDevicePS().SetExplodedState( true );
+	}
+
+	private function DoPhysicsPulse( damageType : TweakDBID )
+	{
+		var impulseRadius : Float;
+		impulseRadius = GetAttackRange( damageType );
+		CombatGadgetHelper.SpawnPhysicalImpulse( this, impulseRadius );
+	}
+
+	private function Explosion( index : Int32 )
+	{
+		var i : Int32;
+		var distractionName : CName;
+		distractionName = StringToName( "hardCodeDoNotRemoveExplosion" + index );
+		for( i = 0; i < GetFxResourceMapper().GetAreaEffectDataSize(); i += 1 )
+		{
+			if( GetFxResourceMapper().GetAreaEffectDataByIndex( i ).areaEffectID == distractionName )
+			{
+				TriggerArreaEffectDistraction( GetFxResourceMapper().GetAreaEffectDataByIndex( i ) );
+				break;
+			}
+		}
+	}
+
+	protected event OnExplosiveDeviceHideDeviceEvent( evt : ExplosiveDeviceHideDeviceEvent )
+	{
+		SendSwapMeshDelayedEvent( GetDevicePS().GetTimeToMeshSwap() );
+	}
+
+	private function DoAttack( damageType : TweakDBID, optional instigator : weak< GameObject > )
+	{
+		var attack : Attack_GameEffect;
+		var hitFlags : array< SHitFlag >;
+		var flag, quickhackFlag : SHitFlag;
+		var attackPosition : Vector4;
+		var roleMappinTransform : WorldTransform;
+		flag.source = 'ExplosiveDevice';
+		if( !( instigator.IsPlayer() ) )
+		{
+			flag.flag = hitFlag.FriendlyFire;
+		}
+		else
+		{
+			quickhackFlag.source = 'ExplosiveDevice';
+			quickhackFlag.flag = hitFlag.QuickHack;
+			hitFlags.PushBack( quickhackFlag );
+		}
+		hitFlags.PushBack( flag );
+		if( GetUISlotComponent() && GetUISlotComponent().GetSlotTransform( 'roleMappin', roleMappinTransform ) )
+		{
+			attackPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( roleMappinTransform ) );
+		}
+		else
+		{
+			attackPosition = GetWorldPosition();
+		}
+		attack = RPGManager.PrepareGameEffectAttack( GetGame(), ( ( instigator ) ? ( instigator ) : ( this ) ), this, damageType, attackPosition, hitFlags );
+		if( attack )
+		{
+			attack.StartAttack();
+		}
+	}
+
+	private function DoAdditionalGameEffect( additionalGameEffect : EExplosiveAdditionalGameEffectType )
+	{
+		switch( additionalGameEffect )
+		{
+			case EExplosiveAdditionalGameEffectType.EMP:
+			{
+				CreateEMPGameEffect( 10.0 );
+				KillNPCWorkspotUser( 1.0 );
+				break;
+			}
+			default:
+			{
+			}
+		}
+	}
+
+	protected virtual function ToggleVisibility( visible : Bool )
+	{
+		var i : Int32;
+		m_mesh.Toggle( visible );
+		m_collider.Toggle( visible );
+		for( i = 0; i < m_numberOfComponentsToON; i += 1 )
+		{
+			m_componentsON[ i ].Toggle( !( visible ) );
+		}
+		for( i = 0; i < m_numberOfComponentsToOFF; i += 1 )
+		{
+			m_componentsOFF[ i ].Toggle( visible );
+		}
+		SetGameplayRoleToNone();
+		GetDevicePS().ForceDisableDevice();
+	}
+
+	protected function SendSwapMeshDelayedEvent( delay : Float )
+	{
+		var evt : SwapMeshDelayedEvent;
+		evt = new SwapMeshDelayedEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, delay );
+	}
+
+	protected event OnSwapMeshDelayedEvent( evt : SwapMeshDelayedEvent )
+	{
+		ToggleVisibility( false );
+	}
+
+	protected function KillAllFxInstances()
+	{
+		var i : Int32;
+		for( i = 0; i < m_spawnedFxInstancesToKill.Size(); i += 1 )
+		{
+			m_spawnedFxInstancesToKill[ i ].Kill();
+		}
+	}
+
+	private function SpawnVFXs( fxEventName : array< CName > ) : Bool
+	{
+		var i : Int32;
+		if( fxEventName.Size() == 0 )
+		{
+			return false;
+		}
+		for( i = 0; i < fxEventName.Size(); i += 1 )
+		{
+			GameObjectEffectHelper.StartEffectEvent( this, fxEventName[ i ] );
+		}
+		return true;
+	}
+
+	private function SpawnVFXs( fx : FxResource, optional newPosition : Vector4, optional hitDirection : Vector4 )
+	{
+		var fxInstance : FxInstance;
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		var angle : EulerAngles;
+		if( FxResource.IsValid( fx ) )
+		{
+			if( !( Vector4.IsZero( newPosition ) ) )
+			{
+				WorldPosition.SetVector4( position, newPosition );
+			}
+			else
+			{
+				WorldPosition.SetVector4( position, GetWorldPosition() );
+			}
+			WorldTransform.SetWorldPosition( transform, position );
+			if( !( Vector4.IsZero( newPosition ) ) )
+			{
+				WorldTransform.SetOrientationFromDir( transform, hitDirection );
+				angle = Quaternion.ToEulerAngles( WorldTransform.GetOrientation( transform ) );
+				angle.Yaw = angle.Yaw - 90.0;
+				WorldTransform.SetOrientationEuler( transform, angle );
+			}
+			fxInstance = CreateFxInstance( fx, transform );
+			m_spawnedFxInstancesToKill.PushBack( fxInstance );
+		}
+	}
+
+	private function CreateFxInstance( resource : FxResource, transform : WorldTransform ) : FxInstance
+	{
+		var fx : FxInstance;
+		var fxSystem : FxSystem;
+		fxSystem = GameInstance.GetFxSystem( GetGame() );
+		fx = fxSystem.SpawnEffect( resource, transform );
+		return fx;
+	}
+
+	protected event OnSpiderbotExplodeExplosiveDevicePerformed( evt : SpiderbotExplodeExplosiveDevicePerformed )
+	{
+		StartExplosionPipeline( this, 4.0 );
+	}
+
+	protected event OnSpiderbotDistractExplosiveDevicePerformed( evt : SpiderbotDistractExplosiveDevicePerformed )
+	{
+		Explosion( 0 );
+	}
+
+	protected event OnQuestForceDetonate( evt : QuestForceDetonate )
+	{
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValue( this.GetEntityID(), gamedataStatPoolType.Health, 0.0, this, false );
+		StartExplosionPipeline( this );
+	}
+
+	protected event OnForceDetonate( evt : ForceDetonate )
+	{
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValue( this.GetEntityID(), gamedataStatPoolType.Health, 0.0, this, false );
+		StartExplosionPipeline( this );
+	}
+
+	protected event OnQuickHackExplodeExplosive( evt : QuickHackExplodeExplosive )
+	{
+		StartExplosionPipeline( GetPlayerMainObject() );
+	}
+
+	protected event OnQuickHackDistractExplosive( evt : QuickHackDistractExplosive )
+	{
+		Explosion( 0 );
+	}
+
+	protected override function TurnOffDevice()
+	{
+		super.TurnOffDevice();
+		ToggleLightsON_OFF( false );
+		ToggleComponentsON_OFF( false );
+		if( m_loopAudioEvent != '' )
+		{
+			StopSoundEvent( this, m_loopAudioEvent );
+		}
+	}
+
+	protected override function TurnOnDevice()
+	{
+		super.TurnOnDevice();
+		ToggleLightsON_OFF( true );
+		ToggleComponentsON_OFF( true );
+		if( m_loopAudioEvent != '' )
+		{
+			PlaySoundEvent( this, m_loopAudioEvent );
+		}
+	}
+
+	protected function ToggleComponentsON_OFF( visible : Bool )
+	{
+		var i : Int32;
+		for( i = 0; i < m_indexesOfComponentsToOFF.Size(); i += 1 )
+		{
+			m_componentsOFF[ m_indexesOfComponentsToOFF[ i ] ].Toggle( visible );
+		}
+	}
+
+	protected function ToggleLightsON_OFF( on : Bool )
+	{
+		var evt : ToggleLightEvent;
+		evt = new ToggleLightEvent;
+		evt.toggle = on;
+		QueueEvent( evt );
+	}
+
+	protected override function StartDistraction( optional loopAnimation : Bool )
+	{
+		super.StartDistraction( loopAnimation );
+		if( m_distractionCollider )
+		{
+			m_distractionCollider.Toggle( true );
+		}
+		m_distractionTimeStart = GameInstance.GetTimeSystem( GetGame() ).GetGameTimeStamp();
+	}
+
+	protected override function StopDistraction()
+	{
+		if( !( m_shouldDistractionVFXstay ) )
+		{
+			super.StopDistraction();
+		}
+		else
+		{
+			StopDistractAnimation();
+			MeshSwapOnDistraction( false );
+		}
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.ExplodeLethal;
+	}
+
+	public const override function DeterminGameplayRoleMappinRange( data : SDeviceMappinData ) : Float
+	{
+		var i : Int32;
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		var currentResolve : Float;
+		var biggestRange : Float;
+		dataArray = GetDevicePS().GetExplosionDefinitionArray();
+		for( i = 0; i < dataArray.Size(); i += 1 )
+		{
+			currentResolve = GetAttackRange( dataArray[ i ].damageType );
+			if( currentResolve > biggestRange )
+			{
+				biggestRange = currentResolve;
+			}
+		}
+		return biggestRange;
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		var devicePosition : Vector4;
+		var oilGrowthRatePerSecond : Float;
+		var curTime : Float;
+		var endRadius : Float;
+		var curRadius : Float;
+		if( evt.attackData.GetAttackType() == gamedataAttackType.QuickMelee )
+		{
+			return true;
+		}
+		else if( ( m_distractionCollider != evt.hitComponent ) || evt.attackData.GetAttackType() == gamedataAttackType.Explosion )
+		{
+			super.OnHit( evt );
+			return true;
+		}
+		if( m_distractionCollider == evt.hitComponent )
+		{
+			dataArray = GetDevicePS().GetExplosionDefinitionArray();
+			if( dataArray.Size() > 0 )
+			{
+				devicePosition = GetWorldPosition();
+				oilGrowthRatePerSecond = 0.04;
+				curTime = GameInstance.GetTimeSystem( GetGame() ).GetGameTimeStamp();
+				endRadius = 1.79999995;
+				curRadius = oilGrowthRatePerSecond * ( curTime - m_distractionTimeStart );
+				if( ( ( curRadius < endRadius ) && ( Vector4.Length2D( evt.hitPosition - devicePosition ) < curRadius ) ) || ( curRadius >= endRadius ) )
+				{
+					if( GetDevicePS().GetHealthDecay() > 0.0 )
+					{
+						InitializeHealthDecay( GetDevicePS().GetHealthDecay(), 0.0 );
+						if( GetDevicePS().GetDistractionHitVFXIgnoreHitPosition() )
+						{
+							SpawnVFXs( dataArray[ 0 ].vfxResourceOnFirstHit[ 1 ] );
+						}
+						else
+						{
+							SpawnVFXs( dataArray[ 0 ].vfxResourceOnFirstHit[ 1 ], evt.hitPosition, evt.hitDirection );
+						}
+						BroadcastEnvironmentalHazardStimuli();
+					}
+				}
+			}
+		}
+	}
+
+	protected export override function DamagePipelineFinalized( evt : gameHitEvent )
+	{
+		if( evt.attackData.GetAttackType() == gamedataAttackType.QuickMelee )
+		{
+			return;
+		}
+		else if( ( m_distractionCollider != evt.hitComponent ) || evt.attackData.GetAttackType() == gamedataAttackType.Explosion )
+		{
+			super.DamagePipelineFinalized( evt );
+			return;
+		}
+	}
+
+	protected event OnDamageReceived( evt : gameDamageReceivedEvent )
+	{
+		var dataArray : array< ExplosiveDeviceResourceDefinition >;
+		var statPoolsSystem : StatPoolsSystem;
+		var weaponObject : WeaponObject;
+		var deviceID : EntityID;
+		var attackPenetration : Float;
+		dataArray = GetDevicePS().GetExplosionDefinitionArray();
+		if( dataArray.Size() > 0 )
+		{
+			if( AttackData.IsMelee( evt.hitEvent.attackData.GetAttackType() ) && !( evt.hitEvent.attackData.GetInstigator().IsPlayer() ) )
+			{
+				return false;
+			}
+			statPoolsSystem = GameInstance.GetStatPoolsSystem( GetGame() );
+			deviceID = GetEntityID();
+			if( AttackData.IsExplosion( evt.hitEvent.attackData.GetAttackType() ) )
+			{
+				statPoolsSystem.RequestSettingStatPoolValue( deviceID, gamedataStatPoolType.Health, 0.0, evt.hitEvent.attackData.GetInstigator() );
+				m_killedByExplosion = true;
+				StopDistraction();
+				super.OnDamageReceived( evt );
+				return true;
+			}
+			weaponObject = evt.hitEvent.attackData.GetWeapon();
+			if( weaponObject )
+			{
+				attackPenetration = GameInstance.GetStatsSystem( weaponObject.GetGame() ).GetStatValue( weaponObject.GetEntityID(), gamedataStatType.AttackPenetration ) + 1.0;
+			}
+			m_devicePenetrationHealth = MaxF( m_devicePenetrationHealth - attackPenetration, 0.0 );
+			if( m_devicePenetrationHealth <= 0.0 )
+			{
+				statPoolsSystem.RequestSettingStatPoolValue( deviceID, gamedataStatPoolType.Health, 0.0, evt.hitEvent.attackData.GetInstigator() );
+				StopDistraction();
+				super.OnDamageReceived( evt );
+			}
+			if( GetDevicePS().GetHealthDecay() > 0.0 )
+			{
+				SpawnVFXs( dataArray[ 0 ].vfxResourceOnFirstHit[ 0 ], evt.hitEvent.hitPosition, evt.hitEvent.hitDirection );
+				InitializeHealthDecay( ( ( ExplosiveDeviceControllerPS )( GetDevicePS() ) ).GetHealthDecay(), 0.0 );
+				super.OnDamageReceived( evt );
+				BroadcastEnvironmentalHazardStimuli();
+			}
+		}
+	}
+
+	private function InitializeHealthDecay( health : Float, delay : Float )
+	{
+		var modifier : StatPoolModifier;
+		modifier.enabled = true;
+		modifier.rangeBegin = 0.0;
+		modifier.rangeEnd = 100.0;
+		modifier.startDelay = delay;
+		modifier.valuePerSec = health;
+		modifier.delayOnChange = false;
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingModifier( this.GetEntityID(), gamedataStatPoolType.Health, gameStatPoolModificationTypes.Decay, modifier );
+	}
+
+	private function BroadcastEnvironmentalHazardStimuli()
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetStimBroadcasterComponent();
+		if( !( m_isBroadcastingEnvironmentalHazardStim ) )
+		{
+			if( broadcaster && broadcaster.ResolveStimProcessingCooldown( GetEntityID(), gamedataStimType.EnvironmentalHazard, , 1.0 ) )
+			{
+				broadcaster.AddActiveStimuli( this, gamedataStimType.EnvironmentalHazard, 2.0 );
+				m_isBroadcastingEnvironmentalHazardStim = true;
+			}
+		}
+	}
+
+	private function RemoveEnvironmentalHazardStimuli()
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetStimBroadcasterComponent();
+		if( m_isBroadcastingEnvironmentalHazardStim )
+		{
+			broadcaster.RemoveActiveStimuliByName( this, gamedataStimType.EnvironmentalHazard );
+			m_isBroadcastingEnvironmentalHazardStim = false;
+		}
+	}
+
+	public const override function IsExplosive() : Bool
+	{
+		return true;
+	}
+
+	public const override function CanOverrideNetworkContext() : Bool
+	{
+		if( GetDevicePS().IsExplosiveWithQhacks() )
+		{
+			return super.CanOverrideNetworkContext();
+		}
+		return GetCurrentGameplayRole() != EGameplayRole.None;
+	}
+
+	public const override function HasImportantInteraction() : Bool
+	{
+		return super.HasImportantInteraction();
+	}
+
+	protected const override function HasAnyDirectInteractionActive() : Bool
+	{
+		if( IsDead() )
+		{
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	public const override function GetCurrentOutline() : EFocusOutlineType
+	{
+		var outlineType : EFocusOutlineType;
+		if( IsQuest() )
+		{
+			outlineType = EFocusOutlineType.QUEST;
+		}
+		else if( !( GetDevicePS().IsExploded() ) )
+		{
+			outlineType = EFocusOutlineType.HOSTILE;
+		}
+		else
+		{
+			outlineType = EFocusOutlineType.INVALID;
+		}
+		return outlineType;
+	}
+
+	public const override function GetDefaultHighlight() : FocusForcedHighlightData
+	{
+		var highlight : FocusForcedHighlightData;
+		var outline : EFocusOutlineType;
+		if( GetDevicePS().IsDisabled() )
+		{
+			return NULL;
+		}
+		if( GetCurrentGameplayRole() == EGameplayRole.None || GetCurrentGameplayRole() == EGameplayRole.Clue )
+		{
+			return NULL;
+		}
+		if( m_scanningComponent.IsBraindanceBlocked() || m_scanningComponent.IsPhotoModeBlocked() )
+		{
+			return NULL;
+		}
+		outline = GetCurrentOutline();
+		highlight = new FocusForcedHighlightData;
+		highlight.sourceID = GetEntityID();
+		highlight.sourceName = GetClassName();
+		highlight.priority = EPriority.Low;
+		highlight.outlineType = outline;
+		if( outline == EFocusOutlineType.QUEST )
+		{
+			highlight.highlightType = EFocusForcedHighlightType.QUEST;
+		}
+		else if( outline == EFocusOutlineType.HOSTILE )
+		{
+			highlight.highlightType = EFocusForcedHighlightType.HOSTILE;
+		}
+		else
+		{
+			highlight = NULL;
+		}
+		if( highlight != NULL )
+		{
+			if( IsNetrunner() && highlight.outlineType != EFocusOutlineType.NEUTRAL )
+			{
+				highlight.patternType = VisionModePatternType.Netrunner;
+			}
+			else
+			{
+				highlight.patternType = VisionModePatternType.Default;
+			}
+		}
+		return highlight;
+	}
+
+}
+
+class ExplosiveDeviceDelayedEvent extends Event
+{
+	var arrayIndex : Int32;
+	var instigator : weak< GameObject >;
+}
+
+class ExplosiveDeviceHideDeviceEvent extends Event
+{
+}
+
+class SwapMeshDelayedEvent extends Event
+{
+}
+

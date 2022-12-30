@@ -1,0 +1,290 @@
+class PhoneDialerGameController extends inkHUDGameController
+{
+	private editable var m_contactsList : inkWidgetRef;
+	private editable var m_avatarImage : inkImageRef;
+	private editable var m_hintMessenger : inkWidgetRef;
+	private editable var m_scrollArea : inkScrollAreaRef;
+	private editable var m_scrollControllerWidget : inkWidgetRef;
+	private var m_journalManager : JournalManager;
+	private var m_phoneSystem : weak< PhoneSystem >;
+	private var m_active : Bool;
+	private var m_listController : weak< inkVirtualListController >;
+	private var m_dataSource : ScriptableDataSource;
+	private var m_dataView : DialerContactDataView;
+	private var m_templateClassifier : DialerContactTemplateClassifier;
+	private var m_scrollController : weak< inkScrollController >;
+	private editable var m_soundName : CName;
+	default m_soundName = 'Phone';
+	private editable var m_audioPhoneNavigation : CName;
+	default m_audioPhoneNavigation = 'ui_phone_navigation';
+	private var m_phoneBlackboard : weak< IBlackboard >;
+	private var m_phoneBBDefinition : UI_ComDeviceDef;
+	private var m_contactOpensBBID : CallbackHandle;
+	private var m_switchAnimProxy : inkAnimProxy;
+	private var m_transitionAnimProxy : inkAnimProxy;
+	private var m_repeatingScrollActionEnabled : Bool;
+	default m_repeatingScrollActionEnabled = false;
+	private var m_firstInit : Bool;
+
+	protected event OnInitialize()
+	{
+		var owner : weak< GameObject >;
+		var gameInstance : GameInstance;
+		owner = ( ( GameObject )( GetPlayerControlledObject() ) );
+		gameInstance = ( ( GameInstance )( owner.GetGame() ) );
+		m_journalManager = GameInstance.GetJournalManager( gameInstance );
+		m_phoneSystem = ( ( PhoneSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'PhoneSystem' ) ) );
+		m_phoneBBDefinition = GetAllBlackboardDefs().UI_ComDevice;
+		m_phoneBlackboard = GetBlackboardSystem().Get( m_phoneBBDefinition );
+		m_contactOpensBBID = m_phoneBlackboard.RegisterDelayedListenerBool( m_phoneBBDefinition.ContactsActive, this, 'OnPhoneStateChanged' );
+		GetRootWidget().SetVisible( false );
+		InitVirtualList();
+		PopupStateUtils.SetBackgroundBlurBlendTime( this, 0.1 );
+		inkScrollAreaRef.RegisterToCallback( m_scrollArea, 'OnScrollChanged', this, 'OnScrollChanged' );
+		m_scrollController = ( ( inkScrollController )( inkWidgetRef.GetControllerByType( m_scrollControllerWidget, 'inkScrollController' ) ) );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_phoneBlackboard.UnregisterDelayedListener( m_phoneBBDefinition.ContactsActive, m_contactOpensBBID );
+		CleanVirtualList();
+		CloseContactList();
+		Hide();
+	}
+
+	protected event OnScrollChanged( value : Vector2 )
+	{
+		m_scrollController.UpdateScrollPositionFromScrollArea();
+	}
+
+	protected event OnPhoneStateChanged( value : Bool )
+	{
+		if( m_active != value )
+		{
+			m_active = value;
+			( ( m_active ) ? ( Show() ) : ( Hide() ) );
+		}
+	}
+
+	private function InitVirtualList()
+	{
+		m_templateClassifier = new DialerContactTemplateClassifier;
+		m_dataView = new DialerContactDataView;
+		m_dataSource = new ScriptableDataSource;
+		m_dataView.Setup();
+		m_dataView.SetSource( m_dataSource );
+		m_listController = ( ( inkVirtualListController )( inkWidgetRef.GetControllerByType( m_contactsList, 'inkVirtualListController' ) ) );
+		m_listController.SetClassifier( m_templateClassifier );
+		m_listController.SetSource( m_dataView );
+		m_listController.RegisterToCallback( 'OnItemSelected', this, 'OnItemSelected' );
+		m_listController.RegisterToCallback( 'OnAllElementsSpawned', this, 'OnAllElementsSpawned' );
+	}
+
+	private function CleanVirtualList()
+	{
+		m_listController.SetSource( NULL );
+		m_listController.SetClassifier( NULL );
+		m_dataView.SetSource( NULL );
+		m_dataView = NULL;
+		m_dataSource = NULL;
+		m_templateClassifier = NULL;
+	}
+
+	protected event OnItemSelected( previous : inkVirtualCompoundItemController, next : inkVirtualCompoundItemController )
+	{
+		var contactData : ContactData;
+		contactData = ( ( ContactData )( ( ( IScriptable )( next.GetData() ) ) ) );
+		InkImageUtils.RequestSetImage( this, m_avatarImage, contactData.avatarID );
+		if( m_switchAnimProxy )
+		{
+			m_switchAnimProxy.Stop();
+			m_switchAnimProxy = NULL;
+		}
+		m_switchAnimProxy = PlayLibraryAnimation( 'switchContact' );
+		inkWidgetRef.SetVisible( m_hintMessenger, contactData.playerCanReply || contactData.hasMessages );
+	}
+
+	private function Show()
+	{
+		var uiSystem : UISystem;
+		var player : GameObject;
+		player = GetPlayerControlledObject();
+		uiSystem = GameInstance.GetUISystem( player.GetGame() );
+		uiSystem.PushGameContext( UIGameContext.ModalPopup );
+		uiSystem.RequestNewVisualState( 'inkModalPopupState' );
+		TimeDilationHelper.SetTimeDilationWithProfile( player, "radialMenu", true );
+		player.RegisterInputListener( this, 'popup_moveDown' );
+		player.RegisterInputListener( this, 'popup_moveUp' );
+		player.RegisterInputListener( this, 'popup_goto' );
+		player.RegisterInputListener( this, 'OpenPauseMenu' );
+		player.RegisterInputListener( this, 'proceed' );
+		player.RegisterInputListener( this, 'cancel' );
+		GetRootWidget().SetVisible( true );
+		PopulateData();
+		if( m_transitionAnimProxy )
+		{
+			m_transitionAnimProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnHideAnimFinished' );
+			m_transitionAnimProxy.Stop();
+			m_transitionAnimProxy = NULL;
+		}
+		m_transitionAnimProxy = PlayLibraryAnimation( 'fadeIn' );
+		PlaySound( 'Holocall', 'OnPickingUp' );
+		PopupStateUtils.SetBackgroundBlur( this, true );
+	}
+
+	private function Hide()
+	{
+		var uiSystem : UISystem;
+		var player : GameObject;
+		player = GetPlayerControlledObject();
+		uiSystem = GameInstance.GetUISystem( player.GetGame() );
+		uiSystem.PopGameContext( UIGameContext.ModalPopup );
+		uiSystem.RestorePreviousVisualState( 'inkModalPopupState' );
+		player.UnregisterInputListener( this );
+		TimeDilationHelper.SetTimeDilationWithProfile( player, "radialMenu", false );
+		GetRootWidget().SetVisible( false );
+		PlaySound( 'Holocall', 'OnHangUp' );
+		PopupStateUtils.SetBackgroundBlur( this, false );
+		m_repeatingScrollActionEnabled = false;
+	}
+
+	protected event OnHideAnimFinished( proxy : inkAnimProxy )
+	{
+		GetRootWidget().SetVisible( false );
+	}
+
+	protected event OnAllElementsSpawned()
+	{
+		if( m_firstInit )
+		{
+			m_firstInit = false;
+			m_listController.SelectItem( 0 );
+		}
+	}
+
+	private function PopulateData()
+	{
+		var contactDataArray : array< IScriptable >;
+		contactDataArray = m_journalManager.GetContactDataArray( false );
+		m_dataView.EnableSorting();
+		m_dataSource.Reset( contactDataArray );
+		m_dataView.DisableSorting();
+		m_firstInit = true;
+	}
+
+	private function CallSelectedContact()
+	{
+		var callRequest : questTriggerCallRequest;
+		var contactData : ContactData;
+		var item : PhoneContactItemVirtualController;
+		item = ( ( PhoneContactItemVirtualController )( m_listController.GetSelectedItem() ) );
+		contactData = item.GetContactData();
+		if( contactData )
+		{
+			callRequest = new questTriggerCallRequest;
+			callRequest.addressee = StringToName( contactData.id );
+			callRequest.caller = 'Player';
+			callRequest.callPhase = questPhoneCallPhase.IncomingCall;
+			callRequest.callMode = questPhoneCallMode.Video;
+			m_phoneSystem.QueueRequest( callRequest );
+		}
+	}
+
+	private function CloseContactList()
+	{
+		if( m_phoneBlackboard )
+		{
+			m_phoneBlackboard.SetBool( m_phoneBBDefinition.ContactsActive, false, true );
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : CName;
+		var handled : Bool;
+		handled = false;
+		actionName = ListenerAction.GetName( action );
+		if( ListenerAction.GetType( action ) == gameinputActionType.REPEAT )
+		{
+			if( !( m_repeatingScrollActionEnabled ) )
+			{
+				return false;
+			}
+			switch( actionName )
+			{
+				case 'popup_moveDown':
+					m_listController.Navigate( inkDiscreteNavigationDirection.Down );
+				handled = true;
+				break;
+				case 'popup_moveUp':
+					m_listController.Navigate( inkDiscreteNavigationDirection.Up );
+				handled = true;
+				break;
+			}
+		}
+		else if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_PRESSED )
+		{
+			actionName = ListenerAction.GetName( action );
+			if( !( m_repeatingScrollActionEnabled ) )
+			{
+				m_repeatingScrollActionEnabled = true;
+			}
+			switch( actionName )
+			{
+				case 'popup_moveDown':
+					m_listController.Navigate( inkDiscreteNavigationDirection.Down );
+				handled = true;
+				break;
+				case 'popup_moveUp':
+					m_listController.Navigate( inkDiscreteNavigationDirection.Up );
+				handled = true;
+				break;
+				case 'proceed':
+					CallSelectedContact();
+				handled = true;
+				break;
+				case 'OpenPauseMenu':
+					ListenerActionConsumer.DontSendReleaseEvent( consumer );
+				CloseContactList();
+				handled = true;
+				break;
+				case 'cancel':
+					CloseContactList();
+				handled = true;
+				break;
+				case 'popup_goto':
+					if( inkWidgetRef.IsVisible( m_hintMessenger ) )
+					{
+						GotoMessengerMenu();
+						CloseContactList();
+					}
+				handled = true;
+				break;
+			}
+		}
+		if( handled )
+		{
+			PlaySound( 'Holocall', 'Navigation' );
+		}
+	}
+
+	private function GotoMessengerMenu()
+	{
+		var evt : StartHubMenuEvent;
+		var userData : MessageMenuAttachmentData;
+		var contactData : ContactData;
+		var item : PhoneContactItemVirtualController;
+		item = ( ( PhoneContactItemVirtualController )( m_listController.GetSelectedItem() ) );
+		contactData = item.GetContactData();
+		if( contactData.playerCanReply || contactData.hasMessages )
+		{
+			userData = new MessageMenuAttachmentData;
+			userData.m_entryHash = contactData.hash;
+			evt = new StartHubMenuEvent;
+			evt.SetStartMenu( 'phone', , userData );
+			QueueBroadcastEvent( evt );
+		}
+	}
+
+}
+

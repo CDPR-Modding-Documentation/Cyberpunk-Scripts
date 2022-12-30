@@ -1,0 +1,942 @@
+class LiftDevice extends InteractiveMasterDevice
+{
+	default m_controllerTypeName = 'LiftController';
+	protected const instanceeditable var m_advertismentNames : array< CName >;
+	protected var m_advertisments : array< IPlacedComponent >;
+	private var m_movingPlatform : MovingPlatform;
+	private var m_floors : array< ElevatorFloorSetup >;
+	protected var QuestSafeguardColliders : array< IPlacedComponent >;
+	protected var QuestSafeguardColliderNames : array< CName >;
+	protected var m_frontDoorOccluder : IPlacedComponent;
+	protected var m_backDoorOccluder : IPlacedComponent;
+	protected var m_radioMesh : IPlacedComponent;
+	protected var m_radioDestroyed : IPlacedComponent;
+	protected var m_offMeshConnectionComponent : OffMeshConnectionComponent;
+	private var m_isLoadPerformed : Bool;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		var i : Int32;
+		EntityRequestComponentsInterface.RequestComponent( ri, 'FrontDoorOccluder', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'BackDoorOccluder', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'radioMesh', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'radioDestroyed', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'movingPlatform', 'MovingPlatform', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'controller', m_controllerTypeName, true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'safeguardCollider', 'entColliderComponent', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'offMeshConnection', 'OffMeshConnectionComponent', true );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ui', 'worlduiWidgetComponent', false );
+		for( i = 0; i < m_advertismentNames.Size(); i += 1 )
+		{
+			EntityRequestComponentsInterface.RequestComponent( ri, m_advertismentNames[ i ], 'IPlacedComponent', false );
+		}
+		super.OnRequestComponents( ri );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		var i : Int32;
+		m_movingPlatform = ( ( MovingPlatform )( EntityResolveComponentsInterface.GetComponent( ri, 'movingPlatform' ) ) );
+		m_radioMesh = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'radioMesh' ) ) );
+		m_radioDestroyed = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'radioDestroyed' ) ) );
+		m_frontDoorOccluder = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'FrontDoorOccluder' ) ) );
+		m_backDoorOccluder = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'BackDoorOccluder' ) ) );
+		QuestSafeguardColliders.PushBack( ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'safeguardCollider' ) ) ) );
+		m_offMeshConnectionComponent = ( ( OffMeshConnectionComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'offMeshConnection' ) ) );
+		m_uiComponent = ( ( worlduiWidgetComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ui' ) ) );
+		for( i = 0; i < m_advertismentNames.Size(); i += 1 )
+		{
+			m_advertisments.PushBack( ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, m_advertismentNames[ i ] ) ) ) );
+		}
+		super.OnTakeControl( ri );
+		m_controller = ( ( LiftController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	public const override function GetDevicePS() : LiftControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	private const override function GetController() : LiftController
+	{
+		return ( ( LiftController )( m_controller ) );
+	}
+
+	public const function IsPlayerInsideLift() : Bool
+	{
+		return GetDevicePS().IsPlayerInsideLift();
+	}
+
+	protected override function CreateBlackboard()
+	{
+		m_blackboard = IBlackboard.Create( GetAllBlackboardDefs().ElevatorDeviceBlackboard );
+	}
+
+	public const override function GetBlackboardDef() : ElevatorDeviceBlackboardDef
+	{
+		return GetDevicePS().GetBlackboardDef();
+	}
+
+	protected export override function IsDeviceMovableScript() : Bool
+	{
+		return true;
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		if( !( GameInstance.IsRestoringState( GetGame() ) ) )
+		{
+			SetMovementState( gamePlatformMovementState.Stopped );
+		}
+		else if( GetDevicePS().IsMoving() )
+		{
+			if( !( m_wasAnimationFastForwarded ) )
+			{
+				FastForwardAnimations();
+			}
+		}
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		super.ResolveGameplayState();
+		if( m_radioMesh )
+		{
+			GetDevicePS().SetHasSpeaker( true );
+			RefreshSpeaker();
+		}
+		else
+		{
+			PlayRadioStation();
+		}
+		RefreshAdsState();
+	}
+
+	protected override function DetermineInteractionState( optional context : GetActionsContext )
+	{
+		if( ( ( PlayerPuppet )( context.processInitiatorObject ) ) )
+		{
+			if( context.requestType == gamedeviceRequestType.Direct )
+			{
+				RefreshFloorsData_Event();
+			}
+		}
+		super.DetermineInteractionState( context );
+	}
+
+	protected event OnInitializeFloorsData( evt : RefreshFloorDataEvent )
+	{
+		var floorName : String;
+		var arrivedAtEvent : ArrivedAt;
+		var activeFloor : Int32;
+		var teleportToEvent : TeleportTo;
+		arrivedAtEvent = new ArrivedAt;
+		teleportToEvent = new TeleportTo;
+		m_floors = GetDevicePS().GetFloors();
+		activeFloor = GetDevicePS().GetActiveFloor();
+		GameObject.PlayMetadataEvent( this, 'startMusic' );
+		GameObject.PlayMetadataEvent( this, 'unmuteMusic' );
+		floorName = ElevatorFloorSetup.GetFloorName( m_floors[ activeFloor ] );
+		SendLiftDataToUIBlackboard( floorName, true );
+		if( GetDevicePS().GetMovementState() == gamePlatformMovementState.Stopped )
+		{
+			arrivedAtEvent.destinationName = 'startingFloor';
+			arrivedAtEvent.data = activeFloor;
+			QueueEvent( arrivedAtEvent );
+			teleportToEvent.destinationNode = GetDevicePS().GetFloorMarker( activeFloor );
+			teleportToEvent.rootEntityPosition = GetWorldPosition();
+			QueueEvent( teleportToEvent );
+		}
+		else if( ( GetDevicePS().GetCachedGoToFloorAction() != -1 ) && ( GetDevicePS().GetCachedGoToFloorAction() != activeFloor ) )
+		{
+			SendLiftMovementLoadEvent();
+			m_isLoadPerformed = true;
+		}
+	}
+
+	protected event OnSlaveStateChanged( evt : PSDeviceChangedEvent )
+	{
+		RefreshFloorsAuthorizationData_Event();
+		super.OnSlaveStateChanged( evt );
+	}
+
+	protected override function UpdateDeviceState( optional isDelayed : Bool ) : Bool
+	{
+		if( super.UpdateDeviceState( isDelayed ) )
+		{
+			RefreshUI( isDelayed );
+			NotifyFloors();
+			EvaluateOffMeshLinks();
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function RefreshFloorsData_Event()
+	{
+		var evt : RefreshFloorDataEvent;
+		evt = new RefreshFloorDataEvent;
+		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( GetDevicePS().GetID(), GetDevicePS().GetClassName(), evt );
+	}
+
+	private function RefreshFloorsAuthorizationData_Event()
+	{
+		var evt : RefreshFloorAuthorizationDataEvent;
+		evt = new RefreshFloorAuthorizationDataEvent;
+		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( GetDevicePS().GetID(), GetDevicePS().GetClassName(), evt );
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		GameObject.PlayMetadataEvent( this, 'stopMusic' );
+		GetDevicePS().SetStartingFloor( GetDevicePS().GetActiveFloor() );
+	}
+
+	public const function GetMovingMode() : Int32
+	{
+		switch( GetDevicePS().GetMovementState() )
+		{
+			case gamePlatformMovementState.Stopped:
+				return 0;
+			case gamePlatformMovementState.MovingUp:
+				return 1;
+			case gamePlatformMovementState.MovingDown:
+				return -1;
+			case gamePlatformMovementState.Paused:
+				return 2;
+		}
+	}
+
+	protected function MoveToFloor( starting : Int32, ending : Int32, type : gameMovingPlatformMovementInitializationType, value : Float, optional destName : CName, optional shouldMuteSound : Bool )
+	{
+		if( !( GetDevicePS().IsMoving() ) )
+		{
+			if( !( shouldMuteSound ) )
+			{
+				GameObject.PlayMetadataEvent( this, 'startMoving' );
+			}
+			SendLiftDepartedEvent( GetDevicePS().GetActiveFloor() );
+			if( starting != ending )
+			{
+				UpdateAnimState( false, false, false );
+			}
+			SetIsMovingFromToFloor( starting, ending, value == 0.0 );
+			SendMoveToFloorEvent( starting, ending, type, value, destName );
+		}
+	}
+
+	protected function SendMoveToFloorEvent( starting : Int32, ending : Int32, type : gameMovingPlatformMovementInitializationType, value : Float, optional destName : CName )
+	{
+		var moveToEvent : MoveTo;
+		var dynamicMov : MovingPlatformMovementDynamic;
+		moveToEvent = new MoveTo;
+		dynamicMov = new MovingPlatformMovementDynamic;
+		dynamicMov.curveName = 'cosine';
+		dynamicMov.SetInitData( type, value );
+		dynamicMov.SetDestinationNode( GetDevicePS().GetFloorMarker( ending ) );
+		moveToEvent.movement = dynamicMov;
+		moveToEvent.data = ending;
+		if( destName != '' )
+		{
+			moveToEvent.destinationName = destName;
+		}
+		QueueEvent( moveToEvent );
+		ToggleOccluders( true );
+	}
+
+	protected function PauseMovement()
+	{
+		var timeWhenPaused : Float;
+		timeWhenPaused = m_movingPlatform.Pause();
+		GetDevicePS().SetTimeWhenPaused( timeWhenPaused );
+		SetMovementState( gamePlatformMovementState.Paused );
+		SetIsPausedBlackboard( true );
+	}
+
+	protected function UnpauseMovement()
+	{
+		var timeWhenPaused : Float;
+		var movementState : gamePlatformMovementState;
+		timeWhenPaused = GetDevicePS().GetTimeWhenPaused();
+		movementState = m_movingPlatform.Unpause( timeWhenPaused );
+		SetMovementState( movementState );
+		GetDevicePS().SetTimeWhenPaused( 0.0 );
+		SetIsPausedBlackboard( false );
+	}
+
+	protected function StopMovement()
+	{
+		var moveToEvent : MoveTo;
+		var dynamicMov : MovingPlatformMovementDynamic;
+		moveToEvent = new MoveTo;
+		dynamicMov = new MovingPlatformMovementDynamic;
+		dynamicMov.curveName = 'cosine';
+		dynamicMov.SetInitData( gameMovingPlatformMovementInitializationType.Speed, 0.001 );
+		dynamicMov.SetDestinationNode( GetDevicePS().GetFloorMarker( 0 ) );
+		moveToEvent.movement = dynamicMov;
+		moveToEvent.data = 0;
+		QueueEvent( moveToEvent );
+	}
+
+	protected event OnGoToFloor( evt : GoToFloor )
+	{
+		GameObject.PlayMetadataEvent( this, 'ui_generic_set_14_positive' );
+		if( ( ( ( Int32 )evt.prop.first ) != GetDevicePS().GetActiveFloor() ) && !( GetDevicePS().IsMoving() ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), T"BaseStatusEffect.TemporarilyBlockMovement" );
+			SendLiftStartDelayedEvent( ( ( Int32 )evt.prop.first ) );
+		}
+	}
+
+	protected function SendLiftStartDelayedEvent( target : Int32 )
+	{
+		var delayEvent : LiftStartDelayEvent;
+		delayEvent = new LiftStartDelayEvent;
+		delayEvent.targetFloor = target;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, delayEvent, GetDevicePS().GetLiftStartingDelay() );
+		GetDevicePS().SetCachedGoToFloorAction( target );
+		ToggleSafeguardColliders( true );
+		GameObject.PlayMetadataEvent( this, 'startMoving' );
+		GameObject.PlayMetadataEvent( this, 'floorSelection' );
+		SendLiftDepartedEvent( GetDevicePS().GetActiveFloor() );
+		SetIsMovingFromToFloor( GetDevicePS().GetActiveFloor(), delayEvent.targetFloor, false );
+		SendLiftDataToUIBlackboard( ElevatorFloorSetup.GetFloorName( m_floors[ target ] ) );
+		UpdateAnimState( false, false, false );
+	}
+
+	protected function PlayHandAnimationOnPlayer()
+	{
+		var adHocAnimEvent : AdHocAnimationEvent;
+		adHocAnimEvent = new AdHocAnimationEvent;
+		adHocAnimEvent.animationIndex = 3;
+		adHocAnimEvent.useBothHands = false;
+		adHocAnimEvent.unequipWeapon = false;
+		GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().QueueEvent( adHocAnimEvent );
+	}
+
+	protected event OnLiftStartDelayEvent( evt : LiftStartDelayEvent )
+	{
+		var activeFloor : Int32;
+		activeFloor = GetDevicePS().GetActiveFloor();
+		if( GetDevicePS().IsLiftTravelTimeOverride() )
+		{
+			SendMoveToFloorEvent( activeFloor, evt.targetFloor, gameMovingPlatformMovementInitializationType.Time, GetDevicePS().GetLiftTravelTimeOverride() );
+		}
+		else
+		{
+			SendMoveToFloorEvent( activeFloor, evt.targetFloor, gameMovingPlatformMovementInitializationType.Speed, GetDevicePS().GetLiftSpeed() );
+		}
+		GetDevicePS().SetCachedGoToFloorAction( -1 );
+	}
+
+	protected event OnQuestForceEnabled( evt : QuestForceEnabled )
+	{
+		RestoreDeviceState();
+		ActivateDevice();
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestGoToFloor( evt : QuestGoToFloor )
+	{
+		if( ( ( ( Int32 )evt.prop.first ) != GetDevicePS().GetActiveFloor() ) && !( GetDevicePS().IsMoving() ) )
+		{
+			SendLiftStartDelayedEvent( ( ( Int32 )evt.prop.first ) );
+		}
+	}
+
+	protected event OnQuestForceGoToFloor( evt : QuestForceGoToFloor )
+	{
+		if( ( ( ( Int32 )evt.prop.first ) != GetDevicePS().GetActiveFloor() ) && !( GetDevicePS().IsMoving() ) )
+		{
+			SendLiftStartDelayedEvent( ( ( Int32 )evt.prop.first ) );
+		}
+	}
+
+	protected event OnQuestForceTeleportToFloor( evt : QuestForceTeleportToFloor )
+	{
+		MoveToFloor( ( ( Int32 )evt.prop.first ), ( ( Int32 )evt.prop.first ) );
+	}
+
+	protected function MoveToFloor( start : Int32, target : Int32 )
+	{
+		if( GetDevicePS().IsLiftTravelTimeOverride() )
+		{
+			MoveToFloor( start, target, gameMovingPlatformMovementInitializationType.Time, GetDevicePS().GetLiftTravelTimeOverride() );
+		}
+		else
+		{
+			MoveToFloor( start, target, gameMovingPlatformMovementInitializationType.Speed, GetDevicePS().GetLiftSpeed() );
+		}
+	}
+
+	protected event OnQuestStopElevator( evt : QuestStopElevator )
+	{
+		PauseMovement();
+		RefreshUI();
+		GameObject.PlayMetadataEvent( this, 'stopMoving' );
+	}
+
+	protected event OnQuestResumeElevator( evt : QuestResumeElevator )
+	{
+		UnpauseMovement();
+		RefreshUI();
+		GameObject.PlayMetadataEvent( this, 'startMoving' );
+	}
+
+	protected event OnQuestCloseAllDoors( evt : QuestCloseAllDoors )
+	{
+		var shouldOpen : Bool;
+		shouldOpen = !( ( ( Bool )evt.prop.first ) );
+		UpdateAnimState( shouldOpen, shouldOpen, shouldOpen );
+		if( shouldOpen )
+		{
+			ToggleSafeguardColliders( !( shouldOpen ) );
+			ToggleOccluders( !( shouldOpen ) );
+		}
+	}
+
+	protected event OnQuestToggleAds( evt : QuestToggleAds )
+	{
+		RefreshAdsState();
+	}
+
+	protected function RefreshAdsState()
+	{
+		var i : Int32;
+		for( i = 0; i < m_advertisments.Size(); i += 1 )
+		{
+			m_advertisments[ i ].Toggle( GetDevicePS().IsAdsEnabled() );
+		}
+	}
+
+	protected event OnQuestSetRadioStation( evt : QuestSetRadioStation )
+	{
+		PlayRadioStation();
+	}
+
+	protected event OnDisableRadio( evt : QuestDisableRadio )
+	{
+		PlayRadioStation();
+	}
+
+	protected event OnCallElevator( evt : CallElevator )
+	{
+		var caller : Int32;
+		var activeFloor : Int32;
+		activeFloor = GetDevicePS().GetActiveFloor();
+		caller = evt.m_destination;
+		if( ( caller == activeFloor ) || ElevatorFloorSetup.GetFloorName( m_floors[ caller ] ) == ElevatorFloorSetup.GetFloorName( m_floors[ activeFloor ] ) )
+		{
+			UpdateAnimState( m_floors[ activeFloor ].doorShouldOpenFrontLeftRight[ 0 ], m_floors[ activeFloor ].doorShouldOpenFrontLeftRight[ 1 ], m_floors[ activeFloor ].doorShouldOpenFrontLeftRight[ 2 ] );
+			SendArrivedAtFloorEvent( GetDevicePS().GetStartingFloor() );
+			return false;
+		}
+		SendLiftStartDelayedEvent( caller );
+	}
+
+	private function SendArrivedAtFloorEvent( activeFloor : Int32 )
+	{
+		var floorID : PersistentID;
+		var evt : LiftArrivedEvent;
+		floorID = GetDevicePS().GetFloorPSID( activeFloor );
+		evt = new LiftArrivedEvent;
+		evt.floor = GetDevicePS().GetActiveFloorDisplayName();
+		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( floorID, 'ElevatorFloorTerminalControllerPS', evt );
+	}
+
+	private function SendLiftDepartedEvent( activeFloor : Int32 )
+	{
+		var floorID : PersistentID;
+		var evt : LiftDepartedEvent;
+		floorID = GetDevicePS().GetFloorPSID( activeFloor );
+		evt = new LiftDepartedEvent;
+		evt.floor = GetDevicePS().GetActiveFloorDisplayName();
+		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( floorID, 'ElevatorFloorTerminalControllerPS', evt );
+	}
+
+	private function NotifyFloors()
+	{
+		var i : Int32;
+		var deviceChangedEvent : PSDeviceChangedEvent;
+		deviceChangedEvent = new PSDeviceChangedEvent;
+		deviceChangedEvent.persistentID = GetDevicePS().GetID();
+		deviceChangedEvent.className = GetClassName();
+		for( i = 0; i < m_floors.Size(); i += 1 )
+		{
+			GetDevicePS().GetPersistencySystem().QueueEntityEvent( GetDevicePS().GetFloorID( i ), deviceChangedEvent );
+		}
+	}
+
+	protected event OnLiftSetMovementStateEvent( evt : LiftSetMovementStateEvent )
+	{
+		NotifyFloors();
+	}
+
+	protected event OnArrivedAt( evt : ArrivedAt )
+	{
+		var activeFloor : Int32;
+		GetDevicePS().ChangeActiveFloor( evt.data );
+		SendArrivedAtFloorEvent( evt.data );
+		activeFloor = GetDevicePS().GetActiveFloor();
+		SetIsMovingFromToFloor( 0, 0, false );
+		RefreshUI();
+		if( !( GetDevicePS().IsAllDoorsClosed() ) )
+		{
+			UpdateAnimState( m_floors[ activeFloor ].doorShouldOpenFrontLeftRight[ 0 ], m_floors[ activeFloor ].doorShouldOpenFrontLeftRight[ 1 ], m_floors[ activeFloor ].doorShouldOpenFrontLeftRight[ 2 ] );
+			ToggleSafeguardColliders( false );
+			ToggleOccluders( false );
+		}
+		GameObject.PlayMetadataEvent( this, 'destinationFloor' );
+		GameObject.PlayMetadataEvent( this, 'stopMoving' );
+		if( ( ( GetDevicePS().GetCachedGoToFloorAction() != -1 ) && ( GetDevicePS().GetCachedGoToFloorAction() != evt.data ) ) && !( m_isLoadPerformed ) )
+		{
+			SendLiftMovementLoadEvent();
+		}
+	}
+
+	protected event OnBeforeArrivedAt( evt : BeforeArrivedAt )
+	{
+		GameObject.PlayMetadataEvent( this, 'preStopMoving' );
+	}
+
+	private function SetUsesSleepMode( allowSleepState : Bool )
+	{
+		AnimationControllerComponent.SetUsesSleepMode( this, allowSleepState );
+	}
+
+	private function PlayRadioStation()
+	{
+		var station : RadioStationsMap;
+		var stationIndex : Int32;
+		if( GetDevicePS().IsSpeakerDestroyed() )
+		{
+			AudioSwitch( this, 'radio_station', 'station_none', 'radio' );
+			return;
+		}
+		stationIndex = GetDevicePS().GetActiveRadioStationNumber();
+		if( stationIndex == -1 )
+		{
+			AudioSwitch( this, 'radio_station', 'station_none', 'radio' );
+		}
+		else
+		{
+			station = GetDevicePS().GetStationByIndex( stationIndex );
+			AudioSwitch( this, 'radio_station', station.soundEvent, 'radio' );
+		}
+	}
+
+	private function UpdateAnimState( isOpenFront : Bool, isOpenLeft : Bool, isOpenRight : Bool )
+	{
+		var animFeature : AnimFeature_SimpleDevice;
+		animFeature = new AnimFeature_SimpleDevice;
+		animFeature.isOpen = isOpenFront;
+		animFeature.isOpenLeft = isOpenLeft;
+		animFeature.isOpenRight = isOpenRight;
+		AnimationControllerComponent.ApplyFeature( this, 'ElevatorInnerDoor', animFeature );
+		if( !( m_wasAnimationFastForwarded ) )
+		{
+			FastForwardAnimations();
+		}
+	}
+
+	protected function RefreshSpeaker()
+	{
+		m_radioMesh.Toggle( !( GetDevicePS().IsSpeakerDestroyed() ) );
+		m_radioDestroyed.Toggle( GetDevicePS().IsSpeakerDestroyed() );
+		PlayRadioStation();
+	}
+
+	protected function SendLiftDataToUIBlackboard( displayFloor : String, optional force : Bool )
+	{
+		var activeFloor : Int32;
+		activeFloor = GetDevicePS().GetActiveFloor();
+		if( !( IsStringValid( displayFloor ) ) )
+		{
+			displayFloor = GetProperDisplayFloorNumber( activeFloor );
+		}
+		GetBlackboard().SetString( GetAllBlackboardDefs().ElevatorDeviceBlackboard.CurrentFloor, displayFloor, force );
+	}
+
+	private function GetProperDisplayFloorNumber( floor : Int32 ) : String
+	{
+		var displayFloor : String;
+		if( floor < 10 )
+		{
+			displayFloor = "0" + ( ( String )( floor ) );
+		}
+		else
+		{
+			displayFloor = ( ( String )( floor ) );
+		}
+		return displayFloor;
+	}
+
+	protected function SetMovementState( movementState : gamePlatformMovementState )
+	{
+		var movementStateEvent : LiftSetMovementStateEvent;
+		movementStateEvent = new LiftSetMovementStateEvent;
+		movementStateEvent.movementState = movementState;
+		SendEventToDefaultPS( movementStateEvent );
+	}
+
+	protected function SetIsPlayerInsideLift( value : Bool )
+	{
+		var evt : SetIsPlayerInsideLiftEvent;
+		evt = new SetIsPlayerInsideLiftEvent;
+		evt.value = value;
+		SendEventToDefaultPS( evt );
+	}
+
+	protected function SetIsPausedBlackboard( value : Bool )
+	{
+		GetBlackboard().SetBool( GetAllBlackboardDefs().ElevatorDeviceBlackboard.isPaused, value, true );
+		GetBlackboard().FireCallbacks();
+	}
+
+	protected function SetIsPlayerScannedBlackboard( value : Bool )
+	{
+		var evt : ScanPlayerDelayEvent;
+		var ui_scanningTime : Float;
+		if( !( value ) )
+		{
+			GetBlackboard().SetBool( GetAllBlackboardDefs().ElevatorDeviceBlackboard.isPlayerScanned, false, true );
+			GetBlackboard().FireCallbacks();
+		}
+		else
+		{
+			evt = new ScanPlayerDelayEvent;
+			ui_scanningTime = TweakDBInterface.GetFloat( GetTweakDBRecord() + T".UI_PlayerScanningTime", 2.0 );
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, ui_scanningTime, true );
+		}
+	}
+
+	protected function SendLiftMovementLoadEvent()
+	{
+		var evt : LiftMovementLoadEvent;
+		evt = new LiftMovementLoadEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 0.40000001, true );
+	}
+
+	protected event OnLiftMovementLoadEvent( evt : LiftMovementLoadEvent )
+	{
+		SendLiftStartDelayedEvent( GetDevicePS().GetCachedGoToFloorAction() );
+		GetDevicePS().SetCachedGoToFloorAction( -1 );
+		FastForwardAnimations();
+	}
+
+	protected event OnScanPlayerDelayEvent( evt : ScanPlayerDelayEvent )
+	{
+		if( GetDevicePS().IsPlayerInsideLift() )
+		{
+			GetBlackboard().SetBool( GetAllBlackboardDefs().ElevatorDeviceBlackboard.isPlayerScanned, true );
+			GetBlackboard().FireCallbacks();
+		}
+	}
+
+	private function SetIsMovingFromToFloor( startingFloor : Int32, destinationFloor : Int32, teleport : Bool )
+	{
+		var movementStateEvent : LiftSetMovementStateEvent;
+		var isElevatorMoving : Bool;
+		movementStateEvent = new LiftSetMovementStateEvent;
+		if( teleport )
+		{
+			movementStateEvent.movementState = gamePlatformMovementState.Stopped;
+		}
+		else if( startingFloor < destinationFloor )
+		{
+			movementStateEvent.movementState = gamePlatformMovementState.MovingUp;
+			isElevatorMoving = true;
+		}
+		else if( startingFloor > destinationFloor )
+		{
+			movementStateEvent.movementState = gamePlatformMovementState.MovingDown;
+			isElevatorMoving = true;
+		}
+		else
+		{
+			movementStateEvent.movementState = gamePlatformMovementState.Stopped;
+		}
+		if( GetDevicePS().IsPlayerInsideLift() )
+		{
+			SetPlayerInsideElevatorBlackboard( true, isElevatorMoving );
+		}
+		SendEventToDefaultPS( movementStateEvent );
+		GetDevicePS().SetMovementState( movementStateEvent.movementState );
+		return;
+	}
+
+	private override function InitializeScreenDefinition()
+	{
+		if( !( TDBID.IsValid( m_screenDefinition.screenDefinition ) ) )
+		{
+			m_screenDefinition.screenDefinition = T"DevicesUIDefinitions.Terminal_9x16";
+		}
+		if( !( TDBID.IsValid( m_screenDefinition.style ) ) )
+		{
+			m_screenDefinition.style = T"DevicesUIStyles.Zetatech";
+		}
+	}
+
+	protected event OnAreaEnter( trigger : AreaEnteredEvent )
+	{
+		var sourceIsPlayer : Bool;
+		sourceIsPlayer = ( ( GameObject )( EntityGameInterface.GetEntity( trigger.activator ) ) ).IsPlayer();
+		if( sourceIsPlayer )
+		{
+			SetPlayerInsideElevatorBlackboard( true );
+			SetIsPlayerInsideLift( true );
+			SetIsPlayerScannedBlackboard( true );
+		}
+	}
+
+	protected event OnAreaExit( trigger : AreaExitedEvent )
+	{
+		var sourceIsPlayer : Bool;
+		sourceIsPlayer = ( ( GameObject )( EntityGameInterface.GetEntity( trigger.activator ) ) ).IsPlayer();
+		if( sourceIsPlayer )
+		{
+			SetPlayerInsideElevatorBlackboard( false );
+			SetIsPlayerInsideLift( false );
+			SetIsPlayerScannedBlackboard( false );
+		}
+	}
+
+	private function SetPlayerInsideElevatorBlackboard( isInside : Bool, optional isElevatorMoving : Bool )
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		blackboardSystem = GameInstance.GetBlackboardSystem( GetGame() );
+		blackboard = blackboardSystem.GetLocalInstanced( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		blackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideElevator, isInside );
+		blackboard.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.CurrentElevator, ( ( weak< weak< GameObject > > )( this ) ) );
+		if( !( isInside ) )
+		{
+			isElevatorMoving = false;
+		}
+		blackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideMovingElevator, isElevatorMoving );
+	}
+
+	private function GetPlayerInsideElevatorBlackboard() : Bool
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		blackboardSystem = GameInstance.GetBlackboardSystem( GetGame() );
+		blackboard = blackboardSystem.GetLocalInstanced( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return blackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideElevator );
+	}
+
+	protected function ToggleSafeguardColliders( value : Bool )
+	{
+		var i : Int32;
+		for( i = 0; i < QuestSafeguardColliders.Size(); i += 1 )
+		{
+			if( QuestSafeguardColliders[ i ].IsEnabled() == value )
+			{
+				return;
+			}
+			else
+			{
+				QuestSafeguardColliders[ i ].Toggle( value );
+			}
+		}
+	}
+
+	public static function IsPlayerInsideElevator( game : GameInstance ) : Bool
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		if( !( GameInstance.IsValid( game ) ) )
+		{
+			return false;
+		}
+		blackboardSystem = GameInstance.GetBlackboardSystem( game );
+		blackboard = blackboardSystem.GetLocalInstanced( GameInstance.GetPlayerSystem( game ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return blackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideElevator );
+	}
+
+	public static function GetCurrentElevator( game : GameInstance, out elevator : weak< GameObject > ) : Bool
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		if( !( GameInstance.IsValid( game ) ) )
+		{
+			elevator = NULL;
+			return false;
+		}
+		blackboardSystem = GameInstance.GetBlackboardSystem( game );
+		blackboard = blackboardSystem.GetLocalInstanced( GameInstance.GetPlayerSystem( game ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( blackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideElevator ) )
+		{
+			elevator = ( ( weak< weak< GameObject > > )( blackboard.GetVariant( GetAllBlackboardDefs().PlayerStateMachine.CurrentElevator ) ) );
+		}
+		if( elevator )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected function ToggleOccluders( toggle : Bool )
+	{
+		var hasFrontDoor : Bool;
+		var hasBackDoor : Bool;
+		if( m_frontDoorOccluder )
+		{
+			hasFrontDoor = true;
+		}
+		if( m_backDoorOccluder )
+		{
+			hasBackDoor = true;
+		}
+		if( toggle )
+		{
+			if( hasFrontDoor )
+			{
+				m_frontDoorOccluder.Toggle( true );
+			}
+			if( hasBackDoor )
+			{
+				m_backDoorOccluder.Toggle( true );
+			}
+		}
+		else
+		{
+			if( m_floors[ GetDevicePS().GetActiveFloor() ].doorShouldOpenFrontLeftRight[ 0 ] )
+			{
+				if( hasFrontDoor )
+				{
+					m_frontDoorOccluder.Toggle( false );
+				}
+			}
+			if( m_floors[ GetDevicePS().GetActiveFloor() ].doorShouldOpenFrontLeftRight[ 1 ] )
+			{
+				if( hasBackDoor )
+				{
+					m_backDoorOccluder.Toggle( false );
+				}
+			}
+		}
+	}
+
+	public override function OnMaraudersMapDeviceDebug( sink : MaraudersMapDevicesSink )
+	{
+		var iter : Int32;
+		var keycards : array< TweakDBID >;
+		var persistentFloors : array< ElevatorFloorSetup >;
+		super.OnMaraudersMapDeviceDebug( sink );
+		sink.BeginCategory( "LIFT DEVICE" );
+		sink.EndCategory();
+		persistentFloors = GetDevicePS().GetFloors();
+		keycards = GetDevicePS().GetKeycards();
+		sink.PushString( "StartingFloor - ", ( ( String )( GetDevicePS().GetStartingFloor() ) ) );
+		sink.PushString( "Movement State - ", ( ( String )( GetDevicePS().GetMovementState() ) ) );
+		sink.PushString( "Has Speaker - ", ( ( String )( GetDevicePS().HasSpeaker() ) ) );
+		sink.PushString( "Speaker Fact - ", ( ( String )( GetDevicePS().GetSpeakerDestroyedQuestFact() ) ) );
+		for( iter = 0; iter < persistentFloors.Size(); iter = iter + 1 )
+		{
+			sink.PushString( "FloorData ", ( ( String )( iter ) ) );
+			sink.PushBool( "Is Inactive", persistentFloors[ iter ].m_isInactive );
+			sink.PushBool( "Is Hidden", persistentFloors[ iter ].m_isHidden );
+			sink.PushString( "Floor Name", persistentFloors[ iter ].m_floorName );
+			sink.PushString( "Floor Marker", ( ( String )( persistentFloors[ iter ].m_floorMarker ) ) );
+		}
+		sink.PushString( "KEYCARDS: ", "" );
+		for( iter = 0; iter < keycards.Size(); iter = iter + 1 )
+		{
+			sink.PushString( ( "Keycard" + IntToString( iter ) ) + " ", TDBID.ToStringDEBUG( keycards[ iter ] ) );
+		}
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		if( GetDevicePS().HasSpeaker() && !( GetDevicePS().IsSpeakerDestroyed() ) )
+		{
+			if( m_radioMesh == evt.hitComponent )
+			{
+				GetDevicePS().SetSpeakerDestroyed( true );
+				RefreshSpeaker();
+				SetFactValue( GetGame(), GetDevicePS().GetSpeakerDestroyedQuestFact(), 1 );
+				GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.Start, GetDevicePS().GetSpeakerDestroyedVFX() );
+			}
+		}
+	}
+
+	protected event OnRefreshPlayerAuthorizationEvent( evt : RefreshPlayerAuthorizationEvent )
+	{
+		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( GetDevicePS().GetID(), GetDevicePS().GetClassName(), evt );
+	}
+
+	private function EvaluateOffMeshLinks()
+	{
+		var ps : LiftControllerPS;
+		if( m_offMeshConnectionComponent == NULL )
+		{
+			return;
+		}
+		ps = GetDevicePS();
+		if( ( ps.IsDisabled() || ps.IsOFF() ) || ps.IsUnpowered() )
+		{
+			DisableOffMeshConnections();
+		}
+		else if( ps.IsON() )
+		{
+			EnableOffMeshConnections();
+		}
+	}
+
+	protected function EnableOffMeshConnections()
+	{
+		if( m_offMeshConnectionComponent != NULL )
+		{
+			m_offMeshConnectionComponent.EnableForPlayer();
+		}
+	}
+
+	protected function DisableOffMeshConnections()
+	{
+		if( m_offMeshConnectionComponent != NULL )
+		{
+			m_offMeshConnectionComponent.DisableForPlayer();
+		}
+	}
+
+}
+
+class LiftArrivedEvent extends Event
+{
+	var floor : String;
+}
+
+class LiftDepartedEvent extends Event
+{
+	var floor : String;
+}
+
+class LiftStartDelayEvent extends Event
+{
+	var targetFloor : Int32;
+}
+
+class LiftSetMovementStateEvent extends Event
+{
+	var movementState : gamePlatformMovementState;
+}
+
+class SetIsPlayerInsideLiftEvent extends Event
+{
+	var value : Bool;
+}
+
+class ScanPlayerDelayEvent extends Event
+{
+}
+
+class LiftMovementLoadEvent extends Event
+{
+}
+

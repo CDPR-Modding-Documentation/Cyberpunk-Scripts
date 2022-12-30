@@ -1,0 +1,263 @@
+class BaseModalListPopupGameController extends inkGameController
+{
+	protected editable var m_content : inkWidgetRef;
+	protected var m_listController : weak< inkVirtualListController >;
+	protected var m_playerPuppet : weak< GameObject >;
+	protected var m_popupData : inkGameNotificationData;
+	private var m_templateClassifier : BaseModalListPopupTemplateClassifier;
+	private var m_systemRequestsHandler : weak< inkISystemRequestsHandler >;
+	private var m_switchAnimProxy : inkAnimProxy;
+	private var m_transitionAnimProxy : inkAnimProxy;
+	private var m_isInMenuCallbackID : CallbackHandle;
+	private const var c_scrollInputThreshold : Float;
+	default c_scrollInputThreshold = 0.75f;
+	private var m_firstInit : Bool;
+
+	protected virtual function SetupData() {}
+
+	protected virtual function SetupVirtualList() {}
+
+	protected virtual function CleanVirtualList() {}
+
+	protected virtual function Activate() {}
+
+	protected virtual function VirtualListReady() {}
+
+	protected virtual function Select( previous : inkVirtualCompoundItemController, next : inkVirtualCompoundItemController ) {}
+
+	protected virtual function OnClose() {}
+
+	protected event OnInitialize()
+	{
+		m_popupData = ( ( inkGameNotificationData )( GetRootWidget().GetUserData( 'inkGameNotificationData' ) ) );
+		m_systemRequestsHandler = GetSystemRequestsHandler();
+		SetTimeDilatation( true );
+		BaseSetupVirtualList();
+		m_transitionAnimProxy = PlayLibraryAnimation( 'fadeIn' );
+		PopupStateUtils.SetBackgroundBlurBlendTime( this, 0.1 );
+	}
+
+	protected event OnUninitialize()
+	{
+		SendPSMRadialCloseRequest();
+		SetTimeDilatation( false );
+		CleanVirtualList();
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		var uiSystem : UISystem;
+		var playerControlledObject : GameObject;
+		var uiSystemBB : IBlackboard;
+		uiSystem = GameInstance.GetUISystem( playerPuppet.GetGame() );
+		uiSystem.PushGameContext( UIGameContext.ModalPopup );
+		uiSystem.RequestNewVisualState( 'inkModalPopupState' );
+		m_playerPuppet = playerPuppet;
+		playerControlledObject = GetPlayerControlledObject();
+		SetupData();
+		playerControlledObject.RegisterInputListener( this, 'left_stick_y_scroll_up' );
+		playerControlledObject.RegisterInputListener( this, 'left_stick_y_scroll_down' );
+		playerControlledObject.RegisterInputListener( this, 'popup_moveDown' );
+		playerControlledObject.RegisterInputListener( this, 'popup_moveUp' );
+		playerControlledObject.RegisterInputListener( this, 'OpenPauseMenu' );
+		playerControlledObject.RegisterInputListener( this, 'proceed' );
+		playerControlledObject.RegisterInputListener( this, 'cancel' );
+		uiSystemBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_System );
+		m_isInMenuCallbackID = uiSystemBB.RegisterDelayedListenerBool( GetAllBlackboardDefs().UI_System.IsInMenu, this, 'OnIsInMenuChanged' );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		var uiSystemBB : IBlackboard;
+		if( m_isInMenuCallbackID )
+		{
+			uiSystemBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_System );
+			uiSystemBB.UnregisterDelayedListener( GetAllBlackboardDefs().UI_System.IsInMenu, m_isInMenuCallbackID );
+		}
+		GetPlayerControlledObject().UnregisterInputListener( this );
+	}
+
+	protected event OnIsInMenuChanged( param : Bool )
+	{
+		if( param )
+		{
+			Close();
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : CName;
+		var actionType : gameinputActionType;
+		actionType = ListenerAction.GetType( action );
+		actionName = ListenerAction.GetName( action );
+		if( actionType == gameinputActionType.REPEAT )
+		{
+			switch( actionName )
+			{
+				case 'popup_moveUp':
+					ScrollPrior();
+				break;
+				case 'popup_moveDown':
+					ScrollNext();
+				break;
+			}
+		}
+		else if( actionType == gameinputActionType.BUTTON_PRESSED )
+		{
+			switch( actionName )
+			{
+				case 'proceed':
+					Activate();
+				break;
+				case 'popup_moveUp':
+					ScrollPrior();
+				break;
+				case 'popup_moveDown':
+					ScrollNext();
+				break;
+				case 'OpenPauseMenu':
+					ListenerActionConsumer.DontSendReleaseEvent( consumer );
+				Close();
+				break;
+				case 'cancel':
+					Close();
+				break;
+			}
+		}
+		else if( actionType == gameinputActionType.BUTTON_HOLD_COMPLETE )
+		{
+			if( actionName == 'left_stick_y_scroll_up' )
+			{
+				ScrollPrior();
+			}
+			else if( actionName == 'left_stick_y_scroll_down' )
+			{
+				ScrollNext();
+			}
+		}
+	}
+
+	protected event OnItemSelected( previous : inkVirtualCompoundItemController, next : inkVirtualCompoundItemController )
+	{
+		Select( previous, next );
+		if( m_switchAnimProxy )
+		{
+			m_switchAnimProxy.Stop();
+			m_switchAnimProxy = NULL;
+		}
+		m_switchAnimProxy = PlayLibraryAnimation( 'switch' );
+	}
+
+	private function BaseSetupVirtualList()
+	{
+		m_templateClassifier = new BaseModalListPopupTemplateClassifier;
+		m_listController = ( ( inkVirtualListController )( inkWidgetRef.GetControllerByType( m_content, 'inkVirtualListController' ) ) );
+		m_listController.SetClassifier( m_templateClassifier );
+		m_listController.RegisterToCallback( 'OnItemSelected', this, 'OnItemSelected' );
+		m_listController.RegisterToCallback( 'OnAllElementsSpawned', this, 'OnAllElementsSpawned' );
+		m_firstInit = true;
+		SetupVirtualList();
+	}
+
+	protected event OnAllElementsSpawned()
+	{
+		if( m_firstInit )
+		{
+			m_firstInit = false;
+			m_listController.SelectItem( 0 );
+			VirtualListReady();
+		}
+	}
+
+	private function HandleScroll( axisData : Float )
+	{
+		if( AbsF( axisData ) >= c_scrollInputThreshold )
+		{
+			if( axisData > 0.0 )
+			{
+				ScrollNext();
+			}
+			else
+			{
+				ScrollPrior();
+			}
+		}
+	}
+
+	private function ScrollNext()
+	{
+		if( m_listController )
+		{
+			m_listController.Navigate( inkDiscreteNavigationDirection.Down );
+		}
+	}
+
+	private function ScrollPrior()
+	{
+		if( m_listController )
+		{
+			m_listController.Navigate( inkDiscreteNavigationDirection.Up );
+		}
+	}
+
+	protected function Close()
+	{
+		if( m_transitionAnimProxy )
+		{
+			m_transitionAnimProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnHideAnimFinished' );
+			m_transitionAnimProxy.Stop();
+			m_transitionAnimProxy = NULL;
+		}
+		m_transitionAnimProxy = PlayLibraryAnimation( 'fadeOut' );
+		m_transitionAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnHideAnimFinished' );
+		OnClose();
+	}
+
+	private function SendPSMRadialCloseRequest()
+	{
+		var psmEvent : PSMPostponedParameterBool;
+		psmEvent = new PSMPostponedParameterBool;
+		psmEvent.id = 'RadialWheelCloseRequest';
+		psmEvent.value = true;
+		m_playerPuppet.QueueEvent( psmEvent );
+	}
+
+	protected event OnHideAnimFinished( proxy : inkAnimProxy )
+	{
+		SetTimeDilatation( false );
+		m_popupData.token.TriggerCallback( m_popupData );
+	}
+
+	protected function SetTimeDilatation( enable : Bool )
+	{
+		var uiSystem : UISystem;
+		uiSystem = GameInstance.GetUISystem( m_playerPuppet.GetGame() );
+		if( enable )
+		{
+			TimeDilationHelper.SetTimeDilationWithProfile( GetPlayerControlledObject(), "radialMenu", true );
+			uiSystem.PushGameContext( UIGameContext.ModalPopup );
+			uiSystem.RequestNewVisualState( 'inkModalPopupState' );
+			PopupStateUtils.SetBackgroundBlur( this, true );
+		}
+		else
+		{
+			TimeDilationHelper.SetTimeDilationWithProfile( GetPlayerControlledObject(), "radialMenu", false );
+			uiSystem.PopGameContext( UIGameContext.ModalPopup );
+			uiSystem.RestorePreviousVisualState( 'inkModalPopupState' );
+			PopupStateUtils.SetBackgroundBlur( this, false );
+		}
+	}
+
+}
+
+class BaseModalListPopupTemplateClassifier extends inkVirtualItemTemplateClassifier
+{
+
+	public virtual function ClassifyItem( data : Variant ) : Uint32
+	{
+		return 0;
+	}
+
+}
+

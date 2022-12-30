@@ -1,0 +1,295 @@
+struct SPresetTimetableEntry
+{
+	instanceeditable var time : SSimpleGameTime;
+	instanceeditable var useTime : Bool;
+	var arrayPosition : Int32;
+	var entryID : Uint32;
+}
+
+struct SmartHouseConfiguration
+{
+	instanceeditable var enableInteraction : Bool;
+	instanceeditable var factName : CName;
+}
+
+class SmartHouseController extends MasterController
+{
+
+	public const override function GetPS() : SmartHouseControllerPS
+	{
+		return ( ( SmartHouseControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class SmartHouseControllerPS extends MasterControllerPS
+{
+	default m_deviceName = "LocKey#15648";
+	default m_tweakDBRecord = T"Devices.SmartHouse";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.SmartHouse";
+	protected var m_timetable : array< SPresetTimetableEntry >;
+	protected inlined var m_activePreset : SmartHousePreset;
+	protected const instanceeditable inlined var m_availablePresets : array< SmartHousePreset >;
+	protected instanceeditable var m_smartHouseCustomization : SmartHouseConfiguration;
+	protected var m_callbackID : Uint32;
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+	}
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+	}
+
+	protected override function GameAttached()
+	{
+		InitializePreset();
+	}
+
+	public function GetCustomizationFact() : CName
+	{
+		return m_smartHouseCustomization.factName;
+	}
+
+	public function RegisterFactCallback()
+	{
+		if( m_smartHouseCustomization.enableInteraction && IsNameValid( m_smartHouseCustomization.factName ) )
+		{
+			m_callbackID = GameInstance.GetQuestsSystem( GetGameInstance() ).RegisterEntity( m_smartHouseCustomization.factName, PersistentID.ExtractEntityID( GetID() ) );
+		}
+	}
+
+	public function UnregisterFactCallback()
+	{
+		if( m_smartHouseCustomization.enableInteraction && IsNameValid( m_smartHouseCustomization.factName ) )
+		{
+			GameInstance.GetQuestsSystem( GetGameInstance() ).UnregisterEntity( m_smartHouseCustomization.factName, m_callbackID );
+		}
+	}
+
+	public override function GetActions( out outActions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		var i : Int32;
+		var fact : Int32;
+		super.GetActions( outActions, context );
+		for( i = 0; i < m_availablePresets.Size(); i += 1 )
+		{
+			if( ( m_activePreset != m_availablePresets[ i ] ) && PresetAction.IsAvailable( this ) )
+			{
+				outActions.PushBack( ActionPreset( m_availablePresets[ i ] ) );
+			}
+		}
+		fact = GameInstance.GetQuestsSystem( GetGameInstance() ).GetFact( m_smartHouseCustomization.factName );
+		if( m_smartHouseCustomization.enableInteraction && ( fact == 0 ) )
+		{
+			outActions.PushBack( ActionOpenInteriorManager() );
+		}
+		SetActionIllegality( outActions, m_illegalActions.regularActions );
+		return true;
+	}
+
+	protected function ActionOpenInteriorManager() : OpenInteriorManager
+	{
+		var action : OpenInteriorManager;
+		action = new OpenInteriorManager;
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public virtual function OnOpenInteriorManager( evt : OpenInteriorManager ) : EntityNotificationType
+	{
+		UseNotifier( evt );
+		SetFactValue( GetGameInstance(), m_smartHouseCustomization.factName, 1 );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected function ActionPreset( preset : SmartHousePreset ) : PresetAction
+	{
+		var action : PresetAction;
+		action = new PresetAction;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOnClearance();
+		action.SetUp( this );
+		action.SetProperties( preset );
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public virtual function OnPresetAction( evt : PresetAction ) : EntityNotificationType
+	{
+		UseNotifier( evt );
+		m_activePreset = evt.GetPreset();
+		m_activePreset.ExecutePresetActions( GetImmediateSlaves() );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public function ActivatePreset( i : Int32 )
+	{
+		m_activePreset = m_availablePresets[ i ];
+		if( GetActiveTimeTableEntry() == i )
+		{
+			m_activePreset.ExecutePresetActions( GetImmediateSlaves() );
+		}
+	}
+
+	public function QuestForcePreset( preset : CName )
+	{
+		var i : Int32;
+		for( i = 0; i < m_availablePresets.Size(); i += 1 )
+		{
+			if( m_availablePresets[ i ].GetClassName() == preset )
+			{
+				m_activePreset = m_availablePresets[ i ];
+				m_activePreset.ExecutePresetActions( GetImmediateSlaves() );
+				NotifyParents();
+				break;
+			}
+		}
+	}
+
+	protected function InitializePreset()
+	{
+		var i : Int32;
+		var currentTimetable : SPresetTimetableEntry;
+		for( i = 0; i < m_availablePresets.Size(); i += 1 )
+		{
+			currentTimetable = m_availablePresets[ i ].GetTimeTable();
+			if( m_timetable.Size() == 0 )
+			{
+				if( currentTimetable.useTime )
+				{
+					currentTimetable.arrayPosition = i;
+					m_timetable.PushBack( currentTimetable );
+				}
+			}
+			else
+			{
+				CheckTimetable( currentTimetable, i );
+			}
+		}
+		InitializeTimetable();
+	}
+
+	protected function InitializeTimetable()
+	{
+		var i : Int32;
+		var activeEntry : Int32;
+		var evt : PresetTimetableEvent;
+		var timeout : GameTime;
+		var entryTime : GameTime;
+		var timeSystem : TimeSystem;
+		timeSystem = GameInstance.GetTimeSystem( GetGameInstance() );
+		activeEntry = GetActiveTimeTableEntry();
+		for( i = 0; i < m_timetable.Size(); i += 1 )
+		{
+			evt = new PresetTimetableEvent;
+			evt.arrayPosition = m_timetable[ i ].arrayPosition;
+			entryTime = MakeTime( m_timetable[ i ].time );
+			timeout = GameTime.MakeGameTime( 0, 24, 0, 0 );
+			m_timetable[ i ].entryID = timeSystem.RegisterIntervalListener( GetOwnerEntityWeak(), evt, entryTime, timeout, -1 );
+			if( i == activeEntry )
+			{
+				GetOwnerEntityWeak().QueueEvent( evt );
+			}
+		}
+	}
+
+	public function UninitializeTimetable()
+	{
+		var i : Int32;
+		for( i = 0; i < m_timetable.Size(); i += 1 )
+		{
+			GameInstance.GetTimeSystem( GetGameInstance() ).UnregisterListener( m_timetable[ i ].entryID );
+		}
+	}
+
+	protected const function GetActiveTimeTableEntry() : Int32
+	{
+		var currentTime : GameTime;
+		var entryTime : GameTime;
+		var time : GameTime;
+		var storedtime : GameTime;
+		var i : Int32;
+		var id : Int32;
+		var wasTimeStored : Bool;
+		currentTime = GetCurrentTime();
+		for( i = 0; i < m_timetable.Size(); i += 1 )
+		{
+			entryTime = MakeTime( m_timetable[ i ].time );
+			if( currentTime < entryTime )
+			{
+				time = ( GameTime.MakeGameTime( 0, 24, 0, 0 ) - entryTime ) + currentTime;
+			}
+			else
+			{
+				time = currentTime - entryTime;
+			}
+			if( ( time < storedtime ) || !( wasTimeStored ) )
+			{
+				wasTimeStored = true;
+				storedtime = time;
+				id = i;
+			}
+		}
+		return id;
+	}
+
+	protected function CheckTimetable( newTable : SPresetTimetableEntry, arrayPos : Int32 )
+	{
+		var i : Int32;
+		var sameHour : Bool;
+		for( i = 0; i < m_timetable.Size(); i += 1 )
+		{
+			if( newTable.useTime )
+			{
+				if( m_timetable[ i ].time.hours == newTable.time.hours )
+				{
+					sameHour = true;
+				}
+			}
+		}
+		if( !( sameHour ) )
+		{
+			newTable.arrayPosition = arrayPos;
+			m_timetable.PushBack( newTable );
+		}
+	}
+
+	protected const function GetCurrentTime() : GameTime
+	{
+		var currentTime : GameTime;
+		currentTime = GameInstance.GetTimeSystem( GetGameInstance() ).GetGameTime();
+		return GameTime.MakeGameTime( 0, GameTime.Hours( currentTime ), GameTime.Minutes( currentTime ), GameTime.Seconds( currentTime ) );
+	}
+
+	protected const function MakeTime( time : SSimpleGameTime ) : GameTime
+	{
+		return GameTime.MakeGameTime( 0, time.hours, time.minutes, time.seconds );
+	}
+
+	public override function GetDeviceWidget( context : GetActionsContext ) : SDeviceWidgetPackage
+	{
+		var widgetData : SDeviceWidgetPackage;
+		widgetData = super.GetDeviceWidget( context );
+		return widgetData;
+	}
+
+	protected override function GetInkWidgetTweakDBID( context : GetActionsContext ) : TweakDBID
+	{
+		if( !( IsUserAuthorized( context.processInitiatorObject.GetEntityID() ) ) && !( context.ignoresAuthorization ) )
+		{
+			return super.GetInkWidgetTweakDBID( context );
+		}
+		else
+		{
+			return T"DevicesUIDefinitions.SmartHouseDeviceWidget";
+		}
+	}
+
+}
+

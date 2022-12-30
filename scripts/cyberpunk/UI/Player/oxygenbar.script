@@ -1,0 +1,235 @@
+class OxygenbarWidgetGameController extends inkHUDGameController
+{
+	private editable var m_oxygenControllerRef : inkWidgetRef;
+	private editable var m_oxygenPercTextPath : inkTextRef;
+	private editable var m_oxygenStatusTextPath : inkTextRef;
+	private var m_bbPSceneTierEventId : CallbackHandle;
+	private var m_swimmingStateBlackboardId : CallbackHandle;
+	private var m_oxygenController : weak< NameplateBarLogicController >;
+	private var m_RootWidget : weak< inkWidget >;
+	private var m_animHideTemp : inkAnimDef;
+	private var m_animShortFade : inkAnimDef;
+	private var m_animLongFade : inkAnimDef;
+	private var m_animHideOxygenProxy : inkAnimProxy;
+	private var m_currentOxygen : Float;
+	default m_currentOxygen = 100.f;
+	private var m_sceneTier : GameplayTier;
+	default m_sceneTier = GameplayTier.Tier1_FullGameplay;
+	private var m_currentSwimmingState : gamePSMSwimming;
+	private var m_oxygenListener : OxygenListener;
+
+	protected event OnInitialize()
+	{
+		m_RootWidget = ( ( inkWidget )( GetRootWidget() ) );
+		m_RootWidget.SetVisible( false );
+		m_oxygenController = ( ( NameplateBarLogicController )( inkWidgetRef.GetController( m_oxygenControllerRef ) ) );
+		m_oxygenListener = new OxygenListener;
+		m_oxygenListener.BindOxygenBar( this );
+		CreateAnimations();
+		EvaluateOxygenBarVisibility();
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_oxygenListener )
+		{
+			m_oxygenListener = NULL;
+		}
+	}
+
+	protected event OnPlayerAttach( playerGameObject : GameObject )
+	{
+		RegisterPSMListeners( playerGameObject );
+		m_oxygenListener = new OxygenListener;
+		m_oxygenListener.BindOxygenBar( this );
+		GameInstance.GetStatPoolsSystem( playerGameObject.GetGame() ).RequestRegisteringListener( playerGameObject.GetEntityID(), gamedataStatPoolType.Oxygen, m_oxygenListener );
+	}
+
+	protected event OnPlayerDetach( playerGameObject : GameObject )
+	{
+		if( m_oxygenListener )
+		{
+			GameInstance.GetStatPoolsSystem( playerGameObject.GetGame() ).RequestUnregisteringListener( playerGameObject.GetEntityID(), gamedataStatPoolType.Oxygen, m_oxygenListener );
+			m_oxygenListener = NULL;
+		}
+		UnregisterPSMListeners( playerGameObject );
+	}
+
+	protected function RegisterPSMListeners( playerPuppet : GameObject )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerPuppet.IsControlledByLocalPeer() )
+		{
+			playerStateMachineBlackboard = GetPSMBlackboard( playerPuppet );
+			if( playerStateMachineBlackboard )
+			{
+				m_bbPSceneTierEventId = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.SceneTier, this, 'OnSceneTierChange' );
+				m_swimmingStateBlackboardId = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.Swimming, this, 'OnPSMSwimmingStateChanged' );
+			}
+		}
+	}
+
+	protected function UnregisterPSMListeners( playerPuppet : GameObject )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerPuppet.IsControlledByLocalPeer() )
+		{
+			playerStateMachineBlackboard = GetPSMBlackboard( playerPuppet );
+			if( playerStateMachineBlackboard )
+			{
+				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.SceneTier, m_bbPSceneTierEventId );
+				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.Swimming, m_swimmingStateBlackboardId );
+			}
+		}
+	}
+
+	public function UpdateOxygenValue( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		var oxygenPerc : Int32;
+		m_currentOxygen = newValue;
+		oxygenPerc = ( ( Int32 )( 100.0 * ( m_currentOxygen / 100.0 ) ) );
+		m_oxygenController.SetNameplateBarProgress( newValue / 100.0, false );
+		inkTextRef.SetTextFromParts( m_oxygenPercTextPath, IntToString( ( ( Int32 )( newValue ) ) ), "Common-Characters-Percetage", "" );
+		UpdateOxygenLevelWarningFluffTexts( oxygenPerc );
+	}
+
+	public function UpdateOxygenLevelWarningFluffTexts( oxygenPerc : Int32 )
+	{
+		var critOxygenThreshold : Float;
+		var lowOxygenThreshold : Float;
+		critOxygenThreshold = TDB.GetFloat( T"player.oxygenThresholds.critOxygenThreshold", 10.0 );
+		lowOxygenThreshold = TDB.GetFloat( T"player.oxygenThresholds.lowOxygenThreshold", 20.0 );
+		if( oxygenPerc <= 0 )
+		{
+			inkTextRef.SetText( m_oxygenStatusTextPath, "UI-ScriptExports-OutOfOxygen0" );
+		}
+		else if( oxygenPerc <= ( ( Int32 )( critOxygenThreshold ) ) )
+		{
+			inkTextRef.SetText( m_oxygenStatusTextPath, "UI-Cyberpunk-Player-STATUS_CRITICAL" );
+		}
+		else if( oxygenPerc <= ( ( Int32 )( lowOxygenThreshold ) ) )
+		{
+			inkTextRef.SetText( m_oxygenStatusTextPath, "UI-Cyberpunk-Player-STATUS_WARNING" );
+		}
+		else
+		{
+			inkTextRef.SetText( m_oxygenStatusTextPath, "UI-Cyberpunk-Player-STATUS_READINGS_NOMINAL" );
+		}
+	}
+
+	public function EvaluateOxygenBarVisibility()
+	{
+		var animFade : inkAnimDef;
+		var isMaxOxygen, isMultiplayer : Bool;
+		isMaxOxygen = m_currentOxygen > 99.0;
+		isMultiplayer = IsPlayingMultiplayer();
+		switch( m_currentSwimmingState )
+		{
+			case gamePSMSwimming.Diving:
+				m_RootWidget.SetVisible( true );
+			break;
+			default:
+				m_RootWidget.SetVisible( false );
+			break;
+		}
+		m_RootWidget.SetVisible( ( m_sceneTier != GameplayTier.Tier3_LimitedGameplay && m_sceneTier != GameplayTier.Tier4_FPPCinematic ) && m_sceneTier != GameplayTier.Tier5_Cinematic );
+		if( isMaxOxygen && !( isMultiplayer ) )
+		{
+			animFade = m_animLongFade;
+			m_RootWidget.SetVisible( false );
+			if( m_RootWidget.IsVisible() && ( !( m_animHideOxygenProxy ) || !( m_animHideOxygenProxy.IsPlaying() ) ) )
+			{
+				m_animHideOxygenProxy = m_RootWidget.PlayAnimation( animFade );
+				m_animHideOxygenProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnOxygenHideAnimationFinished' );
+			}
+		}
+		else
+		{
+			if( m_animHideOxygenProxy && m_animHideOxygenProxy.IsPlaying() )
+			{
+				m_animHideOxygenProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnOxygenHideAnimationFinished' );
+				m_animHideOxygenProxy.Stop();
+			}
+			m_RootWidget.SetOpacity( 1.0 );
+			m_RootWidget.SetVisible( true );
+		}
+	}
+
+	protected event OnOxygenHideAnimationFinished( anim : inkAnimProxy )
+	{
+		m_RootWidget.SetVisible( false );
+	}
+
+	private function CreateAnimations()
+	{
+		var fadeInterp : inkAnimTransparency;
+		var animStartDelay : Float;
+		animStartDelay = 1.0;
+		m_animShortFade = new inkAnimDef;
+		fadeInterp = new inkAnimTransparency;
+		fadeInterp.SetStartDelay( 0.2 );
+		fadeInterp.SetStartTransparency( 1.0 );
+		fadeInterp.SetEndTransparency( 0.0 );
+		fadeInterp.SetDuration( 0.34999999 );
+		m_animShortFade.AddInterpolator( fadeInterp );
+		m_animLongFade = new inkAnimDef;
+		fadeInterp = new inkAnimTransparency;
+		fadeInterp.SetStartDelay( 10.0 );
+		fadeInterp.SetStartTransparency( 1.0 );
+		fadeInterp.SetEndTransparency( 0.0 );
+		fadeInterp.SetDuration( 0.34999999 );
+		m_animLongFade.AddInterpolator( fadeInterp );
+		m_animHideTemp = new inkAnimDef;
+		fadeInterp = new inkAnimTransparency;
+		fadeInterp.SetStartDelay( animStartDelay + 0.25999999 );
+		fadeInterp.SetStartTransparency( 1.0 );
+		fadeInterp.SetEndTransparency( 0.0 );
+		fadeInterp.SetDuration( 0.22 );
+		m_animHideTemp.AddInterpolator( fadeInterp );
+	}
+
+	protected event OnPSMSwimmingStateChanged( value : Int32 )
+	{
+		m_currentSwimmingState = ( ( gamePSMSwimming )( value ) );
+		EvaluateOxygenBarVisibility();
+	}
+
+	protected event OnSceneTierChange( argTier : Int32 )
+	{
+		m_sceneTier = ( ( GameplayTier )( argTier ) );
+		EvaluateOxygenBarVisibility();
+	}
+
+	protected event OnForceHide()
+	{
+		EvaluateOxygenBarVisibility();
+	}
+
+	protected event OnForceTierVisibility( tierVisibility : Bool )
+	{
+		EvaluateOxygenBarVisibility();
+	}
+
+}
+
+class OxygenListener extends ScriptStatPoolsListener
+{
+	private var m_oxygenBar : weak< OxygenbarWidgetGameController >;
+
+	public function BindOxygenBar( bar : weak< OxygenbarWidgetGameController > )
+	{
+		m_oxygenBar = bar;
+	}
+
+	public override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		m_oxygenBar.UpdateOxygenValue( oldValue, newValue, percToPoints );
+		m_oxygenBar.EvaluateOxygenBarVisibility();
+	}
+
+}
+

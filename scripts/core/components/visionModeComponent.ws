@@ -1,0 +1,1293 @@
+class RestoreRevealStateEvent extends Event
+{
+}
+
+class RevealQuestTargetEvent extends Event
+{
+	editable var sourceName : CName;
+	editable var durationType : ERevealDurationType;
+	default durationType = ERevealDurationType.TEMPORARY;
+	editable var reveal : Bool;
+	default reveal = true;
+	var timeout : Float;
+	default timeout = 4.0f;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Reveal Quest Target";
+	}
+
+}
+
+class ToggleForcedHighlightEvent extends Event
+{
+	editable var sourceName : CName;
+	editable inlined var highlightData : HighlightEditableData;
+	editable var operation : EToggleOperationType;
+
+	public constexpr export function GetFriendlyDescription() : String
+	{
+		return "Toggle Forced Highlight";
+	}
+
+}
+
+class SetPersistentForcedHighlightEvent extends Event
+{
+	editable var sourceName : CName;
+	editable inlined var highlightData : HighlightEditableData;
+	editable var operation : EToggleOperationType;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Set Persitent Forced Highlight";
+	}
+
+}
+
+class SetDefaultHighlightEvent extends Event
+{
+	editable inlined var highlightData : HighlightEditableData;
+
+	public constexpr export function GetFriendlyDescription() : String
+	{
+		return "Set Default Highlight";
+	}
+
+}
+
+class RevealStateChangedEvent extends Event
+{
+	var state : ERevealState;
+	var reason : gameVisionModeSystemRevealIdentifier;
+	var transitionTime : Float;
+}
+
+class ClearAllRevealRequestsEvent extends Event
+{
+}
+
+class ForceUpdateDefaultHighlightEvent extends Event
+{
+}
+
+class ForceVisionApperanceEvent extends Event
+{
+	var forcedHighlight : FocusForcedHighlightData;
+	var apply : Bool;
+	var forceCancel : Bool;
+	var ignoreStackEvaluation : Bool;
+	var responseData : IScriptable;
+}
+
+import class RevealObjectEvent extends Event
+{
+	import var reveal : Bool;
+	import var reason : gameVisionModeSystemRevealIdentifier;
+	var lifetime : Float;
+}
+
+class ForceReactivateHighlightsEvent extends Event
+{
+}
+
+class HighlightEditableData extends IScriptable
+{
+	editable var highlightType : EFocusForcedHighlightType;
+	editable var outlineType : EFocusOutlineType;
+	default outlineType = EFocusOutlineType.INVALID;
+	editable var priority : EPriority;
+	default priority = EPriority.VeryLow;
+	editable var inTransitionTime : Float;
+	default inTransitionTime = 0.5f;
+	editable var outTransitionTime : Float;
+	default outTransitionTime = 0.5f;
+	editable var isRevealed : Bool;
+	editable var patternType : VisionModePatternType;
+}
+
+class FocusForcedHighlightPersistentData extends IScriptable
+{
+	private persistent var sourceID : EntityID;
+	private persistent var sourceName : CName;
+	private persistent var highlightType : EFocusForcedHighlightType;
+	private persistent var outlineType : EFocusOutlineType;
+	private persistent var priority : EPriority;
+	private persistent var inTransitionTime : Float;
+	private persistent var outTransitionTime : Float;
+	private persistent var isRevealed : Bool;
+	private persistent var patternType : VisionModePatternType;
+
+	public function Initialize( data : FocusForcedHighlightData )
+	{
+		if( data == NULL )
+		{
+			return;
+		}
+		sourceID = data.sourceID;
+		sourceName = data.sourceName;
+		highlightType = data.highlightType;
+		outlineType = data.outlineType;
+		priority = data.priority;
+		inTransitionTime = data.inTransitionTime;
+		outTransitionTime = data.outTransitionTime;
+		isRevealed = data.isRevealed;
+		patternType = data.patternType;
+	}
+
+	public const function GetData() : FocusForcedHighlightData
+	{
+		var data : FocusForcedHighlightData;
+		data = new FocusForcedHighlightData;
+		data.sourceID = sourceID;
+		data.sourceName = sourceName;
+		data.highlightType = highlightType;
+		data.outlineType = outlineType;
+		data.priority = priority;
+		data.inTransitionTime = inTransitionTime;
+		data.outTransitionTime = outTransitionTime;
+		data.isRevealed = isRevealed;
+		data.patternType = patternType;
+		data.isSavable = true;
+		return data;
+	}
+
+}
+
+class FocusForcedHighlightData extends IScriptable
+{
+	var sourceID : EntityID;
+	var sourceName : CName;
+	var highlightType : EFocusForcedHighlightType;
+	var outlineType : EFocusOutlineType;
+	default outlineType = EFocusOutlineType.INVALID;
+	var priority : EPriority;
+	var inTransitionTime : Float;
+	default inTransitionTime = 0.5f;
+	var outTransitionTime : Float;
+	default outTransitionTime = 2f;
+	var hudData : HighlightInstance;
+	var isRevealed : Bool;
+	var isSavable : Bool;
+	var patternType : VisionModePatternType;
+
+	public function IsValid() : Bool
+	{
+		return ( IsNameValid( sourceName ) || EntityID.IsDefined( sourceID ) ) && ( highlightType != EFocusForcedHighlightType.INVALID || outlineType != EFocusOutlineType.INVALID );
+	}
+
+	public function InitializeWithHudInstruction( data : HighlightInstance )
+	{
+		hudData = data;
+		isRevealed = data.isRevealed;
+		if( data.instant )
+		{
+			inTransitionTime = 0.0;
+			outTransitionTime = 0.0;
+		}
+	}
+
+	private function GetFillColorIndex() : Int32
+	{
+		switch( highlightType )
+		{
+			case EFocusForcedHighlightType.INTERACTION:
+				return 2;
+			case EFocusForcedHighlightType.IMPORTANT_INTERACTION:
+				return 5;
+			case EFocusForcedHighlightType.WEAKSPOT:
+				return 6;
+			case EFocusForcedHighlightType.QUEST:
+				return 1;
+			case EFocusForcedHighlightType.DISTRACTION:
+				return 3;
+			case EFocusForcedHighlightType.CLUE:
+				return 4;
+			case EFocusForcedHighlightType.NPC:
+				return 0;
+			case EFocusForcedHighlightType.AOE:
+				return 7;
+			case EFocusForcedHighlightType.ITEM:
+				return 5;
+			case EFocusForcedHighlightType.HOSTILE:
+				return 7;
+			case EFocusForcedHighlightType.FRIENDLY:
+				return 4;
+			case EFocusForcedHighlightType.NEUTRAL:
+				return 2;
+			case EFocusForcedHighlightType.HACKABLE:
+				return 4;
+			case EFocusForcedHighlightType.ENEMY_NETRUNNER:
+				return 6;
+			case EFocusForcedHighlightType.BACKDOOR:
+				return 5;
+			default:
+				return 0;
+		}
+	}
+
+	private function GetOutlineColorIndex() : Int32
+	{
+		switch( outlineType )
+		{
+			case EFocusOutlineType.HOSTILE:
+				return 2;
+			case EFocusOutlineType.FRIENDLY:
+				return 1;
+			case EFocusOutlineType.NEUTRAL:
+				return 3;
+			case EFocusOutlineType.ITEM:
+				return 6;
+			case EFocusOutlineType.INTERACTION:
+				return 3;
+			case EFocusOutlineType.IMPORTANT_INTERACTION:
+				return 6;
+			case EFocusOutlineType.QUEST:
+				return 5;
+			case EFocusOutlineType.CLUE:
+				return 1;
+			case EFocusOutlineType.DISTRACTION:
+				return 7;
+			case EFocusOutlineType.AOE:
+				return 2;
+			case EFocusOutlineType.HACKABLE:
+				return 1;
+			case EFocusOutlineType.WEAKSPOT:
+				return 4;
+			case EFocusOutlineType.ENEMY_NETRUNNER:
+				return 4;
+			case EFocusOutlineType.BACKDOOR:
+				return 6;
+			default:
+				return 0;
+		}
+	}
+
+	public function GetVisionApperance() : VisionAppearance
+	{
+		var apperance : VisionAppearance;
+		apperance.patternType = patternType;
+		if( hudData == NULL )
+		{
+			apperance.fill = GetFillColorIndex();
+			apperance.outline = GetOutlineColorIndex();
+		}
+		else
+		{
+			if( hudData.context == HighlightContext.FILL )
+			{
+				apperance.fill = GetFillColorIndex();
+			}
+			else if( hudData.context == HighlightContext.OUTLINE )
+			{
+				apperance.outline = GetOutlineColorIndex();
+			}
+			else if( hudData.context == HighlightContext.FULL )
+			{
+				apperance.fill = GetFillColorIndex();
+				apperance.outline = GetOutlineColorIndex();
+			}
+			apperance.showThroughWalls = hudData.isRevealed;
+		}
+		switch( highlightType )
+		{
+			case EFocusForcedHighlightType.QUEST:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.INTERACTION:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.IMPORTANT_INTERACTION:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.WEAKSPOT:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.DISTRACTION:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.CLUE:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.NPC:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.AOE:
+				apperance.showThroughWalls = false;
+			break;
+			case EFocusForcedHighlightType.ITEM:
+				apperance.showThroughWalls = false;
+			break;
+			default:
+				break;
+		}
+		return apperance;
+	}
+
+}
+
+import final class gameVisionModeComponentPS extends GameComponentPS
+{
+	private persistent var m_storedHighlightData : FocusForcedHighlightPersistentData;
+
+	public function StoreHighlightData( data : FocusForcedHighlightData )
+	{
+		if( data )
+		{
+			m_storedHighlightData = new FocusForcedHighlightPersistentData;
+			m_storedHighlightData.Initialize( data );
+		}
+		else
+		{
+			m_storedHighlightData = NULL;
+		}
+	}
+
+	public const function GetStoredHighlightData() : FocusForcedHighlightData
+	{
+		if( m_storedHighlightData != NULL )
+		{
+			return m_storedHighlightData.GetData();
+		}
+		else
+		{
+			return NULL;
+		}
+	}
+
+	private function OnSetPersistentForcedHighlightEvent( evt : SetPersistentForcedHighlightEvent ) : EntityNotificationType
+	{
+		var highlight : FocusForcedHighlightData;
+		if( evt.operation == EToggleOperationType.REMOVE )
+		{
+			StoreHighlightData( NULL );
+		}
+		else
+		{
+			highlight = new FocusForcedHighlightData;
+			highlight.sourceID = PersistentID.ExtractEntityID( GetID() );
+			highlight.sourceName = evt.sourceName;
+			highlight.highlightType = evt.highlightData.highlightType;
+			highlight.outlineType = evt.highlightData.outlineType;
+			highlight.inTransitionTime = evt.highlightData.inTransitionTime;
+			highlight.outTransitionTime = evt.highlightData.outTransitionTime;
+			highlight.priority = evt.highlightData.priority;
+			highlight.isRevealed = evt.highlightData.isRevealed;
+			highlight.isSavable = true;
+			StoreHighlightData( highlight );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+}
+
+import final class VisionModeComponent extends GameComponent
+{
+	private instanceeditable inlined var m_defaultHighlightData : HighlightEditableData;
+	private var m_forcedHighlights : array< FocusForcedHighlightData >;
+	private var m_activeForcedHighlight : FocusForcedHighlightData;
+	private var m_currentDefaultHighlight : FocusForcedHighlightData;
+	private var m_activeRevealRequests : array< gameVisionModeSystemRevealIdentifier >;
+	private var m_isFocusModeActive : Bool;
+	private var m_wasCleanedUp : Bool;
+	private var m_slaveObjectsToHighlight : array< EntityID >;
+
+	public import function SetHiddenInVisionMode( hidden : Bool, type : gameVisionModeType );
+
+	protected export function OnGameAttach()
+	{
+		GetVisionModeSystem().GetDelayedRevealEntries( GetOwner().GetEntityID(), m_activeRevealRequests );
+		AddForcedHighlight( GetMyPS().GetStoredHighlightData() );
+	}
+
+	protected export function OnGameDetach()
+	{
+		if( m_activeForcedHighlight && m_activeForcedHighlight.isSavable )
+		{
+			GetMyPS().StoreHighlightData( m_activeForcedHighlight );
+		}
+	}
+
+	protected event OnRestoreRevealEvent( evt : RestoreRevealStateEvent )
+	{
+		RestoreReveal();
+	}
+
+	private function RestoreReveal()
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRevealRequests.Size(); i += 1 )
+		{
+			if( i == 0 )
+			{
+				SendRevealStateChangedEvent( ERevealState.STARTED, m_activeRevealRequests[ i ] );
+			}
+			else
+			{
+				SendRevealStateChangedEvent( ERevealState.CONTINUE, m_activeRevealRequests[ i ] );
+			}
+		}
+	}
+
+	private const function GetMyPS() : gameVisionModeComponentPS
+	{
+		return ( ( gameVisionModeComponentPS )( GetPS() ) );
+	}
+
+	private const function GetOwner() : GameObject
+	{
+		return ( ( GameObject )( GetEntity() ) );
+	}
+
+	private function AddForcedHighlight( data : FocusForcedHighlightData )
+	{
+		if( ( data == NULL ) || !( data.IsValid() ) )
+		{
+			return;
+		}
+		if( !( HasForcedHighlightOnStack( data ) ) )
+		{
+			m_forcedHighlights.PushBack( data );
+		}
+		if( m_forcedHighlights.Size() > 0 )
+		{
+			EvaluateForcedHighLightsStack();
+		}
+	}
+
+	private function RemoveForcedHighlight( data : FocusForcedHighlightData, optional ignoreStackEvaluation : Bool )
+	{
+		var i : Int32;
+		var evaluate : Bool;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( m_forcedHighlights[ i ].sourceID == data.sourceID )
+			{
+				if( m_forcedHighlights[ i ].sourceName == data.sourceName )
+				{
+					if( m_forcedHighlights[ i ].highlightType == data.highlightType && m_forcedHighlights[ i ].outlineType == data.outlineType )
+					{
+						m_forcedHighlights[ i ] = NULL;
+						m_forcedHighlights.Erase( i );
+						evaluate = true;
+						break;
+					}
+				}
+			}
+		}
+		if( evaluate && !( ignoreStackEvaluation ) )
+		{
+			EvaluateForcedHighLightsStack();
+		}
+	}
+
+	private function EvaluateForcedHighLightsStack()
+	{
+		var i : Int32;
+		var currentForcedHighlight : FocusForcedHighlightData;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( ( currentForcedHighlight == NULL ) || ( ( currentForcedHighlight != NULL ) && ( ( ( Int32 )( m_forcedHighlights[ i ].priority ) ) >= ( ( Int32 )( currentForcedHighlight.priority ) ) ) ) )
+			{
+				currentForcedHighlight = m_forcedHighlights[ i ];
+			}
+		}
+		UpdateActiveForceHighlight( currentForcedHighlight );
+	}
+
+	protected event OnAIAction( evt : AIEvent )
+	{
+		var puppet : ScriptedPuppet;
+		if( evt.name == 'NewWeaponEquipped' )
+		{
+			puppet = ( ( ScriptedPuppet )( GetOwner() ) );
+			if( puppet && puppet.IsActive() )
+			{
+				ForwardHighlightToSlaveEntity( m_activeForcedHighlight, true );
+			}
+		}
+	}
+
+	private function UpdateActiveForceHighlight( data : FocusForcedHighlightData )
+	{
+		if( data != m_activeForcedHighlight )
+		{
+			if( data != NULL )
+			{
+				ForceVisionAppearance( data );
+				m_activeForcedHighlight = data;
+			}
+			else if( m_activeForcedHighlight != NULL )
+			{
+				CancelForcedVisionAppearance( m_activeForcedHighlight.outTransitionTime );
+				m_activeForcedHighlight = NULL;
+			}
+		}
+	}
+
+	private function ReactivateForceHighlight()
+	{
+		if( m_activeForcedHighlight != NULL )
+		{
+			ForceVisionAppearance( m_activeForcedHighlight );
+		}
+	}
+
+	private function HasForcedHighlightOnStack( data : FocusForcedHighlightData ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( m_forcedHighlights[ i ].sourceID == data.sourceID )
+			{
+				if( m_forcedHighlights[ i ].sourceName == data.sourceName )
+				{
+					if( m_forcedHighlights[ i ].highlightType == data.highlightType && m_forcedHighlights[ i ].outlineType == data.outlineType )
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	private function ForceVisionAppearance( data : FocusForcedHighlightData )
+	{
+		var appearance : VisionAppearance;
+		appearance = data.GetVisionApperance();
+		if( IsRevealed() || data.isRevealed )
+		{
+			data.isRevealed = true;
+			appearance.showThroughWalls = true;
+		}
+		else
+		{
+			data.isRevealed = false;
+			appearance.showThroughWalls = false;
+		}
+		GameInstance.GetVisionModeSystem( GetOwner().GetGame() ).ForceVisionAppearance( GetOwner(), appearance, data.inTransitionTime );
+		ForwardHighlightToSlaveEntity( data, true );
+	}
+
+	private function CancelForcedVisionAppearance( transitionTime : Float )
+	{
+		GameInstance.GetVisionModeSystem( GetOwner().GetGame() ).CancelForceVisionAppearance( GetOwner(), transitionTime );
+		ForwardHighlightToSlaveEntity( m_activeForcedHighlight, false );
+	}
+
+	private const function GetDefaultHighlight( optional data : HighlightInstance ) : FocusForcedHighlightData
+	{
+		var highlight : FocusForcedHighlightData;
+		if( GetOwner().IsBraindanceBlocked() || GetOwner().IsPhotoModeBlocked() )
+		{
+			return NULL;
+		}
+		if( m_defaultHighlightData != NULL )
+		{
+			highlight = new FocusForcedHighlightData;
+			highlight.sourceID = GetOwner().GetEntityID();
+			highlight.sourceName = GetOwner().GetClassName();
+			highlight.outlineType = m_defaultHighlightData.outlineType;
+			highlight.highlightType = m_defaultHighlightData.highlightType;
+			highlight.priority = m_defaultHighlightData.priority;
+			highlight.inTransitionTime = m_defaultHighlightData.inTransitionTime;
+			highlight.outTransitionTime = m_defaultHighlightData.outTransitionTime;
+		}
+		else
+		{
+			highlight = GetOwner().GetDefaultHighlight();
+			if( data != NULL )
+			{
+				highlight.InitializeWithHudInstruction( data );
+			}
+		}
+		return highlight;
+	}
+
+	public function ToggleRevealObject( reveal : Bool, optional forced : Bool )
+	{
+		if( reveal )
+		{
+			if( ( m_activeForcedHighlight != NULL ) && !( m_activeForcedHighlight.isRevealed ) )
+			{
+				if( forced )
+				{
+					m_activeForcedHighlight.isRevealed = reveal;
+				}
+				CancelForcedVisionAppearance( 0.30000001 );
+				ReactivateForceHighlight();
+			}
+		}
+		else
+		{
+			if( ( m_activeForcedHighlight != NULL ) && m_activeForcedHighlight.isRevealed )
+			{
+				if( forced )
+				{
+					m_activeForcedHighlight.isRevealed = reveal;
+				}
+				CancelForcedVisionAppearance( 0.30000001 );
+				ReactivateForceHighlight();
+			}
+		}
+	}
+
+	private function IsTagged() : Bool
+	{
+		return GetOwner().IsTaggedinFocusMode();
+	}
+
+	private function AddRevealRequest( data : gameVisionModeSystemRevealIdentifier ) : Int32
+	{
+		if( !( HasRevealRequest( data ) ) )
+		{
+			m_activeRevealRequests.PushBack( data );
+			return m_activeRevealRequests.Size() - 1;
+		}
+		return -1;
+	}
+
+	private function RemoveRevealRequest( data : gameVisionModeSystemRevealIdentifier )
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRevealRequests.Size(); i += 1 )
+		{
+			if( m_activeRevealRequests[ i ].reason == data.reason && ( m_activeRevealRequests[ i ].sourceEntityId == data.sourceEntityId ) )
+			{
+				m_activeRevealRequests.Erase( i );
+				break;
+			}
+		}
+	}
+
+	public function HasRevealRequest( data : gameVisionModeSystemRevealIdentifier ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRevealRequests.Size(); i += 1 )
+		{
+			if( m_activeRevealRequests[ i ].reason == data.reason && ( m_activeRevealRequests[ i ].sourceEntityId == data.sourceEntityId ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private const function GetRevealRequestIndex( data : gameVisionModeSystemRevealIdentifier ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_activeRevealRequests.Size(); i += 1 )
+		{
+			if( IsRequestTheSame( m_activeRevealRequests[ i ], data ) )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function IsRequestTheSame( request1, request2 : gameVisionModeSystemRevealIdentifier ) : Bool
+	{
+		if( request1.reason == request2.reason && ( request1.sourceEntityId == request2.sourceEntityId ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function IsRevealed() : Bool
+	{
+		return m_activeRevealRequests.Size() > 0;
+	}
+
+	private function IsRevealRequestIndexValid( index : Int32 ) : Bool
+	{
+		if( ( index >= 0 ) && ( index < m_activeRevealRequests.Size() ) )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function UpdateDefaultHighlight( data : FocusForcedHighlightData )
+	{
+		if( data == NULL )
+		{
+			if( m_currentDefaultHighlight != NULL )
+			{
+				RemoveForcedHighlight( m_currentDefaultHighlight );
+				m_currentDefaultHighlight = NULL;
+			}
+		}
+		else
+		{
+			if( m_currentDefaultHighlight == NULL )
+			{
+				AddForcedHighlight( data );
+				m_currentDefaultHighlight = data;
+			}
+			else if( ( m_currentDefaultHighlight != NULL ) && !( CompareHighlightData( m_currentDefaultHighlight, data ) ) )
+			{
+				RemoveForcedHighlight( m_currentDefaultHighlight, true );
+				AddForcedHighlight( data );
+				m_currentDefaultHighlight = data;
+			}
+		}
+	}
+
+	private function RequestHUDRefresh()
+	{
+		var request : RefreshActorRequest;
+		request = new RefreshActorRequest;
+		request.ownerID = GetOwner().GetEntityID();
+		GetOwner().GetHudManager().QueueRequest( request );
+	}
+
+	private function GetVisionModeSystem() : VisionModeSystem
+	{
+		return GameInstance.GetVisionModeSystem( GetOwner().GetGame() );
+	}
+
+	private function SendRevealStateChangedEvent( state : ERevealState, reason : gameVisionModeSystemRevealIdentifier )
+	{
+		var evt : RevealStateChangedEvent;
+		var request : RevealStatusNotification;
+		var hudManager : HUDManager;
+		if( state != ERevealState.CONTINUE )
+		{
+			hudManager = GetOwner().GetHudManager();
+			if( hudManager )
+			{
+				request = new RevealStatusNotification;
+				request.ownerID = GetOwner().GetEntityID();
+				if( state == ERevealState.STARTED )
+				{
+					request.isRevealed = true;
+				}
+				else if( state == ERevealState.STOPPED )
+				{
+					request.isRevealed = false;
+				}
+				hudManager.QueueRequest( request );
+			}
+		}
+		evt = new RevealStateChangedEvent;
+		evt.state = state;
+		evt.reason = reason;
+		if( m_activeForcedHighlight )
+		{
+			evt.transitionTime = m_activeForcedHighlight.outTransitionTime;
+		}
+		GetOwner().QueueEvent( evt );
+	}
+
+	private function ClearAllReavealRequests() : Bool
+	{
+		var i : Int32;
+		var evaluate : Bool;
+		var lastRequest : gameVisionModeSystemRevealIdentifier;
+		for( i = m_activeRevealRequests.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_activeRevealRequests[ i ].reason != 'tag' )
+			{
+				evaluate = true;
+				if( i == 0 )
+				{
+					lastRequest = m_activeRevealRequests[ i ];
+					break;
+				}
+				else
+				{
+					m_activeRevealRequests.Erase( i );
+				}
+			}
+		}
+		if( evaluate )
+		{
+			RevealObject( false, lastRequest, 0.0 );
+		}
+		return evaluate;
+	}
+
+	private function ClearForcedHighlights() : Bool
+	{
+		var i : Int32;
+		var evaluate : Bool;
+		for( i = m_forcedHighlights.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_forcedHighlights[ i ] != m_currentDefaultHighlight )
+			{
+				m_forcedHighlights.Erase( i );
+				evaluate = true;
+			}
+		}
+		if( evaluate )
+		{
+			EvaluateForcedHighLightsStack();
+		}
+		return evaluate;
+	}
+
+	private function CompareHighlightData( data1 : FocusForcedHighlightData, data2 : FocusForcedHighlightData ) : Bool
+	{
+		if( data1.patternType != data2.patternType )
+		{
+			return false;
+		}
+		if( ( data1.sourceID != data2.sourceID ) || data1.sourceName != data2.sourceName )
+		{
+			return false;
+		}
+		if( data1.highlightType != data2.highlightType || data1.outlineType != data2.outlineType )
+		{
+			return false;
+		}
+		if( ( data1.hudData && !( data2.hudData ) ) || ( data2.hudData && !( data1.hudData ) ) )
+		{
+			return false;
+		}
+		if( data1.hudData && data2.hudData )
+		{
+			if( data1.hudData.context != data2.hudData.context )
+			{
+				return false;
+			}
+			if( data1.hudData.isRevealed != data2.hudData.isRevealed )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	protected function ForwardHighlightToSlaveEntity( data : FocusForcedHighlightData, apply : Bool )
+	{
+		var evt : ForceVisionApperanceEvent;
+		var objectsToHighlight : array< weak< GameObject > >;
+		var i : Int32;
+		objectsToHighlight = GetOwner().GetObjectToForwardHighlight();
+		UpdateSlaveObjectsToHighlight( objectsToHighlight );
+		if( m_slaveObjectsToHighlight.Size() <= 0 )
+		{
+			return;
+		}
+		evt = new ForceVisionApperanceEvent;
+		evt.forcedHighlight = data;
+		evt.apply = apply;
+		evt.forceCancel = true;
+		evt.ignoreStackEvaluation = apply;
+		for( i = 0; i < m_slaveObjectsToHighlight.Size(); i += 1 )
+		{
+			if( EntityID.IsDefined( m_slaveObjectsToHighlight[ i ] ) )
+			{
+				GetOwner().QueueEventForEntityID( m_slaveObjectsToHighlight[ i ], evt );
+			}
+		}
+		if( !( apply ) )
+		{
+			m_slaveObjectsToHighlight.Clear();
+		}
+	}
+
+	private function UpdateSlaveObjectsToHighlight( objectsToHighlight : ref< array< weak< GameObject > > > )
+	{
+		var currentID : EntityID;
+		var i : Int32;
+		for( i = 0; i < objectsToHighlight.Size(); i += 1 )
+		{
+			currentID = objectsToHighlight[ i ].GetEntityID();
+			if( !( m_slaveObjectsToHighlight.Contains( currentID ) ) )
+			{
+				m_slaveObjectsToHighlight.PushBack( currentID );
+			}
+		}
+	}
+
+	protected event OnForceVisionApperance( evt : ForceVisionApperanceEvent )
+	{
+		var responseEvt : ResponseEvent;
+		var reason : gameVisionModeSystemRevealIdentifier;
+		if( evt.forceCancel )
+		{
+			if( m_activeForcedHighlight != NULL )
+			{
+				RemoveForcedHighlight( m_activeForcedHighlight, evt.ignoreStackEvaluation );
+			}
+			else
+			{
+				CancelForcedVisionAppearance( 0.0 );
+			}
+		}
+		if( evt.forcedHighlight != NULL )
+		{
+			if( evt.apply )
+			{
+				if( evt.forcedHighlight.isRevealed )
+				{
+					reason.reason = evt.forcedHighlight.sourceName;
+					reason.sourceEntityId = evt.forcedHighlight.sourceID;
+					RevealObject( true, reason, 0.0 );
+				}
+				AddForcedHighlight( evt.forcedHighlight );
+			}
+			else
+			{
+				if( evt.forcedHighlight.isRevealed )
+				{
+					reason.reason = evt.forcedHighlight.sourceName;
+					reason.sourceEntityId = evt.forcedHighlight.sourceID;
+					RevealObject( false, reason, 0.0 );
+				}
+				RemoveForcedHighlight( evt.forcedHighlight, evt.ignoreStackEvaluation );
+			}
+			if( evt.responseData )
+			{
+				responseEvt = new ResponseEvent;
+				responseEvt.responseData = evt.responseData;
+				GetOwner().QueueEventForEntityID( evt.forcedHighlight.sourceID, responseEvt );
+			}
+		}
+	}
+
+	protected event OnRevealObject( evt : RevealObjectEvent )
+	{
+		RevealObject( evt.reveal, evt.reason, evt.lifetime );
+	}
+
+	protected event OnVisionRevealExpiredEvent( evt : gameVisionRevealExpiredEvent )
+	{
+		RevealObject( false, evt.revealId, 0.0 );
+	}
+
+	private function RevealObject( reveal : Bool, reason : gameVisionModeSystemRevealIdentifier, lifetime : Float )
+	{
+		var index : Int32;
+		var visonModeSystem : VisionModeSystem;
+		if( reveal )
+		{
+			visonModeSystem = GetVisionModeSystem();
+			index = GetRevealRequestIndex( reason );
+			if( IsRevealRequestIndexValid( index ) && visonModeSystem.IsDelayedRevealInProgress( GetOwner().GetEntityID(), reason ) )
+			{
+				visonModeSystem.UnregisterDelayedReveal( GetOwner().GetEntityID(), reason );
+				RemoveRevealRequest( reason );
+			}
+			if( !( IsRevealed() ) )
+			{
+				SendRevealStateChangedEvent( ERevealState.STARTED, reason );
+			}
+			else
+			{
+				SendRevealStateChangedEvent( ERevealState.CONTINUE, reason );
+			}
+			index = AddRevealRequest( reason );
+			if( lifetime > 0.0 )
+			{
+				if( !( IsRevealRequestIndexValid( index ) ) )
+				{
+					return;
+				}
+				RemoveRevealWithDelay( reason, lifetime );
+				return;
+			}
+		}
+		else
+		{
+			index = GetRevealRequestIndex( reason );
+			if( !( IsRevealRequestIndexValid( index ) ) )
+			{
+				return;
+			}
+			if( lifetime > 0.0 )
+			{
+				RemoveRevealWithDelay( reason, lifetime );
+				return;
+			}
+			RemoveRevealRequest( reason );
+			if( !( IsRevealed() ) )
+			{
+				SendRevealStateChangedEvent( ERevealState.STOPPED, reason );
+			}
+			else
+			{
+				SendRevealStateChangedEvent( ERevealState.CONTINUE, reason );
+			}
+		}
+	}
+
+	private function RemoveRevealWithDelay( reason : gameVisionModeSystemRevealIdentifier, lifetime : Float )
+	{
+		GetVisionModeSystem().RegisterDelayedReveal( GetOwner().GetEntityID(), reason, lifetime );
+	}
+
+	protected event OnForceReactivateHighlights( evt : ForceReactivateHighlightsEvent )
+	{
+		ReactivateForceHighlight();
+	}
+
+	protected event OnHUDInstruction( evt : HUDInstruction )
+	{
+		var highlight : FocusForcedHighlightData;
+		if( evt.braindanceInstructions.GetState() == InstanceState.ON )
+		{
+			if( GetOwner().IsBraindanceBlocked() || GetOwner().IsPhotoModeBlocked() )
+			{
+				UpdateDefaultHighlight( NULL );
+				ToggleRevealObject( false );
+				return false;
+			}
+		}
+		if( evt.highlightInstructions.GetState() == InstanceState.ON )
+		{
+			highlight = GetDefaultHighlight( evt.highlightInstructions );
+			UpdateDefaultHighlight( highlight );
+			ToggleRevealObject( evt.highlightInstructions.isRevealed );
+		}
+		else
+		{
+			if( evt.highlightInstructions.WasProcessed() )
+			{
+				UpdateDefaultHighlight( NULL );
+				ToggleRevealObject( false );
+			}
+		}
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		if( !( m_wasCleanedUp ) )
+		{
+			CleanUp();
+		}
+	}
+
+	protected event OnDefeated( evt : DefeatedEvent )
+	{
+		if( !( m_wasCleanedUp ) )
+		{
+			CleanUp();
+		}
+	}
+
+	private function CleanUp()
+	{
+		ClearAllReavealRequests();
+		ClearForcedHighlights();
+	}
+
+	protected event OnForceUpdateDefultHighlight( evt : ForceUpdateDefaultHighlightEvent )
+	{
+		RequestHUDRefresh();
+	}
+
+	protected event OnSetForcedDefaultHighlight( evt : SetDefaultHighlightEvent )
+	{
+		m_defaultHighlightData = evt.highlightData;
+		RequestHUDRefresh();
+	}
+
+	protected event OnRevealQuestTargetEvent( evt : RevealQuestTargetEvent )
+	{
+		var revealData : gameVisionModeSystemRevealIdentifier;
+		var duration : Float;
+		revealData.reason = evt.sourceName;
+		if( evt.durationType == ERevealDurationType.TEMPORARY && evt.reveal == true )
+		{
+			duration = evt.timeout;
+		}
+		else
+		{
+			duration = 0.0;
+		}
+		RevealObject( evt.reveal, revealData, duration );
+	}
+
+	protected event OnSetPersistentForcedHighlightEvent( evt : SetPersistentForcedHighlightEvent )
+	{
+		ToggleForcedHighlight( evt.sourceName, evt.highlightData, evt.operation );
+	}
+
+	protected event OnToggleForcedHighlightEvent( evt : ToggleForcedHighlightEvent )
+	{
+		ToggleForcedHighlight( evt.sourceName, evt.highlightData, evt.operation );
+	}
+
+	private function ToggleForcedHighlight( sourceName : CName, highlightData : HighlightEditableData, operation : EToggleOperationType )
+	{
+		var highlight : FocusForcedHighlightData;
+		var reason : gameVisionModeSystemRevealIdentifier;
+		highlight = new FocusForcedHighlightData;
+		highlight.sourceID = GetOwner().GetEntityID();
+		highlight.sourceName = sourceName;
+		highlight.highlightType = highlightData.highlightType;
+		highlight.outlineType = highlightData.outlineType;
+		highlight.inTransitionTime = highlightData.inTransitionTime;
+		highlight.outTransitionTime = highlightData.outTransitionTime;
+		highlight.priority = highlightData.priority;
+		highlight.isSavable = true;
+		if( operation == EToggleOperationType.ADD )
+		{
+			AddForcedHighlight( highlight );
+			if( highlightData.isRevealed )
+			{
+				reason.reason = sourceName;
+				reason.sourceEntityId = GetOwner().GetEntityID();
+				RevealObject( true, reason, 0.0 );
+			}
+		}
+		else
+		{
+			RemoveForcedHighlight( highlight );
+			if( highlightData.isRevealed )
+			{
+				reason.reason = sourceName;
+				reason.sourceEntityId = GetOwner().GetEntityID();
+				RevealObject( false, reason, 0.0 );
+			}
+		}
+	}
+
+	public const function HasStaticDefaultHighlight() : Bool
+	{
+		return m_defaultHighlightData != NULL;
+	}
+
+	public const function HasDefaultHighlight() : Bool
+	{
+		if( GetOwner().IsBraindanceBlocked() || GetOwner().IsPhotoModeBlocked() )
+		{
+			return false;
+		}
+		if( m_defaultHighlightData )
+		{
+			return true;
+		}
+		return GetOwner().GetDefaultHighlight() != NULL;
+	}
+
+	public const function HasOutlineOrFill( highlightType : EFocusForcedHighlightType, outlineType : EFocusOutlineType ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( m_forcedHighlights[ i ].highlightType == highlightType || m_forcedHighlights[ i ].outlineType == outlineType )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function HasHighlight( highlightType : EFocusForcedHighlightType, outlineType : EFocusOutlineType ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( m_forcedHighlights[ i ].highlightType == highlightType && m_forcedHighlights[ i ].outlineType == outlineType )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function HasHighlight( highlightType : EFocusForcedHighlightType, outlineType : EFocusOutlineType, sourceID : EntityID ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( ( m_forcedHighlights[ i ].highlightType == highlightType && m_forcedHighlights[ i ].outlineType == outlineType ) && ( m_forcedHighlights[ i ].sourceID == sourceID ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function HasHighlight( highlightType : EFocusForcedHighlightType, outlineType : EFocusOutlineType, sourceID : EntityID, sourceName : CName ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_forcedHighlights.Size(); i += 1 )
+		{
+			if( ( ( m_forcedHighlights[ i ].highlightType == highlightType && m_forcedHighlights[ i ].outlineType == outlineType ) && ( m_forcedHighlights[ i ].sourceID == sourceID ) ) && m_forcedHighlights[ i ].sourceName == sourceName )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+}
+
+enum EToggleOperationType
+{
+	ADD = 0,
+	REMOVE = 1,
+}
+
+enum EPriority
+{
+	VeryLow = 0,
+	Low = 1,
+	Medium = 2,
+	High = 3,
+	VeryHigh = 4,
+	Absolute = 5,
+}
+
+enum EFocusForcedHighlightType
+{
+	INTERACTION = 0,
+	IMPORTANT_INTERACTION = 1,
+	QUEST = 2,
+	DISTRACTION = 3,
+	CLUE = 4,
+	NPC = 5,
+	WEAKSPOT = 6,
+	AOE = 7,
+	ITEM = 8,
+	HOSTILE = 9,
+	FRIENDLY = 10,
+	NEUTRAL = 11,
+	HACKABLE = 12,
+	ENEMY_NETRUNNER = 13,
+	BACKDOOR = 14,
+	INVALID = 15,
+}
+
+enum EFocusOutlineType
+{
+	HOSTILE = 0,
+	FRIENDLY = 1,
+	NEUTRAL = 2,
+	ITEM = 3,
+	INTERACTION = 4,
+	IMPORTANT_INTERACTION = 5,
+	QUEST = 6,
+	CLUE = 7,
+	DISTRACTION = 8,
+	AOE = 9,
+	HACKABLE = 10,
+	WEAKSPOT = 11,
+	ENEMY_NETRUNNER = 12,
+	BACKDOOR = 13,
+	INVALID = 14,
+}
+
+enum ERevealState
+{
+	STARTED = 0,
+	CONTINUE = 1,
+	STOPPED = 2,
+}
+
+enum ERevealDurationType
+{
+	TEMPORARY = 0,
+	PERMANENT = 1,
+}
+

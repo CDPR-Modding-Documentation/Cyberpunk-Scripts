@@ -1,0 +1,457 @@
+class ItemsNotificationQueue extends gameuiGenericNotificationGameController
+{
+	private var m_showDuration : Float;
+	default m_showDuration = 6.0f;
+	private var m_transactionSystem : weak< TransactionSystem >;
+	private var m_currencyNotification : CName;
+	default m_currencyNotification = 'notification_currency';
+	private var m_itemNotification : CName;
+	default m_itemNotification = 'Item_Received_SMALL';
+	private var m_xpNotification : CName;
+	default m_xpNotification = 'progression';
+	private var m_playerPuppet : weak< GameObject >;
+	private var m_inventoryListener : weak< InventoryScriptListener >;
+	private var m_currencyInventoryListener : weak< InventoryScriptListener >;
+	private var m_playerDevelopmentSystem : PlayerDevelopmentSystem;
+	private var m_combatModeListener : CallbackHandle;
+	private var m_InventoryManager : InventoryDataManagerV2;
+	private var m_comparisonResolver : ItemPreferredComparisonResolver;
+	private var m_combatModePSM : gamePSMCombat;
+
+	public export override function GetShouldSaveState() : Bool
+	{
+		return true;
+	}
+
+	public export override function GetID() : Int32
+	{
+		return ( ( Int32 )( GenericNotificationType.ProgressionNotification ) );
+	}
+
+	protected event OnCombatStateChanged( value : Int32 )
+	{
+		m_combatModePSM = ( ( gamePSMCombat )( value ) );
+		if( m_combatModePSM == gamePSMCombat.InCombat )
+		{
+			SetNotificationPause( true );
+			GetRootWidget().SetVisible( false );
+		}
+		else
+		{
+			SetNotificationPause( false );
+			GetRootWidget().SetVisible( true );
+		}
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		var itemCallback : ItemAddedInventoryCallback;
+		var currencyCallback : CurrencyChangeInventoryCallback;
+		itemCallback = new ItemAddedInventoryCallback;
+		itemCallback.m_notificationQueue = this;
+		m_playerPuppet = playerPuppet;
+		m_transactionSystem = GameInstance.GetTransactionSystem( playerPuppet.GetGame() );
+		m_inventoryListener = m_transactionSystem.RegisterInventoryListener( playerPuppet, itemCallback );
+		currencyCallback = new CurrencyChangeInventoryCallback;
+		currencyCallback.m_notificationQueue = this;
+		m_currencyInventoryListener = m_transactionSystem.RegisterInventoryListener( playerPuppet, currencyCallback );
+		m_playerDevelopmentSystem = ( ( PlayerDevelopmentSystem )( GameInstance.GetScriptableSystemsContainer( m_playerPuppet.GetGame() ).Get( 'PlayerDevelopmentSystem' ) ) );
+		RegisterPSMListeners( m_playerPuppet );
+		m_InventoryManager = new InventoryDataManagerV2;
+		m_InventoryManager.Initialize( ( ( PlayerPuppet )( m_playerPuppet ) ) );
+		m_comparisonResolver = ItemPreferredComparisonResolver.Make( m_InventoryManager );
+		SetNotificationPauseWhenHidden( true );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		m_transactionSystem.UnregisterInventoryListener( playerPuppet, m_inventoryListener );
+		m_inventoryListener = NULL;
+		m_transactionSystem.UnregisterInventoryListener( playerPuppet, m_currencyInventoryListener );
+		m_currencyInventoryListener = NULL;
+		UnregisterPSMListeners( m_playerPuppet );
+	}
+
+	protected event OnUILootedItemEvent( evt : UILootedItemEvent )
+	{
+		var inventoryItem : InventoryItemData;
+		inventoryItem = m_InventoryManager.GetItemFromRecord( ItemID.GetTDBID( evt.itemID ) );
+		if( NeedsNotification( inventoryItem ) )
+		{
+			PushItemNotification( evt.itemID, InventoryItemData.GetQuality( inventoryItem ) );
+		}
+	}
+
+	private function NeedsNotification( newItem : InventoryItemData ) : Bool
+	{
+		if( EquipmentAreaNeedsNotification( InventoryItemData.GetEquipmentArea( newItem ) ) )
+		{
+			if( ShouldRarityForceNotification( newItem ) || InventoryItemData.GetLootItemType( newItem ) == LootItemType.Quest )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function EquipmentAreaNeedsNotification( area : gamedataEquipmentArea ) : Bool
+	{
+		return ( ( ( ( ( ( ( ( ( ( area == gamedataEquipmentArea.Weapon || area == gamedataEquipmentArea.WeaponHeavy ) || area == gamedataEquipmentArea.WeaponWheel ) || area == gamedataEquipmentArea.WeaponLeft ) || area == gamedataEquipmentArea.Face ) || area == gamedataEquipmentArea.Feet ) || area == gamedataEquipmentArea.Head ) || area == gamedataEquipmentArea.InnerChest ) || area == gamedataEquipmentArea.OuterChest ) || area == gamedataEquipmentArea.Legs ) || area == gamedataEquipmentArea.Outfit ) || area == gamedataEquipmentArea.Quest;
+	}
+
+	private function ShouldRarityForceNotification( newItem : InventoryItemData ) : Bool
+	{
+		return InventoryItemData.GetQuality( newItem ) == 'Legendary' || RPGManager.IsItemIconic( InventoryItemData.GetGameItemData( newItem ) );
+	}
+
+	private function IsBestInBackpack( newItem : InventoryItemData ) : Bool
+	{
+		var items : array< InventoryItemData >;
+		var itemToCompare : InventoryItemData;
+		var i, limit : Int32;
+		items = m_InventoryManager.GetPlayerInventoryData( InventoryItemData.GetEquipmentArea( newItem ), true );
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			itemToCompare = items[ i ];
+			if( ItemID.GetTDBID( InventoryItemData.GetID( newItem ) ) == ItemID.GetTDBID( InventoryItemData.GetID( itemToCompare ) ) )
+			{
+				if( m_comparisonResolver.CompareItems( itemToCompare, newItem ) == ItemComparisonState.Better )
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	protected event OnVendorBoughtItemEvent( evt : VendorBoughtItemEvent )
+	{
+		var i, limit : Int32;
+		var inventoryItem : InventoryItemData;
+		for( i = 0, limit = evt.items.Size(); i < limit; i += 1 )
+		{
+			inventoryItem = m_InventoryManager.GetItemFromRecord( ItemID.GetTDBID( evt.items[ i ] ) );
+			PushItemNotification( evt.items[ i ], UIItemsHelper.QualityEnumToName( RPGManager.GetItemDataQuality( InventoryItemData.GetGameItemData( inventoryItem ) ) ) );
+		}
+	}
+
+	protected event OnCharacterProficiencyUpdated( evt : ProficiencyProgressEvent )
+	{
+		switch( evt.type )
+		{
+			case gamedataProficiencyType.Level:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'XP', "LocKey#40364", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.StreetCred:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'StreetCred', "LocKey#1210", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Assault:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22315", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Athletics:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22299", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Brawling:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22306", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.ColdBlood:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22302", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.CombatHacking:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22332", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Engineering:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22326", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Gunslinger:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22311", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Kenjutsu:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22318", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Stealth:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22324", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Demolition:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22320", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Crafting:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22328", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+			case gamedataProficiencyType.Hacking:
+				PushXPNotification( evt.expValue, evt.remainingXP, evt.delta, 'Skills', "LocKey#22330", evt.type, evt.currentLevel, evt.isLevelMaxed );
+			break;
+		}
+	}
+
+	protected event OnNewTarotCardAdded( evt : TarotCardAdded )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : TarotCardAddedNotificationViewData;
+		var action : OpenTarotCollectionNotificationAction;
+		userData = new TarotCardAddedNotificationViewData;
+		userData.cardName = evt.cardName;
+		userData.imagePart = evt.imagePart;
+		userData.animation = 'tarot_card';
+		action = new OpenTarotCollectionNotificationAction;
+		action.m_eventDispatcher = this;
+		userData.action = action;
+		userData.soundEvent = 'TarotCollectedPopup';
+		userData.soundAction = 'OnCollect';
+		notificationData.widgetLibraryItemName = 'tarot_card';
+		notificationData.notificationData = userData;
+		notificationData.time = m_showDuration;
+		AddNewNotificationData( notificationData );
+	}
+
+	public function PushXPNotification( value : Int32, remainingPointsToLevelUp : Int32, delta : Int32, notificationColorTheme : CName, notificationName : String, type : gamedataProficiencyType, currentLevel : Int32, isLevelMaxed : Bool )
+	{
+		var progress : Float;
+		var userData : ProgressionViewData;
+		var notificationData : gameuiGenericNotificationData;
+		var sum : Int32;
+		sum = remainingPointsToLevelUp + value;
+		progress = ( ( Float )( value ) ) / ( ( Float )( sum ) );
+		if( progress == 0.0 )
+		{
+			progress = ( ( Float )( sum ) );
+		}
+		notificationData.widgetLibraryItemName = m_xpNotification;
+		userData = new ProgressionViewData;
+		userData.expProgress = progress;
+		userData.expValue = value;
+		userData.notificationColorTheme = notificationColorTheme;
+		userData.title = notificationName;
+		userData.delta = delta;
+		userData.type = type;
+		userData.currentLevel = currentLevel;
+		userData.isLevelMaxed = isLevelMaxed;
+		notificationData.time = 3.0;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	public function PushCurrencyNotification( diff : Int32, total : Uint32 )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : CurrencyUpdateNotificationViewData;
+		if( diff == 0 )
+		{
+			return;
+		}
+		userData = new CurrencyUpdateNotificationViewData;
+		userData.diff = diff;
+		userData.total = total;
+		userData.soundEvent = 'QuestUpdatePopup';
+		userData.soundAction = 'OnOpen';
+		notificationData.time = 6.0999999;
+		notificationData.widgetLibraryItemName = m_currencyNotification;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	public function PushItemNotification( itemID : ItemID, itemRarity : CName )
+	{
+		var data : ItemAddedNotificationViewData;
+		var notificationData : gameuiGenericNotificationData;
+		var currentItemRecord : Item_Record;
+		var currentItemRecordTags : array< CName >;
+		var isShard : Bool;
+		currentItemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		if( currentItemRecord )
+		{
+			currentItemRecordTags = currentItemRecord.Tags();
+		}
+		isShard = currentItemRecordTags.Contains( 'Shard' );
+		if( ( itemID != MarketSystem.Money() ) && !( isShard ) )
+		{
+			data = new ItemAddedNotificationViewData;
+			data.animation = m_itemNotification;
+			data.itemRarity = itemRarity;
+			data.itemID = itemID;
+			data.title = GetLocalizedText( "Story-base-gameplay-gui-widgets-notifications-quest_update-_localizationString19" );
+			notificationData.time = 7.5;
+			notificationData.widgetLibraryItemName = m_itemNotification;
+			notificationData.notificationData = data;
+			AddNewNotificationData( notificationData );
+		}
+	}
+
+	protected function RegisterPSMListeners( playerObject : GameObject )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			playerStateMachineBlackboard = GetPSMBlackboard( playerObject );
+			if( playerStateMachineBlackboard )
+			{
+				m_combatModeListener = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.Combat, this, 'OnCombatStateChanged' );
+			}
+		}
+	}
+
+	protected function UnregisterPSMListeners( playerObject : GameObject )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			playerStateMachineBlackboard = GetPSMBlackboard( playerObject );
+			if( playerStateMachineBlackboard )
+			{
+				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.Combat, m_combatModeListener );
+			}
+		}
+	}
+
+	private function GetComparisonState( item : InventoryItemData ) : ItemComparisonState
+	{
+		if( m_comparisonResolver.IsComparable( item ) )
+		{
+			return m_comparisonResolver.GetItemComparisonState( item );
+		}
+		return ItemComparisonState.Default;
+	}
+
+}
+
+class ItemAddedInventoryCallback extends InventoryScriptCallback
+{
+	var m_notificationQueue : weak< ItemsNotificationQueue >;
+
+	public override function OnItemNotification( item : ItemID, itemData : weak< gameItemData > )
+	{
+		m_notificationQueue.PushItemNotification( item, GetItemRarity( itemData ) );
+	}
+
+	private function GetItemRarity( data : weak< gameItemData > ) : CName
+	{
+		var quality : CName;
+		var qual : gamedataQuality;
+		qual = RPGManager.GetItemDataQuality( data );
+		quality = UIItemsHelper.QualityEnumToName( qual );
+		return quality;
+	}
+
+}
+
+class ItemAddedNotification extends GenericNotificationController
+{
+	protected editable var m_itemImage : inkImageRef;
+	protected editable var m_rarityBar : inkWidgetRef;
+	protected var m_itemIconGender : ItemIconGender;
+	protected var m_animationName : CName;
+
+	public override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		var data : ItemAddedNotificationViewData;
+		data = ( ( ItemAddedNotificationViewData )( notificationData ) );
+		m_animationName = data.animation;
+		SetIcon( ItemID.GetTDBID( data.itemID ), data.itemRarity );
+		super.SetNotificationData( notificationData );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_itemIconGender = UIGenderHelper.GetIconGender( ( ( PlayerPuppet )( playerPuppet ) ) );
+	}
+
+	private function SetIcon( itemID : TweakDBID, rarity : CName )
+	{
+		var iconName, iconPath : String;
+		var iconsNameResolver : IconsNameResolver;
+		var itemRecord : weak< Item_Record >;
+		var recipeRecord : weak< ItemRecipe_Record >;
+		recipeRecord = TweakDBInterface.GetItemRecipeRecord( itemID );
+		if( recipeRecord )
+		{
+			itemRecord = TweakDBInterface.GetItemRecipeRecord( itemID ).CraftingResult().Item();
+		}
+		else
+		{
+			itemRecord = TweakDBInterface.GetItemRecord( itemID );
+		}
+		iconsNameResolver = IconsNameResolver.GetIconsNameResolver();
+		iconPath = itemRecord.IconPath();
+		inkImageRef.SetVisible( m_itemImage, false );
+		if( IsStringValid( iconPath ) )
+		{
+			iconName = iconPath;
+		}
+		else
+		{
+			iconName = NameToString( iconsNameResolver.TranslateItemToIconName( itemID, m_itemIconGender == ItemIconGender.Male ) );
+		}
+		if( iconName != "None" && iconName != "" )
+		{
+			inkImageRef.SetScale( m_itemImage, ( ( itemRecord.EquipArea().Type() == gamedataEquipmentArea.Outfit ) ? ( Vector2( 0.5, 0.5 ) ) : ( Vector2( 1.0, 1.0 ) ) ) );
+			InkImageUtils.RequestSetImage( this, m_itemImage, "UIIcon." + iconName, 'OnIconCallback' );
+		}
+		UpdateRarity( rarity );
+	}
+
+	protected event OnIconCallback( e : iconAtlasCallbackData )
+	{
+		inkImageRef.SetVisible( m_itemImage, e.loadResult == inkIconResult.Success );
+		PlayLibraryAnimation( m_animationName );
+	}
+
+	protected virtual function UpdateRarity( rarity : CName )
+	{
+		var visible : Bool;
+		visible = rarity != '';
+		visible = false;
+		inkWidgetRef.SetVisible( m_rarityBar, visible );
+		inkWidgetRef.SetState( m_rarityBar, rarity );
+	}
+
+}
+
+import class ItemAddedNotificationViewData extends GenericNotificationViewData
+{
+	import var itemID : ItemID;
+	import var animation : CName;
+	import var itemRarity : CName;
+
+	public override function CanMerge( data : GenericNotificationViewData ) : Bool
+	{
+		var compareTo : ItemAddedNotificationViewData;
+		compareTo = ( ( ItemAddedNotificationViewData )( data ) );
+		return compareTo && ( compareTo.itemID == itemID );
+	}
+
+}
+
+class TarotCardAddedNotification extends GenericNotificationController
+{
+	protected editable var m_cardImage : inkImageRef;
+	protected editable var m_cardNameLabel : inkTextRef;
+
+	public override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		var data : TarotCardAddedNotificationViewData;
+		data = ( ( TarotCardAddedNotificationViewData )( notificationData ) );
+		inkTextRef.SetText( m_cardNameLabel, data.cardName );
+		InkImageUtils.RequestSetImage( this, m_cardImage, "UIIcon." + NameToString( data.imagePart ) );
+		PlayLibraryAnimation( data.animation );
+		super.SetNotificationData( notificationData );
+	}
+
+}
+
+import class TarotCardAddedNotificationViewData extends GenericNotificationViewData
+{
+	import var imagePart : CName;
+	import var cardName : String;
+	import var animation : CName;
+}
+
+class TarotCardAdded extends Event
+{
+	var imagePart : CName;
+	var cardName : String;
+}
+

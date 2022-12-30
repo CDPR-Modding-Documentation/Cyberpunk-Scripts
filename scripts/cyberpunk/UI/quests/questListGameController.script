@@ -1,0 +1,481 @@
+struct QuestUIUtils
+{
+
+	public static function GetJournalStateName( state : gameJournalEntryState, isTracked : Bool ) : CName
+	{
+		switch( state )
+		{
+			case gameJournalEntryState.Active:
+				if( isTracked )
+				{
+					return 'tracked';
+				}
+				else
+				{
+					return 'untracked';
+				}
+			case gameJournalEntryState.Succeeded:
+				return 'succeeded';
+			case gameJournalEntryState.Failed:
+				return 'failed';
+		}
+		return 'Default';
+	}
+
+	public static function GetEntryTypeFromName( entryTypeName : CName ) : UIObjectiveEntryType
+	{
+		switch( entryTypeName )
+		{
+			case 'gameJournalQuest':
+				return UIObjectiveEntryType.Quest;
+			case 'gameJournalQuestObjective':
+				return UIObjectiveEntryType.Objective;
+			case 'gameJournalQuestSubObjective':
+				return UIObjectiveEntryType.SubObjective;
+			default:
+				return UIObjectiveEntryType.Invalid;
+		}
+	}
+
+	public static function GetLibraryIDForEntryType( entryType : UIObjectiveEntryType ) : CName
+	{
+		switch( entryType )
+		{
+			case UIObjectiveEntryType.Quest:
+				return 'QuestEntry';
+			case UIObjectiveEntryType.Objective:
+				return 'ObjectiveEntry';
+			case UIObjectiveEntryType.SubObjective:
+				return 'SubObjectiveEntry';
+			default:
+				return '';
+		}
+	}
+
+}
+
+class QuestListGameController extends inkHUDGameController
+{
+	private editable var m_entryList : inkVerticalPanelRef;
+	private editable var m_scanPulse : inkCompoundRef;
+	private editable var m_optionalHeader : inkWidgetRef;
+	private editable var m_toDoHeader : inkWidgetRef;
+	private editable var m_optionalList : inkVerticalPanelRef;
+	private editable var m_nonOptionalList : inkVerticalPanelRef;
+	private var m_entryControllers : inkArray;
+	private var m_scanPulseAnimProxy : inkAnimProxy;
+	private var m_stateChangesBlackboardId : Uint32;
+	private var m_trackedChangesBlackboardId : Uint32;
+	private var m_JournalWrapper : JournalWrapper;
+	private var m_player : weak< GameObject >;
+	private var m_optionalHeaderController : weak< QuestListHeaderLogicController >;
+	private var m_toDoHeaderController : weak< QuestListHeaderLogicController >;
+	private var m_lastNonOptionalObjective : QuestObjectiveWrapper;
+
+	protected event OnInitialize()
+	{
+		var ownerEntity : weak< GameObject >;
+		var gameInstance : GameInstance;
+		ownerEntity = ( ( GameObject )( GetOwnerEntity() ) );
+		gameInstance = ( ( GameInstance )( ownerEntity.GetGame() ) );
+		m_JournalWrapper = new JournalWrapper;
+		m_JournalWrapper.Init( gameInstance );
+		m_JournalWrapper.GetJournalManager().RegisterScriptCallback( this, 'OnStateChanges', gameJournalListenerType.State );
+		m_JournalWrapper.GetJournalManager().RegisterScriptCallback( this, 'OnTrackedEntryChanges', gameJournalListenerType.Tracked );
+		m_JournalWrapper.GetJournalManager().RegisterScriptCallback( this, 'OnCounterChanged', gameJournalListenerType.Counter );
+		m_entryControllers = new inkArray;
+		m_player = ( ( GameObject )( GetOwnerEntity() ) );
+		m_player.RegisterInputListener( this, 'VisionPush' );
+		m_player.RegisterInputListener( this, 'UI_DPadDown' );
+		m_optionalHeaderController = ( ( QuestListHeaderLogicController )( inkWidgetRef.GetController( m_optionalHeader ) ) );
+		m_optionalHeaderController.SetLabel( "UI-Cyberpunk-HUD-QuestList-optional" );
+		inkWidgetRef.SetVisible( m_optionalHeader, false );
+		m_toDoHeaderController = ( ( QuestListHeaderLogicController )( inkWidgetRef.GetController( m_toDoHeader ) ) );
+		m_toDoHeaderController.SetLabel( "UI-Cyberpunk-HUD-QuestList-toDo" );
+		inkWidgetRef.SetVisible( m_toDoHeader, false );
+		UpdateEntries();
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_JournalWrapper.GetJournalManager() )
+		{
+			m_JournalWrapper.GetJournalManager().UnregisterScriptCallback( this, 'OnStateChanges' );
+			m_JournalWrapper.GetJournalManager().UnregisterScriptCallback( this, 'OnTrackedEntryChanges' );
+			m_JournalWrapper.GetJournalManager().UnregisterScriptCallback( this, 'OnCounterChanged' );
+		}
+	}
+
+	protected event OnStateChanges( hash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		UpdateEntries();
+	}
+
+	protected event OnTrackedEntryChanges( hash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		UpdateEntries();
+	}
+
+	protected event OnCounterChanged( hash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		UpdateEntries();
+	}
+
+	private function UpdateEntries()
+	{
+		var i, limit, oldEntriesNum : Int32;
+		var listQuests : array< weak< JournalEntry > >;
+		var entryControllers : array< weak< IScriptable > >;
+		var entryController : ObjectiveEntryLogicController;
+		entryControllers = m_entryControllers.Get();
+		for( i = 0, oldEntriesNum = entryControllers.Size(); i < oldEntriesNum; i += 1 )
+		{
+			entryController = ( ( ObjectiveEntryLogicController )( entryControllers[ i ] ) );
+			entryController.SetUpdated( false );
+		}
+		m_JournalWrapper.GetQuests( listQuests );
+		for( i = 0, limit = listQuests.Size(); i < limit; i += 1 )
+		{
+			UpdateQuest( m_JournalWrapper.BuildQuestData( ( ( JournalQuest )( listQuests[ i ] ) ) ) );
+		}
+		entryControllers = m_entryControllers.Get();
+		for( i = 0, limit = entryControllers.Size(); i < limit; i += 1 )
+		{
+			entryController = ( ( ObjectiveEntryLogicController )( entryControllers[ i ] ) );
+			if( !( entryController.IsUpdated() ) )
+			{
+				entryController.Hide();
+			}
+		}
+	}
+
+	private function UpdateQuest( questData : QuestDataWrapper ) : Bool
+	{
+		var entryController : weak< ObjectiveEntryLogicController >;
+		var trackedQuest : Bool;
+		var isOptional : Bool;
+		var hasOptionalObjectives : Bool;
+		trackedQuest = questData.IsTracked() || questData.IsTrackedInHierarchy();
+		if( trackedQuest )
+		{
+			entryController = GetOrCreateEntry( questData.GetUniqueId(), UIObjectiveEntryType.Quest, NULL );
+			if( entryController )
+			{
+				entryController.SetEntryData( BuildEntryData( questData ) );
+				isOptional = UpdateObjectives( questData, entryController, trackedQuest );
+				if( !( hasOptionalObjectives ) && isOptional )
+				{
+					hasOptionalObjectives = true;
+				}
+			}
+		}
+		else
+		{
+			entryController = FindEntry( questData.GetUniqueId() );
+			if( entryController )
+			{
+				entryController.SetEntryData( BuildEntryData( questData ) );
+				isOptional = UpdateObjectives( questData, entryController, trackedQuest );
+				if( !( hasOptionalObjectives ) && isOptional )
+				{
+					hasOptionalObjectives = true;
+				}
+			}
+			if( entryController.GetEntryState() != gameJournalEntryState.Succeeded && entryController.GetEntryState() != gameJournalEntryState.Failed )
+			{
+				entryController.Hide();
+			}
+		}
+		return hasOptionalObjectives;
+	}
+
+	private function UpdateObjectives( questData : QuestDataWrapper, parent : weak< ObjectiveEntryLogicController >, isParentTracked : Bool ) : Bool
+	{
+		var questObjectives : array< QuestObjectiveWrapper >;
+		var i, limit : Int32;
+		var hasOptionalObjectives : Bool;
+		var isOptional : Bool;
+		hasOptionalObjectives = false;
+		isOptional = false;
+		questObjectives = questData.GetObjectives();
+		for( i = 0, limit = questObjectives.Size(); i < limit; i += 1 )
+		{
+			UpdateObjective( questObjectives[ i ], parent, isParentTracked );
+			isOptional = questObjectives[ i ].IsOptional();
+			if( !( hasOptionalObjectives ) && isOptional )
+			{
+				hasOptionalObjectives = true;
+			}
+		}
+		return hasOptionalObjectives;
+	}
+
+	private function UpdateObjective( objectiveData : QuestObjectiveWrapper, parent : weak< ObjectiveEntryLogicController >, isParentTracked : Bool )
+	{
+		var entryController : weak< ObjectiveEntryLogicController >;
+		var entryState : gameJournalEntryState;
+		if( isParentTracked && objectiveData.GetStatus() == gameJournalEntryState.Active )
+		{
+			entryController = GetOrCreateEntry( objectiveData.GetUniqueId(), UIObjectiveEntryType.Objective, parent, objectiveData.IsOptional() );
+		}
+		else
+		{
+			entryController = FindEntry( objectiveData.GetUniqueId() );
+		}
+		if( entryController )
+		{
+			entryController.SetEntryData( BuildEntryData( objectiveData ) );
+			UpdateSubObjectives( objectiveData, entryController, objectiveData.IsTracked() || objectiveData.IsTrackedInHierarchy() );
+			entryState = entryController.GetEntryState();
+			if( ( !( isParentTracked ) && entryState != gameJournalEntryState.Succeeded ) && entryState != gameJournalEntryState.Failed )
+			{
+				entryController.Hide();
+			}
+		}
+	}
+
+	private function UpdateSubObjectives( questData : QuestObjectiveWrapper, parent : weak< ObjectiveEntryLogicController >, isParentTracked : Bool )
+	{
+		var questSubObjectives : array< QuestSubObjectiveWrapper >;
+		var i, limit : Int32;
+		questSubObjectives = questData.GetSubObjectives();
+		for( i = 0, limit = questSubObjectives.Size(); i < limit; i += 1 )
+		{
+			UpdateSubObjective( questSubObjectives[ i ], parent, isParentTracked );
+		}
+	}
+
+	private function UpdateSubObjective( subObjectiveData : QuestSubObjectiveWrapper, parent : weak< ObjectiveEntryLogicController >, isParentTracked : Bool )
+	{
+		var entryController : weak< ObjectiveEntryLogicController >;
+		if( isParentTracked && subObjectiveData.GetStatus() == gameJournalEntryState.Active )
+		{
+			entryController = GetOrCreateEntry( subObjectiveData.GetUniqueId(), UIObjectiveEntryType.SubObjective, parent );
+		}
+		else
+		{
+			entryController = FindEntry( subObjectiveData.GetUniqueId() );
+		}
+		if( entryController )
+		{
+			entryController.SetEntryData( BuildEntryData( subObjectiveData ) );
+			if( ( !( isParentTracked ) && entryController.GetEntryState() != gameJournalEntryState.Succeeded ) && entryController.GetEntryState() != gameJournalEntryState.Failed )
+			{
+				entryController.Hide();
+			}
+		}
+	}
+
+	private function FindEntry( entryId : Int32 ) : weak< ObjectiveEntryLogicController >
+	{
+		var entryControllers : array< weak< IScriptable > >;
+		var totalControllers : Int32;
+		var i : Int32;
+		var entryController : weak< ObjectiveEntryLogicController >;
+		entryControllers = m_entryControllers.Get();
+		totalControllers = entryControllers.Size();
+		for( i = 0; i < totalControllers; i += 1 )
+		{
+			entryController = ( ( ObjectiveEntryLogicController )( entryControllers[ i ] ) );
+			if( entryController.GetEntryId() == entryId )
+			{
+				return entryController;
+			}
+		}
+		return NULL;
+	}
+
+	private function GetOrCreateEntry( id : Int32, entryType : UIObjectiveEntryType, parent : weak< ObjectiveEntryLogicController >, optional isOptional : Bool ) : weak< ObjectiveEntryLogicController >
+	{
+		var entryWidget : weak< inkWidget >;
+		var entryController : weak< ObjectiveEntryLogicController >;
+		var libraryID : CName;
+		var entryIndex : Int32;
+		var list : inkVerticalPanelRef;
+		libraryID = QuestUIUtils.GetLibraryIDForEntryType( entryType );
+		entryController = FindEntry( id );
+		if( entryController == NULL )
+		{
+			if( isOptional )
+			{
+				list = m_optionalList;
+			}
+			else
+			{
+				list = m_nonOptionalList;
+			}
+			entryWidget = SpawnFromLocal( inkVerticalPanelRef.Get( list ), libraryID );
+			entryWidget.SetHAlign( inkEHorizontalAlign.Right );
+			entryController = ( ( ObjectiveEntryLogicController )( entryWidget.GetController() ) );
+			entryController.SetEntryId( id );
+			entryController.RegisterToCallback( 'OnReadyToRemove', this, 'OnRemoveEntry' );
+			if( entryType != UIObjectiveEntryType.SubObjective || ( parent == NULL ) )
+			{
+				m_entryControllers.PushBack( entryController );
+			}
+			else
+			{
+				entryIndex = FindNewEntryIndex( entryType, parent );
+				if( entryIndex > -1 )
+				{
+					inkVerticalPanelRef.ReorderChild( list, entryWidget, entryIndex );
+					m_entryControllers.InsertAt( ( ( Uint32 )( entryIndex ) ), entryController );
+				}
+				else
+				{
+					m_entryControllers.PushBack( entryController );
+				}
+				entryController.AttachToParent( parent );
+			}
+		}
+		return entryController;
+	}
+
+	private function FindNewEntryIndex( entryType : UIObjectiveEntryType, parent : ObjectiveEntryLogicController ) : Int32
+	{
+		var entryControllers : array< weak< IScriptable > >;
+		var totalControllers : Int32;
+		var i : Int32;
+		var currEntryController : weak< ObjectiveEntryLogicController >;
+		var foundParent : Bool;
+		foundParent = false;
+		entryControllers = m_entryControllers.Get();
+		totalControllers = entryControllers.Size();
+		for( i = 0; i < totalControllers; i += 1 )
+		{
+			currEntryController = ( ( ObjectiveEntryLogicController )( entryControllers[ i ] ) );
+			if( !( foundParent ) )
+			{
+				foundParent = currEntryController.GetEntryId() == parent.GetEntryId();
+			}
+			else
+			{
+				if( currEntryController.GetEntryType() != entryType )
+				{
+					return i;
+				}
+			}
+		}
+		return -1;
+	}
+
+	protected event OnRemoveEntry( entryWidget : weak< inkWidget > )
+	{
+		var entryController : weak< ObjectiveEntryLogicController >;
+		entryController = ( ( ObjectiveEntryLogicController )( entryWidget.GetController() ) );
+		if( entryController.IsReadyToRemove() )
+		{
+			entryController.DetachFromParent();
+			RemoveEntry( entryWidget );
+			m_entryControllers.Remove( entryController );
+		}
+	}
+
+	private function RemoveEntry( entryWidget : weak< inkWidget > )
+	{
+		var i : Int32;
+		var entryController : weak< ObjectiveEntryLogicController >;
+		var tempInkWidget : weak< inkWidget >;
+		var tempController : weak< ObjectiveEntryLogicController >;
+		entryController = ( ( ObjectiveEntryLogicController )( entryWidget.GetController() ) );
+		for( i = 0; i < inkVerticalPanelRef.GetNumChildren( m_optionalList ); i += 1 )
+		{
+			tempInkWidget = inkVerticalPanelRef.GetWidgetByIndex( m_optionalList, i );
+			tempController = ( ( ObjectiveEntryLogicController )( tempInkWidget.GetController() ) );
+			if( tempController == entryController )
+			{
+				inkVerticalPanelRef.RemoveChild( m_optionalList, entryWidget );
+				break;
+			}
+		}
+		for( i = 0; i < inkVerticalPanelRef.GetNumChildren( m_nonOptionalList ); i += 1 )
+		{
+			tempInkWidget = inkVerticalPanelRef.GetWidgetByIndex( m_nonOptionalList, i );
+			tempController = ( ( ObjectiveEntryLogicController )( tempInkWidget.GetController() ) );
+			if( tempController == entryController )
+			{
+				inkVerticalPanelRef.RemoveChild( m_nonOptionalList, entryWidget );
+				break;
+			}
+		}
+	}
+
+	private function BuildEntryData( inData : ABaseWrapper ) : UIObjectiveEntryData
+	{
+		var outData : UIObjectiveEntryData;
+		var questData : QuestDataWrapper;
+		var objectiveData : QuestObjectiveWrapper;
+		var subObjectiveData : QuestSubObjectiveWrapper;
+		questData = ( ( QuestDataWrapper )( inData ) );
+		if( questData )
+		{
+			outData.m_name = questData.GetTitle();
+			outData.m_counter = "";
+			outData.m_isTracked = questData.IsTracked();
+			outData.m_type = UIObjectiveEntryType.Quest;
+			outData.m_state = questData.GetStatus();
+			outData.m_isOptional = questData.IsOptional();
+		}
+		else
+		{
+			objectiveData = ( ( QuestObjectiveWrapper )( inData ) );
+			if( objectiveData )
+			{
+				outData.m_name = objectiveData.GetDescription();
+				outData.m_counter = objectiveData.GetCounterText();
+				outData.m_isTracked = objectiveData.IsTracked();
+				outData.m_type = UIObjectiveEntryType.Objective;
+				outData.m_state = objectiveData.GetStatus();
+				outData.m_isOptional = questData.IsOptional() || objectiveData.IsOptional();
+			}
+			else
+			{
+				subObjectiveData = ( ( QuestSubObjectiveWrapper )( inData ) );
+				if( subObjectiveData )
+				{
+					outData.m_name = subObjectiveData.GetDescription();
+					outData.m_isTracked = subObjectiveData.IsTracked();
+					outData.m_isTracked = subObjectiveData.IsTracked();
+					outData.m_type = UIObjectiveEntryType.SubObjective;
+					outData.m_state = subObjectiveData.GetStatus();
+					outData.m_isOptional = questData.IsOptional();
+				}
+			}
+		}
+		return outData;
+	}
+
+	private function ShouldDisplayEntry( entryType : UIObjectiveEntryType ) : Bool
+	{
+		return entryType != UIObjectiveEntryType.Invalid;
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : CName;
+		var actionType : gameinputActionType;
+		actionName = ListenerAction.GetName( action );
+		actionType = ListenerAction.GetType( action );
+		if( actionName == 'VisionPush' && actionType == gameinputActionType.BUTTON_PRESSED )
+		{
+			if( m_scanPulseAnimProxy.IsPlaying() )
+			{
+				m_scanPulseAnimProxy.Stop();
+			}
+			m_scanPulseAnimProxy = PlayLibraryAnimation( 'ScanPulseAnimation' );
+		}
+	}
+
+}
+
+class QuestListHeaderLogicController extends inkLogicController
+{
+	private editable var m_label : inkTextRef;
+
+	public function SetLabel( text : String )
+	{
+		inkTextRef.SetText( m_label, text );
+	}
+
+}
+

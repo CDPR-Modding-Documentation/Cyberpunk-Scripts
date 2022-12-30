@@ -1,0 +1,4752 @@
+class VehicleComponent extends ScriptableDeviceComponent
+{
+	var m_interaction : InteractionComponent;
+	var m_scanningComponent : ScanningComponent;
+	var m_damageLevel : Int32;
+	default m_damageLevel = 0;
+	var m_coolerDestro : Bool;
+	var m_bumperFrontState : Int32;
+	var m_bumperBackState : Int32;
+	var m_visualDestructionSet : Bool;
+	var m_healthStatPoolListener : VehicleHealthStatPoolListener;
+	var m_vehicleBlackboard : weak< IBlackboard >;
+	var m_radioState : Bool;
+	var m_mounted : Bool;
+	var m_enterTime : Float;
+	var m_mappinID : NewMappinID;
+	var m_ignoreAutoDoorClose : Bool;
+	var m_timeSystemCallbackID : Uint32;
+	var m_vehicleTPPCallbackID : CallbackHandle;
+	var m_vehicleSpeedCallbackID : CallbackHandle;
+	var m_vehicleRPMCallbackID : CallbackHandle;
+	var m_broadcasting : Bool;
+	var m_hasSpoiler : Bool;
+	var m_spoilerUp : Float;
+	var m_spoilerDown : Float;
+	var m_spoilerDeployed : Bool;
+	var m_hasTurboCharger : Bool;
+	var m_overheatEffectBlackboard : worldEffectBlackboard;
+	var m_overheatActive : Bool;
+	var m_hornOn : Bool;
+	var m_hasSiren : Bool;
+	var m_hornPressTime : Float;
+	var m_radioPressTime : Float;
+	var m_raceClockTickID : DelayID;
+	var m_objectActionsCallbackCtrl : gameObjectActionsCallbackController;
+	var m_trunkNpcBody : weak< GameObject >;
+	var m_mountedPlayer : weak< PlayerPuppet >;
+	var m_isIgnoredInTargetingSystem : Bool;
+	default m_isIgnoredInTargetingSystem = false;
+	var m_arePlayerHitShapesEnabled : Bool;
+	default m_arePlayerHitShapesEnabled = true;
+	var m_uiWantedBarBB : weak< IBlackboard >;
+	var m_currentWantedLevelCallback : CallbackHandle;
+	private var m_vehicleController : vehicleController;
+
+	private export function OnGameAttach()
+	{
+		m_interaction = ( ( InteractionComponent )( FindComponentByName( 'interaction' ) ) );
+		m_scanningComponent = ( ( ScanningComponent )( FindComponentByName( 'scanning' ) ) );
+		m_ignoreAutoDoorClose = false;
+		m_radioState = false;
+		SetImmortalityMode();
+		m_healthStatPoolListener = new VehicleHealthStatPoolListener;
+		m_healthStatPoolListener.m_owner = GetVehicle();
+		GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).RequestRegisteringListener( GetVehicle().GetEntityID(), gamedataStatPoolType.Health, m_healthStatPoolListener );
+		m_vehicleBlackboard = GetVehicle().GetBlackboard();
+		InitialVehcileSetup();
+		RegisterToHUDManager( true );
+		IsPlayerVehicle();
+		LoadExplodedState();
+		SetupThrusterFX();
+		DoPreventionVehicleSetup();
+		if( GetVehicle().IsPlayerVehicle() && !( GetPS().GetIsDestroyed() ) )
+		{
+			CreateMappin();
+		}
+	}
+
+	private export function OnGameDetach()
+	{
+		DestroyObjectActionsCallbackController();
+		ClearImmortalityMode();
+		GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).RequestUnregisteringListener( GetVehicle().GetEntityID(), gamedataStatPoolType.Health, m_healthStatPoolListener );
+		DestroyMappin();
+		RegisterToHUDManager( false );
+		UnregisterListeners();
+		UnregisterInputListener();
+		DoPanzerCleanup();
+		DoPreventionVehicleCleanup();
+	}
+
+	public static function IsDestroyed( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		GetVehicleFromID( gi, vehicleID, vehicle );
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		return vehicle.IsDestroyed();
+	}
+
+	public constexpr static function GetDriverSlotName() : CName
+	{
+		return 'seat_front_left';
+	}
+
+	public constexpr static function GetFrontPassengerSlotName() : CName
+	{
+		return 'seat_front_right';
+	}
+
+	public constexpr static function GetBackLeftPassengerSlotName() : CName
+	{
+		return 'seat_back_left';
+	}
+
+	public constexpr static function GetBackRightPassengerSlotName() : CName
+	{
+		return 'seat_back_right';
+	}
+
+	public static function GetPassengersSlotNames( out slotNames : array< CName > )
+	{
+		slotNames.Resize( 4 );
+		slotNames[ 0 ] = GetDriverSlotName();
+		slotNames[ 1 ] = GetFrontPassengerSlotName();
+		slotNames[ 2 ] = GetBackLeftPassengerSlotName();
+		slotNames[ 3 ] = GetBackRightPassengerSlotName();
+	}
+
+	public static function IsDriverSlot( slotId : CName ) : Bool
+	{
+		var slotName : String;
+		var driveSlotName : String;
+		slotName = NameToString( slotId );
+		driveSlotName = NameToString( GetDriverSlotName() );
+		return StrContains( slotName, driveSlotName );
+	}
+
+	public static function IsSameSlot( slotId1 : CName, slotId2 : CName ) : Bool
+	{
+		var slotName1 : String;
+		var slotName2 : String;
+		slotName1 = NameToString( slotId1 );
+		slotName2 = NameToString( slotId2 );
+		if( StrLen( slotName1 ) > StrLen( slotName2 ) )
+		{
+			return StrContains( slotName1, slotName2 );
+		}
+		else
+		{
+			return StrContains( slotName2, slotName1 );
+		}
+	}
+
+	public static function GetDriverSlotID() : MountingSlotId
+	{
+		var slotID : MountingSlotId;
+		slotID.id = GetDriverSlotName();
+		return slotID;
+	}
+
+	public static function GetOwnerVehicleSpeed( gi : GameInstance, owner : weak< GameObject > ) : Float
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( owner ) )
+		{
+			return 0.0;
+		}
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( owner.GetEntityID() ) ) )
+		{
+			return 0.0;
+		}
+		if( !( GetVehicle( gi, owner.GetEntityID(), vehicle ) ) )
+		{
+			return 0.0;
+		}
+		return vehicle.GetCurrentSpeed();
+	}
+
+	public static function IsMountedToVehicle( gi : GameInstance, owner : weak< GameObject > ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		return IsMountedToVehicle( gi, owner.GetEntityID() );
+	}
+
+	public static function IsMountedToVehicle( gi : GameInstance, ownerID : EntityID ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( ownerID ) ) )
+		{
+			return false;
+		}
+		if( !( GetVehicle( gi, ownerID, vehicle ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsMountedToProvidedVehicle( gi : GameInstance, ownerID : EntityID, vehicle : weak< VehicleObject > ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		var mountedVeh : EntityID;
+		if( ( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( ownerID ) ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		if( IsMountedToVehicle( gi, ownerID ) )
+		{
+			mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( ownerID );
+			mountedVeh = mountInfo.parentId;
+			if( mountedVeh == vehicle.GetEntityID() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsDriver( gi : GameInstance, owner : weak< GameObject > ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		return IsDriver( gi, owner.GetEntityID() );
+	}
+
+	public static function IsDriver( gi : GameInstance, ownerID : EntityID ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		var vehicle : weak< VehicleObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( ownerID ) ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( ownerID );
+		if( !( EntityID.IsDefined( mountInfo.parentId ) ) )
+		{
+			return false;
+		}
+		if( !( IsDriverSlot( mountInfo.slotId.id ) ) )
+		{
+			return false;
+		}
+		if( !( GetVehicle( gi, ownerID, vehicle ) ) )
+		{
+			return false;
+		}
+		if( vehicle == ( ( AVObject )( vehicle ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetVehicle( gi : GameInstance, owner : weak< GameObject >, out vehicle : weak< GameObject > ) : Bool
+	{
+		var vehicleObj : weak< VehicleObject >;
+		if( !( owner ) )
+		{
+			return false;
+		}
+		if( !( GetVehicle( gi, owner.GetEntityID(), vehicleObj ) ) )
+		{
+			return false;
+		}
+		vehicle = vehicleObj;
+		return vehicle != NULL;
+	}
+
+	public static function GetVehicle( gi : GameInstance, owner : weak< GameObject >, out vehicle : weak< VehicleObject > ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		return GetVehicle( gi, owner.GetEntityID(), vehicle );
+	}
+
+	public static function GetVehicle( gi : GameInstance, ownerID : EntityID, out vehicle : weak< VehicleObject > ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		var vehicleID : EntityID;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( ownerID ) ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( ownerID );
+		vehicleID = mountInfo.parentId;
+		if( !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		return GetVehicleFromID( gi, vehicleID, vehicle );
+	}
+
+	public static function GetVehicleFromID( gi : GameInstance, vehicleID : EntityID, out vehicle : weak< VehicleObject > ) : Bool
+	{
+		if( !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( gi, vehicleID ) ) );
+		if( vehicle )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function GetVehicleID( gi : GameInstance, owner : weak< GameObject >, out vehicleID : EntityID ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		return GetVehicleID( gi, owner.GetEntityID(), vehicleID );
+	}
+
+	public static function GetVehicleID( gi : GameInstance, ownerID : EntityID, out vehicleID : EntityID ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( GetVehicle( gi, ownerID, vehicle ) ) )
+		{
+			return false;
+		}
+		vehicleID = vehicle.GetEntityID();
+		if( !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetVehicleRecord( gi : GameInstance, owner : weak< GameObject >, out vehicleRecord : Vehicle_Record ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		return GetVehicleRecord( gi, owner.GetEntityID(), vehicleRecord );
+	}
+
+	public static function GetVehicleRecord( gi : GameInstance, ownerID : EntityID, out vehicleRecord : Vehicle_Record ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( GetVehicle( gi, ownerID, vehicle ) ) )
+		{
+			return false;
+		}
+		vehicleRecord = TweakDBInterface.GetVehicleRecord( vehicle.GetRecordID() );
+		if( !( vehicleRecord ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetVehicleRecord( vehicle : weak< VehicleObject >, out vehicleRecord : Vehicle_Record ) : Bool
+	{
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		vehicleRecord = TweakDBInterface.GetVehicleRecord( vehicle.GetRecordID() );
+		if( !( vehicleRecord ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetVehicleRecordFromID( gi : GameInstance, vehicleID : EntityID, out vehicleRecord : Vehicle_Record ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( GetVehicleFromID( gi, vehicleID, vehicle ) ) )
+		{
+			return false;
+		}
+		vehicleRecord = TweakDBInterface.GetVehicleRecord( vehicle.GetRecordID() );
+		if( !( vehicleRecord ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetDriver( gi : GameInstance, vehicleID : EntityID ) : weak< GameObject >
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return NULL;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( IsDriverSlot( mountInfos[ i ].slotId.id ) )
+			{
+				return ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			}
+		}
+		return NULL;
+	}
+
+	public static function CanBeDriven( gi : GameInstance, ownerID : EntityID ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( GetVehicle( gi, ownerID, vehicle ) ) )
+		{
+			return false;
+		}
+		return CanBeDriven( gi, vehicle );
+	}
+
+	public static function CanBeDriven( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		if( ( ( ( !( vehicle ) || vehicle.IsDestroyed() ) || HasActiveAutopilot( gi, vehicle ) ) || IsExecutingAnyCommand( gi, vehicle ) ) || vehicle.IsPerformingSceneAnimation() )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function HasActiveAutopilot( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		if( vehicle )
+		{
+			return vehicle.GetBlackboard().GetBool( GetAllBlackboardDefs().Vehicle.IsAutopilotOn );
+		}
+		return false;
+	}
+
+	public static function HasActiveAutopilot( gi : GameInstance, ownerID : EntityID ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( GetVehicle( gi, ownerID, vehicle ) ) )
+		{
+			return false;
+		}
+		return HasActiveAutopilot( gi, vehicle );
+	}
+
+	public static function IsExecutingAnyCommand( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		if( vehicle )
+		{
+			return vehicle.IsExecutingAnyCommand();
+		}
+		return false;
+	}
+
+	public static function HasActiveDriver( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var driver : weak< GameObject >;
+		driver = GetDriver( gi, vehicleID );
+		if( driver && ScriptedPuppet.IsActive( driver ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function QueueEventToPassenger( gi : GameInstance, vehicleID : EntityID, slotID : MountingSlotId, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var delayTime : Float;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID, slotID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( mountInfos[ i ].slotId.id == 'trunk_body' )
+			{
+				continue;
+			}
+			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( passenger )
+			{
+				if( delay > 0.0 )
+				{
+					GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delay );
+				}
+				else if( randomDelay )
+				{
+					delayTime = delayTime + RandRangeF( 0.1, 2.0 );
+					GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delayTime );
+				}
+				else
+				{
+					passenger.QueueEvent( evt );
+				}
+			}
+		}
+		if( !( passenger ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function QueueEventToPassenger( gi : GameInstance, vehicle : weak< VehicleObject >, slotID : MountingSlotId, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	{
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		return QueueEventToPassenger( gi, vehicle.GetEntityID(), slotID, evt, delay, randomDelay );
+	}
+
+	public static function QueueEventToAllPassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var delayTime : Float;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( mountInfos[ i ].slotId.id == 'trunk_body' )
+			{
+				continue;
+			}
+			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( passenger )
+			{
+				if( delay > 0.0 )
+				{
+					GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delay );
+				}
+				else if( randomDelay )
+				{
+					delayTime = delayTime + RandRangeF( 0.1, 2.0 );
+					GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delayTime );
+				}
+				else
+				{
+					passenger.QueueEvent( evt );
+				}
+			}
+		}
+		if( !( passenger ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function QueueEventToAllPassengers( gi : GameInstance, vehicle : weak< VehicleObject >, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	{
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		return QueueEventToAllPassengers( gi, vehicle.GetEntityID(), evt, delay, randomDelay );
+	}
+
+	public static function QueueEventToAllNonFriendlyAggressivePassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, optional delay : Float ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passenger : weak< ScriptedPuppet >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( mountInfos[ i ].slotId.id == 'trunk_body' )
+			{
+				continue;
+			}
+			passenger = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( ( passenger && !( IsFriendlyTowardsPlayer( passenger ) ) ) && passenger.IsAggressive() )
+			{
+				if( delay > 0.0 )
+				{
+					GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delay );
+				}
+				else
+				{
+					passenger.QueueEvent( evt );
+				}
+			}
+		}
+		if( !( passenger ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function QueueEventToPassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, passengers : array< weak< GameObject > >, optional delay : Bool ) : Bool
+	{
+		var i : Int32;
+		var delayTime : Float;
+		if( ( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) ) || ( passengers.Size() == 0 ) )
+		{
+			return false;
+		}
+		for( i = 0; i < passengers.Size(); i += 1 )
+		{
+			if( passengers[ i ] )
+			{
+				if( delay )
+				{
+					delayTime = delayTime + RandRangeF( 0.1, 2.0 );
+					GameInstance.GetDelaySystem( gi ).DelayEvent( passengers[ i ], evt, delayTime );
+				}
+				else
+				{
+					passengers[ i ].QueueEvent( evt );
+				}
+			}
+		}
+		return true;
+	}
+
+	public static function QueueEventToAllNonFriendlyActivePassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, executionOwner : GameObject, optional broadcastHijack : Bool, optional delay : Bool ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var playerMountInfo : MountingInfo;
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var active : Bool;
+		var attitude : EAIAttitude;
+		var broadcaster : StimBroadcasterComponent;
+		var delayTime : Float;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		playerMountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithObjects( GameInstance.GetPlayerSystem( gi ).GetLocalPlayerMainGameObject(),  );
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( mountInfos[ i ].slotId.id == 'trunk_body' )
+			{
+				mountInfos.EraseFast( i );
+				break;
+			}
+		}
+		delayTime = RandRangeF( 0.2, 0.40000001 );
+		broadcaster = GameInstance.GetPlayerSystem( gi ).GetLocalPlayerMainGameObject().GetStimBroadcasterComponent();
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			active = IsSlotOccupiedByActivePassenger( gi, vehicleID, mountInfos[ i ].slotId.id );
+			GetAttitudeOfPassenger( gi, vehicleID, mountInfos[ i ].slotId, attitude );
+			if( playerMountInfo.slotId.id != mountInfos[ i ].slotId.id )
+			{
+				if( ( passenger && active ) && attitude != EAIAttitude.AIA_Friendly )
+				{
+					if( delay )
+					{
+						delayTime = delayTime + RandRangeF( 0.2, 0.40000001 );
+						GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delayTime );
+					}
+					else
+					{
+						passenger.QueueEvent( evt );
+					}
+				}
+			}
+			if( broadcaster && broadcastHijack )
+			{
+				broadcaster.SendDrirectStimuliToTarget( executionOwner, gamedataStimType.HijackVehicle, passenger );
+			}
+		}
+		if( !( passenger ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function QueueHijackExitEventToInactiveDriver( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		var driver : weak< GameObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		driver = GetDriver( gi, vehicle.GetEntityID() );
+		if( ( driver == NULL ) || ScriptedPuppet.IsActive( driver ) )
+		{
+			return false;
+		}
+		VehicleComponent.OpenDoor( vehicle, GetDriverSlotID(), 1.0 );
+		GameInstance.GetWorkspotSystem( vehicle.GetGame() ).UnmountFromVehicle( vehicle, driver, false, , , 'deadstealing' );
+		return true;
+	}
+
+	public static function CheckIfPassengersCanLeaveCar( gi : GameInstance, vehicleID : EntityID, out passengersCanLeaveCar : array< weak< GameObject > >, out passengersCantLeaveCar : array< weak< GameObject > > )
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var active : Bool;
+		var workspotSystem : WorkspotGameSystem;
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		workspotSystem = GameInstance.GetWorkspotSystem( gi );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			active = IsSlotOccupiedByActivePassenger( gi, vehicleID, mountInfos[ i ].slotId.id );
+			if( passenger && active )
+			{
+				if( workspotSystem.HasExitNodes( passenger, true, false, true ) )
+				{
+					passengersCanLeaveCar.PushBack( passenger );
+				}
+				else
+				{
+					passengersCantLeaveCar.PushBack( passenger );
+				}
+			}
+		}
+	}
+
+	public static function IsAnyPassengerCrowd( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passenger : weak< NPCPuppet >;
+		if( !( GameInstance.IsValid( gi ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithObjects( , vehicle );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			passenger = ( ( NPCPuppet )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( passenger.IsCrowd() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsSlotAvailable( gi : GameInstance, vehicle : weak< VehicleObject >, slotName : CName ) : Bool
+	{
+		if( !( vehicle ) || !( IsNameValid( slotName ) ) )
+		{
+			return false;
+		}
+		if( !( HasSlot( gi, vehicle, slotName ) ) )
+		{
+			return false;
+		}
+		if( IsSlotOccupied( gi, vehicle.GetEntityID(), slotName ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsSlotOccupied( gi : GameInstance, vehicleID : EntityID, slotName : CName ) : Bool
+	{
+		var vehicleSlotID : MountingSlotId;
+		if( !( IsNameValid( slotName ) ) )
+		{
+			return false;
+		}
+		vehicleSlotID.id = slotName;
+		if( !( IsSlotOccupied( gi, vehicleID, vehicleSlotID ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsSlotOccupied( gi : GameInstance, vehicleID : EntityID, vehicleSlotID : MountingSlotId ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( , vehicleID, vehicleSlotID );
+		if( !( EntityID.IsDefined( mountInfo.childId ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsSlotOccupiedByActivePassenger( gi : GameInstance, vehicleID : EntityID, slotName : CName ) : Bool
+	{
+		var vehicleSlotID : MountingSlotId;
+		if( !( IsNameValid( slotName ) ) )
+		{
+			return false;
+		}
+		vehicleSlotID.id = slotName;
+		if( !( IsSlotOccupiedByActivePassenger( gi, vehicleID, vehicleSlotID ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsSlotOccupiedByActivePassenger( gi : GameInstance, vehicleID : EntityID, vehicleSlotID : MountingSlotId ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		var passanger : weak< GameObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( , vehicleID, vehicleSlotID );
+		if( !( EntityID.IsDefined( mountInfo.childId ) ) )
+		{
+			return false;
+		}
+		passanger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfo.childId ) ) );
+		if( !( passanger ) || !( ScriptedPuppet.IsActive( passanger ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function HasOnlyOneActivePassenger( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var activePassangers : Int32;
+		if( !( GetNumberOfActivePassengers( gi, vehicleID, activePassangers ) ) )
+		{
+			return false;
+		}
+		if( activePassangers == 1 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function GetNumberOfActivePassengers( gi : GameInstance, vehicleID : EntityID, out activePassangers : Int32 ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passanger : weak< GameObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			passanger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( passanger && ScriptedPuppet.IsActive( passanger ) )
+			{
+				activePassangers += 1;
+			}
+		}
+		return true;
+	}
+
+	public static function HasAnyActivePassengers( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passanger : weak< GameObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			passanger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( passanger && ScriptedPuppet.IsActive( passanger ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsVehicleOccupied( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		if( !( GameInstance.IsValid( gi ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithObjects( , vehicle );
+		return IMountingFacility.InfoHasChild( mountInfo );
+	}
+
+	public static function IsVehicleOccupiedByHostile( vehicleID : EntityID, passanger : weak< GameObject > ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var attitudeOwner : AttitudeAgent;
+		var attitudeTarget : AttitudeAgent;
+		var target : weak< GameObject >;
+		if( !( passanger ) )
+		{
+			return false;
+		}
+		attitudeOwner = passanger.GetAttitudeAgent();
+		mountInfos = GameInstance.GetMountingFacility( passanger.GetGame() ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( mountInfos[ i ].slotId.id == 'trunk_body' )
+			{
+				continue;
+			}
+			target = ( ( GameObject )( GameInstance.FindEntityByID( passanger.GetGame(), mountInfos[ i ].childId ) ) );
+			if( !( target ) || !( ScriptedPuppet.IsActive( target ) ) )
+			{
+				continue;
+			}
+			attitudeTarget = target.GetAttitudeAgent();
+			if( attitudeOwner.GetAttitudeTowards( attitudeTarget ) == EAIAttitude.AIA_Hostile )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function IsVehicleParked() : Bool
+	{
+		return GetVehicle().IsVehicleParked();
+	}
+
+	public static function SetAnimsetOverrideForPassenger( passenger : weak< GameObject >, value : Float ) : array< CName >
+	{
+		var mountInfo : MountingInfo;
+		var animsetOverides : array< CName >;
+		if( !( passenger ) )
+		{
+			return animsetOverides;
+		}
+		mountInfo = GameInstance.GetMountingFacility( passenger.GetGame() ).GetMountingInfoSingleWithIds( passenger.GetEntityID() );
+		if( !( EntityID.IsDefined( mountInfo.parentId ) ) )
+		{
+			return animsetOverides;
+		}
+		return SetAnimsetOverrideForPassenger( passenger, mountInfo.parentId, mountInfo.slotId.id, value );
+	}
+
+	public static function SetAnimsetOverrideForPassenger( passenger : weak< GameObject >, vehicleID : EntityID, slotName : CName, value : Float ) : array< CName >
+	{
+		var boneName : CName;
+		var evt : AnimWrapperWeightSetter;
+		var animsetOverides : array< CName >;
+		var vehicle : weak< VehicleObject >;
+		var i : Int32;
+		if( !( passenger ) )
+		{
+			return animsetOverides;
+		}
+		if( !( EntityID.IsDefined( vehicleID ) ) || !( IsNameValid( slotName ) ) )
+		{
+			return animsetOverides;
+		}
+		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( passenger.GetGame(), vehicleID ) ) );
+		if( !( vehicle ) )
+		{
+			return animsetOverides;
+		}
+		if( vehicle == ( ( BikeObject )( vehicle ) ) )
+		{
+			boneName = slotName;
+		}
+		else
+		{
+			boneName = vehicle.GetBoneNameFromSlot( slotName );
+		}
+		animsetOverides.PushBack( vehicle.GetAnimsetOverrideForPassenger( boneName ) );
+		animsetOverides.PushBack( boneName );
+		for( i = 0; i < animsetOverides.Size(); i += 1 )
+		{
+			evt = new AnimWrapperWeightSetter;
+			evt.key = animsetOverides[ i ];
+			evt.value = value;
+			passenger.QueueEvent( evt );
+		}
+		return animsetOverides;
+	}
+
+	public static function CheckVehicleDesiredTag( vehicle : weak< VehicleObject >, desiredTag : CName ) : Bool
+	{
+		var vehicleRecord : Vehicle_Record;
+		var tags : array< CName >;
+		if( !( GetVehicleRecord( vehicle, vehicleRecord ) ) )
+		{
+			return false;
+		}
+		tags = vehicleRecord.Tags();
+		if( tags.Contains( desiredTag ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function CheckVehicleDesiredTag( gi : GameInstance, owner : weak< GameObject >, desiredTag : CName ) : Bool
+	{
+		var vehicleRecord : Vehicle_Record;
+		if( !( GetVehicleRecord( gi, owner, vehicleRecord ) ) )
+		{
+			return false;
+		}
+		if( vehicleRecord.TagsContains( desiredTag ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function GetVehicleType( gi : GameInstance, owner : weak< GameObject >, out type : String ) : Bool
+	{
+		var vehicleRecord : Vehicle_Record;
+		var vehTypeRecord : VehicleType_Record;
+		if( !( GetVehicleRecord( gi, owner, vehicleRecord ) ) )
+		{
+			return false;
+		}
+		vehTypeRecord = vehicleRecord.Type();
+		type = vehTypeRecord.EnumName();
+		return true;
+	}
+
+	public static function GetAttitudeOfPassenger( gi : GameInstance, ownerID : EntityID, slotID : MountingSlotId, out attitude : EAIAttitude ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		var npcObject : weak< GameObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( ownerID ) ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( , ownerID, slotID );
+		npcObject = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfo.childId ) ) );
+		attitude = GameObject.GetAttitudeTowards( GameInstance.GetPlayerSystem( gi ).GetLocalPlayerMainGameObject(), npcObject );
+		return true;
+	}
+
+	public static function GetVehicleNPCData( gi : GameInstance, owner : GameObject, out vehicleNPCData : AnimFeature_VehicleNPCData ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		var slotName : CName;
+		if( !( GameInstance.IsValid( gi ) ) || !( owner ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithObjects( owner );
+		slotName = mountInfo.slotId.id;
+		if( slotName == 'seat_front_left' || slotName == 'seat_back_left' )
+		{
+			vehicleNPCData.side = 1;
+		}
+		else if( slotName == 'seat_front_right' || slotName == 'seat_back_right' )
+		{
+			vehicleNPCData.side = 2;
+		}
+		else
+		{
+			vehicleNPCData.side = 0;
+		}
+		if( IsDriverSlot( slotName ) )
+		{
+			vehicleNPCData.isDriver = true;
+		}
+		return true;
+	}
+
+	public static function HasSlot( gi : GameInstance, vehicle : weak< VehicleObject >, slotName : CName ) : Bool
+	{
+		var seats : array< weak< VehicleSeat_Record > >;
+		var i : Int32;
+		if( !( IsNameValid( slotName ) ) || !( GetSeats( gi, vehicle, seats ) ) )
+		{
+			return false;
+		}
+		for( i = 0; i < seats.Size(); i += 1 )
+		{
+			if( slotName == seats[ i ].SeatName() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function GetMountedSlotName( gi : GameInstance, owner : weak< GameObject >, out slotName : CName ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		if( !( owner ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithObjects( owner );
+		slotName = mountInfo.slotId.id;
+		return true;
+	}
+
+	public static function GetSeats( gi : GameInstance, vehicle : weak< VehicleObject >, out seats : array< weak< VehicleSeat_Record > > ) : Bool
+	{
+		var vehicleRecord : Vehicle_Record;
+		var vehicleDataPackage : weak< VehicleDataPackage_Record >;
+		var seatSet : weak< VehicleSeatSet_Record >;
+		if( !( GetVehicleRecord( vehicle, vehicleRecord ) ) )
+		{
+			return false;
+		}
+		vehicleDataPackage = vehicleRecord.VehDataPackage();
+		if( !( vehicleDataPackage ) )
+		{
+			return false;
+		}
+		seatSet = vehicleDataPackage.VehSeatSet();
+		if( !( seatSet ) )
+		{
+			return false;
+		}
+		seatSet.VehSeats( seats );
+		if( seats.Size() == 0 )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetFirstAvailableSlot( gi : GameInstance, vehicle : weak< VehicleObject >, out slotName : CName ) : Bool
+	{
+		var seats : array< weak< VehicleSeat_Record > >;
+		var i : Int32;
+		if( !( GetSeats( gi, vehicle, seats ) ) )
+		{
+			return false;
+		}
+		for( i = 0; i < seats.Size(); i += 1 )
+		{
+			slotName = seats[ i ].SeatName();
+			if( !( IsSlotOccupied( gi, vehicle.GetEntityID(), slotName ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function GetNumberOfOccupiedSlots( gi : GameInstance, vehicle : weak< VehicleObject > ) : Int32
+	{
+		var seats : array< weak< VehicleSeat_Record > >;
+		var i : Int32;
+		var occupiedSlots : Int32;
+		var slotName : CName;
+		if( !( GetSeats( gi, vehicle, seats ) ) )
+		{
+			return occupiedSlots;
+		}
+		for( i = 0; i < seats.Size(); i += 1 )
+		{
+			slotName = seats[ i ].SeatName();
+			if( IsSlotOccupied( gi, vehicle.GetEntityID(), slotName ) )
+			{
+				occupiedSlots += 1;
+			}
+		}
+		return occupiedSlots;
+	}
+
+	public static function GetVehicleDataPackage( gi : GameInstance, vehicle : weak< VehicleObject >, out vehDataPackage : weak< VehicleDataPackage_Record > ) : Bool
+	{
+		var vehicleRecord : Vehicle_Record;
+		if( !( GameInstance.IsValid( gi ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		GetVehicleRecord( vehicle, vehicleRecord );
+		vehDataPackage = vehicleRecord.VehDataPackage();
+		return true;
+	}
+
+	public static function GetVehicleAllowsCombat( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
+	{
+		var vehDataPackage : weak< VehicleDataPackage_Record >;
+		if( !( GameInstance.IsValid( gi ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		GetVehicleDataPackage( gi, vehicle, vehDataPackage );
+		return vehDataPackage.SupportsCombat();
+	}
+
+	public static function ToggleVehicleWindow( gi : GameInstance, vehicle : weak< VehicleObject >, slotID : MountingSlotId, toggle : Bool, optional speed : CName ) : Bool
+	{
+		var windowToggleEvent : VehicleExternalWindowRequestEvent;
+		if( !( GameInstance.IsValid( gi ) ) || !( vehicle ) )
+		{
+			return false;
+		}
+		windowToggleEvent = new VehicleExternalWindowRequestEvent;
+		windowToggleEvent.slotName = slotID.id;
+		windowToggleEvent.shouldOpen = toggle;
+		windowToggleEvent.speed = speed;
+		vehicle.QueueEvent( windowToggleEvent );
+		return true;
+	}
+
+	protected const function GetVehicle() : weak< VehicleObject >
+	{
+		return ( ( VehicleObject )( GetEntity() ) );
+	}
+
+	private function GetVehicleController() : vehicleController
+	{
+		if( m_vehicleController == NULL )
+		{
+			m_vehicleController = ( ( VehicleObject )( GetEntity() ) ).GetAccessoryController();
+		}
+		return m_vehicleController;
+	}
+
+	private function GetVehicleControllerPS() : vehicleControllerPS
+	{
+		var persistentId : PersistentID;
+		var vehicleControllerPS : vehicleControllerPS;
+		persistentId = CreatePersistentID( GetEntity().GetEntityID(), 'VehicleController' );
+		vehicleControllerPS = ( ( vehicleControllerPS )( GameInstance.GetPersistencySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).GetConstAccessToPSObject( persistentId, 'gamevehicleControllerPS' ) ) );
+		return vehicleControllerPS;
+	}
+
+	public const override function GetPS() : VehicleComponentPS
+	{
+		return ( ( VehicleComponentPS )( GetBasePS() ) );
+	}
+
+	public static function OpenDoor( vehicle : weak< VehicleObject >, vehicleSlotID : MountingSlotId, optional delay : Float ) : Bool
+	{
+		var doorOpenRequest : VehicleDoorOpen;
+		var persistentId : PersistentID;
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		persistentId = CreatePersistentID( vehicle.GetEntityID(), 'controller' );
+		doorOpenRequest = new VehicleDoorOpen;
+		if( vehicleSlotID.id == 'trunk' || vehicleSlotID.id == 'hood' )
+		{
+			doorOpenRequest.slotID = vehicleSlotID.id;
+		}
+		else
+		{
+			doorOpenRequest.slotID = vehicle.GetBoneNameFromSlot( vehicleSlotID.id );
+		}
+		doorOpenRequest.shouldAutoClose = false;
+		if( delay > 0.0 )
+		{
+			GameInstance.GetDelaySystem( vehicle.GetGame() ).DelayPSEvent( persistentId, 'VehicleComponentPS', doorOpenRequest, delay );
+		}
+		else
+		{
+			GameInstance.GetPersistencySystem( vehicle.GetGame() ).QueuePSEvent( persistentId, 'VehicleComponentPS', doorOpenRequest );
+		}
+		return true;
+	}
+
+	public static function CloseDoor( vehicle : weak< VehicleObject >, vehicleSlotID : MountingSlotId ) : Bool
+	{
+		var doorOpenRequest : VehicleDoorClose;
+		var persistentId : PersistentID;
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		persistentId = CreatePersistentID( vehicle.GetEntityID(), 'controller' );
+		doorOpenRequest = new VehicleDoorClose;
+		if( vehicleSlotID.id == 'trunk' || vehicleSlotID.id == 'hood' )
+		{
+			doorOpenRequest.slotID = vehicleSlotID.id;
+		}
+		else
+		{
+			doorOpenRequest.slotID = vehicle.GetBoneNameFromSlot( vehicleSlotID.id );
+		}
+		GameInstance.GetPersistencySystem( vehicle.GetGame() ).QueuePSEvent( persistentId, 'VehicleComponentPS', doorOpenRequest );
+		return true;
+	}
+
+	protected event OnMountingEvent( evt : MountingEvent )
+	{
+		var mountChild : GameObject;
+		var PSvehicleDooropenRequest : VehicleDoorOpen;
+		var vehicleNPCData : AnimFeature_VehicleNPCData;
+		var vehicleDataPackage : weak< VehicleDataPackage_Record >;
+		mountChild = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), evt.request.lowLevelMountingInfo.childId ) ) );
+		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehicleDataPackage );
+		if( mountChild.IsPlayer() )
+		{
+			m_mountedPlayer = ( ( PlayerPuppet )( mountChild ) );
+			QueueEventToAllPassengers( m_mountedPlayer.GetGame(), GetVehicle().GetEntityID(), PlayerMuntedToMyVehicle.Create( m_mountedPlayer ) );
+			PlayerPuppet.ReevaluateAllBreathingEffects( ( ( PlayerPuppet )( mountChild ) ) );
+			if( !( GetVehicle().IsCrowdVehicle() ) )
+			{
+				GetVehicle().GetDeviceLink().TriggerSecuritySystemNotification( GetVehicle().GetWorldPosition(), mountChild, ESecurityNotificationType.ALARM );
+			}
+			ToggleScanningComponent( false );
+			if( GetVehicle().GetHudManager().IsRegistered( GetVehicle().GetEntityID() ) )
+			{
+				RegisterToHUDManager( false );
+			}
+			RegisterInputListener();
+			FastTravelSystem.AddFastTravelLock( 'InVehicle', GetVehicle().GetGame() );
+			m_mounted = true;
+			m_ignoreAutoDoorClose = true;
+			SetupListeners();
+			DisableTargetingComponents();
+			if( EntityID.IsDefined( evt.request.mountData.mountEventOptions.entityID ) )
+			{
+				m_enterTime = vehicleDataPackage.Stealing() + vehicleDataPackage.SlideDuration();
+			}
+			else
+			{
+				m_enterTime = vehicleDataPackage.Entering() + vehicleDataPackage.SlideDuration();
+			}
+			DrivingStimuli( true );
+			if( evt.request.lowLevelMountingInfo.slotId.id == GetDriverSlotName() )
+			{
+				if( ( ( TankObject )( GetVehicle() ) ) )
+				{
+					TogglePlayerHitShapesForPanzer( m_mountedPlayer, false );
+					ToggleTargetingSystemForPanzer( m_mountedPlayer, true );
+				}
+				SetSteeringLimitAnimFeature( 1 );
+			}
+			if( evt.request.mountData.isInstant )
+			{
+				DetermineShouldCrystalDomeBeOn( 0.0 );
+			}
+			else
+			{
+				DetermineShouldCrystalDomeBeOn( 0.75 );
+			}
+		}
+		if( !( mountChild.IsPlayer() ) )
+		{
+			if( evt.request.mountData.isInstant )
+			{
+				mountChild.QueueEvent( CreateDisableRagdollEvent( 'VehicleComponentOnMountingEvent' ) );
+			}
+			vehicleNPCData = new AnimFeature_VehicleNPCData;
+			GetVehicleNPCData( GetVehicle().GetGame(), mountChild, vehicleNPCData );
+			AnimationControllerComponent.ApplyFeatureToReplicate( mountChild, 'VehicleNPCData', vehicleNPCData );
+			AnimationControllerComponent.PushEventToReplicate( mountChild, 'VehicleNPCData' );
+			if( ( mountChild.IsPuppet() && !( GetVehicle().IsPlayerVehicle() ) ) && ( IsHostileTowardsPlayer( mountChild ) || ( ( ScriptedPuppet )( mountChild ) ).IsAggressive() ) )
+			{
+				EnableTargetingComponents();
+			}
+		}
+		if( !( evt.request.mountData.isInstant ) )
+		{
+			PSvehicleDooropenRequest = new VehicleDoorOpen;
+			PSvehicleDooropenRequest.slotID = GetVehicle().GetBoneNameFromSlot( evt.request.lowLevelMountingInfo.slotId.id );
+			if( EntityID.IsDefined( evt.request.mountData.mountEventOptions.entityID ) )
+			{
+				PSvehicleDooropenRequest.autoCloseTime = vehicleDataPackage.Stealing_open();
+			}
+			else
+			{
+				PSvehicleDooropenRequest.autoCloseTime = vehicleDataPackage.Normal_open();
+			}
+			if( !( GetPS().GetIsDestroyed() ) )
+			{
+				PSvehicleDooropenRequest.shouldAutoClose = true;
+			}
+			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleDooropenRequest );
+		}
+		ManageAdditionalAnimFeatures( mountChild, true );
+		if( GetVehicle().IsPrevention() )
+		{
+			if( mountChild.IsPlayer() )
+			{
+				DestroyMappin();
+			}
+			else
+			{
+				GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).RegisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountChild.GetEntityID() );
+				CreateMappin();
+			}
+		}
+	}
+
+	protected event OnUnmountingEvent( evt : UnmountingEvent )
+	{
+		var mountChild : GameObject;
+		var activePassengers : Int32;
+		var turnedOn : Bool;
+		var engineOn : Bool;
+		mountChild = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), evt.request.lowLevelMountingInfo.childId ) ) );
+		VehicleComponent.SetAnimsetOverrideForPassenger( mountChild, evt.request.lowLevelMountingInfo.parentId, evt.request.lowLevelMountingInfo.slotId.id, 0.0 );
+		if( mountChild && mountChild.IsPlayer() )
+		{
+			PlayerPuppet.ReevaluateAllBreathingEffects( ( ( PlayerPuppet )( mountChild ) ) );
+			ToggleScanningComponent( true );
+			if( GetVehicle().ShouldRegisterToHUD() )
+			{
+				RegisterToHUDManager( true );
+			}
+			UnregisterInputListener();
+			FastTravelSystem.RemoveFastTravelLock( 'InVehicle', GetVehicle().GetGame() );
+			m_mounted = false;
+			UnregisterListeners();
+			ToggleSiren( false, false );
+			if( m_broadcasting )
+			{
+				DrivingStimuli( false );
+			}
+			if( evt.request.lowLevelMountingInfo.slotId.id == 'seat_front_left' )
+			{
+				turnedOn = GetVehicle().IsVehicleTurnedOn();
+				engineOn = GetVehicle().IsEngineTurnedOn();
+				if( turnedOn )
+				{
+					turnedOn = !( turnedOn );
+				}
+				if( engineOn )
+				{
+					engineOn = !( engineOn );
+				}
+				ToggleVehicleSystems( false, turnedOn, engineOn );
+				GetVehicleControllerPS().SetState( vehicleEState.Default );
+				SetSteeringLimitAnimFeature( 0 );
+				m_ignoreAutoDoorClose = false;
+			}
+			DoPanzerCleanup();
+			m_mountedPlayer = NULL;
+			CleanUpRace();
+		}
+		if( mountChild && GetNumberOfActivePassengers( mountChild.GetGame(), GetVehicle().GetEntityID(), activePassengers ) )
+		{
+			if( activePassengers <= 0 )
+			{
+				DisableTargetingComponents();
+				if( GetVehicle().IsPrevention() )
+				{
+					DestroyMappin();
+				}
+			}
+			if( GetVehicle().IsPrevention() )
+			{
+				GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).UnregisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountChild.GetEntityID() );
+			}
+		}
+		ManageAdditionalAnimFeatures( mountChild, false );
+	}
+
+	protected event OnCurrentWantedLevelChanged( value : Int32 )
+	{
+		if( value == 0 )
+		{
+			ToggleSiren( false, false );
+		}
+	}
+
+	public function OnPreventionPassengerDeath( deadEntityID : EntityID )
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var passanger : weak< GameObject >;
+		var activePassengers : Int32;
+		mountInfos = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoMultipleWithIds( , GetVehicle().GetEntityID() );
+		activePassengers = 0;
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( mountInfos[ i ].childId != deadEntityID )
+			{
+				passanger = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountInfos[ i ].childId ) ) );
+				if( passanger && ScriptedPuppet.IsActive( passanger ) )
+				{
+					activePassengers += 1;
+				}
+			}
+		}
+		if( activePassengers == 0 )
+		{
+			DestroyMappin();
+		}
+	}
+
+	protected event OnVehicleFinishedMountingEvent( evt : VehicleFinishedMountingEvent )
+	{
+		var isDestroyed : Bool;
+		if( evt.isMounting )
+		{
+			isDestroyed = GetPS().GetIsDestroyed();
+			if( !( isDestroyed ) )
+			{
+				if( IsDriverSlot( evt.slotID ) )
+				{
+					ToggleVehicleSystems( true, true, true );
+				}
+			}
+		}
+		m_ignoreAutoDoorClose = false;
+	}
+
+	protected event OnVehicleStartedUnmountingEvent( evt : VehicleStartedUnmountingEvent ) {}
+
+	protected event OnVehicleStartedMountingEvent( evt : VehicleStartedMountingEvent )
+	{
+		if( !( evt.isMounting ) )
+		{
+			SendVehicleStartedUnmountingEventToPS( evt.isMounting, evt.slotID, evt.character );
+			if( evt.slotID == 'seat_front_left' && !( GetVehicle().IsAbandoned() ) )
+			{
+				ToggleVehicleSystems( false, true, true );
+				GetVehicleControllerPS().SetState( vehicleEState.Default );
+			}
+		}
+		else
+		{
+			GetVehicle().SendDelayedFinishedMountingEventToPS( evt.isMounting, evt.slotID, evt.character, ( ( evt.instant ) ? ( 0.0 ) : ( m_enterTime ) ) );
+		}
+	}
+
+	protected function SendVehicleStartedUnmountingEventToPS( isMounting : Bool, slotID : CName, character : GameObject )
+	{
+		var evt : VehicleStartedUnmountingEvent;
+		evt = new VehicleStartedUnmountingEvent;
+		evt.slotID = slotID;
+		evt.isMounting = isMounting;
+		evt.character = character;
+		GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), evt );
+	}
+
+	protected function SetSteeringLimitAnimFeature( limit : Int32 )
+	{
+		var steeringLimitAnimFeature : AnimFeature_VehicleSteeringLimit;
+		steeringLimitAnimFeature = new AnimFeature_VehicleSteeringLimit;
+		steeringLimitAnimFeature.state = limit;
+		AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), 'SteeringLimit', steeringLimitAnimFeature );
+	}
+
+	protected function ManageAdditionalAnimFeatures( object : GameObject, value : Bool )
+	{
+		var animFeatures : array< CName >;
+		var vehicleDataPackage : weak< VehicleDataPackage_Record >;
+		var i : Int32;
+		var animFeature : AnimFeature_NPCVehicleAdditionalFeatures;
+		var animFeatureName : CName;
+		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehicleDataPackage );
+		animFeatures = vehicleDataPackage.AdditionalAnimFeatures();
+		if( animFeatures.Size() == 0 )
+		{
+			return;
+		}
+		for( i = 0; i < animFeatures.Size(); i += 1 )
+		{
+			animFeature = new AnimFeature_NPCVehicleAdditionalFeatures;
+			animFeatureName = animFeatures[ i ];
+			animFeature.state = value;
+			AnimationControllerComponent.ApplyFeatureToReplicate( object, animFeatureName, animFeature );
+		}
+	}
+
+	protected event OnVehicleSeatReservationEvent( evt : VehicleSeatReservationEvent ) {}
+
+	protected event OnVehicleBodyDisposalPerformedEvent( evt : VehicleBodyDisposalPerformedEvent )
+	{
+		DetermineInteractionState( 'trunk' );
+	}
+
+	protected function DetermineInteractionState()
+	{
+		var activeInteractions : array< gameinteractionsActiveLayerData >;
+		var i : Int32;
+		var context : VehicleActionsContext;
+		var activeLayerData : gameinteractionsActiveLayerData;
+		m_interaction.GetActiveInputLayers( activeInteractions );
+		for( i = 0; i < activeInteractions.Size(); i += 1 )
+		{
+			activeLayerData = activeInteractions[ i ];
+			context.requestorID = GetVehicle().GetEntityID();
+			context.processInitiatorObject = activeLayerData.activator;
+			context.interactionLayerTag = activeLayerData.layerName;
+			context.eventType = gameinteractionsEInteractionEventType.EIET_activate;
+			GetPS().DetermineActionsToPush( m_interaction, context, m_objectActionsCallbackCtrl, true );
+		}
+	}
+
+	protected function DetermineInteractionState( layerName : CName )
+	{
+		var activeInteractions : array< gameinteractionsActiveLayerData >;
+		var i : Int32;
+		var context : VehicleActionsContext;
+		var activeLayerData : gameinteractionsActiveLayerData;
+		m_interaction.GetActivatorsForLayer( layerName, activeInteractions );
+		for( i = 0; i < activeInteractions.Size(); i += 1 )
+		{
+			activeLayerData = activeInteractions[ i ];
+			context.requestorID = GetVehicle().GetEntityID();
+			context.processInitiatorObject = activeLayerData.activator;
+			context.interactionLayerTag = layerName;
+			context.eventType = gameinteractionsEInteractionEventType.EIET_activate;
+			GetPS().DetermineActionsToPush( m_interaction, context, m_objectActionsCallbackCtrl, true );
+		}
+	}
+
+	protected function GetIsMounted() : Bool
+	{
+		return m_mounted;
+	}
+
+	private function InitialVehcileSetup()
+	{
+		var lightEvent : VehicleLightSetupEvent;
+		m_overheatActive = false;
+		SetupAuxillary();
+		VehicleDefaultStateSetup();
+		EvaluateInteractions();
+		EvaluateDoorState();
+		EvaluateWindowState();
+		SendParkEvent( true );
+		lightEvent = new VehicleLightSetupEvent;
+		GetVehicle().QueueEvent( lightEvent );
+		SetupCrystalDome();
+		SetupWheels();
+		ShouldVisualDestructionBeSet();
+	}
+
+	private function VehicleDefaultStateSetup()
+	{
+		var door : EVehicleDoor;
+		var state : EQuestVehicleDoorState;
+		var recordID : TweakDBID;
+		var record : Vehicle_Record;
+		var defaultState : VehicleDefaultState_Record;
+		var seatStateRecord : SeatState_Record;
+		var i : Int32;
+		var size : Int32;
+		var sirenLight : Bool;
+		var sirenSound : Bool;
+		var sirenDelayEvent : VehicleSirenDelayEvent;
+		var thrusters : Bool;
+		var spawnDestroyed : Bool;
+		recordID = GetVehicle().GetRecordID();
+		record = TweakDBInterface.GetVehicleRecord( recordID );
+		defaultState = record.VehDefaultState();
+		size = ( ( Int32 )( EVehicleDoor.count ) );
+		if( !( GetPS().GetHasDefaultStateBeenSet() ) )
+		{
+			if( defaultState.DisableAllInteractions() )
+			{
+				state = EQuestVehicleDoorState.DisableAllInteractions;
+				CreateAndSendDefaultStateEvent( door, state );
+			}
+			if( defaultState.LockAll() || IsVehicleParked() )
+			{
+				state = EQuestVehicleDoorState.LockAll;
+				CreateAndSendDefaultStateEvent( door, state );
+			}
+			if( defaultState.OpenAll() )
+			{
+				state = EQuestVehicleDoorState.OpenAll;
+				CreateAndSendDefaultStateEvent( door, state );
+			}
+			if( defaultState.CloseAll() )
+			{
+				state = EQuestVehicleDoorState.CloseAll;
+				CreateAndSendDefaultStateEvent( door, state );
+			}
+			if( defaultState.QuestLockAll() )
+			{
+				state = EQuestVehicleDoorState.QuestLockAll;
+				CreateAndSendDefaultStateEvent( door, state );
+			}
+			for( i = 0; i < size; i += 1 )
+			{
+				switch( ( ( EVehicleDoor )( i ) ) )
+				{
+					case EVehicleDoor.seat_front_left:
+						seatStateRecord = defaultState.Seat_front_left();
+					if( seatStateRecord )
+					{
+						door = EVehicleDoor.seat_front_left;
+						if( seatStateRecord.EnableInteraction() )
+						{
+							state = EQuestVehicleDoorState.EnableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.DisableInteraction() )
+						{
+							state = EQuestVehicleDoorState.DisableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceOpen() )
+						{
+							state = EQuestVehicleDoorState.ForceOpen;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceClose() )
+						{
+							state = EQuestVehicleDoorState.ForceClose;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceLock() )
+						{
+							state = EQuestVehicleDoorState.ForceLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceUnlock() )
+						{
+							state = EQuestVehicleDoorState.ForceUnlock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.QuestLock() )
+						{
+							state = EQuestVehicleDoorState.QuestLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+					}
+					break;
+					case EVehicleDoor.seat_front_right:
+						seatStateRecord = defaultState.Seat_front_right();
+					if( seatStateRecord )
+					{
+						door = EVehicleDoor.seat_front_right;
+						if( seatStateRecord.EnableInteraction() )
+						{
+							state = EQuestVehicleDoorState.EnableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.DisableInteraction() )
+						{
+							state = EQuestVehicleDoorState.DisableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceOpen() )
+						{
+							state = EQuestVehicleDoorState.ForceOpen;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceClose() )
+						{
+							state = EQuestVehicleDoorState.ForceClose;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceLock() )
+						{
+							state = EQuestVehicleDoorState.ForceLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceUnlock() )
+						{
+							state = EQuestVehicleDoorState.ForceUnlock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.QuestLock() )
+						{
+							state = EQuestVehicleDoorState.QuestLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+					}
+					break;
+					case EVehicleDoor.seat_back_left:
+						seatStateRecord = defaultState.Seat_back_left();
+					if( seatStateRecord )
+					{
+						door = EVehicleDoor.seat_back_left;
+						if( seatStateRecord.EnableInteraction() )
+						{
+							state = EQuestVehicleDoorState.EnableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.DisableInteraction() )
+						{
+							state = EQuestVehicleDoorState.DisableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceOpen() )
+						{
+							state = EQuestVehicleDoorState.ForceOpen;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceClose() )
+						{
+							state = EQuestVehicleDoorState.ForceClose;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceLock() )
+						{
+							state = EQuestVehicleDoorState.ForceLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceUnlock() )
+						{
+							state = EQuestVehicleDoorState.ForceUnlock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.QuestLock() )
+						{
+							state = EQuestVehicleDoorState.QuestLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+					}
+					break;
+					case EVehicleDoor.seat_back_right:
+						seatStateRecord = defaultState.Seat_back_right();
+					if( seatStateRecord )
+					{
+						door = EVehicleDoor.seat_back_right;
+						if( seatStateRecord.EnableInteraction() )
+						{
+							state = EQuestVehicleDoorState.EnableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.DisableInteraction() )
+						{
+							state = EQuestVehicleDoorState.DisableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceOpen() )
+						{
+							state = EQuestVehicleDoorState.ForceOpen;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceClose() )
+						{
+							state = EQuestVehicleDoorState.ForceClose;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceLock() )
+						{
+							state = EQuestVehicleDoorState.ForceLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceUnlock() )
+						{
+							state = EQuestVehicleDoorState.ForceUnlock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.QuestLock() )
+						{
+							state = EQuestVehicleDoorState.QuestLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+					}
+					break;
+					case EVehicleDoor.trunk:
+						seatStateRecord = defaultState.Trunk();
+					if( seatStateRecord )
+					{
+						door = EVehicleDoor.trunk;
+						if( seatStateRecord.EnableInteraction() )
+						{
+							state = EQuestVehicleDoorState.EnableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.DisableInteraction() )
+						{
+							state = EQuestVehicleDoorState.DisableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceOpen() )
+						{
+							state = EQuestVehicleDoorState.ForceOpen;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceClose() )
+						{
+							state = EQuestVehicleDoorState.ForceClose;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceLock() )
+						{
+							state = EQuestVehicleDoorState.ForceLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceUnlock() )
+						{
+							state = EQuestVehicleDoorState.ForceUnlock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.QuestLock() )
+						{
+							state = EQuestVehicleDoorState.QuestLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+					}
+					break;
+					case EVehicleDoor.hood:
+						seatStateRecord = defaultState.Hood();
+					if( seatStateRecord )
+					{
+						door = EVehicleDoor.hood;
+						if( seatStateRecord.EnableInteraction() )
+						{
+							state = EQuestVehicleDoorState.EnableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.DisableInteraction() )
+						{
+							state = EQuestVehicleDoorState.DisableInteraction;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceOpen() )
+						{
+							state = EQuestVehicleDoorState.ForceOpen;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceClose() )
+						{
+							state = EQuestVehicleDoorState.ForceClose;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceLock() )
+						{
+							state = EQuestVehicleDoorState.ForceLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.ForceUnlock() )
+						{
+							state = EQuestVehicleDoorState.ForceUnlock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+						if( seatStateRecord.QuestLock() )
+						{
+							state = EQuestVehicleDoorState.QuestLock;
+							CreateAndSendDefaultStateEvent( door, state );
+						}
+					}
+					break;
+					default:
+						break;
+				}
+			}
+			sirenLight = defaultState.SirenLight();
+			sirenSound = defaultState.SirenSounds();
+			if( sirenLight || sirenSound )
+			{
+				sirenDelayEvent = new VehicleSirenDelayEvent;
+				sirenDelayEvent.lights = sirenLight;
+				sirenDelayEvent.sounds = sirenSound;
+				GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), sirenDelayEvent, 0.5 );
+			}
+			thrusters = defaultState.Thrusters();
+			if( thrusters )
+			{
+				GetPS().SetThrusterState( true );
+			}
+		}
+		spawnDestroyed = defaultState.SpawnDestroyed();
+		if( spawnDestroyed )
+		{
+			GetPS().SetIsDestroyed( true );
+			if( !( ( ( VehicleComponentPS )( GetPS() ) ).GetIsSubmerged() ) )
+			{
+				GetPS().SetHasExploded( true );
+			}
+		}
+	}
+
+	private function CreateAndSendDefaultStateEvent( door : EVehicleDoor, state : EQuestVehicleDoorState )
+	{
+		var vehicleQuestEvent : VehicleQuestChangeDoorStateEvent;
+		vehicleQuestEvent = new VehicleQuestChangeDoorStateEvent;
+		vehicleQuestEvent.door = door;
+		vehicleQuestEvent.newState = state;
+		GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), vehicleQuestEvent );
+		GetPS().SetHasDefaultStateBeenSet( true );
+	}
+
+	private function ShouldVisualDestructionBeSet()
+	{
+		var vehVisualDestroRecord : weak< VehicleVisualDestruction_Record >;
+		vehVisualDestroRecord = GetVehicle().GetRecord().VisualDestruction();
+		if( vehVisualDestroRecord && vehVisualDestroRecord.SetVisualDestruction() )
+		{
+			VehicleVisualDestructionSetup();
+		}
+	}
+
+	private function VehicleVisualDestructionSetup()
+	{
+		var vehVisualDestroRecord : weak< VehicleVisualDestruction_Record >;
+		var pointValues : Float[ 15 ];
+		var i : Int32;
+		vehVisualDestroRecord = GetVehicle().GetRecord().VisualDestruction();
+		pointValues[ 0 ] = vehVisualDestroRecord.BackLeft();
+		pointValues[ 1 ] = vehVisualDestroRecord.Back();
+		pointValues[ 2 ] = vehVisualDestroRecord.BackRight();
+		pointValues[ 3 ] = vehVisualDestroRecord.Left();
+		pointValues[ 4 ] = 0.0;
+		pointValues[ 5 ] = vehVisualDestroRecord.Right();
+		pointValues[ 6 ] = vehVisualDestroRecord.Left();
+		pointValues[ 7 ] = 0.0;
+		pointValues[ 8 ] = vehVisualDestroRecord.Right();
+		pointValues[ 9 ] = vehVisualDestroRecord.Left();
+		pointValues[ 10 ] = 0.0;
+		pointValues[ 11 ] = vehVisualDestroRecord.Right();
+		pointValues[ 12 ] = vehVisualDestroRecord.FrontLeft();
+		pointValues[ 13 ] = vehVisualDestroRecord.Front();
+		pointValues[ 14 ] = vehVisualDestroRecord.FrontRight();
+		GetVehicle().SetDestructionGridPointValues( 0, pointValues, false );
+		for( i = 0; i < pointValues.Size(); i += 1 )
+		{
+			pointValues[ i ] = vehVisualDestroRecord.Roof();
+		}
+		GetVehicle().SetDestructionGridPointValues( 1, pointValues, false );
+	}
+
+	protected event OnVehicleQuestVisualDestructionEvent( evt : VehicleQuestVisualDestructionEvent )
+	{
+		var pointValues : Float[ 15 ];
+		var i : Int32;
+		pointValues[ 0 ] = evt.backLeft;
+		pointValues[ 1 ] = evt.back;
+		pointValues[ 2 ] = evt.backRight;
+		pointValues[ 3 ] = evt.left;
+		pointValues[ 4 ] = 0.0;
+		pointValues[ 5 ] = evt.right;
+		pointValues[ 6 ] = evt.left;
+		pointValues[ 7 ] = 0.0;
+		pointValues[ 8 ] = evt.right;
+		pointValues[ 9 ] = evt.left;
+		pointValues[ 10 ] = 0.0;
+		pointValues[ 11 ] = evt.right;
+		pointValues[ 12 ] = evt.frontLeft;
+		pointValues[ 13 ] = evt.front;
+		pointValues[ 14 ] = evt.frontRight;
+		GetVehicle().SetDestructionGridPointValues( 0, pointValues, evt.accumulate );
+		for( i = 0; i < pointValues.Size(); i += 1 )
+		{
+			pointValues[ i ] = evt.roof;
+		}
+		GetVehicle().SetDestructionGridPointValues( 1, pointValues, evt.accumulate );
+	}
+
+	private function EvaluateInteractions()
+	{
+		EvaluateTrunkAndHoodInteractions();
+		if( CheckVehicleDesiredTag( GetVehicle(), 'player_bike' ) )
+		{
+			ToggleVehReadyInteractions( true );
+		}
+		ToggleInitialVehDoorInteractions();
+	}
+
+	private function ToggleInitialVehDoorInteractions()
+	{
+		var evt : InteractionMultipleSetEnableEvent;
+		var seats : array< weak< VehicleSeat_Record > >;
+		var i : Int32;
+		evt = new InteractionMultipleSetEnableEvent;
+		GetSeats( GetVehicle().GetGame(), GetVehicle(), seats );
+		for( i = 0; i < seats.Size(); i += 1 )
+		{
+			evt.PushBack( true, seats[ i ].SeatName() );
+		}
+		GetVehicle().QueueEvent( evt );
+	}
+
+	private function EvaluateTrunkAndHoodInteractions()
+	{
+		var evt : InteractionMultipleSetEnableEvent;
+		evt = new InteractionMultipleSetEnableEvent;
+		evt.PushBack( true, 'trunk' );
+		evt.PushBack( true, 'hood' );
+		GetVehicle().QueueEvent( evt );
+	}
+
+	private function EvaluateTrunkInteractions()
+	{
+		ToggleInteraction( 'trunk', true );
+	}
+
+	private function EvaluateHoodInteractions()
+	{
+		ToggleInteraction( 'hood', true );
+	}
+
+	protected function ToggleVehReadyInteractions( toggle : Bool, optional layer : CName )
+	{
+		var evt : InteractionMultipleSetEnableEvent;
+		evt = new InteractionMultipleSetEnableEvent;
+		if( IsNameValid( layer ) )
+		{
+			evt.PushBack( toggle, layer );
+		}
+		else
+		{
+			evt.PushBack( toggle, 'PuppetClose' );
+			evt.PushBack( toggle, 'PuppetFar' );
+		}
+		GetVehicle().QueueEvent( evt );
+	}
+
+	private function EvaluateDoorState()
+	{
+		var i : Int32;
+		var size : Int32;
+		var state : VehicleDoorState;
+		size = ( ( Int32 )( EVehicleDoor.count ) );
+		for( i = 0; i < size; i += 1 )
+		{
+			state = GetPS().GetDoorState( ( ( EVehicleDoor )( i ) ) );
+			SetDoorAnimFeatureData( ( ( EVehicleDoor )( i ) ), state );
+		}
+	}
+
+	protected function SetDoorAnimFeatureData( door : EVehicleDoor, state : VehicleDoorState )
+	{
+		var animFeature : AnimFeature_PartData;
+		var animFeatureName : CName;
+		if( state == VehicleDoorState.Open )
+		{
+			animFeature = new AnimFeature_PartData;
+			animFeature.state = 2;
+			animFeatureName = EnumValueToName( 'EVehicleDoor', ( ( Int64 )( door ) ) );
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, animFeature );
+		}
+	}
+
+	protected event OnVehicleLightSetupEvent( evt : VehicleLightSetupEvent )
+	{
+		var vehicleRecord : Vehicle_Record;
+		var headlightCount : Int32;
+		var interiorlightCount : Int32;
+		var brakelightCount : Int32;
+		var leftBlinkerlightCount : Int32;
+		var rightBLinkerlightCount : Int32;
+		var reverselightCount : Int32;
+		var utilityLightCount : Int32;
+		vehicleRecord = GetVehicle().GetRecord();
+		headlightCount = vehicleRecord.GetHeadlightColorCount();
+		interiorlightCount = vehicleRecord.GetInteriorColorCount();
+		brakelightCount = vehicleRecord.GetBrakelightColorCount();
+		leftBlinkerlightCount = vehicleRecord.GetLeftBlinkerlightColorCount();
+		rightBLinkerlightCount = vehicleRecord.GetRightBLinkerlightColorCount();
+		reverselightCount = vehicleRecord.GetReverselightColorCount();
+		utilityLightCount = vehicleRecord.GetUtilityLightColorCount();
+		if( headlightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.Head, Color( ( ( Uint8 )( vehicleRecord.GetHeadlightColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetHeadlightColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetHeadlightColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetHeadlightColorItem( 3 ) ) ) ) );
+		}
+		if( interiorlightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.Interior, Color( ( ( Uint8 )( vehicleRecord.GetInteriorColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetInteriorColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetInteriorColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetInteriorColorItem( 3 ) ) ) ) );
+		}
+		if( brakelightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.Brake, Color( ( ( Uint8 )( vehicleRecord.GetBrakelightColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetBrakelightColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetBrakelightColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetBrakelightColorItem( 3 ) ) ) ) );
+		}
+		if( leftBlinkerlightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.LeftBlinker, Color( ( ( Uint8 )( vehicleRecord.GetLeftBlinkerlightColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetLeftBlinkerlightColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetLeftBlinkerlightColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetLeftBlinkerlightColorItem( 3 ) ) ) ) );
+		}
+		if( rightBLinkerlightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.RightBlinker, Color( ( ( Uint8 )( vehicleRecord.GetRightBLinkerlightColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetRightBLinkerlightColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetRightBLinkerlightColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetRightBLinkerlightColorItem( 3 ) ) ) ) );
+		}
+		if( reverselightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.Reverse, Color( ( ( Uint8 )( vehicleRecord.GetReverselightColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetReverselightColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetReverselightColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetReverselightColorItem( 3 ) ) ) ) );
+		}
+		if( utilityLightCount == 4 )
+		{
+			GetVehicleController().SetLightColor( vehicleELightType.Utility, Color( ( ( Uint8 )( vehicleRecord.GetUtilityLightColorItem( 0 ) ) ), ( ( Uint8 )( vehicleRecord.GetUtilityLightColorItem( 1 ) ) ), ( ( Uint8 )( vehicleRecord.GetUtilityLightColorItem( 2 ) ) ), ( ( Uint8 )( vehicleRecord.GetUtilityLightColorItem( 3 ) ) ) ) );
+		}
+	}
+
+	private function RegisterInputListener()
+	{
+		var playerPuppet : PlayerPuppet;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject() ) );
+		playerPuppet.RegisterInputListener( this, 'VehicleInsideWheel' );
+		playerPuppet.RegisterInputListener( this, 'VehicleHorn' );
+	}
+
+	private function UnregisterInputListener()
+	{
+		var playerPuppet : PlayerPuppet;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject() ) );
+		if( playerPuppet )
+		{
+			playerPuppet.UnregisterInputListener( this );
+		}
+	}
+
+	private function LoadExplodedState()
+	{
+		var vehicleRecord : Vehicle_Record;
+		var destroyedAppearanceName : CName;
+		if( GetPS().GetHasExploded() )
+		{
+			vehicleRecord = GetVehicle().GetRecord();
+			destroyedAppearanceName = vehicleRecord.DestroyedAppearance();
+			if( IsNameValid( destroyedAppearanceName ) )
+			{
+				GetVehicle().ScheduleAppearanceChange( destroyedAppearanceName );
+			}
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'fire', false );
+			GetVehicle().DetachAllParts();
+			GetVehicle().SetHasExploded();
+		}
+	}
+
+	private function SetupThrusterFX()
+	{
+		var toggle : Bool;
+		toggle = GetPS().GetThrusterState();
+		if( toggle )
+		{
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'thrusters', true );
+		}
+		else
+		{
+			GameObjectEffectHelper.BreakEffectLoopEvent( GetVehicle(), 'thrusters' );
+		}
+	}
+
+	protected function ToggleScanningComponent( toggle : Bool )
+	{
+		m_scanningComponent.Toggle( toggle );
+	}
+
+	private function EnableTargetingComponents()
+	{
+		ToggleTargetingComponents( true );
+	}
+
+	private function DisableTargetingComponents()
+	{
+		ToggleTargetingComponents( false );
+	}
+
+	private function ToggleTargetingComponents( on : Bool )
+	{
+		var front_left_tire : TargetingComponent;
+		var front_right_tire : TargetingComponent;
+		var back_left_tire : TargetingComponent;
+		var back_right_tire : TargetingComponent;
+		var gas_tank : TargetingComponent;
+		front_left_tire = ( ( TargetingComponent )( FindComponentByName( 'front_left_tire' ) ) );
+		front_right_tire = ( ( TargetingComponent )( FindComponentByName( 'front_right_tire' ) ) );
+		back_left_tire = ( ( TargetingComponent )( FindComponentByName( 'back_left_tire' ) ) );
+		back_right_tire = ( ( TargetingComponent )( FindComponentByName( 'back_right_tire' ) ) );
+		gas_tank = ( ( TargetingComponent )( FindComponentByName( 'gas_tank' ) ) );
+		if( front_left_tire )
+		{
+			front_left_tire.Toggle( on );
+		}
+		if( front_right_tire )
+		{
+			front_right_tire.Toggle( on );
+		}
+		if( back_left_tire )
+		{
+			back_left_tire.Toggle( on );
+		}
+		if( back_right_tire )
+		{
+			back_right_tire.Toggle( on );
+		}
+		if( gas_tank )
+		{
+			gas_tank.Toggle( on );
+		}
+	}
+
+	private function BroadcastEnvironmentalHazardStimuli()
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetVehicle().GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.AddActiveStimuli( GetVehicle(), gamedataStimType.EnvironmentalHazard, 10.0 );
+		}
+	}
+
+	private function RemoveEnvironmentalHazardStimuli()
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetVehicle().GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.RemoveActiveStimuliByName( GetVehicle(), gamedataStimType.EnvironmentalHazard );
+		}
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		ToggleSiren( false, false );
+		GetPS().SetIsDestroyed( true );
+		m_interaction.Toggle( false );
+		ExplodeVehicle( evt.instigator );
+		GetVehicle().FindAndRewardKiller( gameKillType.Normal );
+		DisableTargetingComponents();
+		QueueEventToAllPassengers( GetVehicle().GetGame(), GetVehicle(), AIEvents.ExitVehicleEvent(), 0.5 );
+		UnmountTrunkBody();
+		ToggleInteraction( '', false );
+		TryToKnockDownBike();
+		DestroyMappin();
+		RemoveEnvironmentalHazardStimuli();
+	}
+
+	protected event OnVehicleWaterEvent( evt : VehicleWaterEvent )
+	{
+		var vehicle : weak< VehicleObject >;
+		if( evt.isInWater && !( ( ( VehicleComponentPS )( GetPS() ) ).GetIsSubmerged() ) )
+		{
+			vehicle = GetVehicle();
+			( ( VehicleComponentPS )( GetPS() ) ).SetIsSubmerged( true );
+			BreakAllDamageStageFX( true );
+			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'fire' );
+			DestroyVehicle();
+			DestroyRandomWindow();
+			ApplyVehicleDOT( 'high' );
+			GameObjectEffectHelper.StartEffectEvent( vehicle, 'underwater_bubbles' );
+		}
+		ScriptedPuppet.ReevaluateOxygenConsumption( m_mountedPlayer );
+	}
+
+	protected event OnInteractionActivated( evt : InteractionActivationEvent )
+	{
+		var context : VehicleActionsContext;
+		if( GetVehicle().IsCrowdVehicle() && StatusEffectSystem.ObjectHasStatusEffectWithTag( evt.activator, 'BlockTrafficInteractions' ) )
+		{
+			return false;
+		}
+		if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate )
+		{
+			if( evt.IsInputLayerEvent() )
+			{
+				CreateObjectActionsCallbackController( evt.activator );
+			}
+		}
+		else if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+		{
+			if( evt.IsInputLayerEvent() )
+			{
+				DestroyObjectActionsCallbackController();
+			}
+		}
+		context.requestorID = GetVehicle().GetEntityID();
+		context.processInitiatorObject = evt.activator;
+		context.interactionLayerTag = evt.layerData.tag;
+		context.eventType = evt.eventType;
+		GetPS().DetermineActionsToPush( m_interaction, context, m_objectActionsCallbackCtrl, false );
+		if( GetVehicle() == ( ( TankObject )( GetVehicle() ) ) )
+		{
+			EvaluatePanzerInteractions();
+		}
+	}
+
+	protected event OnInteractionUsed( evt : InteractionChoiceEvent )
+	{
+		ExecuteAction( evt.choice, evt.activator );
+		m_interaction.ResetChoices();
+	}
+
+	protected function EvaluatePanzerInteractions()
+	{
+		var state : VehicleDoorInteractionState;
+		state = GetPS().GetDoorInteractionState( EVehicleDoor.seat_front_left );
+		if( ( state == VehicleDoorInteractionState.Locked || state == VehicleDoorInteractionState.Reserved ) || state == VehicleDoorInteractionState.QuestLocked )
+		{
+			GetPS().SetDoorInteractionState( EVehicleDoor.seat_front_left, VehicleDoorInteractionState.Available, "PanzerTankFailsafe" );
+		}
+	}
+
+	private function RegisterToHUDManager( shouldRegister : Bool )
+	{
+		var hudManager : HUDManager;
+		var registration : HUDManagerRegistrationRequest;
+		if( GetVehicle().IsCrowdVehicle() && !( GetVehicle().ShouldForceRegisterInHUDManager() ) )
+		{
+			return;
+		}
+		hudManager = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( GetVehicle().GetGame() ).Get( 'HUDManager' ) ) );
+		if( hudManager )
+		{
+			registration = new HUDManagerRegistrationRequest;
+			registration.SetProperties( GetVehicle(), shouldRegister );
+			hudManager.QueueRequest( registration );
+		}
+	}
+
+	protected event OnHUDInstruction( evt : HUDInstruction )
+	{
+		if( evt.highlightInstructions.GetState() == InstanceState.ON )
+		{
+			GetPS().SetFocusModeData( true );
+		}
+		else if( evt.highlightInstructions.WasProcessed() )
+		{
+			GetPS().SetFocusModeData( false );
+		}
+	}
+
+	public function GetVehicleStateForScanner() : String
+	{
+		if( GetPS().GetIsDestroyed() )
+		{
+			return "LocKey#49082";
+		}
+		if( GetAnyDoorAvailable() && VehicleComponent.IsAnyPassengerCrowd( GetVehicle().GetGame(), GetVehicle() ) )
+		{
+			return "LocKey#49085";
+		}
+		if( !( GetAnySlotAvailable() ) )
+		{
+			return "LocKey#49083";
+		}
+		return "LocKey#49084";
+	}
+
+	private function GetAnySlotAvailable( optional checkOccupied : Bool ) : Bool
+	{
+		var seatSet : array< weak< VehicleSeat_Record > >;
+		var slotName : CName;
+		var i : Int32;
+		var door : EVehicleDoor;
+		VehicleComponent.GetSeats( GetVehicle().GetGame(), GetVehicle(), seatSet );
+		for( i = 0; i < seatSet.Size(); i += 1 )
+		{
+			slotName = seatSet[ i ].SeatName();
+			GetPS().GetVehicleDoorEnum( door, slotName );
+			if( GetPS().GetDoorInteractionState( door ) == VehicleDoorInteractionState.Available )
+			{
+				if( !( VehicleComponent.IsSlotOccupiedByActivePassenger( GetVehicle().GetGame(), GetVehicle().GetEntityID(), slotName ) ) )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private function GetAnyDoorAvailable( optional checkOccupied : Bool ) : Bool
+	{
+		var seatSet : array< weak< VehicleSeat_Record > >;
+		var slotName : CName;
+		var i : Int32;
+		var door : EVehicleDoor;
+		VehicleComponent.GetSeats( GetVehicle().GetGame(), GetVehicle(), seatSet );
+		for( i = 0; i < seatSet.Size(); i += 1 )
+		{
+			slotName = seatSet[ i ].SeatName();
+			GetPS().GetVehicleDoorEnum( door, slotName );
+			if( GetPS().GetDoorInteractionState( door ) == VehicleDoorInteractionState.Available )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function SetVehicleScannerDirty()
+	{
+		GetVehicle().SetScannerDirty( true );
+	}
+
+	private function ExecuteAction( choice : InteractionChoice, executor : weak< GameObject > )
+	{
+		var action : DeviceAction;
+		var i : Int32;
+		for( i = 0; i < choice.data.Size(); i += 1 )
+		{
+			action = ( ( DeviceAction )( choice.data[ i ] ) );
+			if( action )
+			{
+				ExecuteAction( action, executor );
+			}
+		}
+	}
+
+	private function ExecuteAction( action : DeviceAction, optional executor : weak< GameObject > )
+	{
+		var sAction : ScriptableDeviceAction;
+		sAction = ( ( ScriptableDeviceAction )( action ) );
+		if( sAction != NULL )
+		{
+			sAction.RegisterAsRequester( GetEntity().GetEntityID() );
+			if( executor != NULL )
+			{
+				sAction.SetExecutor( executor );
+			}
+			GameInstance.GetPersistencySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).QueuePSDeviceEvent( sAction );
+		}
+	}
+
+	private function ToggleInteraction( layer : CName, toggle : Bool )
+	{
+		var interactionEvent : InteractionSetEnableEvent;
+		interactionEvent = new InteractionSetEnableEvent;
+		interactionEvent.enable = toggle;
+		interactionEvent.layer = layer;
+		GetVehicle().QueueEvent( interactionEvent );
+	}
+
+	private function ProcessExplosionEffects()
+	{
+		BreakAllDamageStageFX( true );
+		GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'explosion', false );
+		GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'fire', false );
+		GameObject.PlaySoundEvent( GetVehicle(), 'v_car_test_explosion' );
+	}
+
+	private function ExplodeVehicle( instigator : weak< GameObject > )
+	{
+		var explosionAttack : Attack_GameEffect;
+		var attackID : TweakDBID;
+		var hitFlags : array< SHitFlag >;
+		var broadcaster : StimBroadcasterComponent;
+		var vehicleRecord : Vehicle_Record;
+		var destroyedAppearanceName : CName;
+		vehicleRecord = GetVehicle().GetRecord();
+		destroyedAppearanceName = vehicleRecord.DestroyedAppearance();
+		if( ( ( VehicleComponentPS )( GetPS() ) ).GetIsSubmerged() )
+		{
+			return;
+		}
+		attackID = T"Attacks.CarMediumKill";
+		if( !( instigator ) )
+		{
+			instigator = GetVehicle();
+		}
+		if( TDBID.IsValid( attackID ) )
+		{
+			explosionAttack = RPGManager.PrepareGameEffectAttack( GetVehicle().GetGame(), instigator, GetVehicle(), attackID, , hitFlags );
+			if( explosionAttack )
+			{
+				explosionAttack.StartAttack();
+				GetVehicle().DetachAllParts();
+				ProcessExplosionEffects();
+				GetPS().SetHasExploded( true );
+				if( IsNameValid( destroyedAppearanceName ) )
+				{
+					GetVehicle().ScheduleAppearanceChange( destroyedAppearanceName );
+				}
+				KillPassengers( instigator );
+				broadcaster = GetVehicle().GetStimBroadcasterComponent();
+				if( broadcaster )
+				{
+					broadcaster.TriggerSingleBroadcast( GetVehicle(), gamedataStimType.DeviceExplosion );
+				}
+			}
+		}
+		if( GetVehicle().IsInTrafficPhysicsState() )
+		{
+			SendExplodedAIEvent();
+		}
+	}
+
+	private function SendExplodedAIEvent()
+	{
+		var evt : AIEvent;
+		evt = new AIEvent;
+		evt.name = 'VehicleExploded';
+		GetVehicle().QueueEvent( evt );
+	}
+
+	protected function KillPassengers( instigator : weak< GameObject > )
+	{
+		var mountInfos : array< MountingInfo >;
+		var seSystem : StatusEffectSystem;
+		var i : Int32;
+		var playerID : EntityID;
+		mountInfos = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoMultipleWithIds( , GetVehicle().GetEntityID() );
+		if( mountInfos.Size() <= 0 )
+		{
+			return;
+		}
+		seSystem = GameInstance.GetStatusEffectSystem( GetVehicle().GetGame() );
+		if( !( seSystem ) )
+		{
+			return;
+		}
+		playerID = GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject().GetEntityID();
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( EntityID.IsDefined( mountInfos[ i ].childId ) )
+			{
+				if( !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( mountInfos[ i ].childId, gameGodModeType.Invulnerable ) ) )
+				{
+					if( playerID == mountInfos[ i ].childId )
+					{
+						if( mountInfos[ i ].slotId.id == 'seat_front_left' )
+						{
+							seSystem.ApplyStatusEffect( mountInfos[ i ].childId, T"BaseStatusEffect.SoftKill", GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
+						}
+						else
+						{
+							seSystem.ApplyStatusEffect( mountInfos[ i ].childId, T"BaseStatusEffect.ForceKill", GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
+						}
+					}
+					else if( !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( mountInfos[ i ].childId, gameGodModeType.Immortal ) ) )
+					{
+						seSystem.ApplyStatusEffect( mountInfos[ i ].childId, T"BaseStatusEffect.ForceKill", GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
+					}
+				}
+			}
+		}
+	}
+
+	private function SetImmortalityMode()
+	{
+		var recordID : TweakDBID;
+		var record : Vehicle_Record;
+		var vehicleID : EntityID;
+		vehicleID = GetVehicle().GetEntityID();
+		recordID = GetVehicle().GetRecordID();
+		record = TweakDBInterface.GetVehicleRecord( recordID );
+		if( record )
+		{
+			if( record.TagsContains( 'Invulnerable' ) )
+			{
+				GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).AddGodMode( vehicleID, gameGodModeType.Invulnerable, 'Default' );
+				return;
+			}
+			else if( record.TagsContains( 'Immortal' ) )
+			{
+				GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).AddGodMode( vehicleID, gameGodModeType.Immortal, 'Default' );
+				return;
+			}
+		}
+	}
+
+	private function ClearImmortalityMode()
+	{
+		GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).ClearGodMode( GetVehicle().GetEntityID(), 'Default' );
+	}
+
+	private function StealVehicle( optional slotID : MountingSlotId )
+	{
+		var vehicle : weak< VehicleObject >;
+		var stealEvent : StealVehicleEvent;
+		var vehicleHijackEvent : VehicleHijackEvent;
+		vehicle = GetVehicle();
+		if( !( vehicle ) )
+		{
+			return;
+		}
+		if( IsNameValid( slotID.id ) )
+		{
+			vehicleHijackEvent = new VehicleHijackEvent;
+			QueueEventToPassenger( vehicle.GetGame(), vehicle, slotID, vehicleHijackEvent );
+		}
+		stealEvent = new StealVehicleEvent;
+		vehicle.QueueEvent( stealEvent );
+	}
+
+	protected function ToggleVehicleSystems( toggle : Bool, vehicle : Bool, engine : Bool )
+	{
+		if( vehicle )
+		{
+			GetVehicle().TurnVehicleOn( toggle );
+		}
+		if( engine )
+		{
+			GetVehicle().TurnEngineOn( toggle );
+		}
+	}
+
+	protected event OnForceCarAlarm( evt : ForceCarAlarm )
+	{
+		var delayEvt : DisableAlarmEvent;
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetVehicle().GetStimBroadcasterComponent();
+		if( GetVehicleControllerPS().IsAlarmOn() )
+		{
+			if( broadcaster )
+			{
+				broadcaster.SetSingleActiveStimuli( GetVehicle(), gamedataStimType.CarAlarm, 5.0 );
+			}
+			delayEvt = new DisableAlarmEvent;
+			GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), delayEvt, 5.0 );
+		}
+	}
+
+	protected event OnDisableAlarm( evt : DisableAlarmEvent )
+	{
+		GetPS().DisableAlarm();
+	}
+
+	protected event OnChangeState( evt : vehicleChangeStateEvent )
+	{
+		var crystalDomeQuestModified : Bool;
+		crystalDomeQuestModified = GetPS().GetIsCrystalDomeQuestModified();
+		if( evt.state == vehicleEState.On )
+		{
+			if( !( crystalDomeQuestModified ) )
+			{
+				if( GetVehicle() != ( ( AVObject )( GetVehicle() ) ) )
+				{
+					ToggleCrystalDome( true );
+				}
+			}
+			if( m_mounted )
+			{
+				DrivingStimuli( true );
+			}
+		}
+		if( evt.state != vehicleEState.On )
+		{
+			if( !( crystalDomeQuestModified ) )
+			{
+				if( GetVehicle() != ( ( AVObject )( GetVehicle() ) ) )
+				{
+					ToggleCrystalDome( false );
+				}
+			}
+			DrivingStimuli( false );
+		}
+	}
+
+	protected event OnVehicleQuestCrystalDomeEvent( evt : VehicleQuestCrystalDomeEvent )
+	{
+		var toggle : Bool;
+		toggle = GetPS().GetCrystalDomeQuestState();
+		ToggleCrystalDome( toggle, true );
+	}
+
+	private function DrivingStimuli( broadcast : Bool )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		broadcaster = GetVehicle().GetStimBroadcasterComponent();
+		if( !( broadcaster ) )
+		{
+			return;
+		}
+		if( broadcast && !( m_broadcasting ) )
+		{
+			broadcaster.SetSingleActiveStimuli( GetVehicle(), gamedataStimType.Driving, -1.0 );
+			m_broadcasting = true;
+		}
+		else if( !( broadcast ) && m_broadcasting )
+		{
+			broadcaster.RemoveActiveStimuliByName( GetVehicle(), gamedataStimType.Driving );
+			m_broadcasting = false;
+		}
+	}
+
+	private function SetupCrystalDome()
+	{
+		if( GetPS().GetCrystalDomeState() )
+		{
+			ToggleCrystalDome( true, false, true, 0.5 );
+		}
+	}
+
+	private function DetermineShouldCrystalDomeBeOn( meshVisibilityDelay : Float )
+	{
+		if( GetVehicleControllerPS().GetState() == vehicleEState.On && !( GetPS().GetIsCrystalDomeQuestModified() ) )
+		{
+			if( GetVehicle() != ( ( AVObject )( GetVehicle() ) ) )
+			{
+				ToggleCrystalDome( true, false, true, 0.0, meshVisibilityDelay );
+			}
+		}
+	}
+
+	private function ToggleCrystalDome( toggle : Bool, optional force : Bool, optional instant : Bool, optional instantDelay : Float, optional meshVisibilityDelay : Float )
+	{
+		var animFeature : AnimFeature_VehicleState;
+		var crystalDomeOffDelayEvent : VehicleCrystalDomeOffDelayEvent;
+		var crystalDomeOnDelayEvent : VehicleCrystalDomeOnDelayEvent;
+		var crystalDomeMeshDelayEvent : VehicleCrystalDomeMeshVisibilityDelayEvent;
+		var vehicle : VehicleObject;
+		var gameInstance : GameInstance;
+		var player : PlayerPuppet;
+		vehicle = GetVehicle();
+		gameInstance = vehicle.GetGame();
+		player = GetPlayer( gameInstance );
+		if( ( !( force ) && !( VehicleComponent.IsMountedToProvidedVehicle( gameInstance, player.GetEntityID(), vehicle ) ) ) && !( instant ) )
+		{
+			return;
+		}
+		animFeature = new AnimFeature_VehicleState;
+		if( toggle )
+		{
+			ToggleTargetingSystemForPanzer( m_mountedPlayer, true );
+			if( instant )
+			{
+				if( instantDelay == 0.0 )
+				{
+					GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_instant_on', true );
+				}
+				else
+				{
+					crystalDomeOnDelayEvent = new VehicleCrystalDomeOnDelayEvent;
+					GameInstance.GetDelaySystem( gameInstance ).DelayEvent( vehicle, crystalDomeOnDelayEvent, instantDelay );
+				}
+				if( meshVisibilityDelay == 0.0 )
+				{
+					animFeature.tppEnabled = !( vehicle.GetCameraManager().IsTPPActive() );
+					AnimationControllerComponent.ApplyFeatureToReplicate( vehicle, 'VehicleState', animFeature );
+					TogglePanzerShadowMeshes( vehicle.GetCameraManager().IsTPPActive() );
+				}
+				else
+				{
+					crystalDomeMeshDelayEvent = new VehicleCrystalDomeMeshVisibilityDelayEvent;
+					GameInstance.GetDelaySystem( gameInstance ).DelayEvent( vehicle, crystalDomeMeshDelayEvent, meshVisibilityDelay );
+				}
+			}
+			else
+			{
+				GameObjectEffectHelper.StartEffectEvent( vehicle, 'crystal_dome_start', true );
+				animFeature.tppEnabled = !( vehicle.GetCameraManager().IsTPPActive() );
+				AnimationControllerComponent.ApplyFeatureToReplicate( vehicle, 'VehicleState', animFeature );
+				TogglePanzerShadowMeshes( vehicle.GetCameraManager().IsTPPActive() );
+			}
+			GetPS().SetCrystalDomeState( true );
+		}
+		else
+		{
+			ToggleTargetingSystemForPanzer( m_mountedPlayer, false );
+			GameObjectEffectHelper.StartEffectEvent( vehicle, 'crystal_dome_stop', true );
+			crystalDomeOffDelayEvent = new VehicleCrystalDomeOffDelayEvent;
+			GameInstance.GetDelaySystem( gameInstance ).DelayEvent( vehicle, crystalDomeOffDelayEvent, 0.60000002 );
+		}
+	}
+
+	private function TogglePanzerShadowMeshes( toggle : Bool )
+	{
+		var shadowMesh1 : IComponent;
+		if( GetVehicle() != ( ( TankObject )( GetVehicle() ) ) )
+		{
+			return;
+		}
+		shadowMesh1 = FindComponentByName( 'av_militech_basilisk__ext01_canopy_a_shadow' );
+		shadowMesh1.Toggle( toggle );
+	}
+
+	protected event OnVehicleCrystalDomeOffDelayEvent( evt : VehicleCrystalDomeOffDelayEvent )
+	{
+		var animFeature : AnimFeature_VehicleState;
+		animFeature = new AnimFeature_VehicleState;
+		GetPS().SetCrystalDomeState( false );
+		animFeature.tppEnabled = false;
+		AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), 'VehicleState', animFeature );
+	}
+
+	protected event OnVehicleCrystalDomeOnDelayEvent( evt : VehicleCrystalDomeOnDelayEvent )
+	{
+		GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_instant_on', true );
+	}
+
+	protected event OnVehicleCrystalDomeMeshVisibilityDelayEvent( evt : VehicleCrystalDomeMeshVisibilityDelayEvent )
+	{
+		var animFeature : AnimFeature_VehicleState;
+		animFeature = new AnimFeature_VehicleState;
+		animFeature.tppEnabled = !( GetVehicle().GetCameraManager().IsTPPActive() );
+		AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), 'VehicleState', animFeature );
+		TogglePanzerShadowMeshes( !( GetVehicle().GetCameraManager().IsTPPActive() ) );
+	}
+
+	private function ToggleTargetingSystemForPanzer( mountedPlayer : PlayerPuppet, enable : Bool )
+	{
+		var vehicle : VehicleObject;
+		var targetingSystem : TargetingSystem;
+		vehicle = GetVehicle();
+		if( mountedPlayer )
+		{
+			if( enable && !( m_isIgnoredInTargetingSystem ) )
+			{
+				targetingSystem = GameInstance.GetTargetingSystem( vehicle.GetGame() );
+				targetingSystem.AddIgnoredCollisionEntities( vehicle );
+				targetingSystem.AddIgnoredLookAtEntity( mountedPlayer, vehicle.GetEntityID() );
+				m_isIgnoredInTargetingSystem = true;
+			}
+			else if( m_isIgnoredInTargetingSystem )
+			{
+				targetingSystem = GameInstance.GetTargetingSystem( vehicle.GetGame() );
+				targetingSystem.RemoveIgnoredCollisionEntities( vehicle );
+				targetingSystem.RemoveIgnoredLookAtEntity( mountedPlayer, vehicle.GetEntityID() );
+				m_isIgnoredInTargetingSystem = false;
+			}
+		}
+	}
+
+	private function TogglePlayerHitShapesForPanzer( mountedPlayer : PlayerPuppet, enable : Bool )
+	{
+		if( mountedPlayer )
+		{
+			if( enable && !( m_arePlayerHitShapesEnabled ) )
+			{
+				HitShapeUserDataBase.EnableHitShape( mountedPlayer, 'head', false );
+				HitShapeUserDataBase.EnableHitShape( mountedPlayer, 'chest', false );
+				HitShapeUserDataBase.EnableHitShape( mountedPlayer, 'legs', false );
+				m_arePlayerHitShapesEnabled = true;
+			}
+			else if( m_arePlayerHitShapesEnabled )
+			{
+				HitShapeUserDataBase.DisableHitShape( mountedPlayer, 'head', false );
+				HitShapeUserDataBase.DisableHitShape( mountedPlayer, 'chest', false );
+				HitShapeUserDataBase.DisableHitShape( mountedPlayer, 'legs', false );
+				m_arePlayerHitShapesEnabled = false;
+			}
+		}
+	}
+
+	private function DoPanzerCleanup()
+	{
+		if( !( m_arePlayerHitShapesEnabled ) )
+		{
+			TogglePlayerHitShapesForPanzer( m_mountedPlayer, true );
+		}
+		if( m_isIgnoredInTargetingSystem )
+		{
+			ToggleTargetingSystemForPanzer( m_mountedPlayer, false );
+		}
+	}
+
+	private function DoPreventionVehicleSetup()
+	{
+		if( GetVehicle().GetRecord().Affiliation().Type() == gamedataAffiliation.NCPD )
+		{
+			m_uiWantedBarBB = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).Get( GetAllBlackboardDefs().UI_WantedBar );
+			if( m_uiWantedBarBB )
+			{
+				m_currentWantedLevelCallback = m_uiWantedBarBB.RegisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, this, 'OnCurrentWantedLevelChanged' );
+			}
+		}
+	}
+
+	private function DoPreventionVehicleCleanup()
+	{
+		if( GetVehicle().IsPrevention() )
+		{
+			UnregisterPreventionPassengerCallbacks( GetVehicle().GetGame(), GetVehicle().GetEntityID() );
+			if( m_uiWantedBarBB && m_currentWantedLevelCallback )
+			{
+				m_uiWantedBarBB.UnregisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, m_currentWantedLevelCallback );
+				m_uiWantedBarBB = NULL;
+			}
+		}
+	}
+
+	private function UnregisterPreventionPassengerCallbacks( gi : GameInstance, vehicleID : EntityID )
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			GameInstance.GetPreventionSpawnSystem( gi ).UnregisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountInfos[ i ].childId );
+		}
+	}
+
+	protected event OnVehicleForceOccupantOut( evt : VehicleForceOccupantOut )
+	{
+		StealVehicle();
+	}
+
+	protected event OnActionDemolition( evt : ActionDemolition )
+	{
+		StealVehicle( evt.slotID );
+	}
+
+	protected event OnActionEngineering( evt : ActionEngineering )
+	{
+		StealVehicle();
+	}
+
+	protected event OnVehicleQuestDoorLocked( evt : VehicleQuestDoorLocked ) {}
+
+	protected event OnVehicleDoorInteraction( evt : VehicleDoorInteraction )
+	{
+		var doorID : CName;
+		doorID = evt.slotID;
+		EvaluateDoorReaction( doorID, false );
+	}
+
+	protected event OnVehicleDoorOpen( evt : VehicleDoorOpen )
+	{
+		var PSVehicleDoorCloseRequest : VehicleDoorClose;
+		var autoCloseDelay : Float;
+		EvaluateDoorReaction( evt.slotID, evt.forceScene );
+		if( evt.shouldAutoClose )
+		{
+			PSVehicleDoorCloseRequest = new VehicleDoorClose;
+			PSVehicleDoorCloseRequest.slotID = evt.slotID;
+			autoCloseDelay = evt.autoCloseTime;
+			if( autoCloseDelay == 0.0 )
+			{
+				autoCloseDelay = 1.5;
+			}
+			GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayPSEvent( GetPS().GetID(), GetPS().GetClassName(), PSVehicleDoorCloseRequest, autoCloseDelay, true );
+		}
+		GetPS().SetHasAnyDoorOpen( true );
+	}
+
+	protected event OnVehicleDoorClose( evt : VehicleDoorClose )
+	{
+		EvaluateDoorReaction( evt.slotID, evt.forceScene );
+	}
+
+	protected function GetVehicleDoorEnum( out door : EVehicleDoor, doorName : CName ) : Bool
+	{
+		var res : Int32;
+		res = ( ( Int32 )( EnumValueFromName( 'EVehicleDoor', doorName ) ) );
+		if( res < 0 )
+		{
+			return false;
+		}
+		door = ( ( EVehicleDoor )( res ) );
+		return true;
+	}
+
+	protected event OnVehicleDoorInteractionStateChange( evt : VehicleDoorInteractionStateChange )
+	{
+		var layerName : CName;
+		layerName = EnumValueToName( 'EVehicleDoor', ( ( Int64 )( evt.door ) ) );
+		DetermineInteractionState( layerName );
+	}
+
+	protected function EvaluateDoorReaction( doorID : CName, immediate : Bool )
+	{
+		var doorState : VehicleDoorState;
+		var door : EVehicleDoor;
+		var animFeature : AnimFeature_PartData;
+		var animFeatureName : CName;
+		var vehDataPackage : weak< VehicleDataPackage_Record >;
+		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehDataPackage );
+		animFeature = new AnimFeature_PartData;
+		animFeatureName = doorID;
+		if( !( GetVehicleDoorEnum( door, doorID ) ) )
+		{
+			return;
+		}
+		doorState = GetPS().GetDoorState( door );
+		if( doorState == VehicleDoorState.Open )
+		{
+			animFeature.state = 1;
+			animFeature.duration = ( ( immediate ) ? ( vehDataPackage.Immediate_open_close_duration() ) : ( vehDataPackage.Open_close_duration() ) );
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, animFeature );
+			AnimationControllerComponent.PushEvent( GetVehicle(), GetAnimEventName( doorState, door ) );
+		}
+		if( doorState == VehicleDoorState.Closed )
+		{
+			animFeature.state = 3;
+			animFeature.duration = ( ( immediate ) ? ( vehDataPackage.Immediate_open_close_duration() ) : ( vehDataPackage.Open_close_duration() ) );
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, animFeature );
+			AnimationControllerComponent.PushEvent( GetVehicle(), GetAnimEventName( doorState, door ) );
+		}
+	}
+
+	private function GetAnimEventName( doorState : VehicleDoorState, door : EVehicleDoor ) : CName
+	{
+		if( door == EVehicleDoor.seat_front_left )
+		{
+			if( doorState == VehicleDoorState.Open )
+			{
+				return 'doorOpenFrontLeft';
+			}
+			if( doorState == VehicleDoorState.Closed )
+			{
+				return 'doorCloseFrontLeft';
+			}
+		}
+		if( door == EVehicleDoor.seat_front_right )
+		{
+			if( doorState == VehicleDoorState.Open )
+			{
+				return 'doorOpenFrontRight';
+			}
+			if( doorState == VehicleDoorState.Closed )
+			{
+				return 'doorCloseFrontRight';
+			}
+		}
+		if( door == EVehicleDoor.seat_back_left )
+		{
+			if( doorState == VehicleDoorState.Open )
+			{
+				return 'doorOpenBackLeft';
+			}
+			if( doorState == VehicleDoorState.Closed )
+			{
+				return 'doorCloseBackLeft';
+			}
+		}
+		if( door == EVehicleDoor.seat_back_right )
+		{
+			if( doorState == VehicleDoorState.Open )
+			{
+				return 'doorOpenBackRight';
+			}
+			if( doorState == VehicleDoorState.Closed )
+			{
+				return 'doorCloseBackRight';
+			}
+		}
+		return '';
+	}
+
+	protected event OnVehicleExternalDoorRequestEvent( evt : VehicleExternalDoorRequestEvent )
+	{
+		var PSvehicleDooropenRequest : VehicleDoorOpen;
+		PSvehicleDooropenRequest = new VehicleDoorOpen;
+		PSvehicleDooropenRequest.slotID = evt.slotName;
+		PSvehicleDooropenRequest.shouldAutoClose = evt.autoClose;
+		PSvehicleDooropenRequest.autoCloseTime = evt.autoCloseTime;
+		GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleDooropenRequest );
+	}
+
+	protected event OnVehicleExternalWindowRequestEvent( evt : VehicleExternalWindowRequestEvent )
+	{
+		var PSvehicleWindowopenRequest : VehicleWindowOpen;
+		var PSvehicleWindowcloseRequest : VehicleWindowClose;
+		if( evt.shouldOpen )
+		{
+			PSvehicleWindowopenRequest = new VehicleWindowOpen;
+			PSvehicleWindowopenRequest.slotID = evt.slotName;
+			PSvehicleWindowopenRequest.speed = evt.speed;
+			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleWindowopenRequest );
+		}
+		else
+		{
+			PSvehicleWindowcloseRequest = new VehicleWindowClose;
+			PSvehicleWindowcloseRequest.slotID = evt.slotName;
+			PSvehicleWindowcloseRequest.speed = evt.speed;
+			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleWindowcloseRequest );
+		}
+	}
+
+	protected event OnVehicleWindowOpen( evt : VehicleWindowOpen )
+	{
+		EvaluateWindowReaction( evt.slotID, evt.speed );
+	}
+
+	protected event OnVehicleWindowClose( evt : VehicleWindowClose )
+	{
+		EvaluateWindowReaction( evt.slotID, evt.speed );
+	}
+
+	protected function EvaluateWindowReaction( doorID : CName, speed : CName )
+	{
+		var windowState : EVehicleWindowState;
+		var door : EVehicleDoor;
+		var animFeature : AnimFeature_PartData;
+		var animFeatureName : CName;
+		animFeature = new AnimFeature_PartData;
+		animFeatureName = StringToName( NameToString( doorID ) + "_window" );
+		if( !( GetVehicleDoorEnum( door, doorID ) ) )
+		{
+			return;
+		}
+		windowState = GetPS().GetWindowState( door );
+		if( speed == 'Fast' )
+		{
+			animFeature.duration = 0.2;
+		}
+		else
+		{
+			animFeature.duration = -1.0;
+		}
+		if( windowState == EVehicleWindowState.Open )
+		{
+			animFeature.state = 1;
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, animFeature );
+		}
+		if( windowState == EVehicleWindowState.Closed )
+		{
+			animFeature.state = 3;
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, animFeature );
+		}
+	}
+
+	private function EvaluateWindowState()
+	{
+		var i : Int32;
+		var size : Int32;
+		var state : EVehicleWindowState;
+		size = ( ( Int32 )( EVehicleDoor.count ) );
+		for( i = 0; i < size; i += 1 )
+		{
+			state = GetPS().GetWindowState( ( ( EVehicleDoor )( i ) ) );
+			SetWindowAnimFeatureData( ( ( EVehicleDoor )( i ) ), state );
+		}
+	}
+
+	protected function SetWindowAnimFeatureData( door : EVehicleDoor, state : EVehicleWindowState )
+	{
+		var animFeature : AnimFeature_PartData;
+		var animFeatureName : CName;
+		if( state == EVehicleWindowState.Open )
+		{
+			animFeature = new AnimFeature_PartData;
+			animFeature.state = 2;
+			animFeatureName = StringToName( NameToString( EnumValueToName( 'EVehicleDoor', ( ( Int64 )( door ) ) ) ) + "_window" );
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, animFeature );
+		}
+	}
+
+	protected event OnToggleDoorInteractionEvent( evt : ToggleDoorInteractionEvent )
+	{
+		EvaluateTrunkAndHoodInteractions();
+	}
+
+	protected event OnOpenTrunk( evt : VehicleOpenTrunk )
+	{
+		var vehicle : weak< VehicleObject >;
+		var delayEvt : ToggleDoorInteractionEvent;
+		delayEvt = new ToggleDoorInteractionEvent;
+		vehicle = ( ( VehicleObject )( GetEntity() ) );
+		AnimationControllerComponent.PushEvent( vehicle, 'doorOpenTrunk' );
+		EvaluateDoorReaction( 'trunk', false );
+		ToggleInteraction( 'trunk', false );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( ( ( VehicleObject )( GetEntity() ) ), delayEvt, 1.0 );
+		GetPS().SetHasAnyDoorOpen( true );
+	}
+
+	protected event OnCloseTrunk( evt : VehicleCloseTrunk )
+	{
+		var vehicle : weak< VehicleObject >;
+		var delayEvt : ToggleDoorInteractionEvent;
+		delayEvt = new ToggleDoorInteractionEvent;
+		vehicle = ( ( VehicleObject )( GetEntity() ) );
+		AnimationControllerComponent.PushEvent( vehicle, 'doorCloseTrunk' );
+		EvaluateDoorReaction( 'trunk', false );
+		ToggleInteraction( 'trunk', false );
+		GameInstance.GetDelaySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).DelayEvent( GetVehicle(), delayEvt, 1.0 );
+	}
+
+	protected event OnVehicleDumpBody( evt : VehicleDumpBody )
+	{
+		var mountingInfo : MountingInfo;
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerPuppet : PlayerPuppet;
+		var slotID : MountingSlotId;
+		var vehDataPackage : weak< VehicleDataPackage_Record >;
+		var unmountEvent : UnmountingRequest;
+		var dumpBodyWorkspotEvent : DumpBodyWorkspotDelayEvent;
+		var vehicleDumpBodyCloseTrunkEvent : VehicleDumpBodyCloseTrunkEvent;
+		unmountEvent = new UnmountingRequest;
+		dumpBodyWorkspotEvent = new DumpBodyWorkspotDelayEvent;
+		vehicleDumpBodyCloseTrunkEvent = new VehicleDumpBodyCloseTrunkEvent;
+		slotID.id = 'trunk';
+		OpenDoor( GetVehicle(), slotID );
+		ToggleInteraction( 'trunk', false );
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject() ) );
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		mountingInfo = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoSingleWithObjects( , playerPuppet );
+		m_trunkNpcBody = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountingInfo.childId ) ) );
+		unmountEvent.lowLevelMountingInfo = mountingInfo;
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal, true );
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, true );
+		playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.Dispose ) ) );
+		GameInstance.GetMountingFacility( GetVehicle().GetGame() ).Unmount( unmountEvent );
+		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehDataPackage );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), dumpBodyWorkspotEvent, 0.001 );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), vehicleDumpBodyCloseTrunkEvent, TweakDBInterface.GetFloat( vehDataPackage.GetID() + T".body_dump_close_trunk_delay", 2.0 ) );
+	}
+
+	protected event OnDumpBodyWorkspotDelayEvent( evt : DumpBodyWorkspotDelayEvent )
+	{
+		var workspotSystem : WorkspotGameSystem;
+		workspotSystem = GameInstance.GetWorkspotSystem( GetVehicle().GetGame() );
+		workspotSystem.PlayNpcInWorkspot( m_trunkNpcBody, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), GetVehicle(), 'trunkBodyDisposalNpc', '', 0.001 );
+		workspotSystem.PlayInDevice( GetVehicle(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), 'lockedCamera', 'trunkBodyDisposalPlayer', '', 'bodyDisposalSync', 0.1, WorkspotSlidingBehaviour.DontPlayAtResourcePosition );
+	}
+
+	public function MountNpcBodyToTrunk()
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).GetLocalInstanced( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal, false );
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, false );
+		playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.Default ) ) );
+		MountEntityToSlot( GetVehicle().GetEntityID(), m_trunkNpcBody.GetEntityID(), 'trunk_body' );
+		if( !( RPGManager.IsInventoryEmpty( m_trunkNpcBody ) ) )
+		{
+			( ( weak< weak< NPCPuppet > > )( m_trunkNpcBody ) ).DropLootBag();
+		}
+	}
+
+	protected event OnVehicleDumpBodyCloseTrunkEvent( evt : VehicleDumpBodyCloseTrunkEvent )
+	{
+		var slotID : MountingSlotId;
+		slotID.id = 'trunk';
+		CloseDoor( GetVehicle(), slotID );
+		EvaluateTrunkInteractions();
+	}
+
+	protected event OnVehicleTakeBody( evt : VehicleTakeBody )
+	{
+		var pickupBodyWorkspotEvent : PickupBodyWorkspotDelayEvent;
+		var slotID : MountingSlotId;
+		var mountingInfo : MountingInfo;
+		var trunkPickUpAIevent : AIEvent;
+		pickupBodyWorkspotEvent = new PickupBodyWorkspotDelayEvent;
+		slotID.id = 'trunk_body';
+		mountingInfo = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoSingleWithObjects( , GetVehicle(), slotID );
+		m_trunkNpcBody = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountingInfo.childId ) ) );
+		trunkPickUpAIevent = new AIEvent;
+		trunkPickUpAIevent.name = 'InstantUnmount';
+		m_trunkNpcBody.QueueEvent( trunkPickUpAIevent );
+		( ( NPCPuppet )( m_trunkNpcBody ) ).SetDisableRagdoll( true );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), pickupBodyWorkspotEvent, 0.001 );
+	}
+
+	protected event OnPickupBodyWorkspotDelayEvent( evt : PickupBodyWorkspotDelayEvent )
+	{
+		var workspotSystem : WorkspotGameSystem;
+		workspotSystem = GameInstance.GetWorkspotSystem( GetVehicle().GetGame() );
+		workspotSystem.PlayNpcInWorkspot( m_trunkNpcBody, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), GetVehicle(), 'trunkBodyPickupNpc', '', 0.001 );
+		workspotSystem.PlayInDevice( GetVehicle(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), 'lockedCamera', 'trunkBodyPickupPlayer', '', 'bodyPickupSync', 0.1, WorkspotSlidingBehaviour.DontPlayAtResourcePosition );
+	}
+
+	public function FinishTrunkBodyPickup()
+	{
+		MountBodyToPlayer( m_trunkNpcBody );
+		ToggleInteraction( 'trunk', false );
+		EvaluateTrunkInteractions();
+		( ( NPCPuppet )( m_trunkNpcBody ) ).SetDisableRagdoll( false );
+	}
+
+	private function MountBodyToPlayer( npcBody : weak< GameObject > )
+	{
+		var addCarriedObjectSM : PSMAddOnDemandStateMachine;
+		if( !( npcBody ) )
+		{
+			return;
+		}
+		GameInstance.GetStatusEffectSystem( GetVehicle().GetGame() ).ApplyStatusEffect( npcBody.GetEntityID(), T"BaseStatusEffect.VehicleTrunkBodyPickup", GetVehicle().GetRecordID(), GetVehicle().GetEntityID() );
+		addCarriedObjectSM = new PSMAddOnDemandStateMachine;
+		addCarriedObjectSM.owner = npcBody;
+		addCarriedObjectSM.stateMachineName = 'CarriedObject';
+		GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject().QueueEvent( addCarriedObjectSM );
+	}
+
+	protected function MountEntityToSlot( parentID : EntityID, childId : EntityID, slot : CName )
+	{
+		var lowLevelMountingInfo : MountingInfo;
+		var mountingRequest : MountingRequest;
+		var mountData : MountEventData;
+		var mountOptions : MountEventOptions;
+		mountingRequest = new MountingRequest;
+		mountData = new MountEventData;
+		mountOptions = new MountEventOptions;
+		lowLevelMountingInfo.parentId = parentID;
+		lowLevelMountingInfo.childId = childId;
+		lowLevelMountingInfo.slotId.id = slot;
+		mountingRequest.lowLevelMountingInfo = lowLevelMountingInfo;
+		mountingRequest.preservePositionAfterMounting = true;
+		mountingRequest.mountData = mountData;
+		mountOptions.alive = false;
+		mountOptions.occupiedByNeutral = false;
+		mountingRequest.mountData.mountEventOptions = mountOptions;
+		GameInstance.GetMountingFacility( ( ( weak< weak< GameObject > > )( GetEntity() ) ).GetGame() ).Mount( mountingRequest );
+	}
+
+	private function UnmountTrunkBody()
+	{
+		var npcBody : weak< GameObject >;
+		var mountingInfo : MountingInfo;
+		var slotID : MountingSlotId;
+		var instantUnmount : AIEvent;
+		slotID.id = 'trunk_body';
+		mountingInfo = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoSingleWithObjects( , GetVehicle(), slotID );
+		npcBody = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountingInfo.childId ) ) );
+		if( !( npcBody ) )
+		{
+			return;
+		}
+		instantUnmount = new AIEvent;
+		instantUnmount.name = 'InstantUnmount';
+		npcBody.QueueEvent( instantUnmount );
+	}
+
+	protected event OnVehiclePlayerTrunk( evt : VehiclePlayerTrunk )
+	{
+		var player : GameObject;
+		var storageBB : IBlackboard;
+		var storageData : StorageUserData;
+		player = GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject();
+		Stash.ProcessStashRetroFixes( GetVehicle() );
+		storageData = new StorageUserData;
+		storageData.storageObject = GetVehicle();
+		storageBB = GameInstance.GetBlackboardSystem( player.GetGame() ).Get( GetAllBlackboardDefs().StorageBlackboard );
+		if( storageBB )
+		{
+			storageBB.SetVariant( GetAllBlackboardDefs().StorageBlackboard.StorageData, storageData, true );
+		}
+	}
+
+	protected event OnOpenHood( evt : VehicleOpenHood )
+	{
+		var delayEvt : ToggleDoorInteractionEvent;
+		delayEvt = new ToggleDoorInteractionEvent;
+		EvaluateDoorReaction( 'hood', false );
+		ToggleInteraction( 'hood', false );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( ( ( VehicleObject )( GetEntity() ) ), delayEvt, 1.0 );
+		GetPS().SetHasAnyDoorOpen( true );
+	}
+
+	protected event OnCloseHood( evt : VehicleCloseHood )
+	{
+		var delayEvt : ToggleDoorInteractionEvent;
+		delayEvt = new ToggleDoorInteractionEvent;
+		EvaluateDoorReaction( 'hood', false );
+		ToggleInteraction( 'hood', false );
+		GameInstance.GetDelaySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).DelayEvent( GetVehicle(), delayEvt, 1.0 );
+	}
+
+	protected event OnSummonStartedEvent( evt : SummonStartedEvent )
+	{
+		if( evt.state == vehicleSummonState.EnRoute || evt.state == vehicleSummonState.AlreadySummoned )
+		{
+			CreateMappin();
+			if( evt.state == vehicleSummonState.EnRoute )
+			{
+				SendParkEvent( false );
+			}
+			if( evt.state == vehicleSummonState.AlreadySummoned )
+			{
+				HonkAndFlash();
+			}
+		}
+	}
+
+	protected event OnSummonFinishedEvent( evt : SummonFinishedEvent )
+	{
+		if( evt.state == vehicleSummonState.Arrived )
+		{
+			CreateMappin();
+			HonkAndFlash();
+			SendParkEvent( true );
+			PlaySummonArrivalSFX();
+		}
+	}
+
+	private function PlaySummonArrivalSFX()
+	{
+		var audioEvent : SoundPlayEvent;
+		audioEvent = new SoundPlayEvent;
+		audioEvent.soundName = 'ui_jingle_vehicle_arrive';
+		GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject().QueueEvent( audioEvent );
+	}
+
+	private function HonkAndFlash()
+	{
+		var lightsEvt : VehicleLightQuestToggleEvent;
+		var hornEvt : VehicleQuestHornEvent;
+		lightsEvt = new VehicleLightQuestToggleEvent;
+		lightsEvt.toggle = true;
+		lightsEvt.lightType = vehicleELightType.Default;
+		OnVehicleLightQuestToggleEvent( lightsEvt );
+		lightsEvt = new VehicleLightQuestToggleEvent;
+		lightsEvt.toggle = false;
+		lightsEvt.lightType = vehicleELightType.Default;
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), lightsEvt, 1.0 );
+		hornEvt = new VehicleQuestHornEvent;
+		hornEvt.honkTime = 2.0;
+		GetVehicle().QueueEvent( hornEvt );
+	}
+
+	private function IsPlayerVehicle()
+	{
+		if( GetVehicle().IsPlayerVehicle() )
+		{
+			GetPS().SetIsPlayerVehicle( true );
+		}
+	}
+
+	private function SetupAuxillary()
+	{
+		var vehDataPackage : weak< VehicleDataPackage_Record >;
+		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehDataPackage );
+		m_hasSpoiler = vehDataPackage.HasSpoiler();
+		m_hasSiren = vehDataPackage.HasSiren();
+		if( m_hasSpoiler )
+		{
+			m_spoilerUp = vehDataPackage.SpoilerSpeedToDeploy();
+			m_spoilerDown = vehDataPackage.SpoilerSpeedToRetract();
+		}
+		m_hasTurboCharger = vehDataPackage.HasTurboCharger();
+		if( m_hasTurboCharger )
+		{
+			m_overheatEffectBlackboard = new worldEffectBlackboard;
+			m_overheatEffectBlackboard.SetValue( 'overheatValue', 1.0 );
+		}
+	}
+
+	private function SetupWheels()
+	{
+		var record : Vehicle_Record;
+		var wheelAnimFeature : AnimFeature_CamberData;
+		var animFeatureName : CName;
+		record = GetVehicle().GetRecord();
+		wheelAnimFeature = new AnimFeature_CamberData;
+		animFeatureName = 'wheel_data';
+		wheelAnimFeature.rightFrontCamber = record.RightFrontCamber();
+		wheelAnimFeature.leftFrontCamber = record.LeftFrontCamber();
+		wheelAnimFeature.rightBackCamber = record.RightBackCamber();
+		wheelAnimFeature.leftBackCamber = record.LeftBackCamber();
+		wheelAnimFeature.rightFrontCamberOffset = Vector4.Vector3To4( record.RightFrontCamberOffset() );
+		wheelAnimFeature.leftFrontCamberOffset = Vector4.Vector3To4( record.LeftFrontCamberOffset() );
+		wheelAnimFeature.rightBackCamberOffset = Vector4.Vector3To4( record.RightBackCamberOffset() );
+		wheelAnimFeature.leftBackCamberOffset = Vector4.Vector3To4( record.LeftBackCamberOffset() );
+		AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), animFeatureName, wheelAnimFeature );
+	}
+
+	protected event OnGridDestruction( evt : VehicleGridDestructionEvent )
+	{
+		var i : Int32;
+		var gridState : Float;
+		var desiredChange : Float;
+		var owner : weak< VehicleObject >;
+		var biggestImpact : Float;
+		var broadcaster : StimBroadcasterComponent;
+		for( i = 0; i < evt.rawChange.Size(); i += 1 )
+		{
+			gridState = evt.state[ i ];
+			desiredChange = evt.desiredChange[ i ];
+			SendDestructionDataToGraph( i, gridState );
+			DetermineAdditionalEngineFX( i, gridState );
+			if( desiredChange > biggestImpact )
+			{
+				biggestImpact = desiredChange;
+			}
+		}
+		CreateHitEventOnSelf( biggestImpact );
+		owner = GetVehicle();
+		broadcaster = owner.GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			if( biggestImpact < 0.03 )
+			{
+				broadcaster.TriggerSingleBroadcast( owner, gamedataStimType.CrowdIllegalAction, 10.0 );
+			}
+			else
+			{
+				broadcaster.TriggerSingleBroadcast( owner, gamedataStimType.VehicleHit, 5.0 );
+			}
+		}
+	}
+
+	private function CreateHitEventOnSelf( force : Float )
+	{
+		var evt : gameHitEvent;
+		var vehicleID : StatsObjectID;
+		var statsDataSystem : StatsDataSystem;
+		var vehHealthPrecent : Float;
+		var mountInfo : MountingInfo;
+		var slotId : MountingSlotId;
+		var attackContext : AttackInitContext;
+		var attack : IAttack;
+		var instigator : weak< GameObject >;
+		if( force >= 0.1 )
+		{
+			vehicleID = GetVehicle().GetEntityID();
+			vehHealthPrecent = GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).GetStatPoolValue( vehicleID, gamedataStatPoolType.Health );
+			statsDataSystem = GameInstance.GetStatsDataSystem( GetVehicle().GetGame() );
+			if( vehHealthPrecent >= 10.0 )
+			{
+				evt = new gameHitEvent;
+				evt.attackData = new AttackData;
+				slotId.id = GetDriverSlotName();
+				mountInfo = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoSingleWithObjects( , GetVehicle(), slotId );
+				instigator = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountInfo.childId ) ) );
+				attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.VehicleImpact" );
+				attackContext.instigator = instigator;
+				attackContext.source = GetVehicle();
+				attack = IAttack.Create( attackContext );
+				evt.target = GetVehicle();
+				evt.attackData.SetVehicleImpactForce( statsDataSystem.GetValueFromCurve( 'vehicle_collision_damage', force, 'collision_damage' ) );
+				evt.attackData.AddFlag( hitFlag.VehicleImpact, 'VehicleImpact' );
+				evt.attackData.AddFlag( hitFlag.CannotModifyDamage, 'VehicleImpact' );
+				evt.attackData.SetSource( GetVehicle() );
+				evt.attackData.SetInstigator( instigator );
+				evt.attackData.SetAttackDefinition( attack );
+				GameInstance.GetDamageSystem( GetVehicle().GetGame() ).QueueHitEvent( evt, GetVehicle() );
+			}
+		}
+	}
+
+	private function TryToKnockDownBike()
+	{
+		var knockOverBike : KnockOverBikeEvent;
+		knockOverBike = new KnockOverBikeEvent;
+		GetVehicle().QueueEvent( knockOverBike );
+	}
+
+	public function ReactToHPChange( destruction : Float )
+	{
+		var currDmgLevel : Int32;
+		var vehicleRecord : weak< Vehicle_Record >;
+		var destroyedAppearanceName : CName;
+		var damageStageTurnOffDelayEvent : VehicleDamageStageTurnOffEvent;
+		currDmgLevel = m_damageLevel;
+		m_damageLevel = EvaluateDamageLevel( destruction );
+		if( ( ( VehicleComponentPS )( GetPS() ) ).GetIsSubmerged() )
+		{
+			return;
+		}
+		if( m_damageLevel > currDmgLevel )
+		{
+			if( m_damageLevel == 1 )
+			{
+				BreakAllDamageStageFX();
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage1', false );
+			}
+			else if( m_damageLevel == 2 )
+			{
+				BreakAllDamageStageFX();
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage2', false );
+				GetVehicle().DetachPart( 'Hood' );
+				damageStageTurnOffDelayEvent = new VehicleDamageStageTurnOffEvent;
+				GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), damageStageTurnOffDelayEvent, RandRangeF( 35.0, 55.0 ) );
+			}
+			else if( m_damageLevel == 3 )
+			{
+				vehicleRecord = GetVehicle().GetRecord();
+				BreakAllDamageStageFX();
+				destroyedAppearanceName = vehicleRecord.DestroyedAppearance();
+				TutorialCarDamageFact();
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage3', false );
+				DestroyVehicle();
+				if( IsNameValid( destroyedAppearanceName ) )
+				{
+					GetVehicle().PrefetchAppearanceChange( destroyedAppearanceName );
+				}
+				BroadcastEnvironmentalHazardStimuli();
+			}
+			m_vehicleBlackboard.SetInt( GetAllBlackboardDefs().Vehicle.DamageState, m_damageLevel );
+		}
+	}
+
+	private function DestroyVehicle()
+	{
+		var exitVehicleEvent : AIEvent;
+		if( !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( GetVehicle().GetEntityID(), gameGodModeType.Immortal ) ) )
+		{
+			GetPS().SetIsDestroyed( true );
+			DestroyMappin();
+			ToggleInteraction( '', false );
+			DisableRadio();
+			exitVehicleEvent = new AIEvent;
+			exitVehicleEvent.name = 'ExitVehicle';
+			QueueEventToAllPassengers( GetVehicle().GetGame(), GetVehicle(), exitVehicleEvent );
+		}
+	}
+
+	private function RepairVehicle()
+	{
+		GetPS().SetIsDestroyed( false );
+		CreateMappin();
+		ToggleInteraction( '', true );
+		ToggleVehicleSystems( true, true, true );
+	}
+
+	protected event OnVehicleRepairEvent( re : VehicleRepairEvent )
+	{
+		RepairVehicle();
+	}
+
+	private function DisableRadio()
+	{
+		var radioEvent : VehicleRadioEvent;
+		radioEvent = new VehicleRadioEvent;
+		radioEvent.toggle = false;
+		GetVehicle().QueueEvent( radioEvent );
+	}
+
+	private function DestroyRandomWindow()
+	{
+		var vehicleRecord : Vehicle_Record;
+		var glassArray : array< weak< VehicleDestructibleGlass_Record > >;
+		var destructionEvent : VehicleGlassDestructionEvent;
+		if( ( VehicleComponent.GetVehicleRecord( GetVehicle(), vehicleRecord ) && vehicleRecord.Destruction() ) && ( vehicleRecord.Destruction().GetGlassCount() > 1 ) )
+		{
+			vehicleRecord.Destruction().Glass( glassArray );
+			destructionEvent = new VehicleGlassDestructionEvent;
+			destructionEvent.glassName = glassArray[ RandRange( 1, glassArray.Size() ) ].Component();
+			GetVehicle().QueueEvent( destructionEvent );
+		}
+	}
+
+	private function TutorialCarDamageFact()
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( GetVehicle().GetGame() );
+		if( ( IsMountedToVehicle( GetVehicle().GetGame(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject() ) && ( questSystem.GetFact( 'car_damage_tutorial' ) == 0 ) ) && ( questSystem.GetFact( 'disable_tutorials' ) == 0 ) )
+		{
+			questSystem.SetFact( 'car_damage_tutorial', 1 );
+		}
+	}
+
+	private function BreakAllDamageStageFX( optional auxillaryFX : Bool )
+	{
+		var vehicle : GameObject;
+		vehicle = GetVehicle();
+		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage1' );
+		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage2' );
+		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage3' );
+		if( auxillaryFX )
+		{
+			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'cooler_destro_fx' );
+		}
+	}
+
+	private function SendDestructionDataToGraph( gridID : Int32, gridState : Float )
+	{
+		if( gridState >= 0.15000001 )
+		{
+			PlayCrystalDomeGlitchEffect();
+			m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.Collision, true );
+			m_vehicleBlackboard.SignalBool( GetAllBlackboardDefs().Vehicle.Collision );
+		}
+		if( gridState >= 0.40000001 )
+		{
+			if( gridID == 6 )
+			{
+				if( gridState >= 0.80000001 )
+				{
+					AnimationControllerComponent.SetInputFloat( GetVehicle(), 'wheel_f_l_destruction', 1.0 );
+				}
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'bumper_f_destruction_side_2', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'hood_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'destruction', 1.0 );
+			}
+			else if( gridID == 7 )
+			{
+				if( gridState >= 0.80000001 )
+				{
+					AnimationControllerComponent.SetInputFloat( GetVehicle(), 'wheel_f_r_destruction', 1.0 );
+				}
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'bumper_f_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'hood_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'destruction', 1.0 );
+			}
+			else if( gridID == 5 )
+			{
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'door_f_r_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'destruction', 1.0 );
+			}
+			else if( gridID == 3 )
+			{
+			}
+			else if( gridID == 1 )
+			{
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'bumper_b_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'trunk_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'destruction', 1.0 );
+			}
+			else if( gridID == 0 )
+			{
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'bumper_b_destruction_side_2', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'trunk_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'destruction', 1.0 );
+			}
+			else if( gridID == 2 )
+			{
+			}
+			else if( gridID == 4 )
+			{
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'door_f_l_destruction', 1.0 );
+				AnimationControllerComponent.SetInputFloat( GetVehicle(), 'destruction', 1.0 );
+			}
+		}
+	}
+
+	private function DetermineAdditionalEngineFX( gridID : Int32, gridState : Float )
+	{
+		if( !( m_coolerDestro ) )
+		{
+			if( ( gridID == 6 ) || ( gridID == 7 ) )
+			{
+				if( gridState >= 0.80000001 )
+				{
+					GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'cooler_destro_fx', true );
+					m_coolerDestro = true;
+				}
+			}
+		}
+	}
+
+	private function EvaluateDamageLevel( destruction : Float ) : Int32
+	{
+		var statPoolMod : PoolValueModifier_Record;
+		statPoolMod = TweakDBInterface.GetPoolValueModifierRecord( T"BaseStatPools.VehicleHealthDecay" );
+		if( ( destruction <= 75.0 ) && ( destruction > 55.0 ) )
+		{
+			m_damageLevel = 1;
+		}
+		else if( ( destruction <= 55.0 ) && ( destruction > statPoolMod.RangeEnd() ) )
+		{
+			m_damageLevel = 2;
+		}
+		else if( ( destruction <= statPoolMod.RangeEnd() ) && ( destruction > 0.0 ) )
+		{
+			m_damageLevel = 3;
+		}
+		if( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( GetVehicle().GetEntityID(), gameGodModeType.Immortal ) )
+		{
+			if( m_damageLevel > 2 )
+			{
+				m_damageLevel = 2;
+			}
+		}
+		return m_damageLevel;
+	}
+
+	protected event OnVehicleDamageStageTurnOffEvent( evt : VehicleDamageStageTurnOffEvent )
+	{
+		if( m_damageLevel == 2 )
+		{
+			BreakAllDamageStageFX();
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage1', false );
+			m_damageLevel = 1;
+		}
+	}
+
+	private function PlayCrystalDomeGlitchEffect()
+	{
+		if( GetPS().GetCrystalDomeState() )
+		{
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_fl_b', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_fl_f', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_fr_b', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_fr_f', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_ml', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_mr', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_ol', true );
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'crystal_dome_or', true );
+		}
+	}
+
+	protected event OnVehicleOnPartDetached( evt : VehicleOnPartDetachedEvent )
+	{
+		var partName : CName;
+		partName = evt.partName;
+		if( partName == 'Trunk' )
+		{
+			GetPS().SetDoorState( EVehicleDoor.trunk, VehicleDoorState.Detached, false );
+		}
+		else if( partName == 'Hood' )
+		{
+			GetPS().SetDoorState( EVehicleDoor.hood, VehicleDoorState.Detached, false );
+		}
+		else if( ( ( partName == 'DoorFrontLeft' || partName == 'DoorFrontLeft_A' ) || partName == 'DoorFrontLeft_B' ) || partName == 'DoorFrontLeft_C' )
+		{
+			GetPS().SetDoorState( EVehicleDoor.seat_front_left, VehicleDoorState.Detached, false );
+		}
+		else if( ( ( partName == 'DoorFrontRight' || partName == 'DoorFrontRight_A' ) || partName == 'DoorFrontRight_B' ) || partName == 'DoorFrontRight_C' )
+		{
+			GetPS().SetDoorState( EVehicleDoor.seat_front_right, VehicleDoorState.Detached, false );
+		}
+		else if( partName == 'DoorBackLeft' )
+		{
+			GetPS().SetDoorState( EVehicleDoor.seat_back_left, VehicleDoorState.Detached, false );
+		}
+		else if( partName == 'DoorBackRight' )
+		{
+			GetPS().SetDoorState( EVehicleDoor.seat_back_right, VehicleDoorState.Detached, false );
+		}
+	}
+
+	protected event OnVehicleRadioStationInitialized( evt : VehicleRadioStationInitialized )
+	{
+		m_radioState = true;
+		m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehRadioState, true );
+		m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
+	}
+
+	protected event OnVehicleRadioEvent( evt : VehicleRadioEvent )
+	{
+		var toggle : Bool;
+		var setStation : Bool;
+		var station : Int32;
+		var uiRadioEvent : UIVehicleRadioEvent;
+		var uiSystem : UISystem;
+		toggle = evt.toggle;
+		setStation = evt.setStation;
+		station = evt.station;
+		uiSystem = GameInstance.GetUISystem( GetVehicle().GetGame() );
+		uiRadioEvent = new UIVehicleRadioEvent;
+		if( toggle )
+		{
+			if( !( m_radioState ) )
+			{
+				GetVehicle().ToggleRadioReceiver( true );
+				m_radioState = true;
+				m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehRadioState, true );
+				m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
+				uiSystem.QueueEvent( uiRadioEvent );
+			}
+			else
+			{
+				GetVehicle().NextRadioReceiverStation();
+				m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
+				uiSystem.QueueEvent( uiRadioEvent );
+			}
+		}
+		else if( !( toggle ) )
+		{
+			GetVehicle().ToggleRadioReceiver( false );
+			if( m_radioState )
+			{
+				m_radioState = false;
+				m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehRadioState, false );
+			}
+		}
+		if( setStation )
+		{
+			GetVehicle().SetRadioReceiverStation( ( ( Uint32 )( station ) ) );
+			m_radioState = true;
+			m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehRadioState, true );
+			m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
+			uiSystem.QueueEvent( uiRadioEvent );
+			return false;
+		}
+	}
+
+	protected event OnVehicleRadioTierEvent( evt : VehicleRadioTierEvent )
+	{
+		GetVehicle().SetRadioTier( evt.radioTier, evt.overrideTier );
+	}
+
+	private function SendParkEvent( park : Bool )
+	{
+		var parkEvent : VehicleParkedEvent;
+		if( GetVehicle() == ( ( BikeObject )( GetVehicle() ) ) )
+		{
+			parkEvent = new VehicleParkedEvent;
+			parkEvent.park = park;
+			GetVehicle().QueueEvent( parkEvent );
+		}
+	}
+
+	protected event OnVehicleLightQuestToggleEvent( evt : VehicleLightQuestToggleEvent )
+	{
+		var vehController : vehicleController;
+		var toggle : Bool;
+		var lightType : vehicleELightType;
+		toggle = evt.toggle;
+		lightType = evt.lightType;
+		vehController = GetVehicleController();
+		vehController.ToggleLights( toggle, lightType );
+	}
+
+	protected event OnVehicleCycleLightsEvent( evt : VehicleCycleLightsEvent )
+	{
+		GetVehicleControllerPS().CycleLightMode();
+	}
+
+	protected event OnVehicleQuestSirenEvent( evt : VehicleQuestSirenEvent )
+	{
+		if( m_hasSiren )
+		{
+			ToggleSiren( GetPS().GetSirenLightsState(), GetPS().GetSirenSoundsState() );
+		}
+	}
+
+	protected event OnVehicleChaseTargetEvent( evt : VehicleChaseTargetEvent )
+	{
+		if( evt.inProgress )
+		{
+			ToggleSiren( true, true );
+		}
+	}
+
+	private function CanShowMappin() : Bool
+	{
+		var bb : IBlackboard;
+		if( GetVehicle().IsPrevention() && GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).IsPreventionVehiclePrototypeEnabled() )
+		{
+			return true;
+		}
+		bb = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).Get( GetAllBlackboardDefs().VehicleSummonData );
+		if( bb )
+		{
+			return vehicleGarageState.SummonAvailable == ( ( vehicleGarageState )( bb.GetUint( GetAllBlackboardDefs().VehicleSummonData.GarageState ) ) );
+		}
+		return false;
+	}
+
+	private function CreateMappin()
+	{
+		var mappinData : MappinData;
+		var system : MappinSystem;
+		var isBike : Bool;
+		if( CanShowMappin() )
+		{
+			if( m_mappinID.value == ( ( Uint64 )( 0 ) ) )
+			{
+				system = GameInstance.GetMappinSystem( GetVehicle().GetGame() );
+				isBike = GetVehicle() == ( ( BikeObject )( GetVehicle() ) );
+				mappinData.mappinType = T"Mappins.QuestDynamicMappinDefinition";
+				mappinData.variant = ( ( GetVehicle().IsPrevention() ) ? ( gamedataMappinVariant.Zzz04_PreventionVehicleVariant ) : ( ( ( isBike ) ? ( gamedataMappinVariant.Zzz03_MotorcycleVariant ) : ( gamedataMappinVariant.VehicleVariant ) ) ) );
+				mappinData.active = true;
+				m_mappinID = system.RegisterVehicleMappin( mappinData, GetVehicle(), 'vehMappin' );
+			}
+		}
+	}
+
+	private function DestroyMappin()
+	{
+		var system : MappinSystem;
+		if( m_mappinID.value != ( ( Uint64 )( 0 ) ) )
+		{
+			system = GameInstance.GetMappinSystem( GetVehicle().GetGame() );
+			system.UnregisterMappin( m_mappinID );
+		}
+	}
+
+	protected function RequestHUDRefresh()
+	{
+		var request : RefreshActorRequest;
+		request = new RefreshActorRequest;
+		request.ownerID = GetVehicle().GetEntityID();
+		GetVehicle().GetHudManager().QueueRequest( request );
+	}
+
+	protected function SetupListeners()
+	{
+		SetupGameTimeToBBListener();
+		SetupVehicleTPPBBListener();
+		SetupVehicleSpeedBBListener();
+		SetupVehicleRPMBBListener();
+	}
+
+	protected function UnregisterListeners()
+	{
+		UnregisterGameTimeToBBListener();
+		UnregisterVehicleTPPBBListener();
+		UnregisterVehicleSpeedBBListener();
+		UnregisterVehicleRPMBBListener();
+	}
+
+	protected function SetupGameTimeToBBListener()
+	{
+		var delay : GameTime;
+		var evt : MinutePassedEvent;
+		if( m_timeSystemCallbackID == ( ( Uint32 )( 0 ) ) )
+		{
+			evt = new MinutePassedEvent;
+			delay = GameTime.MakeGameTime( 0, 0, 1, 0 );
+			m_timeSystemCallbackID = GameInstance.GetTimeSystem( GetVehicle().GetGame() ).RegisterDelayedListener( GetVehicle(), evt, delay, -1 );
+			PassGameTimeToVehBB();
+		}
+	}
+
+	protected event OnMinutePassedEvent( evt : MinutePassedEvent )
+	{
+		PassGameTimeToVehBB();
+	}
+
+	protected function PassGameTimeToVehBB()
+	{
+		var timeSys : TimeSystem;
+		var currTime : GameTime;
+		var timeString : String;
+		var hours : Int32;
+		timeSys = GameInstance.GetTimeSystem( GetVehicle().GetGame() );
+		currTime = timeSys.GetGameTime();
+		hours = GameTime.Hours( currTime );
+		if( hours > 12 )
+		{
+			hours = hours - 12;
+		}
+		timeString = ( StrReplace( SpaceFill( IntToString( hours ), 2, ESpaceFillMode.JustifyRight ), " ", "0" ) + ":" ) + StrReplace( SpaceFill( IntToString( GameTime.Minutes( currTime ) ), 2, ESpaceFillMode.JustifyRight ), " ", "0" );
+		m_vehicleBlackboard.SetString( GetAllBlackboardDefs().Vehicle.GameTime, timeString );
+	}
+
+	protected function UnregisterGameTimeToBBListener()
+	{
+		if( m_timeSystemCallbackID > ( ( Uint32 )( 0 ) ) )
+		{
+			GameInstance.GetTimeSystem( GetVehicle().GetGame() ).UnregisterListener( m_timeSystemCallbackID );
+			m_timeSystemCallbackID = ( ( Uint32 )( 0 ) );
+		}
+	}
+
+	protected function SetupVehicleTPPBBListener()
+	{
+		var bbSys : BlackboardSystem;
+		var activeVehicleUIBlackboard : weak< IBlackboard >;
+		if( !( m_vehicleTPPCallbackID ) )
+		{
+			bbSys = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() );
+			activeVehicleUIBlackboard = bbSys.Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+			m_vehicleTPPCallbackID = activeVehicleUIBlackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsTPPCameraOn, this, 'OnVehicleCameraChange' );
+		}
+	}
+
+	protected function UnregisterVehicleTPPBBListener()
+	{
+		var bbSys : BlackboardSystem;
+		var activeVehicleUIBlackboard : weak< IBlackboard >;
+		if( m_vehicleTPPCallbackID )
+		{
+			bbSys = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() );
+			activeVehicleUIBlackboard = bbSys.Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+			activeVehicleUIBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsTPPCameraOn, m_vehicleTPPCallbackID );
+		}
+	}
+
+	protected function OnVehicleCameraChange( state : Bool )
+	{
+		var animFeature : AnimFeature_VehicleState;
+		if( GetPS().GetCrystalDomeState() )
+		{
+			animFeature = new AnimFeature_VehicleState;
+			animFeature.tppEnabled = !( state );
+			AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), 'VehicleState', animFeature );
+			TogglePanzerShadowMeshes( state );
+		}
+	}
+
+	protected function SetupVehicleSpeedBBListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( !( m_vehicleSpeedCallbackID ) )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			m_vehicleSpeedCallbackID = vehicleDefBlackboard.RegisterListenerFloat( GetAllBlackboardDefs().Vehicle.SpeedValue, this, 'OnVehicleSpeedChange' );
+		}
+	}
+
+	protected function UnregisterVehicleSpeedBBListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( m_vehicleSpeedCallbackID )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			vehicleDefBlackboard.UnregisterListenerFloat( GetAllBlackboardDefs().Vehicle.SpeedValue, m_vehicleSpeedCallbackID );
+		}
+	}
+
+	protected function SetupVehicleRPMBBListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( !( m_vehicleRPMCallbackID ) )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			m_vehicleRPMCallbackID = vehicleDefBlackboard.RegisterListenerFloat( GetAllBlackboardDefs().Vehicle.RPMValue, this, 'OnVehicleRPMChange' );
+		}
+	}
+
+	protected function UnregisterVehicleRPMBBListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( m_vehicleRPMCallbackID )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			vehicleDefBlackboard.UnregisterListenerFloat( GetAllBlackboardDefs().Vehicle.RPMValue, m_vehicleRPMCallbackID );
+		}
+	}
+
+	protected function OnVehicleSpeedChange( speed : Float )
+	{
+		var animFeature : AnimFeature_PartData;
+		var vehDataPackage : weak< VehicleDataPackage_Record >;
+		var doors : array< CName >;
+		if( m_hasSpoiler )
+		{
+			if( !( m_spoilerDeployed ) )
+			{
+				if( speed >= m_spoilerUp )
+				{
+					animFeature = new AnimFeature_PartData;
+					animFeature.state = 1;
+					animFeature.duration = 0.75;
+					AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), 'spoiler', animFeature );
+					m_spoilerDeployed = true;
+				}
+			}
+			else if( speed <= m_spoilerDown )
+			{
+				animFeature = new AnimFeature_PartData;
+				animFeature.state = 3;
+				animFeature.duration = 0.75;
+				AnimationControllerComponent.ApplyFeatureToReplicate( GetVehicle(), 'spoiler', animFeature );
+				m_spoilerDeployed = false;
+			}
+		}
+		if( GetPS().GetHasAnyDoorOpen() )
+		{
+			if( m_ignoreAutoDoorClose )
+			{
+				return;
+			}
+			GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehDataPackage );
+			if( speed < 0.0 )
+			{
+				speed = AbsF( speed );
+			}
+			if( speed < 0.5 )
+			{
+				return;
+			}
+			if( speed >= vehDataPackage.SpeedToClose() )
+			{
+				doors.PushBack( 'seat_front_left' );
+				doors.PushBack( 'seat_front_right' );
+				doors.PushBack( 'hood' );
+				if( !( vehDataPackage.SlidingRearDoors() ) )
+				{
+					doors.PushBack( 'seat_back_left' );
+					doors.PushBack( 'seat_back_right' );
+				}
+				if( !( vehDataPackage.BarnDoorsTailgate() ) )
+				{
+					doors.PushBack( 'trunk' );
+				}
+				CloseSelectedDoors( doors );
+				doors.Clear();
+			}
+		}
+	}
+
+	private function CloseSelectedDoors( doors : array< CName > )
+	{
+		var i : Int32;
+		var size : Int32;
+		var PSVehicleDoorCloseRequest : VehicleDoorClose;
+		size = doors.Size();
+		for( i = 0; i < size; i += 1 )
+		{
+			PSVehicleDoorCloseRequest = new VehicleDoorClose;
+			PSVehicleDoorCloseRequest.slotID = doors[ i ];
+			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSVehicleDoorCloseRequest );
+		}
+		GetPS().SetHasAnyDoorOpen( false );
+	}
+
+	protected function OnVehicleRPMChange( rpm : Float )
+	{
+		var value : Float;
+		if( rpm >= 2500.0 )
+		{
+			if( !( m_overheatActive ) )
+			{
+				if( !( m_overheatEffectBlackboard ) )
+				{
+					m_overheatEffectBlackboard = new worldEffectBlackboard;
+					m_overheatEffectBlackboard.SetValue( 'overheatValue', 1.0 );
+				}
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'overheating', false, m_overheatEffectBlackboard );
+				m_overheatActive = true;
+			}
+			value = ( 7100.0 - rpm ) / 7100.0;
+			m_overheatEffectBlackboard.SetValue( 'overheatValue', value );
+		}
+		else if( m_overheatActive )
+		{
+			GameObjectEffectHelper.BreakEffectLoopEvent( GetVehicle(), 'overheating' );
+			m_overheatActive = false;
+		}
+	}
+
+	protected function StartEffectEvent( self : GameObject, effectName : CName, optional shouldPersist : Bool, optional blackboard : worldEffectBlackboard )
+	{
+		var evt : entSpawnEffectEvent;
+		if( !( IsNameValid( effectName ) ) )
+		{
+			return;
+		}
+		evt = new entSpawnEffectEvent;
+		evt.effectName = effectName;
+		evt.persistOnDetach = shouldPersist;
+		evt.blackboard = blackboard;
+		GetVehicle().QueueEvent( evt );
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var releaseTime : Float;
+		var sirenState : Bool;
+		var radioEvent : VehicleRadioEvent;
+		var vehicle : VehicleObject;
+		if( GetPS().GetIsDestroyed() )
+		{
+			return false;
+		}
+		vehicle = GetVehicle();
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		if( ListenerAction.GetName( action ) == 'VehicleInsideWheel' )
+		{
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( vehicle, 'VehicleBlockRadioInput' ) ) )
+			{
+				if( ListenerAction.IsButtonJustPressed( action ) )
+				{
+					m_radioPressTime = EngineTime.ToFloat( GameInstance.GetEngineTime( vehicle.GetGame() ) );
+				}
+				if( ListenerAction.IsButtonJustReleased( action ) )
+				{
+					releaseTime = EngineTime.ToFloat( GameInstance.GetEngineTime( vehicle.GetGame() ) );
+					if( releaseTime <= ( m_radioPressTime + 0.2 ) )
+					{
+						radioEvent = new VehicleRadioEvent;
+						radioEvent.toggle = true;
+						vehicle.QueueEvent( radioEvent );
+					}
+				}
+			}
+		}
+		if( ListenerAction.GetName( action ) == 'VehicleHorn' )
+		{
+			if( m_hasSiren )
+			{
+				sirenState = GetPS().GetSirenState();
+				if( ListenerAction.IsButtonJustPressed( action ) )
+				{
+					m_hornPressTime = EngineTime.ToFloat( GameInstance.GetEngineTime( vehicle.GetGame() ) );
+				}
+				if( ListenerAction.IsButtonJustReleased( action ) )
+				{
+					releaseTime = EngineTime.ToFloat( GameInstance.GetEngineTime( GetVehicle().GetGame() ) );
+					if( releaseTime <= ( m_hornPressTime + 0.2 ) )
+					{
+						ToggleSiren( !( sirenState ), !( sirenState ) );
+					}
+					if( sirenState )
+					{
+						vehicle.ToggleHorn( false, true );
+					}
+					else
+					{
+						vehicle.ToggleHorn( false );
+					}
+					m_hornOn = false;
+				}
+				if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_HOLD_COMPLETE )
+				{
+					if( sirenState )
+					{
+						vehicle.ToggleHorn( true, true );
+					}
+					else
+					{
+						vehicle.ToggleHorn( true );
+					}
+					vehicle.GetStimBroadcasterComponent().TriggerSingleBroadcast( vehicle, gamedataStimType.VehicleHorn );
+					m_hornOn = true;
+				}
+			}
+			else
+			{
+				if( ( ListenerAction.GetValue( action ) == 1.0 ) && !( m_hornOn ) )
+				{
+					vehicle.GetStimBroadcasterComponent().TriggerSingleBroadcast( vehicle, gamedataStimType.VehicleHorn );
+					vehicle.ToggleHorn( true );
+					m_hornOn = true;
+				}
+				else if( ( ListenerAction.GetValue( action ) < 1.0 ) && m_hornOn )
+				{
+					vehicle.ToggleHorn( false );
+					m_hornOn = false;
+				}
+			}
+		}
+	}
+
+	protected event OnVehicleQuestHornEvent( evt : VehicleQuestHornEvent )
+	{
+		var hornOffDelayEvent : VehicleHornOffDelayEvent;
+		var delayTimer : Float;
+		GetVehicle().ToggleHorn( true );
+		m_hornOn = true;
+		delayTimer = evt.honkTime;
+		if( delayTimer == 0.0 )
+		{
+			delayTimer = 4.0;
+		}
+		hornOffDelayEvent = new VehicleHornOffDelayEvent;
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), hornOffDelayEvent, delayTimer );
+	}
+
+	protected event OnVehicleHornProbEvent( evt : VehicleHornProbsEvent )
+	{
+		var hornOffDelayEvent : VehicleHornOffDelayEvent;
+		var delayTimer : Float;
+		var randomDraw : Float;
+		var vehicleObject : weak< VehicleObject >;
+		randomDraw = RandRangeF( 0.0, 1.0 );
+		if( randomDraw <= evt.probability )
+		{
+			vehicleObject = GetVehicle();
+			vehicleObject.ToggleHorn( true );
+			m_hornOn = true;
+			delayTimer = RandRangeF( evt.honkMinTime, evt.honkMaxTime );
+			if( delayTimer == 0.0 )
+			{
+				delayTimer = 3.0;
+			}
+			hornOffDelayEvent = new VehicleHornOffDelayEvent;
+			GameInstance.GetDelaySystem( vehicleObject.GetGame() ).DelayEvent( vehicleObject, hornOffDelayEvent, delayTimer );
+		}
+	}
+
+	protected event OnVehicleHornOffDelayEvent( evt : VehicleHornOffDelayEvent )
+	{
+		GetVehicle().ToggleHorn( false );
+		m_hornOn = false;
+	}
+
+	protected function ToggleSiren( lights : Bool, sounds : Bool )
+	{
+		if( m_hasSiren && !( GetPS().GetIsDestroyed() ) )
+		{
+			GetVehicleController().ToggleLights( lights, vehicleELightType.Utility );
+			if( lights )
+			{
+				StartEffectEvent( GetVehicle(), 'police_sign_combat', true );
+			}
+			else if( !( lights ) )
+			{
+				StartEffectEvent( GetVehicle(), 'police_sign_default', true );
+			}
+			GetPS().SetSirenLightsState( lights );
+			GetVehicle().ToggleSiren( sounds );
+			GetPS().SetSirenSoundsState( sounds );
+			if( lights || sounds )
+			{
+				GetPS().SetSirenState( true );
+			}
+			else
+			{
+				GetPS().SetSirenState( false );
+			}
+		}
+	}
+
+	protected event OnVehicleSirenDelayEvent( evt : VehicleSirenDelayEvent )
+	{
+		ToggleSiren( evt.lights, evt.sounds );
+	}
+
+	protected event OnVehicleFlippedOverEvent( evt : VehicleFlippedOverEvent )
+	{
+		if( !( evt.isFlippedOver ) )
+		{
+			RemoveVehicleDOT();
+		}
+	}
+
+	protected event OnHasVehicleBeenFlippedOverForSomeTimeEvent( evt : HasVehicleBeenFlippedOverForSomeTimeEvent )
+	{
+		var isDestroyed : Bool;
+		var godMode : gameGodModeType;
+		isDestroyed = GetPS().GetIsDestroyed();
+		if( isDestroyed )
+		{
+			return false;
+		}
+		if( GetImmortality( GetVehicle(), godMode ) )
+		{
+			return false;
+		}
+		ApplyVehicleDOT();
+	}
+
+	protected function ApplyVehicleDOT( optional type : CName )
+	{
+		var statusEffectSystem : StatusEffectSystem;
+		statusEffectSystem = GameInstance.GetStatusEffectSystem( GetVehicle().GetGame() );
+		switch( type )
+		{
+			case 'high':
+				if( !( statusEffectSystem.HasStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleHighDamageOverTimeEffect" ) ) )
+				{
+					statusEffectSystem.ApplyStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleHighDamageOverTimeEffect", GetVehicle().GetRecordID(), GetVehicle().GetEntityID() );
+				}
+			break;
+			default:
+				if( !( statusEffectSystem.HasStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleBaseDamageOverTimeEffect" ) ) )
+				{
+					statusEffectSystem.ApplyStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleBaseDamageOverTimeEffect", GetVehicle().GetRecordID(), GetVehicle().GetEntityID() );
+				}
+			break;
+		}
+	}
+
+	protected function RemoveVehicleDOT()
+	{
+		var statusEffectSystem : StatusEffectSystem;
+		statusEffectSystem = GameInstance.GetStatusEffectSystem( GetVehicle().GetGame() );
+		if( statusEffectSystem.HasStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleHighDamageOverTimeEffect" ) )
+		{
+			statusEffectSystem.RemoveStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleHighDamageOverTimeEffect" );
+		}
+		if( statusEffectSystem.HasStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleBaseDamageOverTimeEffect" ) )
+		{
+			statusEffectSystem.RemoveStatusEffect( GetVehicle().GetEntityID(), T"BaseStatusEffect.VehicleBaseDamageOverTimeEffect" );
+		}
+	}
+
+	protected event OnVehicleQuestAVThrusterEvent( evt : VehicleQuestAVThrusterEvent )
+	{
+		SetupThrusterFX();
+	}
+
+	protected event OnVehicleQuestWindowDestructionEvent( evt : VehicleQuestWindowDestructionEvent )
+	{
+		var windowDestructionEvent : VehicleGlassDestructionEvent;
+		var windowName : CName;
+		windowDestructionEvent = new VehicleGlassDestructionEvent;
+		if( evt.windowName != '' )
+		{
+			windowName = evt.windowName;
+		}
+		else
+		{
+			windowName = EnumValueToName( 'vehicleQuestWindowDestruction', ( ( Int32 )( evt.window ) ) );
+		}
+		windowDestructionEvent.glassName = windowName;
+		GetVehicle().QueueEvent( windowDestructionEvent );
+	}
+
+	protected event OnFactChangedEvent( evt : FactChangedEvent )
+	{
+		var uiSystem : UISystem;
+		var forwardEvent : VehicleForwardRaceCheckpointFactEvent;
+		if( evt.GetFactName() == 'sq024_current_race_checkpoint_fact_add' )
+		{
+			uiSystem = GameInstance.GetUISystem( GetVehicle().GetGame() );
+			forwardEvent = new VehicleForwardRaceCheckpointFactEvent;
+			uiSystem.QueueEvent( forwardEvent );
+		}
+	}
+
+	protected event OnVehicleRaceQuestEvent( evt : VehicleRaceQuestEvent )
+	{
+		switch( evt.mode )
+		{
+			case vehicleRaceUI.RaceStart:
+				ToggleRaceClock( true );
+			break;
+			case vehicleRaceUI.RaceEnd:
+				ToggleRaceClock( false );
+			break;
+		}
+	}
+
+	private function ToggleRaceClock( toggle : Bool )
+	{
+		var delaySystem : DelaySystem;
+		var raceClockEvent : VehicleRaceClockUpdateEvent;
+		delaySystem = GameInstance.GetDelaySystem( GetVehicle().GetGame() );
+		if( toggle )
+		{
+			raceClockEvent = new VehicleRaceClockUpdateEvent;
+			m_raceClockTickID = delaySystem.TickOnEvent( GetVehicle(), raceClockEvent, 600.0 );
+		}
+		else
+		{
+			delaySystem.CancelTick( m_raceClockTickID );
+		}
+	}
+
+	protected event OnVehicleRaceClockUpdateEvent( evt : VehicleRaceClockUpdateEvent )
+	{
+		var uiSystem : UISystem;
+		var forwardEvent : VehicleForwardRaceClockUpdateEvent;
+		uiSystem = GameInstance.GetUISystem( GetVehicle().GetGame() );
+		forwardEvent = new VehicleForwardRaceClockUpdateEvent;
+		uiSystem.QueueEvent( forwardEvent );
+	}
+
+	protected function CleanUpRace()
+	{
+		var uiSystem : UISystem;
+		uiSystem = GameInstance.GetUISystem( GetVehicle().GetGame() );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).CancelTick( m_raceClockTickID );
+		uiSystem.PopGameContext( UIGameContext.VehicleRace );
+	}
+
+	private function CreateObjectActionsCallbackController( instigator : weak< Entity > )
+	{
+		m_objectActionsCallbackCtrl = gameObjectActionsCallbackController.Create( GetEntity(), instigator, GetVehicle().GetGame() );
+		m_objectActionsCallbackCtrl.RegisterSkillCheckCallbacks();
+	}
+
+	private function DestroyObjectActionsCallbackController()
+	{
+		m_objectActionsCallbackCtrl.UnregisterSkillCheckCallbacks();
+		m_objectActionsCallbackCtrl = NULL;
+	}
+
+	protected event OnObjectActionRefreshEvent( evt : gameObjectActionRefreshEvent )
+	{
+		if( m_objectActionsCallbackCtrl )
+		{
+			m_objectActionsCallbackCtrl.UnlockNotifications();
+			DetermineInteractionState();
+		}
+	}
+
+	protected event OnVehicleQuestToggleEngineEvent( evt : VehicleQuestToggleEngineEvent )
+	{
+		ToggleVehicleSystems( evt.toggle, true, true );
+	}
+
+	protected event OnSetIgnoreAutoDoorCloseEvent( evt : SetIgnoreAutoDoorCloseEvent )
+	{
+		m_ignoreAutoDoorClose = evt.set;
+	}
+
+}
+
+class DisableAlarmEvent extends Event
+{
+}
+
+class ToggleDoorInteractionEvent extends Event
+{
+}
+
+class SetIgnoreAutoDoorCloseEvent extends Event
+{
+	var set : Bool;
+}
+
+class VehicleHealthStatPoolListener extends CustomValueStatPoolsListener
+{
+	var m_owner : weak< VehicleObject >;
+
+	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		if( m_owner && m_owner.GetVehicleComponent() )
+		{
+			m_owner.GetVehicleComponent().ReactToHPChange( newValue );
+		}
+	}
+
+}
+
+class VehicleRadioTierEvent extends Event
+{
+	editable var radioTier : Uint32;
+	default radioTier = 1;
+	editable var overrideTier : Bool;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Toggle or set Radio Tier";
+	}
+
+}
+
+class VehicleReadyInteractionDelayEvent extends Event
+{
+}
+
+class VehicleExternalDoorRequestEvent extends Event
+{
+	var slotName : CName;
+	var autoClose : Bool;
+	var autoCloseTime : Float;
+}
+
+class VehicleExternalWindowRequestEvent extends Event
+{
+	var slotName : CName;
+	var shouldOpen : Bool;
+	var speed : CName;
+}
+
+class VehicleCycleLightsEvent extends Event
+{
+}
+
+class MinutePassedEvent extends Event
+{
+}
+
+class DumpBodyWorkspotDelayEvent extends Event
+{
+}
+
+class PickupBodyWorkspotDelayEvent extends Event
+{
+}
+
+class VehicleDumpBodyCloseTrunkEvent extends Event
+{
+}
+
+class VehicleLightSetupEvent extends Event
+{
+}
+
+class VehicleCrystalDomeOffDelayEvent extends Event
+{
+}
+
+class VehicleCrystalDomeOnDelayEvent extends Event
+{
+}
+
+class VehicleCrystalDomeMeshVisibilityDelayEvent extends Event
+{
+}
+
+class VehicleSirenDelayEvent extends Event
+{
+	var lights : Bool;
+	var sounds : Bool;
+}
+
+class VehicleDamageStageTurnOffEvent extends Event
+{
+}
+
+class VehicleHornOffDelayEvent extends Event
+{
+}
+
+class VehicleForwardRaceCheckpointFactEvent extends Event
+{
+}
+
+class VehicleRaceClockUpdateEvent extends TickableEvent
+{
+}
+
+class VehicleForwardRaceClockUpdateEvent extends Event
+{
+}
+
+exec function EnableVehicleToggleSummonMode( gameInstance : GameInstance, value : String )
+{
+	var blackboard : IBlackboard;
+	var intValue : Int32;
+	intValue = StringToInt( value );
+	blackboard = GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().GameplaySettings );
+	if( intValue == 1 )
+	{
+		blackboard.SetBool( GetAllBlackboardDefs().GameplaySettings.EnableVehicleToggleSummonMode, true );
+	}
+	else
+	{
+		blackboard.SetBool( GetAllBlackboardDefs().GameplaySettings.EnableVehicleToggleSummonMode, false );
+	}
+}
+

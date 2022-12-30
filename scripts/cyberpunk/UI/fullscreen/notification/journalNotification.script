@@ -1,0 +1,888 @@
+class HackingRewardNotificationEvent extends Event
+{
+	var m_text : String;
+	var m_icons : array< String >;
+}
+
+import class QuestUpdateNotificationViewData extends GenericNotificationViewData
+{
+	import var questEntryId : String;
+	import var canBeMerged : Bool;
+	import var animation : CName;
+	import var SMSText : String;
+	var dontRemoveOnRequest : Bool;
+	var entryHash : Int32;
+	var rewardSC : Int32;
+	var rewardXP : Int32;
+	var priority : EGenericNotificationPriority;
+	default priority = EGenericNotificationPriority.Default;
+
+	public export override function CanMerge( data : GenericNotificationViewData ) : Bool
+	{
+		var compareTo : QuestUpdateNotificationViewData;
+		compareTo = ( ( QuestUpdateNotificationViewData )( data ) );
+		return ( ( ( compareTo != NULL ) && compareTo.questEntryId == questEntryId ) && canBeMerged ) && compareTo.canBeMerged;
+	}
+
+	public export override function OnRemoveNotification( data : IScriptable ) : Bool
+	{
+		var requestData : JournalEntryNotificationRemoveRequestData;
+		var requestHash : Int32;
+		requestData = ( ( JournalEntryNotificationRemoveRequestData )( data ) );
+		requestHash = ( ( Int32 )( requestData.entryHash ) );
+		return ( ( requestData != NULL ) && ( requestHash == entryHash ) ) && !( dontRemoveOnRequest );
+	}
+
+	public export override function GetPriority() : Int32
+	{
+		return ( ( Int32 )( priority ) );
+	}
+
+}
+
+class JournalEntryNotificationRemoveRequestData extends IScriptable
+{
+	var entryHash : Uint32;
+}
+
+import class PhoneMessageNotificationViewData extends QuestUpdateNotificationViewData
+{
+	import var threadHash : Int32;
+	import var contactHash : Int32;
+
+	public override function GetPriority() : Int32
+	{
+		return ( ( Int32 )( EGenericNotificationPriority.Medium ) );
+	}
+
+	public export override function CanMerge( data : GenericNotificationViewData ) : Bool
+	{
+		var compareTo : PhoneMessageNotificationViewData;
+		compareTo = ( ( PhoneMessageNotificationViewData )( data ) );
+		return ( compareTo != NULL ) && ( threadHash == compareTo.threadHash );
+	}
+
+}
+
+class JournalNotificationQueue extends gameuiGenericNotificationGameController
+{
+	private var m_showDuration : Float;
+	default m_showDuration = 6.0f;
+	private var m_currencyNotification : CName;
+	default m_currencyNotification = 'notification_currency';
+	private var m_shardNotification : CName;
+	default m_shardNotification = 'notification_shard';
+	private var m_itemNotification : CName;
+	default m_itemNotification = 'Item_Received_SMALL';
+	private var m_questNotification : CName;
+	default m_questNotification = 'notification_quest';
+	private var m_genericNotification : CName;
+	default m_genericNotification = 'notification';
+	private var m_messageNotification : CName;
+	default m_messageNotification = 'notification_message';
+	private var m_journalMgr : weak< JournalManager >;
+	private var m_newAreablackboard : weak< IBlackboard >;
+	private var m_newAreaDef : UI_MapDef;
+	private var m_newAreaID : CallbackHandle;
+	private var m_tutorialBlackboard : weak< IBlackboard >;
+	private var m_tutorialDef : UIGameDataDef;
+	private var m_tutorialID : CallbackHandle;
+	private var m_tutorialDataID : CallbackHandle;
+	private var m_isHiddenByTutorial : Bool;
+	private var m_customQuestNotificationblackBoardID : CallbackHandle;
+	private var m_customQuestNotificationblackboardDef : UI_CustomQuestNotificationDef;
+	private var m_customQuestNotificationblackboard : weak< IBlackboard >;
+	private var m_transactionSystem : weak< TransactionSystem >;
+	private var m_playerPuppet : weak< GameObject >;
+	private var m_activeVehicleBlackboard : weak< IBlackboard >;
+	private var m_mountBBConnectionId : CallbackHandle;
+	private var m_isPlayerMounted : Bool;
+	private var blackboard : weak< IBlackboard >;
+	private var uiSystemBB : UI_SystemDef;
+	private var uiSystemId : CallbackHandle;
+	private var trackedMappinId : CallbackHandle;
+	private var m_uiSystem : UISystem;
+	private var m_shardTransactionListener : weak< InventoryScriptListener >;
+
+	public export override function GetShouldSaveState() : Bool
+	{
+		return true;
+	}
+
+	public export override function GetID() : Int32
+	{
+		return ( ( Int32 )( GenericNotificationType.JournalNotification ) );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		var shardCallback : ShardCollectedInventoryCallback;
+		m_journalMgr = GameInstance.GetJournalManager( playerPuppet.GetGame() );
+		m_journalMgr.RegisterScriptCallback( this, 'OnJournalUpdate', gameJournalListenerType.State );
+		m_journalMgr.RegisterScriptCallback( this, 'OnJournalEntryVisited', gameJournalListenerType.Visited );
+		m_activeVehicleBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+		m_mountBBConnectionId = m_activeVehicleBlackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsPlayerMounted, this, 'OnPlayerMounted' );
+		m_isPlayerMounted = m_activeVehicleBlackboard.GetBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsPlayerMounted );
+		m_playerPuppet = playerPuppet;
+		m_uiSystem = GameInstance.GetUISystem( playerPuppet.GetGame() );
+		shardCallback = new ShardCollectedInventoryCallback;
+		shardCallback.m_notificationQueue = this;
+		shardCallback.m_journalManager = m_journalMgr;
+		m_transactionSystem = GameInstance.GetTransactionSystem( playerPuppet.GetGame() );
+		m_shardTransactionListener = m_transactionSystem.RegisterInventoryListener( playerPuppet, shardCallback );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		m_journalMgr.UnregisterScriptCallback( this, 'OnJournalUpdate' );
+		m_transactionSystem.UnregisterInventoryListener( playerPuppet, m_shardTransactionListener );
+		m_shardTransactionListener = NULL;
+	}
+
+	protected event OnInitialize()
+	{
+		m_newAreaDef = GetAllBlackboardDefs().UI_Map;
+		m_newAreablackboard = GetBlackboardSystem().Get( m_newAreaDef );
+		m_newAreaID = m_newAreablackboard.RegisterListenerBool( m_newAreaDef.newLocationDiscovered, this, 'OnNewLocationDiscovered' );
+		m_tutorialDef = GetAllBlackboardDefs().UIGameData;
+		m_tutorialBlackboard = GetBlackboardSystem().Get( m_tutorialDef );
+		m_tutorialID = m_tutorialBlackboard.RegisterDelayedListenerBool( m_tutorialDef.Popup_IsShown, this, 'OnTutorialVisibilityUpdate' );
+		m_tutorialDataID = m_tutorialBlackboard.RegisterDelayedListenerVariant( m_tutorialDef.Popup_Data, this, 'OnTutorialDataUpdate' );
+		m_customQuestNotificationblackboardDef = GetAllBlackboardDefs().UI_CustomQuestNotification;
+		m_customQuestNotificationblackboard = GetBlackboardSystem().Get( m_customQuestNotificationblackboardDef );
+		m_customQuestNotificationblackBoardID = m_customQuestNotificationblackboard.RegisterDelayedListenerVariant( m_customQuestNotificationblackboardDef.data, this, 'OnCustomQuestNotificationUpdate' );
+		blackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_System );
+		uiSystemBB = GetAllBlackboardDefs().UI_System;
+		uiSystemId = blackboard.RegisterDelayedListenerBool( uiSystemBB.IsInMenu, this, 'OnMenuUpdate' );
+		trackedMappinId = blackboard.RegisterDelayedListenerVariant( uiSystemBB.TrackedMappin, this, 'OnTrackedMappinUpdated' );
+		blackboard.SignalBool( uiSystemBB.IsInMenu );
+		SetNotificationPauseWhenHidden( true );
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_journalMgr )
+		{
+			m_journalMgr.UnregisterScriptCallback( this, 'OnJournalUpdate' );
+			m_journalMgr.UnregisterScriptCallback( this, 'OnJournalEntryVisited' );
+		}
+		if( uiSystemBB )
+		{
+			blackboard.UnregisterDelayedListener( uiSystemBB.IsInMenu, uiSystemId );
+			blackboard.UnregisterDelayedListener( uiSystemBB.TrackedMappin, trackedMappinId );
+		}
+		if( m_newAreablackboard )
+		{
+			m_newAreablackboard.UnregisterListenerBool( m_newAreaDef.newLocationDiscovered, m_newAreaID );
+			m_newAreablackboard = NULL;
+		}
+		if( m_customQuestNotificationblackboard )
+		{
+			m_customQuestNotificationblackboard.UnregisterDelayedListener( m_customQuestNotificationblackboardDef.data, m_customQuestNotificationblackBoardID );
+		}
+		m_tutorialBlackboard.UnregisterDelayedListener( m_tutorialDef.Popup_IsShown, m_tutorialID );
+		m_tutorialBlackboard.UnregisterDelayedListener( m_tutorialDef.Popup_Data, m_tutorialDataID );
+	}
+
+	protected event OnPlayerMounted( value : Bool )
+	{
+		m_isPlayerMounted = value;
+	}
+
+	protected event OnMenuUpdate( value : Bool )
+	{
+		SetNotificationPause( value );
+		GetRootWidget().SetVisible( !( value ) );
+	}
+
+	protected event OnTrackedMappinUpdated( value : Variant )
+	{
+		var mappin : weak< IMappin >;
+		var mappinText, objectiveText : String;
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		mappin = ( ( weak< weak< IMappin > > )( ( ( IScriptable )value ) ) );
+		if( mappin )
+		{
+			mappinText = NameToString( MappinUIUtils.MappinToString( mappin.GetVariant() ) );
+			objectiveText = NameToString( MappinUIUtils.MappinToObjectiveString( mappin.GetVariant() ) );
+			userData = new QuestUpdateNotificationViewData;
+			userData.title = mappinText;
+			userData.text = objectiveText;
+			userData.soundEvent = 'QuestNewPopup';
+			userData.soundAction = 'OnOpen';
+			userData.animation = 'notification_new_activity';
+			userData.canBeMerged = false;
+			userData.priority = EGenericNotificationPriority.Height;
+			notificationData.widgetLibraryItemName = 'notification_new_activity';
+			notificationData.notificationData = userData;
+			notificationData.time = m_showDuration;
+			AddNewNotificationData( notificationData );
+		}
+	}
+
+	protected event OnTutorialVisibilityUpdate( value : Bool )
+	{
+		if( !( value ) && m_isHiddenByTutorial )
+		{
+			m_isHiddenByTutorial = false;
+			SetNotificationPause( false );
+			GetRootWidget().SetVisible( true );
+		}
+	}
+
+	protected event OnTutorialDataUpdate( data : Variant )
+	{
+		var popupData : PopupData;
+		popupData = ( ( PopupData )data );
+		m_isHiddenByTutorial = popupData.isModal;
+		if( m_isHiddenByTutorial )
+		{
+			SetNotificationPause( true );
+			GetRootWidget().SetVisible( false );
+		}
+	}
+
+	protected event OnCustomQuestNotificationUpdate( value : Variant )
+	{
+		var data : CustomQuestNotificationData;
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		data = ( ( CustomQuestNotificationData )value );
+		userData = new QuestUpdateNotificationViewData;
+		userData.text = GetLocalizedText( data.desc );
+		userData.title = GetLocalizedText( data.header );
+		userData.soundEvent = 'QuestUpdatePopup';
+		userData.soundAction = 'OnOpen';
+		userData.animation = 'notification_quest_completed';
+		userData.canBeMerged = true;
+		notificationData.time = m_showDuration;
+		notificationData.widgetLibraryItemName = m_questNotification;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	protected event OnNCPDJobDoneEvent( evt : NCPDJobDoneEvent )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		userData = new QuestUpdateNotificationViewData;
+		userData.title = "UI-Notifications-QuestCompleted";
+		userData.soundEvent = 'OwCompletePopup';
+		userData.soundAction = 'OnOpen';
+		userData.animation = 'notification_ma_completed';
+		userData.canBeMerged = false;
+		userData.rewardXP = evt.levelXPAwarded;
+		userData.rewardSC = evt.streetCredXPAwarded;
+		notificationData.widgetLibraryItemName = 'notification_ma_completed';
+		notificationData.notificationData = userData;
+		notificationData.time = m_showDuration;
+		AddNewNotificationData( notificationData );
+	}
+
+	protected event OnNewLocationDiscovered( newLocation : Bool )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		if( newLocation )
+		{
+			userData = new QuestUpdateNotificationViewData;
+			userData.title = m_newAreablackboard.GetString( m_newAreaDef.currentLocation );
+			userData.text = m_newAreablackboard.GetString( m_newAreaDef.currentLocationEnumName );
+			userData.animation = 'notification_LocationAdded';
+			userData.soundEvent = 'ui_phone_sms';
+			userData.soundAction = 'OnOpen';
+			notificationData.time = m_showDuration;
+			notificationData.widgetLibraryItemName = 'notification_LocationAdded';
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+		}
+	}
+
+	protected event OnJournalEntryVisited( hash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		var request : JournalEntryNotificationRemoveRequestData;
+		if( ( className == 'gameJournalQuest' || className == 'gameJournalPhoneMessage' ) || className == 'gameJournalContact' )
+		{
+			request = new JournalEntryNotificationRemoveRequestData;
+			request.entryHash = hash;
+			RemoveNotification( request );
+		}
+	}
+
+	protected event OnJournalUpdate( hash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		var entry : weak< JournalEntry >;
+		var entryObjective : weak< JournalQuestObjective >;
+		var entryQuest : weak< JournalQuest >;
+		var state : gameJournalEntryState;
+		var removeRequest : JournalEntryNotificationRemoveRequestData;
+		var stateFinished : Bool;
+		var tarotEntry : weak< JournalTarot >;
+		var tarotAddedEvent : TarotCardAdded;
+		entry = m_journalMgr.GetEntry( hash );
+		entryObjective = ( ( JournalQuestObjective )( entry ) );
+		entryQuest = ( ( JournalQuest )( entry ) );
+		state = m_journalMgr.GetEntryState( entry );
+		stateFinished = state == gameJournalEntryState.Succeeded || state == gameJournalEntryState.Failed;
+		switch( className )
+		{
+			case 'gameJournalQuestObjective':
+				if( notifyOption == JournalNotifyOption.Notify && stateFinished )
+				{
+					PushObjectiveQuestNotification( entryObjective );
+				}
+			break;
+			case 'gameJournalQuest':
+				if( notifyOption == JournalNotifyOption.Notify && ( entryQuest != NULL ) )
+				{
+					PushQuestNotification( entryQuest, state );
+					if( stateFinished )
+					{
+						removeRequest = new JournalEntryNotificationRemoveRequestData;
+						removeRequest.entryHash = ( ( Uint32 )( m_journalMgr.GetEntryHash( entryQuest ) ) );
+						RemoveNotification( removeRequest );
+					}
+				}
+			break;
+			case 'gameJournalPhoneMessage':
+				if( ( notifyOption == JournalNotifyOption.Notify && state == gameJournalEntryState.Active ) && changeType == JournalChangeType.Direct )
+				{
+					ShowNewMessage( entry, state );
+				}
+			break;
+			case 'gameJournalContact':
+				if( ( notifyOption == JournalNotifyOption.Notify && state == gameJournalEntryState.Active ) && changeType == JournalChangeType.Direct )
+				{
+					ShowContactUpdate( entry, state );
+				}
+			break;
+			case 'gameJournalTarot':
+				tarotEntry = ( ( JournalTarot )( entry ) );
+			tarotAddedEvent = new TarotCardAdded;
+			tarotAddedEvent.imagePart = tarotEntry.GetImagePart();
+			tarotAddedEvent.cardName = tarotEntry.GetName();
+			GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() ).QueueEvent( tarotAddedEvent );
+			break;
+			default:
+				break;
+		}
+	}
+
+	protected event OnCustomNotification( evt : CustomNotificationEvent )
+	{
+		PushNotification( evt.header, evt.description, m_genericNotification, 'notification_quest_completed' );
+	}
+
+	protected event OnHackingRewardNotification( evt : HackingRewardNotificationEvent )
+	{
+		PushNotification( "", evt.m_text, 'notification_hacking_reward', 'notification_hacking_reward' );
+	}
+
+	private function ShowContactUpdate( entry : weak< JournalEntry >, state : gameJournalEntryState )
+	{
+		var contactEntry : weak< JournalContact >;
+		var title : String;
+		title = GetLocalizedText( "Story-base-gameplay-gui-widgets-notifications-quest_update-_localizationString6" );
+		contactEntry = ( ( JournalContact )( entry ) );
+		PushNewContactNotification( title, contactEntry.GetLocalizedName( m_journalMgr ), 'notification_NewContactAdded', 'notification_newContactAdded' );
+	}
+
+	private function ShowNewMessage( entry : weak< JournalEntry >, state : gameJournalEntryState )
+	{
+		var msgEntry : weak< JournalPhoneMessage >;
+		var action : OpenMessengerNotificationAction;
+		msgEntry = ( ( JournalPhoneMessage )( entry ) );
+		if( msgEntry.GetSender() != gameMessageSender.Player )
+		{
+			action = new OpenMessengerNotificationAction;
+			action.m_eventDispatcher = this;
+			action.m_journalEntry = entry;
+			PushSMSNotification( msgEntry, action );
+		}
+	}
+
+	private function PushQuestNotification( questEntry : weak< JournalQuest >, state : gameJournalEntryState )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		var questAction : TrackQuestNotificationAction;
+		userData = new QuestUpdateNotificationViewData;
+		userData.entryHash = m_journalMgr.GetEntryHash( questEntry );
+		userData.questEntryId = questEntry.GetId();
+		userData.text = questEntry.GetTitle( m_journalMgr );
+		userData.canBeMerged = false;
+		switch( state )
+		{
+			case gameJournalEntryState.Active:
+				userData.title = "UI-Notifications-NewQuest";
+			questAction = new TrackQuestNotificationAction;
+			questAction.m_questEntry = questEntry;
+			questAction.m_journalMgr = m_journalMgr;
+			userData.action = questAction;
+			userData.soundEvent = 'QuestNewPopup';
+			userData.soundAction = 'OnOpen';
+			userData.animation = 'notification_new_quest_added';
+			notificationData.time = m_showDuration;
+			notificationData.widgetLibraryItemName = 'notification_new_quest_added';
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+			break;
+			case gameJournalEntryState.Succeeded:
+				userData.title = "UI-Notifications-QuestCompleted";
+			userData.soundEvent = 'QuestSuccessPopup';
+			userData.soundAction = 'OnOpen';
+			userData.animation = 'notification_quest_completed';
+			userData.dontRemoveOnRequest = true;
+			notificationData.time = 12.0;
+			notificationData.widgetLibraryItemName = 'notification_quest_completed';
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+			break;
+			case gameJournalEntryState.Failed:
+				userData.title = "LocKey#27566";
+			userData.soundEvent = 'QuestFailedPopup';
+			userData.soundAction = 'OnOpen';
+			userData.animation = 'notification_quest_failed';
+			userData.dontRemoveOnRequest = true;
+			notificationData.time = m_showDuration;
+			notificationData.widgetLibraryItemName = 'notification_quest_failed';
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+			break;
+			default:
+				return;
+		}
+	}
+
+	private function PushObjectiveQuestNotification( entry : weak< JournalEntry > )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		var questAction : TrackQuestNotificationAction;
+		var parentQuestEntry : weak< JournalQuest >;
+		var currentEntry : weak< JournalEntry >;
+		currentEntry = entry;
+		while( parentQuestEntry == NULL )
+		{
+			currentEntry = m_journalMgr.GetParentEntry( currentEntry );
+			if( !( currentEntry ) )
+			{
+				return;
+			}
+			parentQuestEntry = ( ( JournalQuest )( currentEntry ) );
+		}
+		userData = new QuestUpdateNotificationViewData;
+		userData.questEntryId = parentQuestEntry.GetId();
+		userData.entryHash = m_journalMgr.GetEntryHash( parentQuestEntry );
+		userData.text = parentQuestEntry.GetTitle( m_journalMgr );
+		userData.title = "UI-Notifications-QuestUpdated";
+		userData.soundEvent = 'QuestUpdatePopup';
+		userData.soundAction = 'OnOpen';
+		userData.animation = 'notification_quest_updated';
+		userData.canBeMerged = true;
+		questAction = new TrackQuestNotificationAction;
+		questAction.m_questEntry = parentQuestEntry;
+		questAction.m_journalMgr = m_journalMgr;
+		userData.action = questAction;
+		notificationData.time = m_showDuration;
+		notificationData.widgetLibraryItemName = 'notification_quest_updated';
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	private function PushNotification( title : String, text : String, widget : CName, animation : CName, optional action : GenericNotificationBaseAction )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		userData = new QuestUpdateNotificationViewData;
+		userData.title = title;
+		userData.text = text;
+		userData.action = action;
+		userData.animation = animation;
+		userData.soundEvent = 'QuestUpdatePopup';
+		userData.soundAction = 'OnOpen';
+		notificationData.time = m_showDuration;
+		notificationData.widgetLibraryItemName = widget;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	private function PushNewContactNotification( title : String, text : String, widget : CName, animation : CName, optional action : GenericNotificationBaseAction )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : QuestUpdateNotificationViewData;
+		userData = new QuestUpdateNotificationViewData;
+		userData.title = title;
+		userData.text = text;
+		userData.action = action;
+		userData.animation = animation;
+		userData.soundEvent = 'QuestUpdatePopup';
+		userData.soundAction = 'OnOpen';
+		notificationData.time = m_showDuration;
+		notificationData.widgetLibraryItemName = widget;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	private function PushSMSNotification( msgEntry : weak< JournalPhoneMessage >, optional action : GenericNotificationBaseAction )
+	{
+		var msgConversation : weak< JournalPhoneConversation >;
+		var msgContact : weak< JournalContact >;
+		var notificationData : gameuiGenericNotificationData;
+		var userData : PhoneMessageNotificationViewData;
+		msgConversation = ( ( JournalPhoneConversation )( m_journalMgr.GetParentEntry( msgEntry ) ) );
+		msgContact = ( ( JournalContact )( m_journalMgr.GetParentEntry( msgConversation ) ) );
+		userData = new PhoneMessageNotificationViewData;
+		userData.entryHash = m_journalMgr.GetEntryHash( msgEntry );
+		userData.threadHash = m_journalMgr.GetEntryHash( msgConversation );
+		userData.contactHash = m_journalMgr.GetEntryHash( msgContact );
+		userData.title = msgContact.GetLocalizedName( m_journalMgr );
+		userData.SMSText = GetLocalizedText( msgEntry.GetText() );
+		userData.action = action;
+		userData.animation = 'notification_phone_MSG';
+		userData.soundEvent = 'PhoneSmsPopup';
+		userData.soundAction = 'OnOpen';
+		notificationData.time = 6.69999981;
+		notificationData.widgetLibraryItemName = m_messageNotification;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	public function PushNotification( entry : JournalOnscreen )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : ShardCollectedNotificationViewData;
+		userData = GetShardNotificationData( entry );
+		notificationData.time = m_showDuration;
+		notificationData.widgetLibraryItemName = m_shardNotification;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+	}
+
+	private function GetShardNotificationData( entry : JournalOnscreen ) : ShardCollectedNotificationViewData
+	{
+		var userData : ShardCollectedNotificationViewData;
+		var shardOpenAction : OpenShardNotificationAction;
+		userData = new ShardCollectedNotificationViewData;
+		userData.title = ( GetLocalizedText( "UI-Notifications-ShardCollected" ) + " " ) + GetLocalizedText( entry.GetTitle() );
+		userData.text = entry.GetDescription();
+		userData.shardTitle = GetLocalizedText( entry.GetTitle() );
+		userData.entry = entry;
+		shardOpenAction = new OpenShardNotificationAction;
+		shardOpenAction.m_eventDispatcher = m_uiSystem;
+		userData.action = shardOpenAction;
+		userData.soundEvent = 'ShardCollectedPopup';
+		userData.soundAction = 'OnLoot';
+		return userData;
+	}
+
+	public function PushCrackableNotification( itemID : ItemID, entry : JournalOnscreen )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : ShardCollectedNotificationViewData;
+		userData = GetShardNotificationData( entry );
+		userData.isCrypted = true;
+		userData.itemID = itemID;
+		notificationData.time = m_showDuration;
+		notificationData.widgetLibraryItemName = m_shardNotification;
+		notificationData.notificationData = userData;
+		AddNewNotificationData( notificationData );
+		ProcessCrackableShardTutorial();
+	}
+
+	public function ProcessCrackableShardTutorial()
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( GetPlayerControlledObject().GetGame() );
+		if( ( questSystem.GetFact( 'encoded_shard_tutorial' ) == 0 ) && ( questSystem.GetFact( 'disable_tutorials' ) == 0 ) )
+		{
+			questSystem.SetFact( 'encoded_shard_tutorial', 1 );
+		}
+	}
+
+}
+
+class QuestMappinHighlightEvent extends Event
+{
+	var m_hash : Uint32;
+}
+
+class MessengerNotification extends GenericNotificationController
+{
+	private editable var m_messageText : inkTextRef;
+	private editable var m_avatar : inkImageRef;
+	private editable var m_descriptionText : inkTextRef;
+	private editable var m_mappinIcon : inkImageRef;
+	private editable var m_envelopIcon : inkWidgetRef;
+	private var m_interactionsBlackboard : weak< IBlackboard >;
+	private var m_bbListenerId : CallbackHandle;
+	private var m_messageData : PhoneMessageNotificationViewData;
+	private var m_animProxy : inkAnimProxy;
+	private var m_textSizeLimit : Int32;
+	default m_textSizeLimit = 40;
+	private var m_journalMgr : weak< JournalManager >;
+	private var m_mappinSystem : weak< MappinSystem >;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+		m_interactionsBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UIInteractions );
+		m_bbListenerId = m_interactionsBlackboard.RegisterDelayedListenerBool( GetAllBlackboardDefs().UIInteractions.HasScrollableInteraction, this, 'OnInteractionUpdate', true );
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+		m_interactionsBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIInteractions.HasScrollableInteraction, m_bbListenerId );
+	}
+
+	protected event OnInteractionUpdate( value : Bool )
+	{
+		m_blockAction = value;
+		inkWidgetRef.SetVisible( m_actionRef, !( m_blockAction ) );
+	}
+
+	public export override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		var contactEntry : weak< JournalContact >;
+		var messageEntry : weak< JournalPhoneMessage >;
+		var mappinVariantInt : Uint16;
+		var mappinPhaseInt : Uint16;
+		var mappinActive : Bool;
+		var mappinPhase : gamedataMappinPhase;
+		var mappinVariant : gamedataMappinVariant;
+		var texturePart : CName;
+		var attachmentHash : Uint32;
+		var poiHash : Uint32;
+		var fitToContent : Bool;
+		var playbackOptions : inkAnimOptions;
+		var mappinEvent : QuestMappinHighlightEvent;
+		var mappinInfoDisplayed : Bool;
+		if( m_animProxy )
+		{
+			m_animProxy.Stop();
+			m_animProxy = NULL;
+		}
+		mappinInfoDisplayed = false;
+		m_messageData = ( ( PhoneMessageNotificationViewData )( notificationData ) );
+		if( m_messageData )
+		{
+			m_journalMgr = GameInstance.GetJournalManager( GetPlayerControlledObject().GetGame() );
+			m_mappinSystem = GameInstance.GetMappinSystem( GetPlayerControlledObject().GetGame() );
+			playbackOptions.toMarker = 'OutroStart';
+			inkTextRef.SetText( m_messageText, m_messageData.SMSText );
+			fitToContent = StrLen( m_messageData.SMSText ) < m_textSizeLimit;
+			inkTextRef.SetFitToContent( m_messageText, fitToContent );
+			contactEntry = ( ( JournalContact )( m_journalMgr.GetEntry( ( ( Uint32 )( m_messageData.contactHash ) ) ) ) );
+			messageEntry = ( ( JournalPhoneMessage )( m_journalMgr.GetEntry( ( ( Uint32 )( m_messageData.entryHash ) ) ) ) );
+			InkImageUtils.RequestSetImage( this, m_avatar, contactEntry.GetAvatarID( m_journalMgr ) );
+			attachmentHash = messageEntry.GetAttachmentPathHash();
+			if( attachmentHash > ( ( Uint32 )( 0 ) ) )
+			{
+				poiHash = m_journalMgr.GetPointOfInterestMappinHashFromQuestHash( attachmentHash );
+			}
+			if( m_mappinSystem.GetPointOfInterestMappinSavedState( poiHash, mappinPhaseInt, mappinVariantInt, mappinActive ) )
+			{
+				mappinVariant = ( ( gamedataMappinVariant )( ( ( Uint32 )( mappinVariantInt ) ) ) );
+				mappinPhase = ( ( gamedataMappinPhase )( ( ( Uint32 )( mappinPhaseInt ) ) ) );
+				if( mappinPhase != gamedataMappinPhase.UndiscoveredPhase && mappinPhase != gamedataMappinPhase.CompletedPhase )
+				{
+					texturePart = MappinUIUtils.MappinToTexturePart( mappinVariant, mappinPhase );
+					inkImageRef.SetTexturePart( m_mappinIcon, texturePart );
+					inkTextRef.SetLocalizedTextScript( m_descriptionText, MappinUIUtils.MappinToString( mappinVariant, gamedataMappinPhase.DefaultPhase ) );
+					inkImageRef.SetVisible( m_mappinIcon, true );
+					inkWidgetRef.SetVisible( m_envelopIcon, false );
+					mappinEvent = new QuestMappinHighlightEvent;
+					mappinEvent.m_hash = attachmentHash;
+					QueueBroadcastEvent( mappinEvent );
+					mappinInfoDisplayed = true;
+				}
+			}
+			if( !( mappinInfoDisplayed ) )
+			{
+				inkTextRef.SetLocalizedTextScript( m_descriptionText, 'Story-base-gameplay-gui-widgets-notifications-quest_update-_localizationString9' );
+				inkImageRef.SetVisible( m_mappinIcon, false );
+				inkWidgetRef.SetVisible( m_envelopIcon, true );
+			}
+			m_animProxy = PlayLibraryAnimation( m_messageData.animation, playbackOptions );
+			m_animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnNotificationShown' );
+		}
+		super.SetNotificationData( notificationData );
+	}
+
+	protected event OnNotificationShown( anim : inkAnimProxy )
+	{
+		SetNotificationShown();
+	}
+
+	private const function GetNetworkBlackboardDef() : NetworkBlackboardDef
+	{
+		return GetAllBlackboardDefs().NetworkBlackboard;
+	}
+
+	private const function GetNetworkBlackboard() : IBlackboard
+	{
+		return GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetNetworkBlackboardDef() );
+	}
+
+	private override function OnActionTriggered()
+	{
+		var linkStatus : EPersonalLinkConnectionStatus;
+		linkStatus = ( ( EPersonalLinkConnectionStatus )( GetNetworkBlackboard().GetInt( GetNetworkBlackboardDef().PersonalLinkStatus ) ) );
+		if( linkStatus != EPersonalLinkConnectionStatus.CONNECTING )
+		{
+			SetNotificationShown();
+		}
+	}
+
+	private function SetNotificationShown()
+	{
+		GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData ).SetInt( GetAllBlackboardDefs().UIGameData.NotificationJournalHash, m_messageData.entryHash );
+	}
+
+}
+
+class JournalNotification extends GenericNotificationController
+{
+	protected var m_interactionsBlackboard : weak< IBlackboard >;
+	protected var m_bbListenerId : CallbackHandle;
+	protected var m_animProxy : inkAnimProxy;
+	protected var m_questNotificationData : QuestUpdateNotificationViewData;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+		m_interactionsBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UIInteractions );
+		m_bbListenerId = m_interactionsBlackboard.RegisterDelayedListenerBool( GetAllBlackboardDefs().UIInteractions.HasScrollableInteraction, this, 'OnInteractionUpdate', true );
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+		m_interactionsBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIInteractions.HasScrollableInteraction, m_bbListenerId );
+	}
+
+	protected event OnInteractionUpdate( value : Bool )
+	{
+		m_blockAction = value;
+		inkWidgetRef.SetVisible( m_actionRef, !( m_blockAction ) );
+	}
+
+	public export override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		var playbackOptions : inkAnimOptions;
+		m_questNotificationData = ( ( QuestUpdateNotificationViewData )( notificationData ) );
+		if( m_animProxy )
+		{
+			m_animProxy.Stop();
+			m_animProxy = NULL;
+		}
+		GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData ).SetInt( GetAllBlackboardDefs().UIGameData.NotificationJournalHash, m_questNotificationData.entryHash );
+		m_animProxy = PlayLibraryAnimation( m_questNotificationData.animation, playbackOptions );
+		super.SetNotificationData( notificationData );
+	}
+
+}
+
+class NewLocationNotification extends JournalNotification
+{
+	private editable var districtName : inkTextRef;
+	private editable var districtIcon : inkImageRef;
+	private editable var districtFluffIcon : inkImageRef;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+	}
+
+	protected event OnInteractionUpdate( value : Bool )
+	{
+		m_blockAction = value;
+		inkWidgetRef.SetVisible( m_actionRef, !( m_blockAction ) );
+	}
+
+	public export override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		var playbackOptions : inkAnimOptions;
+		var iconRecord : UIIcon_Record;
+		m_questNotificationData = ( ( QuestUpdateNotificationViewData )( notificationData ) );
+		if( m_animProxy )
+		{
+			m_animProxy.Stop();
+			m_animProxy = NULL;
+		}
+		inkTextRef.SetText( districtName, m_questNotificationData.title );
+		iconRecord = TweakDBInterface.GetUIIconRecord( TDBID.Create( "UIIcon." + m_questNotificationData.text ) );
+		inkImageRef.SetTexturePart( districtIcon, iconRecord.AtlasPartName() );
+		inkImageRef.SetTexturePart( districtFluffIcon, iconRecord.AtlasPartName() );
+		GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData ).SetInt( GetAllBlackboardDefs().UIGameData.NotificationJournalHash, m_questNotificationData.entryHash );
+		m_animProxy = PlayLibraryAnimation( m_questNotificationData.animation, playbackOptions );
+		super.SetNotificationData( notificationData );
+	}
+
+}
+
+class NCPDJobDoneNotification extends JournalNotification
+{
+	private editable var m_NCPD_Reward : inkWidgetRef;
+	private editable var m_NCPD_XP_RewardText : inkTextRef;
+	private editable var m_NCPD_SC_RewardText : inkTextRef;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+	}
+
+	protected event OnInteractionUpdate( value : Bool )
+	{
+		m_blockAction = value;
+		inkWidgetRef.SetVisible( m_actionRef, !( m_blockAction ) );
+	}
+
+	public override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		var playbackOptions : inkAnimOptions;
+		m_questNotificationData = ( ( QuestUpdateNotificationViewData )( notificationData ) );
+		if( m_animProxy )
+		{
+			m_animProxy.Stop();
+			m_animProxy = NULL;
+		}
+		inkTextRef.SetText( m_NCPD_XP_RewardText, IntToString( m_questNotificationData.rewardXP ) );
+		inkTextRef.SetText( m_NCPD_SC_RewardText, IntToString( m_questNotificationData.rewardSC ) );
+		inkWidgetRef.SetVisible( m_NCPD_Reward, ( m_questNotificationData.rewardXP > 0 ) || ( m_questNotificationData.rewardSC > 0 ) );
+		GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData ).SetInt( GetAllBlackboardDefs().UIGameData.NotificationJournalHash, m_questNotificationData.entryHash );
+		m_animProxy = PlayLibraryAnimation( m_questNotificationData.animation, playbackOptions );
+		super.SetNotificationData( notificationData );
+	}
+
+}
+
+class NCPDJobDoneEvent extends Event
+{
+	var levelXPAwarded : Int32;
+	var streetCredXPAwarded : Int32;
+}
+
+exec function TestNotification( gameInstance : GameInstance )
+{
+	var uiSystem : UISystem;
+	var evt : CustomNotificationEvent;
+	evt = new CustomNotificationEvent;
+	evt.header = "Test header";
+	evt.description = "Test description";
+	uiSystem = GameInstance.GetUISystem( GetGameInstance() );
+	uiSystem.QueueEvent( evt );
+}
+

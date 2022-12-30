@@ -1,0 +1,378 @@
+class AlarmEvent extends Event
+{
+	var isValid : Bool;
+	var ID : DelayID;
+}
+
+struct SurveillanceCameraResaveData
+{
+	var m_shouldRotate : Bool;
+	var m_maxRotationAngle : Float;
+	var m_pitchAngle : Float;
+	var m_rotationSpeed : Float;
+	var m_canStreamVideo : Bool;
+	var m_canDetectIntruders : Bool;
+	var m_canBeControled : Bool;
+	var m_factOnFeedReceived : CName;
+	var m_questFactOnDetection : CName;
+}
+
+class SurveillanceCamera extends SensorDevice
+{
+	default m_controllerTypeName = 'SurveillanceCameraController';
+	default m_idleSound = 'dev_surveillance_camera_rotating';
+	default m_idleSoundStop = 'dev_surveillance_camera_rotating_stop';
+	default m_soundDetectionLoop = 'dev_surveillance_camera_detection_loop_start';
+	default m_soundDetectionLoopStop = 'dev_surveillance_camera_detection_loop_stop';
+	private var m_virtualCam : VirtualCameraComponent;
+	private var m_cameraHead : IComponent;
+	private var m_cameraHeadPhysics : IComponent;
+	private var m_verticalDecal1 : IComponent;
+	private var m_verticalDecal2 : IComponent;
+	private editable var m_meshDestrSupport : Bool;
+	private var m_shouldRotate : Bool;
+	default m_shouldRotate = true;
+	hint m_shouldRotate = "Do you want the camera to rotate or stay still";
+	private var m_canStreamVideo : Bool;
+	default m_canStreamVideo = false;
+	hint m_canStreamVideo = "Check this if you want camera to be able to stream video to other devices - SUPER PERFOMANCE HEAVY!";
+	private var m_canDetectIntruders : Bool;
+	default m_canDetectIntruders = true;
+	private var m_currentAngle : Float;
+	private var m_rotateLeft : Bool;
+	private var m_targetPosition : Vector4;
+	private var m_factOnFeedReceived : CName;
+	hint m_factOnFeedReceived = "When Feed is received this fact will be set to 1 and when feed will stop it will be set to 0";
+	private var m_questFactOnDetection : CName;
+	hint m_questFactOnDetection = "This facts will be set to 1 if camera detects intruder and to 0 if it stops detecting";
+	private var m_lookAtEvent : LookAtAddEvent;
+	var m_currentYawModifier : Float;
+	var m_currentPitchModifier : Float;
+
+	private function SetForcedSensesTracing()
+	{
+		if( GetDevicePS().IsON() && GetSensesComponent().IsEnabled() )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'SetForcedSensesTracingTask', gameScriptTaskExecutionStage.Any );
+		}
+	}
+
+	protected export function SetForcedSensesTracingTask( data : ScriptTaskData )
+	{
+		if( GetDevicePS().CanTagEnemies() )
+		{
+			GetSensesComponent().SetForcedSensesTracing( gamedataSenseObjectType.Npc, EAIAttitude.AIA_Neutral );
+			GetSensesComponent().SetForcedSensesTracing( gamedataSenseObjectType.Npc, EAIAttitude.AIA_Hostile );
+			GetSensesComponent().SetTickDistanceOverride( 100.0 );
+		}
+		else
+		{
+			GetSensesComponent().RemoveForcedSensesTracing( gamedataSenseObjectType.Npc, EAIAttitude.AIA_Neutral );
+			GetSensesComponent().RemoveForcedSensesTracing( gamedataSenseObjectType.Npc, EAIAttitude.AIA_Hostile );
+			GetSensesComponent().SetTickDistanceOverride( -1.0 );
+		}
+	}
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'virtualcamera', 'VirtualCameraComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'updateComponent', 'UpdateComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'detectionAreaIndicator', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'main_red', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'right_point', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'middle_point', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'stripes_points', 'gameLightComponent', false );
+		if( m_meshDestrSupport )
+		{
+			EntityRequestComponentsInterface.RequestComponent( ri, 'cameraHead', 'IComponent', true );
+			EntityRequestComponentsInterface.RequestComponent( ri, 'cameraHeadPhysics', 'IComponent', true );
+			EntityRequestComponentsInterface.RequestComponent( ri, 'vertical_decal_1', 'IComponent', false );
+			EntityRequestComponentsInterface.RequestComponent( ri, 'vertical_decal_2', 'IComponent', false );
+		}
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_virtualCam = ( ( VirtualCameraComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'virtualcamera' ) ) );
+		m_lightScanRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'main_red' ) ) ) );
+		m_lightAttitudeRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'stripes_points' ) ) ) );
+		m_lightInfoRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'middle_point' ) ) ) );
+		m_lightInfoRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'right_point' ) ) ) );
+		if( m_meshDestrSupport )
+		{
+			m_cameraHead = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'cameraHead' ) ) );
+			m_verticalDecal1 = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'vertical_decal_1' ) ) );
+			m_verticalDecal2 = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'vertical_decal_2' ) ) );
+			m_cameraHeadPhysics = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'cameraHeadPhysics' ) ) );
+		}
+		super.OnTakeControl( ri );
+		m_controller = ( ( SurveillanceCameraController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		SetSenseObjectType( gamedataSenseObjectType.Camera );
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		super.ResolveGameplayState();
+		RegisterToGameSessionDataSystem( GetDevicePS().CanTagEnemies() );
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		RegisterToGameSessionDataSystem( false );
+	}
+
+	private const override function GetController() : SurveillanceCameraController
+	{
+		return ( ( SurveillanceCameraController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : SurveillanceCameraControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	public const override function IsSurveillanceCamera() : Bool
+	{
+		return true;
+	}
+
+	protected const override function GetScannerName() : String
+	{
+		return "LocKey#100";
+	}
+
+	public override function SetAsIntrestingTarget( target : weak< GameObject > ) : Bool
+	{
+		return super.SetAsIntrestingTarget( target );
+	}
+
+	public override function OnValidTargetAppears( target : weak< GameObject > )
+	{
+		var puppet : ScriptedPuppet;
+		super.OnValidTargetAppears( target );
+		GetDevicePS().ThreatDetected( true );
+		RequestAlarm();
+		puppet = ( ( ScriptedPuppet )( target ) );
+		if( GetDevicePS().CanTagEnemies() && target.IsActive() )
+		{
+			if( puppet && puppet.IsAggressive() )
+			{
+				GameObject.TagObject( puppet );
+			}
+		}
+	}
+
+	public override function OnCurrentTargetAppears( target : weak< GameObject > )
+	{
+		var puppet : ScriptedPuppet;
+		puppet = ( ( ScriptedPuppet )( target ) );
+		if( GetDevicePS().ShouldRevealEnemies() )
+		{
+			ScriptedPuppet.RequestRevealOutline( puppet, true, GetEntityID() );
+		}
+		RequestAlarm();
+		PlaySoundEvent( this, 'q001_sc_00a_before_mission_tbug_hack' );
+		if( !( GetDevicePS().GetSecuritySystem().IsSystemInCombat() ) )
+		{
+			SetWarningMessage( "LocKey#53158" );
+		}
+		super.OnCurrentTargetAppears( target );
+	}
+
+	private function SetWarningMessage( lockey : String )
+	{
+		var simpleScreenMessage : SimpleScreenMessage;
+		simpleScreenMessage.isShown = true;
+		simpleScreenMessage.duration = 5.0;
+		simpleScreenMessage.message = lockey;
+		simpleScreenMessage.isInstant = true;
+		GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, simpleScreenMessage, true );
+	}
+
+	public override function OnValidTargetDisappears( target : weak< GameObject > )
+	{
+		var puppet : ScriptedPuppet;
+		puppet = ( ( ScriptedPuppet )( target ) );
+		ScriptedPuppet.RequestRevealOutline( puppet, false, GetEntityID() );
+		if( GetDevicePS().CanTagEnemies() )
+		{
+			GameObject.UntagObject( puppet );
+		}
+	}
+
+	public override function OnAllValidTargetsDisappears()
+	{
+		super.OnAllValidTargetsDisappears();
+		GetDevicePS().ThreatDetected( false );
+		RequestAlarm();
+	}
+
+	protected override function PushPersistentData()
+	{
+		GetDevicePS().PushPersistentData();
+		super.PushPersistentData();
+	}
+
+	protected override function RestoreDeviceState()
+	{
+		super.RestoreDeviceState();
+	}
+
+	protected override function DeactivateDevice()
+	{
+		super.DeactivateDevice();
+		TurnOffDevice();
+	}
+
+	protected override function TurnOffDevice()
+	{
+		super.TurnOffDevice();
+		TurnOffCamera();
+	}
+
+	protected override function TurnOnDevice()
+	{
+		super.TurnOnDevice();
+		TurnOnCamera();
+	}
+
+	protected override function CutPower()
+	{
+		super.CutPower();
+		TurnOffCamera();
+	}
+
+	protected event OnToggleStreamFeed( evt : ToggleStreamFeed )
+	{
+		UpdateDeviceState();
+		ToggleFeed( GetDevicePS().ShouldStream() );
+	}
+
+	protected event OnToggleCamera( evt : ToggleON )
+	{
+		UpdateDeviceState();
+		( ( GetDevicePS().IsON() ) ? ( TurnOnCamera() ) : ( TurnOffCamera() ) );
+	}
+
+	private function TurnOnCamera()
+	{
+		RequestAlarm();
+		SetForcedSensesTracing();
+	}
+
+	private function TurnOffCamera()
+	{
+		ToggleFeed( false );
+		ToggleAreaIndicator( false );
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		super.OnDeath( evt );
+		if( m_meshDestrSupport )
+		{
+			m_cameraHead.Toggle( false );
+			m_verticalDecal1.Toggle( false );
+			m_verticalDecal2.Toggle( false );
+			m_cameraHeadPhysics.Toggle( true );
+		}
+	}
+
+	protected event OnSetDeviceAttitude( evt : SetDeviceAttitude )
+	{
+		super.OnSetDeviceAttitude( evt );
+		SetForcedSensesTracing();
+		RegisterToGameSessionDataSystem( true );
+	}
+
+	protected event OnCameraTagLockEvent( evt : CameraTagLockEvent )
+	{
+		GetDevicePS().SetTagLockFromSystem( evt.isLocked );
+		SetForcedSensesTracing();
+	}
+
+	private function RegisterToGameSessionDataSystem( add : Bool )
+	{
+		var cameraTagLimitData : CameraTagLimitData;
+		cameraTagLimitData = new CameraTagLimitData;
+		cameraTagLimitData.add = add;
+		cameraTagLimitData.object = this;
+		GameSessionDataSystem.AddDataEntryRequest( GetGame(), EGameSessionDataType.CameraTagLimit, cameraTagLimitData );
+	}
+
+	private function ToggleFeed( shouldBeOn : Bool )
+	{
+		m_virtualCam.Toggle( shouldBeOn );
+		if( shouldBeOn )
+		{
+			SetFactValue( GetGame(), m_factOnFeedReceived, 1 );
+		}
+		else
+		{
+			SetFactValue( GetGame(), m_factOnFeedReceived, 0 );
+			GetDevicePS().ClearFeedReceivers();
+		}
+	}
+
+	private function RequestAlarm()
+	{
+		if( GetDevicePS().IsDetecting() )
+		{
+			SetFactValue( GetGame(), GetDevicePS().GetQuestFactOnDetection(), 1 );
+		}
+		else
+		{
+			SetFactValue( GetGame(), GetDevicePS().GetQuestFactOnDetection(), 0 );
+		}
+	}
+
+	protected override function OverrideLookAtSetupHor( out lookAtEntityEvent : LookAtAddEvent )
+	{
+		lookAtEntityEvent.request.limits.softLimitDegrees = GetDevicePS().GetBehaviourMaxRotationAngle() * 2.0;
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.Alarm;
+	}
+
+	protected event OnActionEngineering( evt : ActionEngineering )
+	{
+		PlaySoundEvent( this, 'dev_surveillance_camera_fry_circuit' );
+		UpdateDeviceState();
+	}
+
+	protected event OnTCSTakeOverControlActivate( evt : TCSTakeOverControlActivate )
+	{
+		super.OnTCSTakeOverControlActivate( evt );
+		GameObjectEffectHelper.StartEffectEvent( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'fish_eye' );
+	}
+
+	protected event OnTCSTakeOverControlDeactivate( evt : TCSTakeOverControlDeactivate )
+	{
+		super.OnTCSTakeOverControlDeactivate( evt );
+		GameObjectEffectHelper.StopEffectEvent( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), 'fish_eye' );
+	}
+
+}
+
+enum ESurveillanceCameraStatus
+{
+	THREAT = -1,
+	STREAMING = 0,
+	WORKING = 1,
+}
+
+enum ESurveillanceCameraState
+{
+	Off = 0,
+	Active = 1,
+}
+

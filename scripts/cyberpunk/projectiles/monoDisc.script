@@ -1,0 +1,461 @@
+class MonoDisc extends BaseProjectile
+{
+	private var m_throwtype : ThrowType;
+	private var m_targetAcquired : Bool;
+	private var m_player : weak< GameObject >;
+	private var m_disc : weak< GameObject >;
+	private var m_target : weak< GameObject >;
+	private var m_blackboard : weak< IBlackboard >;
+	private var m_discSpawnPoint : Vector4;
+	private var m_discPosition : Vector4;
+	private var m_collisionCount : Int32;
+	private var m_airTime : Float;
+	private var m_destroyTimer : Float;
+	private var m_returningToPlayer : Bool;
+	private var m_catchingPlayer : Bool;
+	private var m_discCaught : Bool;
+	private var m_discLodgedToSurface : Bool;
+	private var m_OnProjectileCaughtCallback : CallbackHandle;
+	private var m_wasNPCHit : Bool;
+	default m_wasNPCHit = false;
+	private var m_animationController : AnimationControllerComponent;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+	}
+
+	protected event OnProjectileInitialize( eventData : gameprojectileSetUpEvent )
+	{
+		m_player = eventData.owner;
+		m_disc = eventData.weapon;
+		ResetParameters();
+		UpdateAnimData();
+		RegisterForProjectileCaught();
+	}
+
+	private function RegisterForProjectileCaught()
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		blackboardSystem = GameInstance.GetBlackboardSystem( GetGame() );
+		blackboard = blackboardSystem.Get( GetAllBlackboardDefs().LeftHandCyberware );
+		m_OnProjectileCaughtCallback = blackboard.RegisterListenerBool( GetAllBlackboardDefs().LeftHandCyberware.ProjectileCaught, this, 'OnProjectileCaught' );
+	}
+
+	protected event OnShoot( eventData : gameprojectileShootEvent )
+	{
+		var quickThrowTarget : IPlacedComponent;
+		var angleDist : EulerAngles;
+		quickThrowTarget = GameInstance.GetTargetingSystem( GetGame() ).GetComponentClosestToCrosshair( eventData.owner, angleDist, TSQ_EnemyNPC() );
+		GeneralShoot( eventData );
+		SetTargetComponentQuickThrow( quickThrowTarget );
+	}
+
+	protected event OnShootTarget( eventData : gameprojectileShootTargetEvent )
+	{
+		GeneralShoot( eventData );
+		SetTargetComponent( eventData.params.trackedTargetComponent );
+	}
+
+	private function GeneralShoot( eventData : gameprojectileShootEvent )
+	{
+		var chargeParam : Float;
+		var chargeData : gameprojectileWeaponParams;
+		var blackboardSystem : BlackboardSystem;
+		var playerPuppet : GameObject;
+		m_discSpawnPoint = eventData.startPoint;
+		chargeData = eventData.params;
+		chargeParam = chargeData.charge;
+		blackboardSystem = GameInstance.GetBlackboardSystem( GetGame() );
+		playerPuppet = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject();
+		m_blackboard = blackboardSystem.GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		GetThrowType( chargeParam );
+		LaunchDisc( eventData );
+	}
+
+	private function ResetParameters()
+	{
+		m_targetAcquired = false;
+		m_returningToPlayer = false;
+		m_discLodgedToSurface = false;
+		m_catchingPlayer = false;
+		m_collisionCount = 0;
+		m_discCaught = false;
+		m_destroyTimer = 0.0;
+		m_airTime = 0.0;
+	}
+
+	private function GetThrowType( chargeParam : Float )
+	{
+		if( chargeParam < 1.0 )
+		{
+			m_throwtype = ThrowType.Quick;
+		}
+		else if( chargeParam >= 1.0 )
+		{
+			m_throwtype = ThrowType.Charge;
+		}
+	}
+
+	protected event OnProjectileCaught( value : Bool )
+	{
+		if( value )
+		{
+			AnimationControllerComponent.SetInputBool( this, 'is_caught', true );
+			AnimationControllerComponent.SetInputBool( this, 'is_thrown', false );
+		}
+	}
+
+	private function LaunchDisc( eventData : gameprojectileShootEvent )
+	{
+		var startVelocity : Float;
+		var distance : Float;
+		var sideOffset : Float;
+		var height : Float;
+		var minPlayerSpeed : Float;
+		minPlayerSpeed = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "minPlayerSpeed" ), 0.0 );
+		if( m_throwtype == ThrowType.Quick )
+		{
+			if( !( IsPlayerInKerenzikov() ) && ( GetPlayerSpeed() < minPlayerSpeed ) )
+			{
+				startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "startVel" ), 0.0 );
+				distance = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeDistance" ), 0.0 );
+				sideOffset = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeSideOffset" ), 0.0 );
+				height = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeHeight" ), 0.0 );
+			}
+			else if( IsPlayerInKerenzikov() || ( GetPlayerSpeed() >= minPlayerSpeed ) )
+			{
+				startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "startVelFastMovement" ), 0.0 );
+				distance = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeDistanceFastMovement" ), 0.0 );
+				sideOffset = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeSideOffsetFastMovement" ), 0.0 );
+				height = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeHeightFastMovement" ), 0.0 );
+			}
+		}
+		else if( m_throwtype == ThrowType.Charge )
+		{
+			startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "startVelCharge" ), 0.0 );
+			distance = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeDistanceCharge" ), 0.0 );
+			sideOffset = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeSideOffsetCharge" ), 0.0 );
+			height = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "fakeHeightCharge" ), 0.0 );
+		}
+		NoTargetLaunch( eventData.localToWorld, startVelocity, distance, sideOffset, height );
+		SpawnTrailEffects();
+		if( m_animationController )
+		{
+			AnimationControllerComponent.SetInputBool( this, 'is_caught', false );
+			AnimationControllerComponent.SetInputBool( this, 'is_thrown', true );
+		}
+	}
+
+	private function NoTargetLaunch( localToWorld : Matrix, startVelocity : Float, distance : Float, sideOffset : Float, height : Float )
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		var fakeTargetPosition : Vector4;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		m_projectileComponent.ClearTrajectories();
+		followCurveParams.startVelocity = startVelocity;
+		followCurveParams.linearTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetLinearTimeRatioNoTarget" ), 0.0 );
+		followCurveParams.interpolationTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetInterpolationTimeRatioNoTarget" ), 0.0 );
+		followCurveParams.returnTimeMargin = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "returnTimeMarginNoTarget" ), 0.0 );
+		followCurveParams.bendTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "bendTimeRatioNoTarget" ), 0.0 );
+		followCurveParams.bendFactor = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "bendFactorNoTarget" ), 0.0 );
+		followCurveParams.accuracy = 0.5;
+		followCurveParams.halfLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "halfLeanAngleNoTarget" ), 0.0 );
+		followCurveParams.endLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "endLeanAngleNoTarget" ), 0.0 );
+		followCurveParams.angleInterpolationDuration = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "angleInterpolationDurationNoTarget" ), 0.0 );
+		fakeTargetPosition = ( ( Matrix.GetTranslation( localToWorld ) + ( Matrix.GetAxisY( localToWorld ) * distance ) ) - ( Matrix.GetAxisX( localToWorld ) * sideOffset ) ) + ( Matrix.GetAxisZ( localToWorld ) * height );
+		followCurveParams.targetPosition = fakeTargetPosition;
+		m_projectileComponent.AddFollowCurve( followCurveParams );
+		m_targetAcquired = false;
+	}
+
+	private function GetBlackboardIntVariable( id : BlackboardID_Int ) : Int32
+	{
+		return m_blackboard.GetInt( id );
+	}
+
+	private function UpdateAnimData()
+	{
+		AnimationControllerComponent.SetInputFloat( this, 'max_rotation_speed', TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "maxRotationSpeed" ), 3000.0 ) );
+		AnimationControllerComponent.SetInputFloat( this, 'time_to_max_rotation', TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "timeToMaxRotation" ), 0.89999998 ) );
+		AnimationControllerComponent.SetInputFloat( this, 'time_to_max_scale', TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "timeToMaxScale" ), 2.0 ) );
+	}
+
+	protected event OnTick( eventData : gameprojectileTickEvent )
+	{
+		var playerPosition : Vector4;
+		m_discPosition = eventData.position;
+		m_airTime += eventData.deltaTime;
+		playerPosition = GetPlayerPosition();
+		if( ( !( m_returningToPlayer ) && !( m_targetAcquired ) ) && ( Vector4.Distance( m_discSpawnPoint, m_discPosition ) >= GetMaxDistance() ) )
+		{
+			ReturnToPlayer();
+		}
+		else if( ( ( m_returningToPlayer && !( m_catchingPlayer ) ) && !( m_discLodgedToSurface ) ) && ( Vector4.Distance( playerPosition, m_discPosition ) <= TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "distanceToStartCatching" ), 0.0 ) ) )
+		{
+			StartCathingPlayer();
+		}
+		else if( ( m_returningToPlayer && !( m_discLodgedToSurface ) ) && ( Vector4.Distance( playerPosition, m_discPosition ) <= TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "distanceToPlayCatchAnim" ), 0.0 ) ) )
+		{
+			PlayCatchAnimation();
+		}
+		else if( ( !( m_returningToPlayer ) && ( Vector4.Distance( playerPosition, m_discPosition ) <= TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "distanceToPlayCatchAnim" ), 0.0 ) ) ) && ( m_airTime >= TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "minAirTimeToCatchTheDisc" ), 0.0 ) ) )
+		{
+			PlayCatchAnimation();
+			Release();
+		}
+		else if( m_discLodgedToSurface )
+		{
+			m_destroyTimer += eventData.deltaTime;
+		}
+		if( m_destroyTimer >= TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "maxTimeToDestroy" ), 0.0 ) )
+		{
+			Release();
+		}
+	}
+
+	private function GetMaxDistance() : Float
+	{
+		var maxDistanceInAir : Float;
+		if( m_throwtype == ThrowType.Quick )
+		{
+			maxDistanceInAir = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "maxDistanceQuickThrow" ), 0.0 );
+		}
+		else if( m_throwtype == ThrowType.Charge )
+		{
+			maxDistanceInAir = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "maxDistanceChargeThrow" ), 0.0 );
+		}
+		return maxDistanceInAir;
+	}
+
+	private function IsPlayerInKerenzikov() : Bool
+	{
+		var isPlayerInKerenzikov : Bool;
+		if( m_blackboard )
+		{
+			isPlayerInKerenzikov = GetBlackboardIntVariable( GetAllBlackboardDefs().PlayerStateMachine.Locomotion ) == ( ( Int32 )( gamePSMLocomotionStates.Kereznikov ) );
+		}
+		return isPlayerInKerenzikov;
+	}
+
+	private function GetPlayerSpeed() : Float
+	{
+		var speed : Float;
+		var velocity : Vector4;
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( m_player ) );
+		velocity = player.GetVelocity();
+		speed = Vector4.Length2D( velocity );
+		return speed;
+	}
+
+	private function GetPlayerPosition() : Vector4
+	{
+		var playerPosition : Vector4;
+		var positionParameter : Variant;
+		positionParameter = m_player.GetWorldPosition();
+		playerPosition = ( ( Vector4 )positionParameter );
+		return playerPosition;
+	}
+
+	protected event OnCollision( eventData : gameprojectileHitEvent )
+	{
+		var object : Entity;
+		m_collisionCount += 1;
+		object = eventData.hitInstances[ 0 ].hitObject;
+		m_target = ( ( NPCPuppet )( object ) );
+		if( !( m_target.HasTag( 'BossExo' ) ) && !( m_wasNPCHit ) )
+		{
+			DealDamage( eventData );
+			m_wasNPCHit = true;
+		}
+		if( !( m_returningToPlayer ) && ( m_collisionCount == 1 ) )
+		{
+			ReturnToPlayer();
+		}
+		if( m_returningToPlayer && ( m_collisionCount >= TDB.GetInt( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "illegalCollisionCount" ), 0 ) ) )
+		{
+			LodgeDiscToSurface();
+		}
+	}
+
+	private function LodgeDiscToSurface()
+	{
+		if( !( m_discLodgedToSurface ) )
+		{
+			GameObject.PlaySoundEvent( this, 'monodisc_projectile_loop_stop' );
+			m_projectileComponent.ClearTrajectories();
+			AnimationControllerComponent.SetInputFloat( this, 'max_rotation_speed', 0.0 );
+			m_discLodgedToSurface = true;
+		}
+	}
+
+	private function DealDamage( eventData : gameprojectileHitEvent )
+	{
+		var damage : EffectInstance;
+		var damageData : EffectData;
+		damage = m_projectileComponent.GetGameEffectInstance();
+		damageData = damage.GetSharedData();
+		EffectData.SetVariant( damageData, GetAllBlackboardDefs().EffectSharedData.projectileHitEvent, eventData );
+		damage.Run();
+	}
+
+	private function SetTargetComponentQuickThrow( quickThrowTarget : IPlacedComponent )
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		if( quickThrowTarget )
+		{
+			m_projectileComponent.ClearTrajectories();
+			followCurveParams.startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetVel" ), 0.0 );
+			followCurveParams.linearTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetLinearTimeRatio" ), 0.0 );
+			followCurveParams.interpolationTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetInterpolationTimeRatio" ), 0.0 );
+			followCurveParams.returnTimeMargin = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetReturnTimeMargin" ), 0.0 );
+			followCurveParams.bendTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "bendTimeRatio" ), 0.0 );
+			followCurveParams.bendFactor = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "bendFactor" ), 0.0 );
+			followCurveParams.halfLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "halfLeanAngleQuickThrow" ), 0.0 );
+			followCurveParams.endLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "endLeanAngleQuickThrow" ), 0.0 );
+			followCurveParams.angleInterpolationDuration = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "angleInterpolationDurationQuickThrow" ), 0.0 );
+			followCurveParams.targetComponent = quickThrowTarget;
+			m_projectileComponent.AddFollowCurve( followCurveParams );
+			m_targetAcquired = true;
+		}
+	}
+
+	private function SetTargetComponent( target : IPlacedComponent )
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		if( target )
+		{
+			m_projectileComponent.ClearTrajectories();
+			followCurveParams.startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetVel" ), 0.0 );
+			followCurveParams.linearTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetLinearTimeRatio" ), 0.0 );
+			followCurveParams.interpolationTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetInterpolationTimeRatio" ), 0.0 );
+			followCurveParams.returnTimeMargin = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetReturnTimeMargin" ), 0.0 );
+			followCurveParams.bendTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "bendTimeRatio" ), 0.0 );
+			followCurveParams.bendFactor = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "bendFactor" ), 0.0 );
+			followCurveParams.halfLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "halfLeanAngleChargeThrow" ), 0.0 );
+			followCurveParams.endLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "endLeanAngleChargeThrow" ), 0.0 );
+			followCurveParams.angleInterpolationDuration = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "angleInterpolationDurationChargeThrow" ), 0.0 );
+			followCurveParams.targetComponent = target;
+			m_projectileComponent.AddFollowCurve( followCurveParams );
+			m_targetAcquired = true;
+		}
+	}
+
+	private function GetPlayerTargetComponent() : CName
+	{
+		var playerTargetingComponent : CName;
+		playerTargetingComponent = TDB.GetCName( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetComponentName" ), 'targeting_cyberarm' );
+		return playerTargetingComponent;
+	}
+
+	private function ReturnToPlayer()
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		m_projectileComponent.ClearTrajectories();
+		followCurveParams.startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetVelReturnToPlayer" ), 0.0 );
+		followCurveParams.linearTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetLinearTimeRatio" ), 0.0 );
+		followCurveParams.interpolationTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetInterpolationTimeRatio" ), 0.0 );
+		followCurveParams.returnTimeMargin = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetReturnTimeMargin" ), 0.0 );
+		followCurveParams.halfLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "halfLeanAngleReturn" ), 0.0 );
+		followCurveParams.endLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "endLeanAngleReturn" ), 0.0 );
+		followCurveParams.componentName = GetPlayerTargetComponent();
+		followCurveParams.target = m_player;
+		m_projectileComponent.AddFollowCurve( followCurveParams );
+		m_returningToPlayer = true;
+	}
+
+	private function StartCathingPlayer()
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		m_projectileComponent.ClearTrajectories();
+		followCurveParams.startVelocity = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetVelToCatchPlayer" ), 0.0 );
+		followCurveParams.linearTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetLinearTimeRatioCatchPlayer" ), 0.0 );
+		followCurveParams.interpolationTimeRatio = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetInterpolationTimeRatioCatchPlayer" ), 0.0 );
+		followCurveParams.returnTimeMargin = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "targetReturnTimeMarginCatchPlayer" ), 0.0 );
+		followCurveParams.accuracy = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "distanceToDestroyDisc" ), 0.0 );
+		followCurveParams.componentName = GetPlayerTargetComponent();
+		followCurveParams.target = m_player;
+		followCurveParams.halfLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "halfLeanAngleCatchingPlayer" ), 0.0 );
+		followCurveParams.endLeanAngle = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "endLeanAngleCatchingPlayer" ), 0.0 );
+		followCurveParams.angleInterpolationDuration = TDB.GetFloat( TDBID.Create( ( ( "cyberware." + m_tweakDBPath ) + "." ) + "angleInterpolationDurationCatchingPlayer" ), 0.0 );
+		m_projectileComponent.AddFollowCurve( followCurveParams );
+		m_catchingPlayer = true;
+	}
+
+	protected event OnFollowSuccess( eventData : gameprojectileFollowEvent )
+	{
+		if( m_player && ( m_player == eventData.followObject ) )
+		{
+			Release();
+		}
+		else if( !( m_returningToPlayer ) && !( m_targetAcquired ) )
+		{
+			ReturnToPlayer();
+		}
+		else if( m_targetAcquired )
+		{
+			ReturnToPlayer();
+		}
+	}
+
+	private function PlayCatchAnimation()
+	{
+		var psmParam : PSMPostponedParameterInt;
+		if( !( m_discCaught ) )
+		{
+			if( m_animationController )
+			{
+				AnimationControllerComponent.SetInputBool( this, 'is_caught', true );
+			}
+			psmParam = new PSMPostponedParameterInt;
+			psmParam.id = 'MonoDiscState';
+			psmParam.value = 1;
+			m_player.QueueEvent( psmParam );
+			m_discCaught = true;
+		}
+	}
+
+	private function SpawnTrailEffects()
+	{
+		var audioSwitchValue : CName;
+		if( m_throwtype == ThrowType.Charge )
+		{
+			SpawnVisualEffect( 'trail_charged', m_disc );
+			SpawnVisualEffect( 'spinning', m_disc );
+			audioSwitchValue = 'monodisc_throw_charged';
+		}
+		else
+		{
+			SpawnVisualEffect( 'trail', m_disc );
+			audioSwitchValue = 'monodisc_throw_quick';
+		}
+		GameObject.SetAudioSwitch( this, 'monodisc_throw_type', audioSwitchValue );
+	}
+
+	private function SpawnVisualEffect( effectName : CName, disc : GameObject )
+	{
+		var spawnEffectEvent : entSpawnEffectEvent;
+		spawnEffectEvent = new entSpawnEffectEvent;
+		spawnEffectEvent.effectName = effectName;
+		QueueEvent( ( ( Event )( spawnEffectEvent ) ) );
+	}
+
+}
+
+enum ThrowType
+{
+	Quick = 0,
+	Charge = 1,
+}
+

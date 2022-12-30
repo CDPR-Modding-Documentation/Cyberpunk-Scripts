@@ -1,0 +1,1677 @@
+import class BackpackMainGameController extends gameuiMenuGameController
+{
+	private editable var m_commonCraftingMaterialsGrid : inkCompoundRef;
+	private editable var m_hackingCraftingMaterialsGrid : inkCompoundRef;
+	private editable var m_filterButtonsGrid : inkCompoundRef;
+	private editable var m_virtualItemsGrid : inkVirtualCompoundRef;
+	private editable var m_TooltipsManagerRef : inkWidgetRef;
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_sortingButton : inkWidgetRef;
+	private editable var m_sortingDropdown : inkWidgetRef;
+	private editable var m_itemsListScrollAreaContainer : inkWidgetRef;
+	private editable var m_itemNotificationRoot : inkWidgetRef;
+	private var m_virtualBackpackItemsListController : weak< inkGridController >;
+	private var m_TooltipsManager : weak< gameuiTooltipsManager >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_itemTypeSorting : array< gamedataItemType >;
+	private var m_InventoryManager : InventoryDataManagerV2;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_itemDropQueueItems : array< ItemID >;
+	private var m_itemDropQueue : array< ItemModParams >;
+	private var m_craftingMaterialsListItems : array< weak< CrafringMaterialItemController > >;
+	private var m_DisassembleCallback : UI_CraftingDef;
+	private var m_DisassembleBlackboard : weak< IBlackboard >;
+	private var m_DisassembleBBID : CallbackHandle;
+	private var m_EquippedCallback : UI_EquipmentDef;
+	private var m_EquippedBlackboard : weak< IBlackboard >;
+	private var m_EquippedBBID : CallbackHandle;
+	private var m_InventoryCallback : UI_InventoryDef;
+	private var m_InventoryBlackboard : weak< IBlackboard >;
+	private var m_InventoryBBID : CallbackHandle;
+	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_activeFilter : weak< BackpackFilterButtonController >;
+	private var m_filterSpawnRequests : array< weak< inkAsyncSpawnRequest > >;
+	private var m_backpackItemsDataSource : ScriptableDataSource;
+	private var m_backpackItemsDataView : BackpackDataView;
+	private var m_comparisonResolver : InventoryItemPreferredComparisonResolver;
+	private var m_backpackInventoryListenerCallback : BackpackInventoryListenerCallback;
+	private var m_backpackInventoryListener : InventoryScriptListener;
+	private var m_backpackItemsClassifier : ItemDisplayTemplateClassifier;
+	private var m_backpackItemsPositionProvider : ItemPositionProvider;
+	private var m_equipSlotChooserPopupToken : inkGameNotificationToken;
+	private var m_quantityPickerPopupToken : inkGameNotificationToken;
+	private var m_equipRequested : Bool;
+	private var m_psmBlackboard : weak< IBlackboard >;
+	private var playerState : gamePSMVehicle;
+	private var m_uiScriptableSystem : weak< UIScriptableSystem >;
+	private var m_uiInventorySystem : weak< UIInventoryScriptableSystem >;
+	private var m_itemDisplayContext : ItemDisplayContextData;
+	private var m_confirmationPopupToken : inkGameNotificationToken;
+	private var m_lastItemHoverOverEvent : ItemDisplayHoverOverEvent;
+	private var m_isComparisonDisabled : Bool;
+	private var m_immediateNotificationListener : BakcpackImmediateNotificationListener;
+	private var m_virtualWidgets : inkWeakHashMap;
+	private var m_allWidgets : inkWeakHashMap;
+	protected var m_itemPreviewPopupToken : inkGameNotificationToken;
+	protected var m_afterCloseRequest : Bool;
+
+	protected event OnInitialize()
+	{
+		var playerPuppet : weak< GameObject >;
+		m_backpackInventoryListenerCallback = new BackpackInventoryListenerCallback;
+		m_backpackInventoryListenerCallback.Setup( ( ( weak< weak< BackpackMainGameController > > )( this ) ) );
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'back', "Common-Access-Close" );
+		m_buttonHintsController.AddButtonHint( 'toggle_comparison_tooltip', GetLocalizedText( "UI-UserActions-DisableComparison" ) );
+		m_itemTypeSorting = InventoryDataManagerV2.GetItemTypesForSorting();
+		m_TooltipsManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_TooltipsManagerRef, 'gameuiTooltipsManager' ) ) );
+		m_TooltipsManager.Setup( ETooltipsStyle.Menus );
+		RegisterToBB();
+		AsyncSpawnFromExternal( inkWidgetRef.Get( m_itemNotificationRoot ), R"base\gameplay\gui\widgets\activity_log\activity_log_panels.inkwidget", 'RootVert' );
+		PlayLibraryAnimation( 'backpack_intro' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+		playerPuppet = ( ( PlayerPuppet )( GetOwnerEntity() ) );
+		m_psmBlackboard = GetPSMBlackboard( playerPuppet );
+		playerState = ( ( gamePSMVehicle )( m_psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle ) ) );
+		super.OnInitialize();
+	}
+
+	protected event OnUninitialize()
+	{
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnCloseMenu', this, 'OnCloseMenu' );
+		m_InventoryManager.UnInitialize();
+		m_uiInventorySystem.FlushFullscreenCache();
+		UnregisterFromBB();
+		GameInstance.GetTransactionSystem( m_player.GetGame() ).UnregisterInventoryListener( m_player, m_backpackInventoryListener );
+		m_backpackInventoryListener = NULL;
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+		super.OnUninitialize();
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		if( m_player != NULL )
+		{
+			GameInstance.GetTransactionSystem( m_player.GetGame() ).UnregisterInventoryListener( m_player, m_backpackInventoryListener );
+		}
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		m_uiScriptableSystem = UIScriptableSystem.GetInstance( m_player.GetGame() );
+		m_uiInventorySystem = UIInventoryScriptableSystem.GetInstance( m_player.GetGame() );
+		m_itemDisplayContext = ItemDisplayContextData.Make( m_player, ItemDisplayContext.Backpack );
+		m_InventoryManager = new InventoryDataManagerV2;
+		m_InventoryManager.Initialize( m_player );
+		m_comparisonResolver = InventoryItemPreferredComparisonResolver.Make( m_uiInventorySystem );
+		m_backpackInventoryListener = GameInstance.GetTransactionSystem( m_player.GetGame() ).RegisterInventoryListener( m_player, m_backpackInventoryListenerCallback );
+		m_isComparisonDisabled = m_uiScriptableSystem.IsComparisionTooltipDisabled();
+		m_buttonHintsController.AddButtonHint( 'toggle_comparison_tooltip', GetLocalizedText( ( ( m_isComparisonDisabled ) ? ( "UI-UserActions-EnableComparison" ) : ( "UI-UserActions-DisableComparison" ) ) ) );
+		SetupVirtualGrid();
+		SetupDropdown();
+		PopulateCraftingMaterials();
+		RefreshUI();
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		ResetVirtualGrid();
+	}
+
+	protected event OnPostOnRelease( evt : inkPointerEvent )
+	{
+		var setComparisionDisabledRequest : UIScriptableSystemSetComparisionTooltipDisabled;
+		if( evt.IsAction( 'toggle_comparison_tooltip' ) )
+		{
+			m_isComparisonDisabled = !( m_isComparisonDisabled );
+			m_buttonHintsController.AddButtonHint( 'toggle_comparison_tooltip', GetLocalizedText( ( ( m_isComparisonDisabled ) ? ( "UI-UserActions-EnableComparison" ) : ( "UI-UserActions-DisableComparison" ) ) ) );
+			setComparisionDisabledRequest = new UIScriptableSystemSetComparisionTooltipDisabled;
+			setComparisionDisabledRequest.value = m_isComparisonDisabled;
+			m_uiScriptableSystem.QueueRequest( setComparisionDisabledRequest );
+			InvalidateItemTooltipEvent();
+		}
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		super.OnSetMenuEventDispatcher( menuEventDispatcher );
+		m_menuEventDispatcher = menuEventDispatcher;
+		m_menuEventDispatcher.RegisterToEvent( 'OnBack', this, 'OnBack' );
+		m_menuEventDispatcher.RegisterToEvent( 'OnCloseMenu', this, 'OnCloseMenu' );
+	}
+
+	protected event OnCloseMenu( userData : IScriptable )
+	{
+		if( ( m_itemDropQueue.Size() == 1 ) && ( m_itemDropQueue[ 0 ].quantity == 1 ) )
+		{
+			ItemActionsHelper.DropItem( m_player, m_itemDropQueue[ 0 ].itemID );
+			m_itemDropQueue.Clear();
+		}
+		else if( m_itemDropQueue.Size() > 0 )
+		{
+			RPGManager.DropManyItems( m_player.GetGame(), m_player, m_itemDropQueue );
+			m_itemDropQueue.Clear();
+		}
+	}
+
+	protected event OnBack( userData : IScriptable )
+	{
+		if( !( m_afterCloseRequest ) )
+		{
+			super.OnBack( userData );
+		}
+		else
+		{
+			m_afterCloseRequest = false;
+		}
+	}
+
+	private function RegisterToBB()
+	{
+		m_DisassembleCallback = GetAllBlackboardDefs().UI_Crafting;
+		m_EquippedCallback = GetAllBlackboardDefs().UI_Equipment;
+		m_InventoryCallback = GetAllBlackboardDefs().UI_Inventory;
+		m_DisassembleBlackboard = GetBlackboardSystem().Get( m_DisassembleCallback );
+		m_EquippedBlackboard = GetBlackboardSystem().Get( m_EquippedCallback );
+		m_InventoryBlackboard = GetBlackboardSystem().Get( m_InventoryCallback );
+		if( m_DisassembleBlackboard )
+		{
+			m_DisassembleBBID = m_DisassembleBlackboard.RegisterDelayedListenerVariant( m_DisassembleCallback.lastIngredients, this, 'OnDisassembleComplete', true );
+		}
+		if( m_EquippedBlackboard )
+		{
+			m_EquippedBBID = m_EquippedBlackboard.RegisterDelayedListenerVariant( m_EquippedCallback.itemEquipped, this, 'OnItemEquipped', true );
+		}
+		if( m_InventoryBlackboard )
+		{
+			m_InventoryBBID = m_InventoryBlackboard.RegisterDelayedListenerVariant( m_InventoryCallback.itemRemoved, this, 'OnInventoryItemRemoved', false );
+		}
+	}
+
+	private function UnregisterFromBB()
+	{
+		if( m_DisassembleBlackboard )
+		{
+			m_DisassembleBlackboard.UnregisterDelayedListener( m_DisassembleCallback.lastIngredients, m_DisassembleBBID );
+		}
+		if( m_EquippedBlackboard )
+		{
+			m_EquippedBlackboard.UnregisterDelayedListener( m_EquippedCallback.itemEquipped, m_EquippedBBID );
+		}
+	}
+
+	protected function SetupVirtualGrid()
+	{
+		m_virtualBackpackItemsListController = ( ( inkGridController )( inkVirtualCompoundRef.GetControllerByType( m_virtualItemsGrid, 'inkGridController' ) ) );
+		m_backpackItemsClassifier = new ItemDisplayTemplateClassifier;
+		m_backpackItemsPositionProvider = new ItemPositionProvider;
+		m_backpackItemsDataSource = new ScriptableDataSource;
+		m_backpackItemsDataView = new BackpackDataView;
+		m_backpackItemsDataView.BindUIScriptableSystem( m_uiScriptableSystem );
+		m_immediateNotificationListener = new BakcpackImmediateNotificationListener;
+		m_immediateNotificationListener.SetBackpackInstance( this );
+		m_virtualWidgets = new inkWeakHashMap;
+		m_backpackItemsDataView.SetSource( m_backpackItemsDataSource );
+		m_backpackItemsDataView.EnableSorting();
+		m_virtualBackpackItemsListController.SetClassifier( m_backpackItemsClassifier );
+		m_virtualBackpackItemsListController.SetProvider( m_backpackItemsPositionProvider );
+		m_virtualBackpackItemsListController.SetSource( m_backpackItemsDataView );
+	}
+
+	protected function ResetVirtualGrid()
+	{
+		m_virtualBackpackItemsListController.SetSource( NULL );
+		m_virtualBackpackItemsListController.SetClassifier( NULL );
+		m_virtualBackpackItemsListController.SetProvider( NULL );
+		m_backpackItemsDataView.SetSource( NULL );
+		m_backpackItemsDataView = NULL;
+		m_backpackItemsDataSource = NULL;
+		m_backpackItemsPositionProvider = NULL;
+		m_backpackItemsClassifier = NULL;
+	}
+
+	private function SetupDropdown()
+	{
+		var controller : DropdownListController;
+		var sortingButtonController : DropdownButtonController;
+		var sorting : Int32;
+		var data : DropdownItemData;
+		inkWidgetRef.RegisterToCallback( m_sortingButton, 'OnRelease', this, 'OnSortingButtonClicked' );
+		controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
+		sortingButtonController = ( ( DropdownButtonController )( inkWidgetRef.GetController( m_sortingButton ) ) );
+		controller.Setup( this, SortingDropdownData.GetDefaultDropdownOptions(), sortingButtonController );
+		sorting = m_uiScriptableSystem.GetBackpackActiveSorting( ( ( Int32 )( ItemSortMode.Default ) ) );
+		data = SortingDropdownData.GetDropdownOption( controller.GetData(), ( ( ItemSortMode )( sorting ) ) );
+		sortingButtonController.SetData( data );
+		m_backpackItemsDataView.SetSortMode( ( ( ItemSortMode )data.identifier ) );
+	}
+
+	protected event OnDropdownItemClickedEvent( evt : DropdownItemClickedEvent )
+	{
+		var identifier : ItemSortMode;
+		var sortingButtonController : DropdownButtonController;
+		var data : DropdownItemData;
+		var setSortingRequest : UIScriptableSystemSetBackpackSorting;
+		identifier = ( ( ItemSortMode )evt.identifier );
+		data = SortingDropdownData.GetDropdownOption( ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) ).GetData(), identifier );
+		if( data )
+		{
+			sortingButtonController = ( ( DropdownButtonController )( inkWidgetRef.GetController( m_sortingButton ) ) );
+			sortingButtonController.SetData( data );
+			m_backpackItemsDataView.SetSortMode( identifier );
+			setSortingRequest = new UIScriptableSystemSetBackpackSorting;
+			setSortingRequest.sortMode = ( ( Int32 )( identifier ) );
+			m_uiScriptableSystem.QueueRequest( setSortingRequest );
+		}
+	}
+
+	public function OnBakcpackItemDisplayNotification( message : ItemDisplayNotificationMessage, id : Uint64, optional data : weak< IScriptable > )
+	{
+		if( message == ItemDisplayNotificationMessage.AddRef )
+		{
+			m_virtualWidgets.Remove( id );
+			m_virtualWidgets.Insert( id, data );
+		}
+		else if( message == ItemDisplayNotificationMessage.RemoveRef )
+		{
+			m_virtualWidgets.Remove( id );
+		}
+	}
+
+	protected event OnDisassembleComplete( value : Variant )
+	{
+		var i, limit : Int32;
+		var itemID : ItemID;
+		var action : CraftingCommands;
+		var updatedIngredients : array< IngredientData >;
+		var ingredientID : ItemID;
+		var controller : weak< ItemDisplayVirtualController >;
+		action = ( ( CraftingCommands )( m_DisassembleBlackboard.GetVariant( m_DisassembleCallback.lastCommand ) ) );
+		if( action == CraftingCommands.DisassemblingFinished )
+		{
+			itemID = ( ( ItemID )( m_DisassembleBlackboard.GetVariant( m_DisassembleCallback.lastItem ) ) );
+			controller = ( ( weak< weak< ItemDisplayVirtualController > > )( m_virtualWidgets.Get( ItemID.GetCombinedHash( itemID ) ) ) );
+			controller.GetItemView().GetUIInventoryItem().GetQuantity( true );
+			controller.Update();
+			updatedIngredients = ( ( array< IngredientData > )value );
+			for( i = 0, limit = updatedIngredients.Size(); i < limit; i += 1 )
+			{
+				ingredientID = ItemID.FromTDBID( updatedIngredients[ i ].id.GetID() );
+				UpdateCraftingMaterial( ingredientID );
+			}
+		}
+	}
+
+	protected event OnItemEquipped( value : Variant )
+	{
+		if( m_equipRequested )
+		{
+			RefreshUI();
+			m_equipRequested = false;
+		}
+	}
+
+	protected event OnInventoryItemRemoved( value : Variant )
+	{
+		RefreshUI();
+	}
+
+	public function UpdateQuantites()
+	{
+		RefreshUI();
+	}
+
+	private function RefreshUI()
+	{
+		PopulateInventory();
+	}
+
+	protected function AddToDropQueue( item : ItemModParams )
+	{
+		var i : Int32;
+		var merged : Bool;
+		var evt : DropQueueUpdatedEvent;
+		for( i = 0; i < m_itemDropQueue.Size(); i += 1 )
+		{
+			if( m_itemDropQueue[ i ].itemID == item.itemID )
+			{
+				m_itemDropQueue[ i ].quantity += item.quantity;
+				merged = true;
+				break;
+			}
+		}
+		if( !( merged ) )
+		{
+			m_itemDropQueue.PushBack( item );
+			m_itemDropQueueItems.PushBack( item.itemID );
+		}
+		evt = new DropQueueUpdatedEvent;
+		evt.m_dropQueue = m_itemDropQueue;
+		QueueEvent( evt );
+	}
+
+	private function GetDropQueueItem( itemID : ItemID ) : ItemModParams
+	{
+		var i, limit : Int32;
+		var dummy : ItemModParams;
+		for( i = 0, limit = m_itemDropQueue.Size(); i < limit; i += 1 )
+		{
+			if( m_itemDropQueue[ i ].itemID == itemID )
+			{
+				return m_itemDropQueue[ i ];
+			}
+		}
+		return dummy;
+	}
+
+	private function PopulateInventory()
+	{
+		var filterManager : ItemCategoryFliterManager;
+		var i, limit : Int32;
+		var wrappedItem : WrappedInventoryItemData;
+		var wrappedItems : array< IScriptable >;
+		var playerItems : inkHashMap;
+		var uiInventoryItem : UIInventoryItem;
+		var values : array< weak< IScriptable > >;
+		var quantity : Int32;
+		var dropItem : ItemModParams;
+		var tagsToFilterOut : array< CName >;
+		filterManager = ItemCategoryFliterManager.Make();
+		filterManager.AddFilterToCheck( ItemFilterCategory.Quest );
+		tagsToFilterOut.PushBack( 'HideInBackpackUI' );
+		tagsToFilterOut.PushBack( 'SoftwareShard' );
+		m_uiInventorySystem.FlushTempData();
+		playerItems = m_uiInventorySystem.GetPlayerItemsMap();
+		playerItems.GetValues( values );
+		for( i = 0, limit = values.Size(); i < limit; i += 1 )
+		{
+			uiInventoryItem = ( ( UIInventoryItem )( values[ i ] ) );
+			if( ItemID.HasFlag( uiInventoryItem.GetID(), gameEItemIDFlag.Preview ) )
+			{
+				continue;
+			}
+			if( uiInventoryItem.HasAnyTag( tagsToFilterOut ) )
+			{
+				continue;
+			}
+			if( m_itemDropQueueItems.Contains( uiInventoryItem.ID ) )
+			{
+				quantity = uiInventoryItem.GetQuantity( true );
+				dropItem = GetDropQueueItem( uiInventoryItem.ID );
+				if( dropItem.quantity >= quantity )
+				{
+					continue;
+				}
+				else
+				{
+					uiInventoryItem.SetQuantity( quantity - dropItem.quantity );
+				}
+			}
+			wrappedItem = new WrappedInventoryItemData;
+			wrappedItem.DisplayContextData = m_itemDisplayContext;
+			wrappedItem.IsNew = m_uiScriptableSystem.IsInventoryItemNew( uiInventoryItem.ID );
+			wrappedItem.Item = uiInventoryItem;
+			wrappedItem.NotificationListener = m_immediateNotificationListener;
+			filterManager.AddItem( uiInventoryItem.GetFilterCategory() );
+			wrappedItems.PushBack( wrappedItem );
+		}
+		filterManager.SortFiltersList();
+		filterManager.AddFilter( ItemFilterCategory.AllItems );
+		RefreshFilterButtons( filterManager.GetFiltersList() );
+		m_backpackItemsDataSource.Reset( wrappedItems );
+	}
+
+	private function ClearCraftingMaterials()
+	{
+		m_craftingMaterialsListItems.Clear();
+		inkCompoundRef.RemoveAllChildren( m_commonCraftingMaterialsGrid );
+		inkCompoundRef.RemoveAllChildren( m_hackingCraftingMaterialsGrid );
+	}
+
+	private function PopulateCraftingMaterials()
+	{
+		var i, limit : Int32;
+		var materialsTweaks : array< TweakDBID >;
+		var commonCraftingMaterials, hackingCraftingMaterials : array< CachedCraftingMaterial >;
+		materialsTweaks = UIInventoryHelper.GetCommonCraftingMaterials();
+		for( i = 0, limit = materialsTweaks.Size(); i < limit; i += 1 )
+		{
+			commonCraftingMaterials.PushBack( CachedCraftingMaterial.Make( materialsTweaks[ i ] ) );
+		}
+		materialsTweaks = UIInventoryHelper.GetHackingCraftingMaterials();
+		for( i = 0, limit = materialsTweaks.Size(); i < limit; i += 1 )
+		{
+			hackingCraftingMaterials.PushBack( CachedCraftingMaterial.Make( materialsTweaks[ i ] ) );
+		}
+		for( i = 0, limit = commonCraftingMaterials.Size(); i < limit; i += 1 )
+		{
+			commonCraftingMaterials[ i ].UpdateQuantity( m_player );
+			CreateCraftingMaterialItem( commonCraftingMaterials[ i ], m_commonCraftingMaterialsGrid );
+		}
+		for( i = 0, limit = hackingCraftingMaterials.Size(); i < limit; i += 1 )
+		{
+			hackingCraftingMaterials[ i ].UpdateQuantity( m_player );
+			CreateCraftingMaterialItem( hackingCraftingMaterials[ i ], m_hackingCraftingMaterialsGrid );
+		}
+	}
+
+	private function CreateCraftingMaterialItem( craftingMaterial : CachedCraftingMaterial, gridList : inkCompoundRef )
+	{
+		var callbackData : BackpackCraftingMaterialItemCallbackData;
+		callbackData = new BackpackCraftingMaterialItemCallbackData;
+		callbackData.craftingMaterial = craftingMaterial;
+		AsyncSpawnFromLocal( inkCompoundRef.Get( gridList ), 'craftingMaterialItem', this, 'OnCraftingMaterialItemSpawned', callbackData );
+	}
+
+	protected event OnCraftingMaterialItemSpawned( widget : inkWidget, callbackData : BackpackCraftingMaterialItemCallbackData )
+	{
+		var controller : CrafringMaterialItemController;
+		widget.SetVAlign( inkEVerticalAlign.Top );
+		widget.SetHAlign( inkEHorizontalAlign.Left );
+		controller = ( ( CrafringMaterialItemController )( widget.GetController() ) );
+		m_craftingMaterialsListItems.PushBack( controller );
+		controller.Setup( callbackData.craftingMaterial );
+		controller.RegisterToCallback( 'OnHoverOver', this, 'OnCraftingMaterialHoverOver' );
+		controller.RegisterToCallback( 'OnHoverOut', this, 'OnCraftingMaterialHoverOut' );
+	}
+
+	private function UpdateCraftingMaterial( materialID : ItemID, optional skipAnim : Bool )
+	{
+		var i, limit, oldQuantity : Int32;
+		var craftingMaterial : weak< CrafringMaterialItemController >;
+		for( i = 0, limit = m_craftingMaterialsListItems.Size(); i < limit; i += 1 )
+		{
+			if( m_craftingMaterialsListItems[ i ].GetItemID() == materialID )
+			{
+				craftingMaterial = m_craftingMaterialsListItems[ i ];
+				oldQuantity = craftingMaterial.GetQuantity();
+				craftingMaterial.GetCachedCraftingMaterial().UpdateQuantity( m_player );
+				craftingMaterial.RefreshUI();
+				craftingMaterial.SetHighlighted( CrafringMaterialItemHighlight.None );
+				if( !( skipAnim ) && ( craftingMaterial.GetQuantity() > oldQuantity ) )
+				{
+					m_craftingMaterialsListItems[ i ].PlayAnimation();
+				}
+			}
+		}
+	}
+
+	private function RefreshFilterButtons( filters : array< ItemFilterCategory > )
+	{
+		var i : Int32;
+		var savedFilter : Int32;
+		var callbackData : BackpackFilterButtonSpawnedCallbackData;
+		savedFilter = m_uiScriptableSystem.GetBackpackActiveFilter( 0 );
+		for( i = 0; i < m_filterSpawnRequests.Size(); i += 1 )
+		{
+			m_filterSpawnRequests[ i ].Cancel();
+		}
+		m_filterSpawnRequests.Clear();
+		inkCompoundRef.RemoveAllChildren( m_filterButtonsGrid );
+		for( i = 0; i < filters.Size(); i += 1 )
+		{
+			callbackData = new BackpackFilterButtonSpawnedCallbackData;
+			callbackData.category = filters[ i ];
+			callbackData.savedFilter = savedFilter;
+			m_filterSpawnRequests.PushBack( AsyncSpawnFromLocal( inkCompoundRef.Get( m_filterButtonsGrid ), 'backpackFilterButtonItem', this, 'OnFilterButtonSpawned', callbackData ) );
+		}
+	}
+
+	protected event OnFilterButtonSpawned( widget : inkWidget, callbackData : BackpackFilterButtonSpawnedCallbackData )
+	{
+		var filterButton : BackpackFilterButtonController;
+		filterButton = ( ( BackpackFilterButtonController )( widget.GetController() ) );
+		filterButton.RegisterToCallback( 'OnRelease', this, 'OnItemFilterClick' );
+		filterButton.RegisterToCallback( 'OnHoverOver', this, 'OnItemFilterHoverOver' );
+		filterButton.RegisterToCallback( 'OnHoverOut', this, 'OnItemFilterHoverOut' );
+		filterButton.Setup( callbackData.category );
+		if( ( ( Int32 )( filterButton.GetFilterType() ) ) == callbackData.savedFilter )
+		{
+			filterButton.SetActive( true );
+			m_activeFilter = filterButton;
+			m_backpackItemsDataView.SetFilterType( m_activeFilter.GetFilterType() );
+		}
+	}
+
+	private function InvalidateItemTooltipEvent()
+	{
+		if( m_lastItemHoverOverEvent != NULL )
+		{
+			OnItemDisplayHoverOver( m_lastItemHoverOverEvent );
+		}
+	}
+
+	protected event OnItemDisplayHoverOver( evt : ItemDisplayHoverOverEvent )
+	{
+		var controller : DropdownListController;
+		controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
+		m_lastItemHoverOverEvent = evt;
+		if( !( controller.IsOpened() ) )
+		{
+			if( evt.uiInventoryItem )
+			{
+				RequestItemInspected( evt.uiInventoryItem.GetID() );
+			}
+			OnInventoryRequestTooltip( evt.display.GetUIInventoryItem(), evt.widget, evt.display.DEBUG_GetIconErrorInfo() );
+			SetInventoryItemButtonHintsHoverOver( evt.itemData );
+			NewShowItemHints( evt.uiInventoryItem );
+			HighlightDisassemblyResults( evt.uiInventoryItem );
+		}
+	}
+
+	private function RequestItemInspected( itemID : ItemID )
+	{
+		var request : UIScriptableSystemInventoryInspectItem;
+		request = new UIScriptableSystemInventoryInspectItem;
+		request.itemID = itemID;
+		m_uiScriptableSystem.QueueRequest( request );
+	}
+
+	protected event OnItemDisplayHoverOut( evt : ItemDisplayHoverOutEvent )
+	{
+		m_TooltipsManager.HideTooltips();
+		SetInventoryItemButtonHintsHoverOut();
+		HideDisassemblyHighlight();
+		m_lastItemHoverOverEvent = NULL;
+	}
+
+	private function HighlightDisassemblyResults( inventoryItem : weak< UIInventoryItem > )
+	{
+		var i, j : Int32;
+		var disassemblyResults : array< IngredientData >;
+		var itemId : ItemID;
+		var highlighted : Bool;
+		if( RPGManager.CanItemBeDisassembled( m_player.GetGame(), inventoryItem.GetID() ) )
+		{
+			disassemblyResults = GetDisassemblyResult( inventoryItem );
+			for( i = 0; i < m_craftingMaterialsListItems.Size(); i += 1 )
+			{
+				itemId = m_craftingMaterialsListItems[ i ].GetItemID();
+				highlighted = false;
+				for( j = 0; j < disassemblyResults.Size(); j += 1 )
+				{
+					if( disassemblyResults[ j ].id.GetID() == ItemID.GetTDBID( itemId ) )
+					{
+						m_craftingMaterialsListItems[ i ].SetHighlighted( CrafringMaterialItemHighlight.Add, disassemblyResults[ j ].quantity );
+						highlighted = true;
+						break;
+					}
+				}
+				if( !( highlighted ) )
+				{
+					m_craftingMaterialsListItems[ i ].SetHighlighted( CrafringMaterialItemHighlight.None );
+				}
+			}
+		}
+	}
+
+	private function HideDisassemblyHighlight()
+	{
+		var i : Int32;
+		for( i = 0; i < m_craftingMaterialsListItems.Size(); i += 1 )
+		{
+			m_craftingMaterialsListItems[ i ].SetHighlighted( CrafringMaterialItemHighlight.None );
+		}
+	}
+
+	private function GetDisassemblyResult( inventoryItem : weak< UIInventoryItem > ) : array< IngredientData >
+	{
+		var craftingSystem : CraftingSystem;
+		var result : array< IngredientData >;
+		var restoredAttachments : array< ItemAttachments >;
+		craftingSystem = CraftingSystem.GetInstance( m_player.GetGame() );
+		result = craftingSystem.GetDisassemblyResultItems( m_player, inventoryItem.GetID(), 1, restoredAttachments, true );
+		return result;
+	}
+
+	protected event OnSortingButtonClicked( evt : inkPointerEvent )
+	{
+		var controller : DropdownListController;
+		if( evt.IsAction( 'click' ) )
+		{
+			controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
+			controller.Toggle();
+			OnItemDisplayHoverOut( NULL );
+		}
+	}
+
+	protected event OnItemDisplayClick( evt : ItemDisplayClickEvent )
+	{
+		var item : ItemModParams;
+		var isUsable : Bool;
+		if( evt.actionName.IsAction( 'drop_item' ) )
+		{
+			if( ( playerState == gamePSMVehicle.Default && RPGManager.CanItemBeDropped( m_player, evt.uiInventoryItem.GetItemData() ) ) && InventoryGPRestrictionHelper.CanDrop( evt.uiInventoryItem, m_player ) )
+			{
+				if( evt.uiInventoryItem.GetQuantity() > 1 )
+				{
+					OpenQuantityPicker( evt.uiInventoryItem, QuantityPickerActionType.Drop );
+				}
+				else
+				{
+					PlaySound( 'ItemGeneric', 'OnDrop' );
+					item.itemID = evt.uiInventoryItem.ID;
+					item.quantity = 1;
+					AddToDropQueue( item );
+					RefreshUI();
+				}
+			}
+			else
+			{
+				ShowNotification( m_player.GetGame(), DetermineUIMenuNotificationType() );
+			}
+		}
+		else if( evt.actionName.IsAction( 'equip_item' ) )
+		{
+			EquipItem( evt.uiInventoryItem );
+		}
+		else if( evt.actionName.IsAction( 'use_item' ) )
+		{
+			isUsable = ( ( ( ItemActionsHelper.GetConsumeAction( evt.uiInventoryItem.GetID() ) || ItemActionsHelper.GetEatAction( evt.uiInventoryItem.GetID() ) ) || ItemActionsHelper.GetDrinkAction( evt.uiInventoryItem.GetID() ) ) || ItemActionsHelper.GetLearnAction( evt.uiInventoryItem.GetID() ) ) || ItemActionsHelper.GetDownloadFunds( evt.uiInventoryItem.GetID() );
+			if( isUsable )
+			{
+				if( !( InventoryGPRestrictionHelper.CanUse( evt.uiInventoryItem, m_player ) ) )
+				{
+					ShowNotification( m_player.GetGame(), DetermineUIMenuNotificationType() );
+					return false;
+				}
+				PlaySound( 'ItemConsumableFood', 'OnUse' );
+				if( evt.uiInventoryItem.GetItemType() == gamedataItemType.Con_Skillbook )
+				{
+					SetWarningMessage( ( GetLocalizedText( "LocKey#46534" ) + "\n" ) + GetLocalizedText( evt.uiInventoryItem.GetDescription() ) );
+				}
+				ItemActionsHelper.PerformItemAction( m_player, evt.uiInventoryItem.GetID() );
+				m_InventoryManager.MarkToRebuild();
+				RefreshUI();
+			}
+		}
+	}
+
+	private function DetermineUIMenuNotificationType() : UIMenuNotificationType
+	{
+		var psmBlackboard : IBlackboard;
+		var inCombat : Bool;
+		inCombat = false;
+		psmBlackboard = m_player.GetPlayerStateMachineBlackboard();
+		inCombat = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) == ( ( Int32 )( gamePSMCombat.InCombat ) );
+		if( inCombat )
+		{
+			return UIMenuNotificationType.InCombat;
+		}
+		else
+		{
+			return UIMenuNotificationType.InventoryActionBlocked;
+		}
+	}
+
+	private function OpenConfirmationPopup( inventoryItem : weak< UIInventoryItem > )
+	{
+		var data : VendorConfirmationPopupData;
+		data = new VendorConfirmationPopupData;
+		data.notificationName = 'base\gameplay\gui\widgets\notifications\vendor_confirmation.inkwidget';
+		data.isBlocking = true;
+		data.useCursor = true;
+		data.queueName = 'modal_popup';
+		data.inventoryItem = inventoryItem;
+		data.quantity = inventoryItem.GetQuantity();
+		data.type = VendorConfirmationPopupType.DisassembeIconic;
+		m_confirmationPopupToken = ShowGameNotification( data );
+		m_confirmationPopupToken.RegisterListener( this, 'OnConfirmationPopupClosed' );
+		m_buttonHintsController.Hide();
+	}
+
+	protected event OnConfirmationPopupClosed( data : inkGameNotificationData )
+	{
+		var resultData : VendorConfirmationPopupCloseData;
+		var itemID : ItemID;
+		m_confirmationPopupToken = NULL;
+		resultData = ( ( VendorConfirmationPopupCloseData )( data ) );
+		if( resultData.confirm )
+		{
+			if( resultData.inventoryItem )
+			{
+				itemID = resultData.inventoryItem.GetID();
+			}
+			else
+			{
+				itemID = InventoryItemData.GetID( resultData.itemData );
+			}
+			ItemActionsHelper.DisassembleItem( m_player, itemID );
+			PlaySound( 'Item', 'OnDisassemble' );
+		}
+		m_buttonHintsController.Show();
+	}
+
+	private function OpenQuantityPicker( itemData : weak< UIInventoryItem >, actionType : QuantityPickerActionType )
+	{
+		var data : QuantityPickerPopupData;
+		var dropItem : ItemModParams;
+		dropItem = GetDropQueueItem( itemData.GetID() );
+		data = new QuantityPickerPopupData;
+		data.notificationName = 'base\gameplay\gui\widgets\notifications\item_quantity_picker.inkwidget';
+		data.isBlocking = true;
+		data.useCursor = true;
+		data.queueName = 'modal_popup';
+		data.maxValue = itemData.GetQuantity( true );
+		if( ItemID.IsValid( dropItem.itemID ) )
+		{
+			data.maxValue -= dropItem.quantity;
+		}
+		data.inventoryItem = itemData;
+		data.actionType = actionType;
+		m_quantityPickerPopupToken = ShowGameNotification( data );
+		m_quantityPickerPopupToken.RegisterListener( this, 'OnQuantityPickerPopupClosed' );
+		m_buttonHintsController.Hide();
+	}
+
+	protected event OnQuantityPickerPopupClosed( data : inkGameNotificationData )
+	{
+		var quantityData : QuantityPickerPopupCloseData;
+		m_quantityPickerPopupToken = NULL;
+		quantityData = ( ( QuantityPickerPopupCloseData )( data ) );
+		if( quantityData.choosenQuantity != -1 )
+		{
+			switch( quantityData.actionType )
+			{
+				case QuantityPickerActionType.Drop:
+					OnQuantityPickerDrop( quantityData );
+				break;
+				case QuantityPickerActionType.Disassembly:
+					OnQuantityPickerDisassembly( quantityData );
+				break;
+			}
+		}
+		m_buttonHintsController.Show();
+	}
+
+	public function OnQuantityPickerDrop( data : QuantityPickerPopupCloseData )
+	{
+		var item : ItemModParams;
+		PlaySound( 'ItemGeneric', 'OnDrop' );
+		if( data.inventoryItem )
+		{
+			item.itemID = data.inventoryItem.GetID();
+		}
+		else
+		{
+			item.itemID = InventoryItemData.GetID( data.itemData );
+		}
+		item.quantity = data.choosenQuantity;
+		AddToDropQueue( item );
+		RefreshUI();
+	}
+
+	public function OnQuantityPickerDisassembly( data : QuantityPickerPopupCloseData )
+	{
+		var itemID : ItemID;
+		itemID = ( ( data.inventoryItem ) ? ( data.inventoryItem.GetID() ) : ( InventoryItemData.GetID( data.itemData ) ) );
+		ItemActionsHelper.DisassembleItem( m_player, itemID, data.choosenQuantity );
+		PlaySound( 'Item', 'OnDisassemble' );
+		m_TooltipsManager.HideTooltips();
+	}
+
+	public function IsEquippable( itemData : gameItemData ) : Bool
+	{
+		return EquipmentSystem.GetInstance( m_player ).GetPlayerData( m_player ).IsEquippable( itemData );
+	}
+
+	public function EquipItem( itemData : weak< UIInventoryItem > )
+	{
+		if( IsEquippable( itemData.GetItemData() ) )
+		{
+			if( !( InventoryGPRestrictionHelper.CanUse( itemData, m_player ) ) )
+			{
+				ShowNotification( m_player.GetGame(), UIMenuNotificationType.InventoryActionBlocked );
+				return;
+			}
+			if( itemData.GetEquipmentArea() == gamedataEquipmentArea.Weapon )
+			{
+				OpenBackpackEquipSlotChooser( itemData );
+				return;
+			}
+			m_equipRequested = true;
+			m_InventoryManager.EquipItem( itemData.ID, 0 );
+		}
+	}
+
+	private function ShowNotification( gameInstance : GameInstance, type : UIMenuNotificationType )
+	{
+		var inventoryNotification : UIMenuNotificationEvent;
+		inventoryNotification = new UIMenuNotificationEvent;
+		inventoryNotification.m_notificationType = type;
+		GameInstance.GetUISystem( gameInstance ).QueueEvent( inventoryNotification );
+	}
+
+	public function OpenBackpackEquipSlotChooser( itemData : weak< UIInventoryItem > )
+	{
+		var data : BackpackEquipSlotChooserData;
+		data = new BackpackEquipSlotChooserData;
+		data.notificationName = 'base\gameplay\gui\widgets\notifications\backpack_equip_notification.inkwidget';
+		data.isBlocking = true;
+		data.useCursor = true;
+		data.queueName = 'modal_popup';
+		data.item = itemData;
+		data.inventoryScriptableSystem = m_uiInventorySystem;
+		m_equipSlotChooserPopupToken = ShowGameNotification( data );
+		m_equipSlotChooserPopupToken.RegisterListener( this, 'OnBackpacEquipSlotChooserClosed' );
+		m_buttonHintsController.Hide();
+	}
+
+	protected event OnBackpacEquipSlotChooserClosed( data : inkGameNotificationData )
+	{
+		var i : Int32;
+		var slotChooserData : BackpackEquipSlotChooserCloseData;
+		m_equipSlotChooserPopupToken = NULL;
+		slotChooserData = ( ( BackpackEquipSlotChooserCloseData )( data ) );
+		if( slotChooserData.confirm )
+		{
+			m_equipRequested = true;
+			if( slotChooserData.itemData.GetEquipmentArea() == gamedataEquipmentArea.Weapon )
+			{
+				for( i = 0; i < UIInventoryScriptableSystem.NumberOfWeaponSlots(); i += 1 )
+				{
+					if( slotChooserData.itemData.ID == m_InventoryManager.GetEquippedItemIdInArea( gamedataEquipmentArea.Weapon, i ) )
+					{
+						m_InventoryManager.UnequipItem( gamedataEquipmentArea.Weapon, i );
+					}
+				}
+			}
+			m_InventoryManager.EquipItem( slotChooserData.itemData.ID, slotChooserData.slotIndex );
+			PlaySound( 'Button', 'OnPress' );
+		}
+		m_buttonHintsController.Show();
+	}
+
+	protected event OnItemPreviewPopup( data : inkGameNotificationData )
+	{
+		m_itemPreviewPopupToken = NULL;
+	}
+
+	protected event OnItemFilterClick( evt : inkPointerEvent )
+	{
+		var widget : inkWidget;
+		var controller : BackpackFilterButtonController;
+		var setFilterRequest : UIScriptableSystemSetBackpackFilter;
+		if( evt.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			widget = evt.GetCurrentTarget();
+			controller = ( ( BackpackFilterButtonController )( widget.GetController() ) );
+			if( m_activeFilter )
+			{
+				m_activeFilter.SetActive( false );
+			}
+			m_activeFilter = controller;
+			m_activeFilter.SetActive( true );
+			m_backpackItemsDataView.SetFilterType( controller.GetFilterType() );
+			setFilterRequest = new UIScriptableSystemSetBackpackFilter;
+			setFilterRequest.filterMode = ( ( Int32 )( controller.GetFilterType() ) );
+			m_uiScriptableSystem.QueueRequest( setFilterRequest );
+			( ( inkScrollController )( inkWidgetRef.GetController( m_itemsListScrollAreaContainer ) ) ).SetScrollPosition( 0.0 );
+			PlayLibraryAnimation( 'filter_change' );
+		}
+	}
+
+	protected event OnItemFilterHoverOver( evt : inkPointerEvent )
+	{
+		var widget : inkWidget;
+		var tooltipData : MessageTooltipData;
+		var controller : BackpackFilterButtonController;
+		widget = evt.GetCurrentTarget();
+		controller = ( ( BackpackFilterButtonController )( widget.GetController() ) );
+		tooltipData = new MessageTooltipData;
+		tooltipData.Title = NameToString( controller.GetLabelKey() );
+		m_TooltipsManager.ShowTooltipAtWidget( 0, widget, tooltipData, gameuiETooltipPlacement.RightTop );
+	}
+
+	protected event OnItemFilterHoverOut( evt : inkPointerEvent )
+	{
+		m_TooltipsManager.HideTooltips();
+	}
+
+	protected event OnCraftingMaterialHoverOver( evt : inkPointerEvent )
+	{
+		var widget : weak< inkWidget >;
+		var tooltipData : MessageTooltipData;
+		var controller : CrafringMaterialItemController;
+		widget = evt.GetCurrentTarget();
+		controller = ( ( CrafringMaterialItemController )( widget.GetController() ) );
+		tooltipData = new MessageTooltipData;
+		tooltipData.Title = controller.GetMateialDisplayName();
+		m_TooltipsManager.ShowTooltipAtWidget( 0, widget, tooltipData, gameuiETooltipPlacement.RightTop );
+	}
+
+	protected event OnCraftingMaterialHoverOut( evt : inkPointerEvent )
+	{
+		m_TooltipsManager.HideTooltips();
+	}
+
+	protected event OnItemDisplayHold( evt : ItemDisplayHoldEvent )
+	{
+		if( evt.actionName.IsAction( 'disassemble_item' ) )
+		{
+			if( RPGManager.CanItemBeDisassembled( m_player.GetGame(), evt.uiInventoryItem.GetItemData() ) )
+			{
+				if( evt.uiInventoryItem.GetQuantity() > 1 )
+				{
+					OpenQuantityPicker( evt.uiInventoryItem, QuantityPickerActionType.Disassembly );
+				}
+				else if( evt.uiInventoryItem.IsIconic() && !( evt.uiInventoryItem.IsEquipped() ) )
+				{
+					OpenConfirmationPopup( evt.uiInventoryItem );
+				}
+				else
+				{
+					ItemActionsHelper.DisassembleItem( m_player, evt.uiInventoryItem.GetID() );
+					PlaySound( 'Item', 'OnDisassemble' );
+					m_TooltipsManager.HideTooltips();
+				}
+			}
+		}
+	}
+
+	private function OnInventoryRequestTooltip( itemData : weak< UIInventoryItem >, widget : weak< inkWidget >, iconErrorInfo : DEBUG_IconErrorInfo )
+	{
+		var tooltipsData : array< ATooltipData >;
+		var itemToCompare : weak< UIInventoryItem >;
+		var itemTooltipData : UIInventoryItemTooltipWrapper;
+		if( itemData )
+		{
+			if( itemData.GetItemType() == gamedataItemType.Prt_Program )
+			{
+				itemTooltipData = UIInventoryItemTooltipWrapper.Make( itemData, m_itemDisplayContext );
+				m_TooltipsManager.ShowTooltipAtWidget( 'programTooltip', widget, itemTooltipData, gameuiETooltipPlacement.RightTop, true );
+				return;
+			}
+			if( !( itemData.IsEquipped() ) && !( m_isComparisonDisabled ) )
+			{
+				itemToCompare = m_comparisonResolver.GetPreferredComparisonItem( itemData );
+			}
+			if( itemToCompare )
+			{
+				m_InventoryManager.PushIdentifiedComparisonTooltipsData( tooltipsData, 'itemTooltip', 'itemTooltipComparision', itemToCompare, itemData, m_itemDisplayContext, iconErrorInfo );
+				m_TooltipsManager.ShowTooltipsAtWidget( tooltipsData, widget );
+			}
+			else
+			{
+				itemTooltipData = UIInventoryItemTooltipWrapper.Make( itemData, m_itemDisplayContext );
+				m_TooltipsManager.ShowTooltipAtWidget( 'itemTooltip', widget, itemTooltipData, gameuiETooltipPlacement.RightTop, true );
+			}
+		}
+	}
+
+	private function NewShowItemHints( itemData : weak< UIInventoryItem > )
+	{
+		var cursorData : MenuCursorUserData;
+		var unequipBlocked : Bool;
+		cursorData = new MenuCursorUserData;
+		cursorData.SetAnimationOverride( 'hoverOnHoldToComplete' );
+		if( !( itemData ) )
+		{
+			SetCursorContext( 'Default' );
+			return;
+		}
+		unequipBlocked = itemData.GetItemData().HasTag( 'UnequipBlocked' );
+		if( ( !( unequipBlocked ) && !( itemData.IsEquipped() ) ) && RPGManager.CanItemBeDisassembled( m_player.GetGame(), itemData.ID ) )
+		{
+			m_buttonHintsController.AddButtonHint( 'disassemble_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "Gameplay-Devices-DisplayNames-DisassemblableItem" ) );
+			cursorData.AddAction( 'disassemble_item' );
+		}
+		else
+		{
+			m_buttonHintsController.RemoveButtonHint( 'disassemble_item' );
+		}
+		if( ( ( !( unequipBlocked ) && !( itemData.IsEquipped() ) ) && !( itemData.IsQuestItem() ) ) && ItemActionsHelper.GetDropAction( itemData.ID ) )
+		{
+			if( playerState == gamePSMVehicle.Default )
+			{
+				m_buttonHintsController.AddButtonHint( 'drop_item', GetLocalizedText( "UI-ScriptExports-Drop0" ) );
+			}
+			else
+			{
+				m_buttonHintsController.RemoveButtonHint( 'drop_item' );
+			}
+		}
+		if( ( ItemActionsHelper.GetConsumeAction( itemData.ID ) || ItemActionsHelper.GetEatAction( itemData.ID ) ) || ItemActionsHelper.GetDrinkAction( itemData.ID ) )
+		{
+			m_buttonHintsController.AddButtonHint( 'use_item', GetLocalizedText( "UI-UserActions-Use" ) );
+		}
+		else if( ItemActionsHelper.GetLearnAction( itemData.ID ) )
+		{
+			m_buttonHintsController.AddButtonHint( 'use_item', GetLocalizedText( "Gameplay-Devices-Interactions-Learn" ) );
+		}
+		else if( RPGManager.HasDownloadFundsAction( itemData.ID ) && RPGManager.CanDownloadFunds( m_player.GetGame(), itemData.ID ) )
+		{
+			m_buttonHintsController.AddButtonHint( 'use_item', GetLocalizedText( "LocKey#23401" ) );
+		}
+		else
+		{
+			m_buttonHintsController.RemoveButtonHint( 'use_item' );
+		}
+		if( cursorData.GetActionsListSize() >= 0 )
+		{
+			SetCursorContext( 'Hover', cursorData );
+		}
+		else
+		{
+			SetCursorContext( 'Hover' );
+		}
+	}
+
+	private function SetInventoryItemButtonHintsHoverOver( displayingData : InventoryItemData )
+	{
+		var cursorData : MenuCursorUserData;
+		var isUsable : Bool;
+		var isLearnble : Bool;
+		cursorData = new MenuCursorUserData;
+		cursorData.SetAnimationOverride( 'hoverOnHoldToComplete' );
+		if( !( InventoryItemData.IsEmpty( displayingData ) ) )
+		{
+			isUsable = ( ItemActionsHelper.GetConsumeAction( InventoryItemData.GetGameItemData( displayingData ).GetID() ) || ItemActionsHelper.GetEatAction( InventoryItemData.GetGameItemData( displayingData ).GetID() ) ) || ItemActionsHelper.GetDrinkAction( InventoryItemData.GetGameItemData( displayingData ).GetID() );
+			isLearnble = ItemActionsHelper.GetLearnAction( InventoryItemData.GetGameItemData( displayingData ).GetID() );
+			if( ( RPGManager.CanItemBeDisassembled( m_player.GetGame(), InventoryItemData.GetID( displayingData ) ) && !( InventoryItemData.IsEquipped( displayingData ) ) ) && !( InventoryItemData.GetGameItemData( displayingData ).HasTag( 'UnequipBlocked' ) ) )
+			{
+				m_buttonHintsController.AddButtonHint( 'disassemble_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "Gameplay-Devices-DisplayNames-DisassemblableItem" ) );
+				cursorData.AddAction( 'disassemble_item' );
+			}
+			else
+			{
+				m_buttonHintsController.RemoveButtonHint( 'disassemble_item' );
+			}
+			if( ( ( !( InventoryItemData.IsEquipped( displayingData ) ) && ItemActionsHelper.GetDropAction( InventoryItemData.GetGameItemData( displayingData ).GetID() ) ) && !( InventoryItemData.GetGameItemData( displayingData ).HasTag( 'UnequipBlocked' ) ) ) && !( InventoryItemData.GetGameItemData( displayingData ).HasTag( 'Quest' ) ) )
+			{
+				if( playerState == gamePSMVehicle.Default )
+				{
+					m_buttonHintsController.AddButtonHint( 'drop_item', GetLocalizedText( "UI-ScriptExports-Drop0" ) );
+				}
+				else
+				{
+					m_buttonHintsController.RemoveButtonHint( 'drop_item' );
+				}
+			}
+			if( isUsable )
+			{
+				m_buttonHintsController.AddButtonHint( 'use_item', GetLocalizedText( "UI-UserActions-Use" ) );
+			}
+			else if( isLearnble )
+			{
+				m_buttonHintsController.AddButtonHint( 'use_item', GetLocalizedText( "Gameplay-Devices-Interactions-Learn" ) );
+			}
+			else if( RPGManager.HasDownloadFundsAction( InventoryItemData.GetID( displayingData ) ) && RPGManager.CanDownloadFunds( m_player.GetGame(), InventoryItemData.GetID( displayingData ) ) )
+			{
+				m_buttonHintsController.AddButtonHint( 'use_item', GetLocalizedText( "LocKey#23401" ) );
+			}
+			else
+			{
+				m_buttonHintsController.RemoveButtonHint( 'use_item' );
+			}
+			if( cursorData.GetActionsListSize() >= 0 )
+			{
+				SetCursorContext( 'Hover', cursorData );
+			}
+			else
+			{
+				SetCursorContext( 'Hover' );
+			}
+		}
+		else
+		{
+			SetCursorContext( 'Default' );
+		}
+	}
+
+	private function SetInventoryItemButtonHintsHoverOut()
+	{
+		m_buttonHintsController.RemoveButtonHint( 'disassemble_item' );
+		m_buttonHintsController.RemoveButtonHint( 'use_item' );
+		m_buttonHintsController.RemoveButtonHint( 'drop_item' );
+		SetCursorContext( 'Default' );
+	}
+
+	private function SetWarningMessage( message : String )
+	{
+		var warningMsg : SimpleScreenMessage;
+		warningMsg.isShown = true;
+		warningMsg.duration = 5.0;
+		warningMsg.message = message;
+		GameInstance.GetBlackboardSystem( m_player.GetGame() ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, warningMsg, true );
+	}
+
+}
+
+class WrappedInventoryItemData extends IScriptable
+{
+	var ItemData : InventoryItemData;
+	var ComparisonState : ItemComparisonState;
+	var IsNew : Bool;
+	var ItemTemplate : Uint32;
+	var DisplayContext : ItemDisplayContext;
+	var NotificationListener : ImmediateNotificationListener;
+	var Item : UIInventoryItem;
+	var DisplayContextData : weak< ItemDisplayContextData >;
+	var OverrideQuantity : Int32;
+	default OverrideQuantity = -1;
+}
+
+class BackgroundDisplayVirtualController extends inkVirtualCompoundBackgroundController
+{
+
+	protected event OnInitialize()
+	{
+		GetRootWidget().SetAnchor( inkEAnchor.Fill );
+	}
+
+}
+
+abstract class ImmediateNotificationListener
+{
+	public virtual function Notify( message : Int32, id : Uint64, optional data : weak< IScriptable > );
+}
+
+class BakcpackImmediateNotificationListener extends ImmediateNotificationListener
+{
+	private var m_backpackInstance : weak< BackpackMainGameController >;
+
+	public function SetBackpackInstance( instance : weak< BackpackMainGameController > )
+	{
+		m_backpackInstance = instance;
+	}
+
+	public override function Notify( message : Int32, id : Uint64, optional data : weak< IScriptable > )
+	{
+		m_backpackInstance.OnBakcpackItemDisplayNotification( ( ( ItemDisplayNotificationMessage )( message ) ), id, data );
+	}
+
+}
+
+class ItemDisplayVirtualController extends inkVirtualCompoundItemController
+{
+	protected editable var m_itemDisplayWidget : inkWidgetRef;
+	protected editable var m_widgetToSpawn : CName;
+	protected var m_wrappedData : WrappedInventoryItemData;
+	protected var m_data : InventoryItemData;
+	protected var m_spawnedWidget : weak< inkWidget >;
+	protected var m_notificationListenerID : Int32;
+	protected var m_immediateNotificationListener : weak< ImmediateNotificationListener >;
+
+	protected event OnInitialize()
+	{
+		GetRootWidget().SetVAlign( inkEVerticalAlign.Top );
+		GetRootWidget().SetHAlign( inkEHorizontalAlign.Left );
+		AsyncSpawnFromLocal( GetRootCompoundWidget(), m_widgetToSpawn, this, 'OnWidgetSpawned' );
+		RegisterToCallback( 'OnSelected', this, 'OnSelected' );
+	}
+
+	protected event OnWidgetSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		m_spawnedWidget = widget;
+		SetupData();
+	}
+
+	protected event OnUninitialize()
+	{
+		m_immediateNotificationListener.Notify( ( ( Int32 )( ItemDisplayNotificationMessage.RemoveRef ) ), ItemID.GetCombinedHash( m_wrappedData.Item.GetID() ) );
+	}
+
+	protected event OnSelected( itemController : weak< inkVirtualCompoundItemController >, discreteNav : Bool )
+	{
+		var widget : weak< inkWidget >;
+		if( discreteNav )
+		{
+			widget = GetRootWidget();
+			SetCursorOverWidget( widget );
+		}
+	}
+
+	protected event OnDataChanged( value : Variant )
+	{
+		if( m_wrappedData )
+		{
+			if( m_wrappedData.Item )
+			{
+				m_immediateNotificationListener.Notify( ( ( Int32 )( ItemDisplayNotificationMessage.RemoveRef ) ), ItemID.GetCombinedHash( m_wrappedData.Item.GetID() ) );
+			}
+		}
+		m_wrappedData = ( ( WrappedInventoryItemData )( ( ( IScriptable )value ) ) );
+		SetupData();
+	}
+
+	private function SetupData()
+	{
+		var itemView : weak< InventoryItemDisplayController >;
+		if( !( m_wrappedData ) || !( m_spawnedWidget ) )
+		{
+			return;
+		}
+		m_immediateNotificationListener = m_wrappedData.NotificationListener;
+		m_immediateNotificationListener.Notify( ( ( Int32 )( ItemDisplayNotificationMessage.AddRef ) ), ItemID.GetCombinedHash( m_wrappedData.Item.GetID() ), this );
+		m_data = m_wrappedData.ItemData;
+		itemView = ( ( InventoryItemDisplayController )( m_spawnedWidget.GetController() ) );
+		if( m_wrappedData.Item )
+		{
+			itemView.Setup( m_wrappedData.Item, m_wrappedData.DisplayContextData );
+		}
+		else
+		{
+			itemView.Setup( m_data, m_wrappedData.DisplayContext );
+		}
+		itemView.SetComparisonState( m_wrappedData.ComparisonState );
+		itemView.SetIsNew( m_wrappedData.IsNew, m_wrappedData );
+	}
+
+	public function Update()
+	{
+		var itemView : weak< InventoryItemDisplayController >;
+		itemView = ( ( InventoryItemDisplayController )( m_spawnedWidget.GetController() ) );
+		if( m_wrappedData.Item )
+		{
+			itemView.Setup( m_wrappedData.Item, m_wrappedData.DisplayContextData );
+		}
+	}
+
+	public function GetWrappedData() : weak< WrappedInventoryItemData >
+	{
+		return m_wrappedData;
+	}
+
+	public function GetItemView() : weak< InventoryItemDisplayController >
+	{
+		var itemView : weak< InventoryItemDisplayController >;
+		itemView = ( ( InventoryItemDisplayController )( m_spawnedWidget.GetController() ) );
+		return itemView;
+	}
+
+}
+
+class ItemDisplayTemplateClassifier extends inkVirtualItemTemplateClassifier
+{
+
+	public export virtual function ClassifyItem( data : Variant ) : Uint32
+	{
+		var m_wrappedData : WrappedInventoryItemData;
+		m_wrappedData = ( ( WrappedInventoryItemData )( ( ( IScriptable )data ) ) );
+		if( !( m_wrappedData ) )
+		{
+			return 0;
+		}
+		if( m_wrappedData.Item )
+		{
+			if( m_wrappedData.Item.IsWeapon() && !( m_wrappedData.Item.IsRecipe() ) )
+			{
+				return 1;
+			}
+		}
+		if( InventoryItemData.GetEquipmentArea( m_wrappedData.ItemData ) == gamedataEquipmentArea.Weapon )
+		{
+			return 1;
+		}
+		return 0;
+	}
+
+}
+
+class ItemPositionProvider extends inkItemPositionProvider
+{
+
+	public export virtual function GetItemPosition( data : Variant ) : Uint32
+	{
+		var m_wrappedData : WrappedInventoryItemData;
+		m_wrappedData = ( ( WrappedInventoryItemData )( ( ( IScriptable )data ) ) );
+		if( !( m_wrappedData ) )
+		{
+			return ( ( Uint32 )( -1 ) );
+		}
+		return InventoryItemData.GetPositionInBackpack( m_wrappedData.ItemData );
+	}
+
+	public export virtual function SaveItemPosition( data : Variant, position : Uint32 )
+	{
+		var m_wrappedData : WrappedInventoryItemData;
+		m_wrappedData = ( ( WrappedInventoryItemData )( ( ( IScriptable )data ) ) );
+		if( m_wrappedData )
+		{
+			InventoryItemData.SetPositionInBackpack( m_wrappedData.ItemData, position );
+		}
+	}
+
+}
+
+class BackpackDataView extends ScriptableDataView
+{
+	private var m_itemSortMode : ItemSortMode;
+	private var m_attachmentsList : array< gamedataItemType >;
+	private var m_uiScriptableSystem : weak< UIScriptableSystem >;
+	protected var m_itemFilterType : ItemFilterCategory;
+
+	public function BindUIScriptableSystem( uiScriptableSystem : weak< UIScriptableSystem > )
+	{
+		m_uiScriptableSystem = uiScriptableSystem;
+	}
+
+	public function SetFilterType( type : ItemFilterCategory )
+	{
+		if( m_itemFilterType != type )
+		{
+			m_itemFilterType = type;
+			Filter();
+		}
+	}
+
+	public function GetFilterType() : ItemFilterCategory
+	{
+		return m_itemFilterType;
+	}
+
+	public function SetSortMode( mode : ItemSortMode )
+	{
+		var wasSortingEnabled : Bool;
+		wasSortingEnabled = IsSortingEnabled();
+		m_itemSortMode = mode;
+		if( !( wasSortingEnabled ) )
+		{
+			EnableSorting();
+			Sort();
+			DisableSorting();
+		}
+		else
+		{
+			Sort();
+		}
+	}
+
+	public function GetSortMode() : ItemSortMode
+	{
+		return m_itemSortMode;
+	}
+
+	protected virtual function PreSortingInjection( builder : ItemCompareBuilder ) : ItemCompareBuilder
+	{
+		return builder;
+	}
+
+	protected virtual function NewPreSortingInjection( builder : NewItemCompareBuilder ) : NewItemCompareBuilder
+	{
+		return builder;
+	}
+
+	protected virtual function PreFilterInjection( itemData : InventoryItemData ) : Bool
+	{
+		return true;
+	}
+
+	public function SortItemNew( left : WrappedInventoryItemData, right : WrappedInventoryItemData ) : Bool
+	{
+		var leftItem, rightItem : UIInventoryItem;
+		leftItem = left.Item;
+		rightItem = right.Item;
+		switch( m_itemSortMode )
+		{
+			case ItemSortMode.NewItems:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NewItem().QualityDesc().ItemType().NameAsc().GetBool();
+			case ItemSortMode.NameAsc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.NameDesc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NameDesc().QualityDesc().GetBool();
+			case ItemSortMode.DpsAsc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).DPSAsc().QualityDesc().NameAsc().GetBool();
+			case ItemSortMode.DpsDesc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).DPSDesc().QualityDesc().NameDesc().GetBool();
+			case ItemSortMode.QualityAsc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.QualityDesc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).QualityAsc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.WeightAsc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).WeightAsc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.WeightDesc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).WeightDesc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.PriceAsc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).PriceAsc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.PriceDesc:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).PriceDesc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.ItemType:
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).ItemType().NameAsc().QualityDesc().GetBool();
+		}
+		return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().ItemType().NameAsc().GetBool();
+	}
+
+	public override function SortItem( left : IScriptable, right : IScriptable ) : Bool
+	{
+		var leftWrapped : WrappedInventoryItemData;
+		var rightWrapped : WrappedInventoryItemData;
+		var leftItem : InventoryItemSortData;
+		var rightItem : InventoryItemSortData;
+		var leftItemData : InventoryItemData;
+		var rightItemData : InventoryItemData;
+		leftWrapped = ( ( WrappedInventoryItemData )( left ) );
+		rightWrapped = ( ( WrappedInventoryItemData )( right ) );
+		if( leftWrapped.Item && rightWrapped.Item )
+		{
+			return SortItemNew( leftWrapped, rightWrapped );
+		}
+		leftItem = InventoryItemData.GetSortData( leftWrapped.ItemData );
+		rightItem = InventoryItemData.GetSortData( rightWrapped.ItemData );
+		if( leftItem.Name == "" )
+		{
+			leftItemData = ( ( InventoryItemData )( ( ( WrappedInventoryItemData )( left ) ).ItemData ) );
+			leftItem = ItemCompareBuilder.BuildInventoryItemSortData( leftItemData, m_uiScriptableSystem );
+		}
+		if( rightItem.Name == "" )
+		{
+			rightItemData = ( ( InventoryItemData )( ( ( WrappedInventoryItemData )( right ) ).ItemData ) );
+			rightItem = ItemCompareBuilder.BuildInventoryItemSortData( rightItemData, m_uiScriptableSystem );
+		}
+		switch( m_itemSortMode )
+		{
+			case ItemSortMode.NewItems:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DLCAddedItem().NewItem( m_uiScriptableSystem ).QualityDesc().ItemType().NameAsc().GetBool();
+			case ItemSortMode.NameAsc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.NameDesc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).NameDesc().QualityDesc().GetBool();
+			case ItemSortMode.DpsAsc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DPSAsc().QualityDesc().NameAsc().GetBool();
+			case ItemSortMode.DpsDesc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DPSDesc().QualityDesc().NameDesc().GetBool();
+			case ItemSortMode.QualityAsc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.QualityDesc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).QualityAsc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.WeightAsc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).WeightAsc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.WeightDesc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).WeightDesc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.PriceAsc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).PriceAsc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.PriceDesc:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).PriceDesc().NameAsc().QualityDesc().GetBool();
+			case ItemSortMode.ItemType:
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).ItemType().NameAsc().QualityDesc().GetBool();
+		}
+		return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().ItemType().NameAsc().GetBool();
+	}
+
+	public export override function FilterItem( data : IScriptable ) : Bool
+	{
+		var m_wrappedData : WrappedInventoryItemData;
+		var derivedFilterResult : DerivedFilterResult;
+		m_wrappedData = ( ( WrappedInventoryItemData )( ( ( IScriptable )( data ) ) ) );
+		if( !( PreFilterInjection( m_wrappedData.ItemData ) ) )
+		{
+			return false;
+		}
+		derivedFilterResult = DerivedFilterItem( data );
+		if( derivedFilterResult != DerivedFilterResult.Pass )
+		{
+			return derivedFilterResult == DerivedFilterResult.True;
+		}
+		return ItemCategoryFliter.FilterItem( m_itemFilterType, m_wrappedData );
+		return true;
+	}
+
+	public virtual function DerivedFilterItem( data : IScriptable ) : DerivedFilterResult
+	{
+		return DerivedFilterResult.Pass;
+	}
+
+	private function FilterWeapons( itemData : InventoryItemData ) : Bool
+	{
+		return InventoryItemData.GetEquipmentArea( itemData ) == gamedataEquipmentArea.Weapon;
+	}
+
+	private function FilterClothes( itemData : InventoryItemData ) : Bool
+	{
+		switch( InventoryItemData.GetEquipmentArea( itemData ) )
+		{
+			case gamedataEquipmentArea.Head:
+			case gamedataEquipmentArea.Face:
+			case gamedataEquipmentArea.OuterChest:
+			case gamedataEquipmentArea.InnerChest:
+			case gamedataEquipmentArea.Legs:
+			case gamedataEquipmentArea.Feet:
+			case gamedataEquipmentArea.Outfit:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private function FilterConsumable( itemData : InventoryItemData ) : Bool
+	{
+		return InventoryItemData.GetEquipmentArea( itemData ) == gamedataEquipmentArea.Consumable;
+	}
+
+	private function FilterCyberwareByItemType( itemType : gamedataItemType ) : Bool
+	{
+		switch( itemType )
+		{
+			case gamedataItemType.Cyb_Ability:
+			case gamedataItemType.Cyb_Launcher:
+			case gamedataItemType.Cyb_MantisBlades:
+			case gamedataItemType.Cyb_NanoWires:
+			case gamedataItemType.Cyb_StrongArms:
+				return true;
+			default:
+				return false;
+		}
+		return false;
+	}
+
+	private function FilterCyberwareByEquipmentArea( equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		switch( equipmentArea )
+		{
+			case gamedataEquipmentArea.AbilityCW:
+			case gamedataEquipmentArea.ArmsCW:
+			case gamedataEquipmentArea.CardiovascularSystemCW:
+			case gamedataEquipmentArea.EyesCW:
+			case gamedataEquipmentArea.FrontalCortexCW:
+			case gamedataEquipmentArea.HandsCW:
+			case gamedataEquipmentArea.ImmuneSystemCW:
+			case gamedataEquipmentArea.IntegumentarySystemCW:
+			case gamedataEquipmentArea.LegsCW:
+			case gamedataEquipmentArea.MusculoskeletalSystemCW:
+			case gamedataEquipmentArea.NervousSystemCW:
+			case gamedataEquipmentArea.PersonalLink:
+			case gamedataEquipmentArea.SystemReplacementCW:
+				return true;
+			default:
+				return false;
+		}
+		return false;
+	}
+
+	private function FilterCyberware( itemData : InventoryItemData ) : Bool
+	{
+		return FilterCyberwareByEquipmentArea( InventoryItemData.GetEquipmentArea( itemData ) ) || FilterCyberwareByItemType( InventoryItemData.GetItemType( itemData ) );
+	}
+
+	private function FilterAttachments( itemData : InventoryItemData ) : Bool
+	{
+		if( m_attachmentsList.Size() == 0 )
+		{
+			m_attachmentsList = InventoryDataManagerV2.GetAttachmentsTypes();
+		}
+		return m_attachmentsList.Contains( InventoryItemData.GetItemType( itemData ) );
+	}
+
+	private function FilterQuestItems( itemData : InventoryItemData ) : Bool
+	{
+		return InventoryItemData.GetGameItemData( itemData ).HasTag( 'Quest' );
+	}
+
+}
+
+class BackpackInventoryListenerCallback extends InventoryScriptCallback
+{
+	private var m_backpackInstance : weak< BackpackMainGameController >;
+
+	public function Setup( backpackInstance : weak< BackpackMainGameController > )
+	{
+		m_backpackInstance = backpackInstance;
+	}
+
+}
+
+class DropQueueUpdatedEvent extends Event
+{
+	var m_dropQueue : array< ItemModParams >;
+}
+
+class BackpackFilterButtonSpawnedCallbackData
+{
+	var category : ItemFilterCategory;
+	var savedFilter : Int32;
+}
+
+class BackpackCraftingMaterialItemCallbackData
+{
+	var craftingMaterial : CachedCraftingMaterial;
+}
+
+class CachedCraftingMaterial
+{
+	var m_itemID : ItemID;
+	var m_displayName : String;
+	var m_iconPath : String;
+	var m_quantity : Int32;
+
+	public static function Make( tweakID : TweakDBID ) : CachedCraftingMaterial
+	{
+		return CachedCraftingMaterial.Make( ItemID.CreateQuery( tweakID ) );
+	}
+
+	public static function Make( itemID : ItemID ) : CachedCraftingMaterial
+	{
+		var instance : CachedCraftingMaterial;
+		var itemTweak : TweakDBID;
+		var itemRecord : weak< Item_Record >;
+		instance = new CachedCraftingMaterial;
+		itemTweak = ItemID.GetTDBID( itemID );
+		itemRecord = TweakDBInterface.GetItemRecord( itemTweak );
+		instance.m_itemID = itemID;
+		instance.m_displayName = GetLocalizedItemNameByCName( itemRecord.DisplayName() );
+		instance.m_iconPath = UIInventoryItemsManager.ResolveItemIconName( itemTweak, itemRecord, false );
+		return instance;
+	}
+
+	public function UpdateQuantity( owner : weak< GameObject > )
+	{
+		var itemData : weak< gameItemData >;
+		itemData = RPGManager.GetItemData( owner.GetGame(), owner, m_itemID );
+		m_quantity = itemData.GetQuantity();
+	}
+
+}
+
+enum ItemDisplayNotificationMessage
+{
+	Default = 0,
+	AddRef = 1,
+	RemoveRef = 2,
+}
+
+enum DerivedFilterResult
+{
+	False = 0,
+	True = 1,
+	Pass = 2,
+}
+

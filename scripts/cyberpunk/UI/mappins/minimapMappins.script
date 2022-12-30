@@ -1,0 +1,1347 @@
+importonly struct gamemappinsSenseCone
+{
+	import const var length : Float;
+	import const var width : Float;
+	import const var angleDegrees : Float;
+	import const var position1 : Vector4;
+	import const var position2 : Vector4;
+}
+
+import class BaseMinimapMappinController extends BaseMappinBaseController
+{
+	protected var m_mappin : weak< IMappin >;
+	protected var m_root : weak< inkWidget >;
+	protected var m_aboveWidget : weak< inkWidget >;
+	protected var m_belowWidget : weak< inkWidget >;
+	protected import editable var clampArrowWidget : inkWidgetRef;
+
+	protected import function SetForceShow( value : Bool );
+	protected import function SetForceHide( value : Bool );
+
+	protected event OnInitialize()
+	{
+		Initialize();
+	}
+
+	protected event OnIntro()
+	{
+		Intro();
+	}
+
+	protected event OnUpdate()
+	{
+		Update();
+	}
+
+	protected virtual function Initialize()
+	{
+		m_root = GetRootWidget();
+		m_root.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+		m_root.SetAnchor( inkEAnchor.Centered );
+		m_aboveWidget = ( ( inkWidget )( GetWidget( 'Canvas/above' ) ) );
+		m_belowWidget = ( ( inkWidget )( GetWidget( 'Canvas/below' ) ) );
+	}
+
+	protected virtual function Intro()
+	{
+		m_mappin = GetMappin();
+		OnUpdate();
+	}
+
+	protected virtual function Update()
+	{
+		UpdateClamping();
+		UpdateRootState();
+		UpdateTrackedState();
+		UpdateAboveBelowVerticalRelation();
+	}
+
+	protected virtual function KeepIconOnClamping() : Bool
+	{
+		return false;
+	}
+
+	protected virtual function UpdateClamping()
+	{
+		var isClamped : Bool;
+		isClamped = IsClamped();
+		if( inkWidgetRef.IsValid( clampArrowWidget ) && !( KeepIconOnClamping() ) )
+		{
+			inkImageRef.SetVisible( iconWidget, !( isClamped ) );
+			inkWidgetRef.SetVisible( clampArrowWidget, isClamped );
+		}
+	}
+
+	protected virtual function UpdateAboveBelowVerticalRelation()
+	{
+		var vertRelation : gamemappinsVerticalPositioning;
+		var shouldShowVertRelation : Bool;
+		var isAbove, isBelow : Bool;
+		var animPlayer : animationPlayer;
+		if( ( m_aboveWidget == NULL ) && ( m_belowWidget == NULL ) )
+		{
+			return;
+		}
+		vertRelation = GetVerticalRelationToPlayer();
+		shouldShowVertRelation = GetRootWidget().IsVisible() && !( IsClamped() );
+		isAbove = shouldShowVertRelation && vertRelation == gamemappinsVerticalPositioning.Above;
+		isBelow = shouldShowVertRelation && vertRelation == gamemappinsVerticalPositioning.Below;
+		m_aboveWidget.SetVisible( isAbove );
+		m_belowWidget.SetVisible( isBelow );
+		animPlayer = GetAnimPlayer_AboveBelow();
+		if( animPlayer != NULL )
+		{
+			animPlayer.PlayOrStop( isAbove || isBelow );
+		}
+	}
+
+}
+
+import class MinimapStealthMappinController extends BaseMinimapMappinController
+{
+	protected import var visionConeWidget : inkImageRef;
+	protected editable var m_pulseWidget : inkWidgetRef;
+	private var m_stealthMappin : weak< StealthMappin >;
+	private var m_fadeOutAnim : inkAnimProxy;
+	private var m_isTagged : Bool;
+	private var m_wasVisible : Bool;
+	private var m_attitudeState : CName;
+	private var m_preventionState : CName;
+	private var m_pulsing : Bool;
+	private var m_hasBeenLooted : Bool;
+	private var m_isAggressive : Bool;
+	private var m_detectionAboveZero : Bool;
+	private var m_isAlive : Bool;
+	private var m_wasAlive : Bool;
+	private var m_wasCompanion : Bool;
+	private var m_couldSeePlayer : Bool;
+	private var m_isPrevention : Bool;
+	private var m_isCrowdNPC : Bool;
+	private var m_cautious : Bool;
+	private var m_shouldShowVisionCone : Bool;
+	private var m_isDevice : Bool;
+	private var m_isCamera : Bool;
+	private var m_isTurret : Bool;
+	private var m_isNetrunner : Bool;
+	private var m_isHacking : Bool;
+	private var m_isSquadInCombat : Bool;
+	private var m_wasSquadInCombat : Bool;
+	private var m_clampingAvailable : Bool;
+	private var m_defaultOpacity : Float;
+	private var m_adjustedOpacity : Float;
+	private var m_defaultConeOpacity : Float;
+	private var m_detectingConeOpacity : Float;
+	private var m_numberOfShotAttempts : Uint32;
+	private var m_highestLootQuality : Uint32;
+	private var m_lockLootQuality : Bool;
+	private var m_highLevelState : gamedataNPCHighLevelState;
+	private var m_iconWidgetGlitch : weak< inkWidget >;
+	private var m_visionConeWidgetGlitch : weak< inkWidget >;
+	private var m_clampArrowWidgetGlitch : weak< inkWidget >;
+	private var m_puppetStateBlackboard : weak< IBlackboard >;
+	private var m_isInVehicleStance : Bool;
+	private var m_stanceStateCb : CallbackHandle;
+	private var m_policeChasePrototypeEnabled : Bool;
+	private var m_showAnim : inkAnimProxy;
+	private var m_alertedAnim : inkAnimProxy;
+	private var m_preventionAnimProxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		Initialize();
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_puppetStateBlackboard && m_stanceStateCb )
+		{
+			m_puppetStateBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PuppetState.Stance, m_stanceStateCb );
+		}
+		m_puppetStateBlackboard = NULL;
+	}
+
+	protected event OnIntro()
+	{
+		Intro();
+	}
+
+	protected event OnUpdate()
+	{
+		Update();
+	}
+
+	protected override function Intro()
+	{
+		var gameObject : weak< GameObject >;
+		var npcPuppet : weak< NPCPuppet >;
+		m_stealthMappin = ( ( StealthMappin )( GetMappin() ) );
+		gameObject = m_stealthMappin.GetGameObject();
+		m_iconWidgetGlitch = inkImageRef.Get( iconWidget );
+		m_visionConeWidgetGlitch = inkImageRef.Get( visionConeWidget );
+		m_clampArrowWidgetGlitch = inkWidgetRef.Get( clampArrowWidget );
+		if( gameObject != NULL )
+		{
+			m_isPrevention = gameObject.IsPrevention();
+			m_isDevice = gameObject.IsDevice();
+			m_isCamera = ( gameObject.IsDevice() && gameObject.IsSensor() ) && !( gameObject.IsTurret() );
+			m_isTurret = gameObject.IsTurret();
+			m_isNetrunner = m_stealthMappin.IsNetrunner();
+			m_policeChasePrototypeEnabled = GameInstance.GetPreventionSpawnSystem( gameObject.GetGame() ).IsPreventionVehiclePrototypeEnabled();
+			if( m_isPrevention && m_policeChasePrototypeEnabled )
+			{
+				npcPuppet = ( ( NPCPuppet )( gameObject ) );
+				if( npcPuppet )
+				{
+					m_puppetStateBlackboard = npcPuppet.GetPuppetStateBlackboard();
+					if( m_puppetStateBlackboard )
+					{
+						m_isInVehicleStance = IsVehicleStance( ( ( gamedataNPCStanceState )( m_puppetStateBlackboard.GetInt( GetAllBlackboardDefs().PuppetState.Stance ) ) ) );
+						m_stanceStateCb = m_puppetStateBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PuppetState.Stance, this, 'OnStanceStateChanged' );
+					}
+				}
+			}
+		}
+		m_isCrowdNPC = m_stealthMappin.IsCrowdNPC();
+		if( ( m_isCrowdNPC && !( m_stealthMappin.IsAggressive() ) ) || ( ( ( ( gameObject != NULL ) && !( gameObject.IsDevice() ) ) && !( m_stealthMappin.IsAggressive() ) ) && m_stealthMappin.GetAttitudeTowardsPlayer() != EAIAttitude.AIA_Friendly ) )
+		{
+			m_defaultOpacity = 0.5;
+		}
+		else
+		{
+			m_defaultOpacity = 1.0;
+		}
+		m_root.SetOpacity( m_defaultOpacity );
+		m_defaultConeOpacity = 0.80000001;
+		m_detectingConeOpacity = 1.0;
+		m_wasCompanion = ScriptedPuppet.IsPlayerCompanion( gameObject );
+		if( m_wasCompanion )
+		{
+			inkImageRef.SetTexturePart( iconWidget, 'friendly_ally15' );
+		}
+		else if( m_isCamera )
+		{
+			inkImageRef.SetTexturePart( iconWidget, 'cameraMappin' );
+			inkImageRef.SetTexturePart( visionConeWidget, 'camera_cone' );
+		}
+		inkImageRef.SetOpacity( visionConeWidget, m_defaultConeOpacity );
+		if( m_isNetrunner )
+		{
+			m_iconWidgetGlitch.SetEffectEnabled( inkEffectType.Glitch, 'Glitch_0', true );
+			m_visionConeWidgetGlitch.SetEffectEnabled( inkEffectType.Glitch, 'Glitch_0', true );
+			m_clampArrowWidgetGlitch.SetEffectEnabled( inkEffectType.Glitch, 'Glitch_0', true );
+		}
+		m_wasAlive = true;
+		m_cautious = false;
+		m_lockLootQuality = false;
+		super.Intro();
+	}
+
+	protected override function Update()
+	{
+		var gameObject : weak< GameObject >;
+		var gameDevice : weak< Device >;
+		var shouldShowMappin : Bool;
+		var isOnSameFloor, hasBeenSeen, isCompanion, hasItems, isHighlighted, isUsingSenseCone, isTagged : Bool;
+		var canSeePlayer, numberOfCombatantsAboveZero, wasDetectionAboveZero, shouldShowVisionCone : Bool;
+		var attitude : EAIAttitude;
+		var vertRelation : gamemappinsVerticalPositioning;
+		var shotAttempts : Uint32;
+		gameObject = m_stealthMappin.GetGameObject();
+		m_isAlive = m_stealthMappin.IsAlive();
+		isTagged = m_stealthMappin.IsTagged();
+		hasBeenSeen = m_stealthMappin.HasBeenSeen();
+		isCompanion = ( gameObject != NULL ) && ScriptedPuppet.IsPlayerCompanion( gameObject );
+		attitude = m_stealthMappin.GetAttitudeTowardsPlayer();
+		vertRelation = GetVerticalRelationToPlayer();
+		shotAttempts = m_stealthMappin.GetNumberOfShotAttempts();
+		m_highLevelState = m_stealthMappin.GetHighLevelState();
+		isHighlighted = m_stealthMappin.IsHighlighted();
+		m_isSquadInCombat = m_stealthMappin.IsSquadInCombat();
+		canSeePlayer = m_stealthMappin.CanSeePlayer();
+		m_detectionAboveZero = m_stealthMappin.GetDetectionProgress() > 0.0;
+		wasDetectionAboveZero = m_stealthMappin.WasDetectionAboveZero();
+		numberOfCombatantsAboveZero = m_stealthMappin.GetNumberOfCombatants() > ( ( Uint32 )( 0 ) );
+		isUsingSenseCone = m_stealthMappin.IsUsingSenseCone();
+		m_isHacking = m_stealthMappin.HasHackingStatusEffect();
+		if( m_isDevice )
+		{
+			m_isAggressive = attitude != EAIAttitude.AIA_Friendly;
+			if( m_isAggressive )
+			{
+				gameDevice = ( ( Device )( gameObject ) );
+				if( gameDevice )
+				{
+					isUsingSenseCone = gameDevice.GetDevicePS().IsON();
+				}
+				if( m_isCamera && numberOfCombatantsAboveZero )
+				{
+					canSeePlayer = false;
+					isUsingSenseCone = false;
+				}
+				else if( m_isTurret )
+				{
+					isUsingSenseCone = isUsingSenseCone && ( attitude == EAIAttitude.AIA_Hostile || !( m_isPrevention ) );
+					if( !( isUsingSenseCone ) )
+					{
+						m_isSquadInCombat = false;
+					}
+				}
+				if( m_stealthMappin.GetStealthAwarenessState() == gameEnemyStealthAwarenessState.Combat )
+				{
+					m_isSquadInCombat = true;
+				}
+			}
+		}
+		else
+		{
+			m_isAggressive = m_stealthMappin.IsAggressive() && attitude != EAIAttitude.AIA_Friendly;
+		}
+		if( !( m_cautious ) )
+		{
+			if( ( ( ( ( !( m_isDevice ) && m_highLevelState != gamedataNPCHighLevelState.Relaxed ) && m_highLevelState != gamedataNPCHighLevelState.Any ) && !( m_isSquadInCombat ) ) && m_isAlive ) && m_isAggressive )
+			{
+				m_cautious = true;
+				PulseContinuous( true );
+			}
+		}
+		else
+		{
+			if( ( ( m_highLevelState == gamedataNPCHighLevelState.Relaxed || m_highLevelState == gamedataNPCHighLevelState.Any ) || m_isSquadInCombat ) || !( m_isAlive ) )
+			{
+				m_cautious = false;
+				PulseContinuous( false );
+			}
+		}
+		if( m_hasBeenLooted || m_stealthMappin.IsHiddenByQuestOnMinimap() )
+		{
+			shouldShowMappin = false;
+		}
+		else
+		{
+			if( m_isPrevention && m_policeChasePrototypeEnabled )
+			{
+				shouldShowMappin = !( m_isInVehicleStance );
+			}
+			else if( m_isDevice && !( m_isAggressive ) )
+			{
+				shouldShowMappin = false;
+			}
+			else
+			{
+				if( !( IsMultiplayer() ) )
+				{
+					shouldShowMappin = ( ( ( ( hasBeenSeen || !( m_isAlive ) ) || isCompanion ) || wasDetectionAboveZero ) || isHighlighted ) || isTagged;
+				}
+				else
+				{
+					shouldShowMappin = ( ( isCompanion || wasDetectionAboveZero ) || isHighlighted ) && m_isAlive;
+				}
+			}
+		}
+		SetForceHide( !( shouldShowMappin ) );
+		if( shouldShowMappin )
+		{
+			if( !( m_isAlive ) )
+			{
+				if( m_wasAlive )
+				{
+					if( !( m_isCamera ) )
+					{
+						inkImageRef.SetTexturePart( iconWidget, 'enemy_icon_4' );
+						inkImageRef.SetScale( iconWidget, Vector2( 0.75, 0.75 ) );
+					}
+					m_defaultOpacity = MinF( m_defaultOpacity, 0.5 );
+					m_wasAlive = false;
+				}
+				hasItems = m_stealthMappin.HasItems();
+				if( !( hasItems ) || m_isDevice )
+				{
+					FadeOut();
+				}
+			}
+			else if( isCompanion && !( m_wasCompanion ) )
+			{
+				inkImageRef.SetTexturePart( iconWidget, 'friendly_ally15' );
+			}
+			else if( m_isTagged != isTagged && !( m_isCamera ) )
+			{
+				if( isTagged )
+				{
+					inkImageRef.SetTexturePart( iconWidget, 'enemyMappinTagged' );
+				}
+				else
+				{
+					inkImageRef.SetTexturePart( iconWidget, 'enemyMappin' );
+				}
+			}
+			m_isTagged = isTagged;
+			if( ( m_isSquadInCombat && !( m_wasSquadInCombat ) ) || ( m_numberOfShotAttempts != shotAttempts ) )
+			{
+				m_numberOfShotAttempts = shotAttempts;
+				Pulse( 2 );
+			}
+			isOnSameFloor = vertRelation == gamemappinsVerticalPositioning.Same;
+			m_adjustedOpacity = ( ( isOnSameFloor ) ? ( m_defaultOpacity ) : ( 0.30000001 * m_defaultOpacity ) );
+			shouldShowVisionCone = ( m_isAlive && isUsingSenseCone ) && m_isAggressive;
+			if( m_shouldShowVisionCone != shouldShowVisionCone )
+			{
+				m_shouldShowVisionCone = shouldShowVisionCone;
+				m_stealthMappin.UpdateSenseConeAvailable( m_shouldShowVisionCone );
+				if( m_shouldShowVisionCone )
+				{
+					m_stealthMappin.UpdateSenseCone();
+				}
+			}
+			if( m_shouldShowVisionCone )
+			{
+				if( canSeePlayer != m_couldSeePlayer || ( m_isSquadInCombat && !( m_wasSquadInCombat ) ) )
+				{
+					if( canSeePlayer && !( m_isSquadInCombat ) )
+					{
+						inkImageRef.SetOpacity( visionConeWidget, m_detectingConeOpacity );
+						inkImageRef.SetScale( visionConeWidget, Vector2( 1.5, 1.5 ) );
+					}
+					else
+					{
+						inkImageRef.SetOpacity( visionConeWidget, m_defaultConeOpacity );
+						inkImageRef.SetScale( visionConeWidget, Vector2( 1.0, 1.0 ) );
+					}
+					m_couldSeePlayer = canSeePlayer;
+				}
+			}
+			inkImageRef.SetVisible( visionConeWidget, m_shouldShowVisionCone );
+			if( !( m_wasVisible ) )
+			{
+				if( m_showAnim )
+				{
+					m_showAnim.Stop();
+				}
+				m_showAnim = PlayLibraryAnimation( 'Show' );
+			}
+		}
+		if( m_isNetrunner )
+		{
+			if( !( m_isAlive ) )
+			{
+				m_iconWidgetGlitch.SetEffectEnabled( inkEffectType.Glitch, 'Glitch_0', false );
+				m_visionConeWidgetGlitch.SetEffectEnabled( inkEffectType.Glitch, 'Glitch_0', false );
+				m_clampArrowWidgetGlitch.SetEffectEnabled( inkEffectType.Glitch, 'Glitch_0', false );
+			}
+			else if( m_isHacking )
+			{
+				m_iconWidgetGlitch.SetEffectParamValue( inkEffectType.Glitch, 'Glitch_0', 'intensity', 0.69999999 );
+				m_visionConeWidgetGlitch.SetEffectParamValue( inkEffectType.Glitch, 'Glitch_0', 'intensity', 0.80000001 );
+				m_clampArrowWidgetGlitch.SetEffectParamValue( inkEffectType.Glitch, 'Glitch_0', 'intensity', 0.2 );
+			}
+			else
+			{
+				m_iconWidgetGlitch.SetEffectParamValue( inkEffectType.Glitch, 'Glitch_0', 'intensity', 0.05 );
+				m_visionConeWidgetGlitch.SetEffectParamValue( inkEffectType.Glitch, 'Glitch_0', 'intensity', 0.05 );
+				m_clampArrowWidgetGlitch.SetEffectParamValue( inkEffectType.Glitch, 'Glitch_0', 'intensity', 0.05 );
+			}
+		}
+		if( !( m_lockLootQuality ) )
+		{
+			m_highestLootQuality = m_stealthMappin.GetHighestLootQuality();
+		}
+		m_attitudeState = GetStateForAttitude( attitude, canSeePlayer );
+		m_stealthMappin.SetVisibleOnMinimap( shouldShowMappin );
+		m_stealthMappin.SetIsPulsing( m_pulsing );
+		m_clampingAvailable = m_isTagged || ( m_isAggressive && ( m_isSquadInCombat || m_detectionAboveZero ) );
+		OverrideClamp( m_clampingAvailable );
+		m_wasCompanion = isCompanion;
+		m_wasSquadInCombat = m_isSquadInCombat;
+		m_wasVisible = shouldShowMappin;
+		super.Update();
+	}
+
+	protected override function UpdateClamping()
+	{
+		if( IsClamped() )
+		{
+			m_root.SetOpacity( 1.0 );
+			inkImageRef.SetVisible( iconWidget, false );
+			inkWidgetRef.SetVisible( m_pulseWidget, false );
+			inkImageRef.SetVisible( visionConeWidget, false );
+			inkWidgetRef.SetVisible( clampArrowWidget, m_clampingAvailable );
+		}
+		else
+		{
+			m_root.SetOpacity( m_adjustedOpacity );
+			inkImageRef.SetVisible( iconWidget, true );
+			inkWidgetRef.SetVisible( m_pulseWidget, m_pulsing );
+			inkImageRef.SetVisible( visionConeWidget, m_shouldShowVisionCone );
+			inkWidgetRef.SetVisible( clampArrowWidget, false );
+		}
+	}
+
+	protected override function UpdateAboveBelowVerticalRelation()
+	{
+		var vertRelation : gamemappinsVerticalPositioning;
+		vertRelation = GetVerticalRelationToPlayer();
+		if( IsClamped() )
+		{
+			m_aboveWidget.SetVisible( false );
+			m_belowWidget.SetVisible( false );
+		}
+		else
+		{
+			m_aboveWidget.SetVisible( vertRelation == gamemappinsVerticalPositioning.Above );
+			m_belowWidget.SetVisible( vertRelation == gamemappinsVerticalPositioning.Below );
+		}
+	}
+
+	protected function Pulse( count : Int32 )
+	{
+		var animOptions : inkAnimOptions;
+		if( !( m_alertedAnim ) || !( m_alertedAnim.IsPlaying() ) )
+		{
+			m_pulsing = true;
+			inkWidgetRef.SetVisible( m_pulseWidget, true );
+			inkWidgetRef.SetOpacity( m_pulseWidget, 1.0 );
+			animOptions.loopType = inkanimLoopType.Cycle;
+			animOptions.loopCounter = ( ( Uint32 )( count ) );
+			m_alertedAnim = PlayLibraryAnimation( 'Alerted', animOptions );
+			m_alertedAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPulsingAnimFinished' );
+		}
+	}
+
+	protected function PulseContinuous( enabled : Bool )
+	{
+		var animOptions : inkAnimOptions;
+		if( m_alertedAnim && m_alertedAnim.IsPlaying() )
+		{
+			m_alertedAnim.Stop();
+		}
+		if( enabled )
+		{
+			m_pulsing = true;
+			inkWidgetRef.SetVisible( m_pulseWidget, true );
+			inkWidgetRef.SetOpacity( m_pulseWidget, 0.5 );
+			animOptions.loopType = inkanimLoopType.Cycle;
+			animOptions.loopInfinite = true;
+			m_alertedAnim = PlayLibraryAnimation( 'Alerted', animOptions );
+		}
+		else
+		{
+			m_pulsing = false;
+			inkWidgetRef.SetVisible( m_pulseWidget, false );
+		}
+	}
+
+	protected override function ComputeRootState() : CName
+	{
+		return m_attitudeState;
+	}
+
+	protected function FadeOut()
+	{
+		var options : inkAnimOptions;
+		if( !( m_fadeOutAnim ) || !( m_fadeOutAnim.IsPlaying() ) )
+		{
+			m_lockLootQuality = true;
+			options.executionDelay = 0.5;
+			m_fadeOutAnim = PlayLibraryAnimation( 'FadeOut', options );
+			m_fadeOutAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnFadeOutAnimFinished' );
+		}
+	}
+
+	protected function GetStateForAttitude( attitude : EAIAttitude, canSeePlayer : Bool ) : CName
+	{
+		if( !( m_isAlive ) && ( m_highestLootQuality > ( ( Uint32 )( 0 ) ) ) )
+		{
+			switch( m_highestLootQuality )
+			{
+				case 0:
+					return 'Quality_Common';
+				case 1:
+					return 'Quality_Uncommon';
+				case 2:
+					return 'Quality_Rare';
+				case 3:
+					return 'Quality_Epic';
+				case 4:
+					return 'Quality_Legendary';
+				case 5:
+					return 'Quality_Iconic';
+				default:
+					return 'Quality_Common';
+			}
+		}
+		else
+		{
+			switch( attitude )
+			{
+				case EAIAttitude.AIA_Hostile:
+				case EAIAttitude.AIA_Neutral:
+					if( m_isSquadInCombat )
+					{
+						return 'Hostile';
+					}
+					else if( canSeePlayer )
+					{
+						return 'Detecting';
+					}
+					else if( m_isAggressive )
+					{
+						return 'Neutral_Aggressive';
+					}
+					else
+					{
+						return 'Neutral';
+					}
+				;
+				case EAIAttitude.AIA_Friendly:
+					return 'Friendly';
+				default:
+					return 'Civilian';
+			}
+		}
+	}
+
+	private function PlayPreventionAnim()
+	{
+		var initialState : CName;
+		StopPreventionAnim();
+		m_preventionAnimProxy = MappinUIUtils.PlayPreventionBlinkAnimation( GetRootWidget(), initialState );
+		if( m_preventionAnimProxy )
+		{
+			m_preventionState = initialState;
+			m_preventionAnimProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnPreventionAnimLoop' );
+		}
+	}
+
+	private function StopPreventionAnim()
+	{
+		if( m_preventionAnimProxy )
+		{
+			m_preventionAnimProxy.Stop();
+			m_preventionAnimProxy = NULL;
+		}
+	}
+
+	private function IsVehicleStance( stance : gamedataNPCStanceState ) : Bool
+	{
+		return stance == gamedataNPCStanceState.Vehicle || stance == gamedataNPCStanceState.VehicleWindow;
+	}
+
+	protected event OnStanceStateChanged( value : Int32 )
+	{
+		var newStanceIsVehicle : Bool;
+		newStanceIsVehicle = IsVehicleStance( ( ( gamedataNPCStanceState )( value ) ) );
+		if( m_isInVehicleStance != newStanceIsVehicle )
+		{
+			m_isInVehicleStance = newStanceIsVehicle;
+			Update();
+		}
+	}
+
+	protected event OnPreventionAnimLoop( anim : inkAnimProxy )
+	{
+		MappinUIUtils.CyclePreventionState( m_preventionState );
+		UpdateRootState();
+	}
+
+	protected event OnPulsingAnimFinished( proxy : inkAnimProxy )
+	{
+		m_alertedAnim.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnPulsingAnimFinished' );
+		inkWidgetRef.SetVisible( m_pulseWidget, false );
+		m_pulsing = false;
+		Update();
+	}
+
+	protected event OnFadeOutAnimFinished( proxy : inkAnimProxy )
+	{
+		m_fadeOutAnim.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnFadeOutAnimFinished' );
+		m_hasBeenLooted = true;
+		Update();
+		m_stealthMappin.UnregisterMappin();
+	}
+
+}
+
+import class MinimapQuestMappinController extends BaseMinimapMappinController
+{
+	private var m_questMappin : weak< QuestMappin >;
+
+	protected override function ComputeRootState() : CName
+	{
+		return 'Quest';
+	}
+
+	protected override function Intro()
+	{
+		m_questMappin = ( ( QuestMappin )( GetMappin() ) );
+		super.Intro();
+	}
+
+	protected override function Update()
+	{
+		var isPlayerInArea : Bool;
+		var shouldHide : Bool;
+		isPlayerInArea = m_questMappin.IsInsideTrigger();
+		shouldHide = !( IsTracked() ) || isPlayerInArea;
+		SetForceHide( shouldHide );
+		super.Update();
+	}
+
+}
+
+import class MinimapQuestAreaInitData extends MappinControllerCustomData
+{
+}
+
+import class MinimapQuestAreaMappinController extends BaseMinimapMappinController
+{
+	protected import var areaShapeWidget : inkShapeRef;
+
+	protected override function ComputeRootState() : CName
+	{
+		return 'Quest';
+	}
+
+	protected override function Update()
+	{
+		var isPlayerInArea : Bool;
+		var shouldHide : Bool;
+		isPlayerInArea = MappinUIUtils.IsPlayerInArea( GetMappin() );
+		shouldHide = !( IsTracked() ) || !( isPlayerInArea );
+		SetForceHide( shouldHide );
+		super.Update();
+	}
+
+}
+
+import class MinimapDeviceMappinController extends BaseMinimapMappinController
+{
+	protected import var effectAreaWidget : inkCircleRef;
+
+	protected import function SetEffectAreaRadius( radius : Float );
+
+	protected override function Update()
+	{
+		var texturePart : CName;
+		var iconID : TweakDBID;
+		var isIconIDValid : Bool;
+		var shouldShowMappin : Bool;
+		var shouldShowEffectArea : Bool;
+		var gameplayRoleData : GameplayRoleMappinData;
+		super.Update();
+		gameplayRoleData = GetVisualData();
+		if( gameplayRoleData && gameplayRoleData.m_showOnMiniMap )
+		{
+			iconID = gameplayRoleData.m_textureID;
+			isIconIDValid = TDBID.IsValid( iconID );
+			if( isIconIDValid )
+			{
+				SetTexture( iconWidget, iconID );
+			}
+			else
+			{
+				texturePart = GetTexturePartForDeviceEffect( gameplayRoleData.m_gameplayRole );
+				inkImageRef.SetTexturePart( iconWidget, texturePart );
+				isIconIDValid = texturePart != '';
+			}
+			shouldShowMappin = isIconIDValid;
+		}
+		else
+		{
+			shouldShowMappin = false;
+		}
+		shouldShowEffectArea = shouldShowMappin && ( gameplayRoleData.m_isCurrentTarget || gameplayRoleData.m_isTagged );
+		SetEffectAreaRadius( ( ( shouldShowEffectArea ) ? ( gameplayRoleData.m_range ) : ( 0.0 ) ) );
+		SetForceHide( !( shouldShowMappin ) );
+	}
+
+	private override function ComputeRootState() : CName
+	{
+		var visualState : EMappinVisualState;
+		var returnValue : CName;
+		var quality : gamedataQuality;
+		var gameplayRoleData : GameplayRoleMappinData;
+		gameplayRoleData = GetVisualData();
+		if( gameplayRoleData )
+		{
+			visualState = gameplayRoleData.m_mappinVisualState;
+			quality = gameplayRoleData.m_quality;
+			if( gameplayRoleData.m_isQuest )
+			{
+				returnValue = 'Quest';
+			}
+			else if( gameplayRoleData.m_gameplayRole == EGameplayRole.ExplodeLethal )
+			{
+				returnValue = 'Explosion';
+			}
+			else if( quality != gamedataQuality.Invalid && quality != gamedataQuality.Random )
+			{
+				switch( quality )
+				{
+					case gamedataQuality.Common:
+						returnValue = 'Common';
+					break;
+					case gamedataQuality.Epic:
+						returnValue = 'Epic';
+					break;
+					case gamedataQuality.Legendary:
+						returnValue = 'Legendary';
+					break;
+					case gamedataQuality.Rare:
+						returnValue = 'Rare';
+					break;
+					case gamedataQuality.Uncommon:
+						returnValue = 'Uncommon';
+					break;
+					default:
+						returnValue = 'Default';
+					break;
+				}
+			}
+			else
+			{
+				switch( visualState )
+				{
+					case EMappinVisualState.Inactive:
+						returnValue = 'Inactive';
+					break;
+					case EMappinVisualState.Available:
+						returnValue = 'Available';
+					break;
+					case EMappinVisualState.Unavailable:
+						returnValue = 'Unavailable';
+					break;
+					case EMappinVisualState.Default:
+						returnValue = 'Default';
+					break;
+				}
+			}
+		}
+		return returnValue;
+	}
+
+	public const override function GetVisualData() : GameplayRoleMappinData
+	{
+		return ( ( GameplayRoleMappinData )( ( ( m_mappin ) ? ( m_mappin.GetScriptData() ) : ( NULL ) ) ) );
+	}
+
+	private function GetTexturePartForDeviceEffect( gameplayRole : EGameplayRole ) : CName
+	{
+		switch( gameplayRole )
+		{
+			case EGameplayRole.Alarm:
+				return 'trigger_alarm1';
+			case EGameplayRole.ControlNetwork:
+				return 'control_network_device1';
+			case EGameplayRole.ControlOtherDevice:
+				return 'control_network_device2';
+			case EGameplayRole.ControlSelf:
+				return 'control_network_device3';
+			case EGameplayRole.CutPower:
+				return 'cut_power1';
+			case EGameplayRole.Distract:
+				return 'distract_enemy3';
+			case EGameplayRole.DropPoint:
+				return 'drop_point1';
+			case EGameplayRole.ExplodeLethal:
+				return 'explosive_lethal1';
+			case EGameplayRole.ExplodeNoneLethal:
+				return 'explosive_non-lethal1';
+			case EGameplayRole.Fall:
+				return 'fall2';
+			case EGameplayRole.GrantInformation:
+				return 'grants_information1';
+			case EGameplayRole.Clue:
+				return 'clue';
+			case EGameplayRole.HideBody:
+				return 'dispose_body1';
+			case EGameplayRole.Loot:
+				return 'loot1';
+			case EGameplayRole.OpenPath:
+				return 'open_path1';
+			case EGameplayRole.ClearPath:
+				return 'movable1';
+			case EGameplayRole.ServicePoint:
+				return 'use_servicepoint1';
+			case EGameplayRole.Shoot:
+				return 'shoots2';
+			case EGameplayRole.SpreadGas:
+				return 'gas_spread1';
+			case EGameplayRole.StoreItems:
+				return 'storage1';
+			case EGameplayRole.GenericRole:
+				return '';
+		}
+		return '';
+	}
+
+}
+
+import class MinimapSecurityAreaInitData extends MappinControllerCustomData
+{
+}
+
+import class MinimapSecurityAreaMappinController extends BaseMinimapMappinController
+{
+	protected import var areaShapeWidget : inkShapeRef;
+	protected import var area : IArea;
+	protected import const var playerInArea : Bool;
+
+	protected override function Update()
+	{
+		var typeState : CName;
+		var shouldShowMappin : Bool;
+		if( area == NULL )
+		{
+			return;
+		}
+		typeState = AreaTypeToState( area.GetType() );
+		shouldShowMappin = typeState != '';
+		SetForceHide( !( shouldShowMappin ) );
+		if( shouldShowMappin )
+		{
+			inkShapeRef.SetState( areaShapeWidget, typeState );
+		}
+	}
+
+	protected event OnPlayerEnterArea()
+	{
+		PlayLibraryAnimation( 'FadeOut' );
+	}
+
+	protected event OnPlayerExitArea()
+	{
+		PlayLibraryAnimation( 'FadeIn' );
+	}
+
+	private function AreaTypeToState( type : CName ) : CName
+	{
+		if( type == 'SAFE' )
+		{
+			return 'Safe';
+		}
+		else if( type == 'RESTRICTED' )
+		{
+			return 'Restricted';
+		}
+		else if( type == 'DANGEROUS' )
+		{
+			return 'Dangerous';
+		}
+		return '';
+	}
+
+}
+
+import class MinimapRemotePlayerMappinController extends BaseMinimapMappinController
+{
+	protected import var dataWidget : inkWidgetRef;
+	protected import var shapeWidget : inkWidgetRef;
+	protected var m_playerMappin : weak< RemotePlayerMappin >;
+
+	protected event OnInitialize()
+	{
+		Initialize();
+	}
+
+	protected event OnUpdate()
+	{
+		Update();
+	}
+
+	protected override function Intro()
+	{
+		m_playerMappin = ( ( RemotePlayerMappin )( GetMappin() ) );
+		super.Intro();
+	}
+
+	protected override function Update()
+	{
+		var isAliveStr : String;
+		var inAreaStr : String;
+		var newStateName : CName;
+		super.Update();
+		if( inkWidgetRef.IsValid( shapeWidget ) )
+		{
+			if( m_playerMappin.vitals == ( ( Int32 )( gamePSMVitals.Alive ) ) )
+			{
+				isAliveStr = "Alive";
+			}
+			else
+			{
+				isAliveStr = "Dead";
+			}
+			if( !( IsClamped() ) )
+			{
+				inAreaStr = "";
+			}
+			else
+			{
+				inAreaStr = "OutsideArea";
+			}
+			newStateName = StringToName( isAliveStr + inAreaStr );
+			if( inkWidgetRef.GetState( shapeWidget ) != newStateName )
+			{
+				inkWidgetRef.SetState( shapeWidget, newStateName );
+			}
+		}
+		if( inkWidgetRef.IsValid( dataWidget ) )
+		{
+			inkWidgetRef.SetVisible( dataWidget, m_playerMappin.hasMissionData );
+		}
+	}
+
+}
+
+import class MinimapPingSystemMappinController extends BaseMinimapMappinController
+{
+
+	protected override function Intro()
+	{
+		var pingMappin : weak< PingSystemMappin >;
+		var pingType : gamedataPingType;
+		var pingTDBID : TweakDBID;
+		var pingString : String;
+		var pingRecord : Ping_Record;
+		var stateName : String;
+		pingMappin = ( ( PingSystemMappin )( GetMappin() ) );
+		pingType = pingMappin.pingType;
+		pingString = EnumValueToString( "gamedataPingType", ( ( Int32 )( pingType ) ) );
+		pingTDBID = TDBID.Create( "PingTypes." + pingString );
+		pingRecord = TweakDBInterface.GetPingRecord( pingTDBID );
+		inkImageRef.SetTexturePart( iconWidget, pingRecord.MinimapIconName() );
+		stateName = pingMappin.ResolveIconState();
+		inkImageRef.SetState( iconWidget, StringToName( stateName ) );
+		super.Intro();
+	}
+
+}
+
+class MinimapPOIMappinController extends BaseMinimapMappinController
+{
+	private editable var m_pulseWidget : inkWidgetRef;
+	private editable var m_pingAnimationOnStateChange : Bool;
+	private var m_poiMappin : weak< PointOfInterestMappin >;
+	private var m_questMappin : weak< QuestMappin >;
+	private var m_isCompletedPhase : Bool;
+	default m_isCompletedPhase = false;
+	private var m_mappinPhase : gamedataMappinPhase;
+	private var m_pingAnim : inkAnimProxy;
+	private const var c_pingAnimCount : Uint32;
+	default c_pingAnimCount = 3;
+	private var m_vehicleMinimapMappinComponent : VehicleMinimapMappinComponent;
+	private var m_keepIconOnClamping : Bool;
+	default m_keepIconOnClamping = false;
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+		inkWidgetRef.SetVisible( m_pulseWidget, false );
+	}
+
+	protected override function Intro()
+	{
+		var vehicleMappin : weak< VehicleMappin >;
+		vehicleMappin = ( ( weak< weak< VehicleMappin > > )( GetMappin() ) );
+		if( vehicleMappin )
+		{
+			m_keepIconOnClamping = true;
+			m_vehicleMinimapMappinComponent = new VehicleMinimapMappinComponent;
+			m_vehicleMinimapMappinComponent.OnInitialize( this, vehicleMappin );
+		}
+		m_poiMappin = ( ( PointOfInterestMappin )( GetMappin() ) );
+		m_questMappin = ( ( QuestMappin )( GetMappin() ) );
+		UpdateIcon();
+		super.Intro();
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_vehicleMinimapMappinComponent )
+		{
+			m_vehicleMinimapMappinComponent.OnUninitialize();
+		}
+	}
+
+	protected override function Update()
+	{
+		var newMappinPhase : gamedataMappinPhase;
+		newMappinPhase = m_mappin.GetPhase();
+		if( m_mappinPhase != newMappinPhase )
+		{
+			m_mappinPhase = newMappinPhase;
+			if( m_mappinPhase == gamedataMappinPhase.DiscoveredPhase && m_pingAnimationOnStateChange )
+			{
+				PlayPingAnimation();
+			}
+		}
+		UpdateVisibility();
+		UpdateIcon();
+		super.Update();
+	}
+
+	public function PlayPingAnimation( optional loopInfinite : Bool )
+	{
+		var animOptions : inkAnimOptions;
+		StopPingAnimation();
+		animOptions.loopType = inkanimLoopType.Cycle;
+		animOptions.loopInfinite = loopInfinite;
+		animOptions.loopCounter = c_pingAnimCount;
+		m_pingAnim = PlayLibraryAnimation( 'Pulse', animOptions );
+		m_pingAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPulseAnimLoop' );
+		inkWidgetRef.SetVisible( m_pulseWidget, true );
+	}
+
+	public function StopPingAnimation( optional goToEnd : Bool )
+	{
+		if( m_pingAnim )
+		{
+			m_pingAnim.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnPulseAnimLoop' );
+			if( goToEnd )
+			{
+				m_pingAnim.GotoEndAndStop();
+			}
+			else
+			{
+				m_pingAnim.Stop();
+			}
+			m_pingAnim = NULL;
+		}
+	}
+
+	protected event OnQuestMappinHighlight( evt : QuestMappinHighlightEvent )
+	{
+		var poiMappin : PointOfInterestMappin;
+		poiMappin = ( ( PointOfInterestMappin )( m_mappin ) );
+		if( poiMappin && ( poiMappin.GetJournalQuestPathHash() == evt.m_hash ) )
+		{
+			PlayPingAnimation();
+		}
+	}
+
+	protected event OnPulseAnimLoop( anim : inkAnimProxy )
+	{
+		inkWidgetRef.SetVisible( m_pulseWidget, false );
+	}
+
+	protected function UpdateVisibility()
+	{
+		var isInArea : Bool;
+		var shouldHide : Bool;
+		m_isCompletedPhase = m_mappinPhase == gamedataMappinPhase.CompletedPhase;
+		if( m_questMappin != NULL )
+		{
+			isInArea = m_questMappin.IsInsideTrigger();
+			shouldHide = !( IsTracked() ) || isInArea;
+			SetForceHide( shouldHide );
+			return;
+		}
+		if( m_poiMappin != NULL )
+		{
+			isInArea = m_poiMappin.IsInsideSecurityAreaTrigger();
+			if( !( IsPlayerTracked() ) )
+			{
+				shouldHide = isInArea || m_poiMappin.IsQuestPath();
+			}
+			shouldHide = shouldHide || m_isCompletedPhase;
+			SetForceHide( shouldHide );
+		}
+	}
+
+	protected function UpdateIcon()
+	{
+		var mappinVariant : gamedataMappinVariant;
+		var texturePart : CName;
+		var iconID : TweakDBID;
+		var roleMappinData : GameplayRoleMappinData;
+		if( m_mappin )
+		{
+			roleMappinData = ( ( GameplayRoleMappinData )( m_mappin.GetScriptData() ) );
+			mappinVariant = m_mappin.GetVariant();
+		}
+		if( roleMappinData )
+		{
+			iconID = roleMappinData.m_textureID;
+		}
+		if( !( TDBID.IsValid( iconID ) ) )
+		{
+			texturePart = MappinUIUtils.MappinToTexturePart( mappinVariant, m_mappinPhase );
+			inkImageRef.SetTexturePart( iconWidget, texturePart );
+		}
+		else
+		{
+			SetTexture( iconWidget, iconID );
+		}
+		inkImageRef.SetOpacity( iconWidget, ( ( m_isCompletedPhase ) ? ( MappinUtils.GetGlobalProfile().CompletedPOIOpacity() ) : ( 1.0 ) ) );
+	}
+
+	protected override function ComputeRootState() : CName
+	{
+		var mappinsGroup : weak< MappinsGroup_Record >;
+		var stateName : CName;
+		if( m_isCompletedPhase )
+		{
+			stateName = 'QuestComplete';
+		}
+		else if( m_mappin != NULL )
+		{
+			mappinsGroup = MappinUtils.GetMappinsGroup( m_mappin.GetVariant() );
+			if( mappinsGroup )
+			{
+				stateName = mappinsGroup.WidgetState();
+			}
+		}
+		if( stateName == '' )
+		{
+			stateName = 'Quest';
+		}
+		return stateName;
+	}
+
+	protected override function KeepIconOnClamping() : Bool
+	{
+		return m_keepIconOnClamping;
+	}
+
+	public function SetPulseWidgetTint( color : HDRColor )
+	{
+		inkWidgetRef.SetTintColor( m_pulseWidget, color );
+	}
+
+}
+
+import class MinimapDynamicEventMappinController extends BaseMinimapMappinController
+{
+	private import var pulseWidget : inkWidgetRef;
+	private import var pulseEnabled : Bool;
+	private var m_pulseAnim : inkAnimProxy;
+
+	private function PlayPulseAnimation()
+	{
+		var animOptions : inkAnimOptions;
+		animOptions.loopType = inkanimLoopType.Cycle;
+		animOptions.loopInfinite = true;
+		m_pulseAnim = PlayLibraryAnimation( 'Pulse', animOptions );
+		if( m_pulseAnim != NULL )
+		{
+			m_pulseAnim.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnPulseAnimLoop' );
+		}
+	}
+
+	private function StopPulseAnimation()
+	{
+		if( m_pulseAnim != NULL )
+		{
+			m_pulseAnim.Stop();
+			m_pulseAnim = NULL;
+		}
+	}
+
+	protected event OnPulseAnimLoop( anim : inkAnimProxy )
+	{
+		if( !( pulseEnabled ) )
+		{
+			StopPulseAnimation();
+		}
+	}
+
+	protected event OnPulseEnabledChanged( enabled : Bool )
+	{
+		if( enabled )
+		{
+			PlayPulseAnimation();
+		}
+	}
+
+}
+
+class VehicleMinimapMappinComponent
+{
+	private var m_minimapPOIMappinController : weak< MinimapPOIMappinController >;
+	private var m_uiWantedBarBB : weak< IBlackboard >;
+	private var m_UIWantedBarDef : UI_WantedBarDef;
+	private var m_currentWantedLevelCallback : CallbackHandle;
+	private var m_playerWanted : Bool;
+	private var m_vehicleIsLatestSummoned : Bool;
+	default m_vehicleIsLatestSummoned = false;
+	private var m_vehicleEntityID : EntityID;
+	private var m_vehicleSummonDataDef : VehicleSummonDataDef;
+	private var m_vehicleSummonDataBB : weak< IBlackboard >;
+	private var m_vehicleSummonStateCallback : CallbackHandle;
+
+	public function OnInitialize( minimapPOIMappinController : weak< MinimapPOIMappinController >, vehicleMappin : weak< VehicleMappin > )
+	{
+		var vehicle : weak< VehicleObject >;
+		m_minimapPOIMappinController = minimapPOIMappinController;
+		vehicle = vehicleMappin.GetVehicle();
+		if( vehicle.IsPrevention() )
+		{
+			m_UIWantedBarDef = GetAllBlackboardDefs().UI_WantedBar;
+			m_uiWantedBarBB = GameInstance.GetBlackboardSystem( vehicle.GetGame() ).Get( m_UIWantedBarDef );
+			m_currentWantedLevelCallback = m_uiWantedBarBB.RegisterListenerInt( m_UIWantedBarDef.CurrentWantedLevel, this, 'OnCurrentWantedLevelChanged' );
+			m_playerWanted = m_uiWantedBarBB.GetInt( m_UIWantedBarDef.CurrentWantedLevel ) > 0;
+			m_minimapPOIMappinController.SetPulseWidgetTint( HDRColor( 1.0, 0.0, 0.0, 0.0 ) );
+			ActivatePingAnimation( m_playerWanted );
+		}
+		else
+		{
+			m_vehicleEntityID = vehicle.GetEntityID();
+			m_vehicleSummonDataDef = GetAllBlackboardDefs().VehicleSummonData;
+			m_vehicleSummonDataBB = GameInstance.GetBlackboardSystem( vehicle.GetGame() ).Get( m_vehicleSummonDataDef );
+			m_vehicleSummonStateCallback = m_vehicleSummonDataBB.RegisterListenerUint( m_vehicleSummonDataDef.SummonState, this, 'OnVehicleSummonStateChanged' );
+			m_minimapPOIMappinController.OverrideClamp( VehicleIsLatestSummoned() );
+		}
+	}
+
+	public function OnUninitialize()
+	{
+		if( m_currentWantedLevelCallback )
+		{
+			m_uiWantedBarBB.UnregisterListenerInt( m_UIWantedBarDef.CurrentWantedLevel, m_currentWantedLevelCallback );
+		}
+		if( m_vehicleSummonStateCallback )
+		{
+			m_vehicleSummonDataBB.UnregisterListenerUint( m_vehicleSummonDataDef.SummonState, m_vehicleSummonStateCallback );
+		}
+	}
+
+	private function VehicleIsLatestSummoned() : Bool
+	{
+		return m_vehicleEntityID == m_vehicleSummonDataBB.GetEntityID( m_vehicleSummonDataDef.SummonedVehicleEntityID );
+	}
+
+	private function ActivatePingAnimation( activate : Bool )
+	{
+		if( activate )
+		{
+			m_minimapPOIMappinController.SetPulseWidgetTint( HDRColor( 1.0, 0.0, 0.0, 0.0 ) );
+			m_minimapPOIMappinController.PlayPingAnimation( true );
+		}
+		else
+		{
+			m_minimapPOIMappinController.StopPingAnimation( true );
+		}
+	}
+
+	protected event OnCurrentWantedLevelChanged( value : Int32 )
+	{
+		var playerWanted : Bool;
+		playerWanted = value > 0;
+		if( m_playerWanted != playerWanted )
+		{
+			ActivatePingAnimation( playerWanted );
+			m_playerWanted = playerWanted;
+		}
+	}
+
+	protected event OnVehicleSummonStateChanged( value : Uint32 )
+	{
+		var isLastSummoned : Bool;
+		isLastSummoned = VehicleIsLatestSummoned();
+		m_minimapPOIMappinController.OverrideClamp( isLastSummoned );
+		if( isLastSummoned && ( ( vehicleSummonState )( value ) ) == vehicleSummonState.AlreadySummoned )
+		{
+			m_minimapPOIMappinController.PlayPingAnimation();
+		}
+	}
+
+}
+

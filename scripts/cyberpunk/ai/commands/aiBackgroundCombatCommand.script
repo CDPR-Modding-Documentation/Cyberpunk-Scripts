@@ -1,0 +1,434 @@
+class AIBackgroundCombatCommand extends AICommand
+{
+	var m_steps : array< AIBackgroundCombatStep >;
+}
+
+struct AIBackgroundCombatStep
+{
+	editable var m_timeMin : Float;
+	hint m_timeMin = "Minimal time to wait since the previous step.";
+	editable var m_timeMax : Float;
+	hint m_timeMax = "Maximal time to wait since the previous step. This value is ignored if it's smaller or equal to 'Time Min'. If it's greater than 'Time Min', the actual time will be a random number in the (Time Min, TimeMax) range.";
+	editable var m_type : EAIBackgroundCombatStep;
+	hint m_type = "Type of the step. I.e. what should be done at this step.";
+	editable var m_argument : EntityReference;
+	hint m_argument = "This is interpreted differently depending on the value of the 'Type' parameter. For 'ChangeCover', this is node reference of the cover. For 'ChangeTarget', this is an entity reference of the target.";
+	editable var m_exposureMethod : AICoverExposureMethod;
+	default m_exposureMethod = AICoverExposureMethod.Stand_Up;
+	hint m_exposureMethod = "This is the method the NPC will use to get out of cover to shoot. Only used for 'ChangeCover' step type.";
+}
+
+class AIBackgroundCombatCommandParams extends ScriptedAICommandParams
+{
+	const editable inlined var m_steps : array< AIBackgroundCombatStep >;
+
+	public constexpr function GetCommandName() : String
+	{
+		return "Background Combat";
+	}
+
+	public override function CreateCommand() : AICommand
+	{
+		var command : AIBackgroundCombatCommand;
+		command = new AIBackgroundCombatCommand;
+		command.m_steps = m_steps;
+		return command;
+	}
+
+}
+
+class AIAnimationTask extends AIbehaviortaskScript
+{
+	[ customEditor = "TweakDBGroupInheritance;AIAction" ]
+	protected editable var m_record : TweakDBID;
+	protected editable inlined var m_animVariation : AIArgumentMapping;
+	protected var m_actionRecord : weak< AIAction_Record >;
+	protected var m_actionDebugName : String;
+	protected var m_animVariationValue : Int32;
+	default m_animVariationValue = -1;
+	protected var m_phaseRecord : weak< AIActionPhase_Record >;
+	protected var m_actionPhase : EAIActionPhase;
+	protected var m_phaseActivationTime : Float;
+	protected var m_phaseDuration : Float;
+
+	private function GetPhaseDuration() : Float
+	{
+		var phaseRecord : AIActionPhase_Record;
+		var duration : Float;
+		phaseRecord = m_phaseRecord;
+		if( phaseRecord )
+		{
+			duration = phaseRecord.AnimationDuration();
+			if( duration >= 0.0 )
+			{
+				return duration;
+			}
+			duration = phaseRecord.Duration();
+			return duration;
+		}
+		return 0.0;
+	}
+
+	private function SendAnimData( context : ScriptExecutionContext, animData : AIActionAnimData_Record )
+	{
+		var animFeature : AnimFeature_AIAction;
+		var animFeatureName : CName;
+		var animProxy : ActionAnimationScriptProxy;
+		var animSlot : AIActionAnimSlot_Record;
+		var slideParams : ActionAnimationSlideParams;
+		var animVariation : Int32;
+		var items : array< weak< ItemObject > >;
+		var i : Int32;
+		animFeature = new AnimFeature_AIAction;
+		animProxy = GetPuppet( context ).GetAIControllerComponent().GetActionAnimationScriptProxy();
+		if( !( animProxy ) )
+		{
+			return;
+		}
+		animFeatureName = animData.AnimFeature();
+		if( m_actionPhase == EAIActionPhase.Inactive )
+		{
+			animProxy.Stop();
+			animProxy.Setup( animFeatureName, animFeature, false, false, false, false, animData.UpdateMovePolicy(), slideParams, NULL, animData.MarginToPlayer() );
+			animProxy.Launch();
+		}
+		else
+		{
+			animFeature.state = ( ( Int32 )( m_actionPhase ) );
+			animFeature.stateDuration = m_phaseDuration;
+			if( m_animVariationValue >= 0 )
+			{
+				animFeature.animVariation = m_animVariationValue;
+			}
+			else if( animData.AnimVariationSubAction() )
+			{
+				if( TweakAISubAction.GetAnimVariation( context, animData.AnimVariationSubAction(), animVariation ) )
+				{
+					animFeature.animVariation = animVariation;
+				}
+				else
+				{
+					animFeature.animVariation = animData.AnimVariation();
+				}
+			}
+			else
+			{
+				animFeature.animVariation = animData.AnimVariation();
+			}
+			animSlot = animData.AnimSlot();
+			animProxy.Stop();
+			animProxy.Setup( animFeatureName, animFeature, animSlot.UseRootMotion(), animSlot.UsePoseMatching(), animSlot.ResetRagdollOnStart(), animSlot.UseDynamicObjectsCheck(), animData.UpdateMovePolicy(), slideParams, NULL, animData.MarginToPlayer() );
+			animProxy.Launch();
+		}
+		if( AIActionHelper.GetItemsFromWeaponSlots( ScriptExecutionContext.GetOwner( context ), items ) )
+		{
+			for( i = 0; i < items.Size(); i += 1 )
+			{
+				AnimationControllerComponent.ApplyFeatureToReplicate( items[ i ], animFeatureName, animFeature );
+			}
+		}
+	}
+
+	private function StartPhase( context : ScriptExecutionContext, newPhase : EAIActionPhase )
+	{
+		var action : AIAction_Record;
+		var animData : AIActionAnimData_Record;
+		var phaseRecord : AIActionPhase_Record;
+		m_actionPhase = newPhase;
+		m_phaseActivationTime = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		action = m_actionRecord;
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				phaseRecord = action.Startup();
+			break;
+			case EAIActionPhase.Loop:
+				phaseRecord = action.Loop();
+			break;
+			case EAIActionPhase.Recovery:
+				phaseRecord = action.Recovery();
+			break;
+			default:
+				phaseRecord = NULL;
+			break;
+		}
+		m_phaseRecord = phaseRecord;
+		if( phaseRecord )
+		{
+			m_phaseDuration = phaseRecord.Duration();
+		}
+		else
+		{
+			m_phaseDuration = 0.0;
+		}
+		animData = action.AnimData();
+		if( animData && ( phaseRecord || m_actionPhase == EAIActionPhase.Inactive ) )
+		{
+			SendAnimData( context, animData );
+		}
+	}
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		m_actionDebugName = "<no action>";
+		TweakAIActionRecord.GetActionRecord( context, m_record, m_actionDebugName, m_actionRecord );
+		if( m_animVariation )
+		{
+			m_animVariationValue = ( ( Int32 )( ScriptExecutionContext.GetMappingValue( context, m_animVariation ) ) );
+		}
+		m_actionPhase = EAIActionPhase.Inactive;
+		m_phaseDuration = 0.0;
+		StartPhase( context, EAIActionPhase.Startup );
+	}
+
+	protected override function Deactivate( context : ScriptExecutionContext ) {}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var currentPhaseDuration : Float;
+		if( !( m_actionRecord ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		currentPhaseDuration = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) - m_phaseActivationTime;
+		if( currentPhaseDuration >= m_phaseDuration )
+		{
+			switch( m_actionPhase )
+			{
+				case EAIActionPhase.Startup:
+					StartPhase( context, EAIActionPhase.Loop );
+				break;
+				case EAIActionPhase.Loop:
+					StartPhase( context, EAIActionPhase.Recovery );
+				break;
+				case EAIActionPhase.Recovery:
+					StartPhase( context, EAIActionPhase.Inactive );
+				return AIbehaviorUpdateOutcome.SUCCESS;
+				break;
+			}
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	public override function GetDescription( context : ScriptExecutionContext ) : String
+	{
+		return m_actionDebugName;
+	}
+
+}
+
+class AIBackgroundCombatDelegate extends ScriptBehaviorDelegate
+{
+	private var m_command : AIBackgroundCombatCommand;
+	private var m_execute : Bool;
+	private var m_steps : array< AIBackgroundCombatStep >;
+	private var m_currentStep : Int32;
+	private var m_desiredCover : NodeRef;
+	private var m_desiredCoverExposureMethod : AICoverExposureMethod;
+	private var m_desiredDestination : NodeRef;
+	private var m_hasDesiredTarget : Bool;
+	private var m_desiredTarget : EntityReference;
+	private var m_desiredCoverId : Uint64;
+	private var m_currentCoverId : Uint64;
+	private var m_currentTarget : weak< GameObject >;
+	private var m_canFireFromCover : Bool;
+	private var m_canFireOutOfCover : Bool;
+
+	private function SetExecute( context : ScriptExecutionContext, value : Bool )
+	{
+		m_execute = value;
+		ScriptExecutionContext.InvokeBehaviorCallback( context, 'ExecuteChanged' );
+	}
+
+	private function SetDesiredCover( context : ScriptExecutionContext, cover : NodeRef, exposureMethod : AICoverExposureMethod )
+	{
+		var cm : CoverManager;
+		var exposureMethods : array< gameAvailableExposureMethodResult >;
+		var exposureMethodIndex : Int32;
+		m_desiredCover = cover;
+		m_desiredCoverExposureMethod = exposureMethod;
+		cm = GameInstance.GetCoverManager( ScriptExecutionContext.GetOwner( context ).GetGame() );
+		if( cm )
+		{
+			m_desiredCoverId = cm.NodeRefToObjectId( cover );
+			exposureMethods = cm.GetUsableExposureSpotsForCover( m_desiredCoverId, m_currentTarget );
+			if( exposureMethods.Size() > 0 )
+			{
+				exposureMethodIndex = RandRange( 0, exposureMethods.Size() );
+				m_desiredCoverExposureMethod = exposureMethods[ exposureMethodIndex ].method;
+			}
+		}
+		ScriptExecutionContext.InvokeBehaviorCallback( context, 'DesiredCoverChanged' );
+	}
+
+	private function SetDesiredDestination( context : ScriptExecutionContext, destination : NodeRef )
+	{
+		m_desiredDestination = destination;
+		ScriptExecutionContext.InvokeBehaviorCallback( context, 'DesiredDestinationChanged' );
+	}
+
+	private function SetDesiredTarget( context : ScriptExecutionContext, target : EntityReference )
+	{
+		m_hasDesiredTarget = true;
+		m_desiredTarget = m_steps[ m_currentStep ].m_argument;
+		ScriptExecutionContext.InvokeBehaviorCallback( context, 'DesiredTargetChanged' );
+	}
+
+	public function DoStartCommand( context : ScriptExecutionContext ) : Bool
+	{
+		var i : Int32;
+		m_steps.Clear();
+		for( i = 0; i < m_command.m_steps.Size(); i += 1 )
+		{
+			m_steps.PushBack( m_command.m_steps[ i ] );
+		}
+		m_currentStep = 0;
+		m_hasDesiredTarget = false;
+		SetExecute( context, true );
+		return true;
+	}
+
+	public function DoEndCommand( context : ScriptExecutionContext ) : Bool
+	{
+		SetExecute( context, false );
+		m_steps.Clear();
+		m_currentStep = -1;
+		return true;
+	}
+
+	public function DoExecuteCurrentStep( context : ScriptExecutionContext ) : Bool
+	{
+		if( m_steps.Size() == 0 )
+		{
+			return false;
+		}
+		if( m_currentStep >= m_steps.Size() )
+		{
+			m_currentStep = 0;
+		}
+		switch( m_steps[ m_currentStep ].m_type )
+		{
+			case EAIBackgroundCombatStep.ChangeCover:
+				if( ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetNPCType() == gamedataNPCType.Drone )
+				{
+					SetDesiredDestination( context, m_steps[ m_currentStep ].m_argument.reference );
+				}
+				else
+				{
+					SetDesiredCover( context, m_steps[ m_currentStep ].m_argument.reference, m_steps[ m_currentStep ].m_exposureMethod );
+				}
+			break;
+			case EAIBackgroundCombatStep.ChangeTarget:
+				SetDesiredTarget( context, m_steps[ m_currentStep ].m_argument );
+			break;
+		}
+		return true;
+	}
+
+	public function DoStartNextStep( context : ScriptExecutionContext ) : Bool
+	{
+		var delay : Float;
+		var minTime, maxTime : Float;
+		var nextStepEvent : AIEvent;
+		if( m_steps.Size() == 0 )
+		{
+			return false;
+		}
+		m_currentStep += 1;
+		if( m_currentStep >= m_steps.Size() )
+		{
+			m_currentStep = 0;
+		}
+		minTime = m_steps[ m_currentStep ].m_timeMin;
+		maxTime = m_steps[ m_currentStep ].m_timeMax;
+		if( maxTime > minTime )
+		{
+			delay = RandRangeF( minTime, maxTime );
+		}
+		else
+		{
+			delay = minTime;
+		}
+		nextStepEvent = new AIEvent;
+		nextStepEvent.name = 'AIBackgroundCommandNextStepEvent';
+		if( delay > 0.0 )
+		{
+			GameInstance.GetDelaySystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).DelayEvent( ScriptExecutionContext.GetOwner( context ), nextStepEvent, delay, true );
+		}
+		else
+		{
+			ScriptExecutionContext.GetOwner( context ).QueueEvent( nextStepEvent );
+		}
+		return true;
+	}
+
+	public function DoAllowCoverChange( context : ScriptExecutionContext ) : Bool
+	{
+		if( m_desiredCoverId != m_currentCoverId )
+		{
+			ScriptExecutionContext.InvokeBehaviorCallback( context, 'BackgroundCombat_CoverChangeAllowed' );
+		}
+		return true;
+	}
+
+	public function DoStartCoverChange() : Bool
+	{
+		m_canFireFromCover = false;
+		m_canFireOutOfCover = true;
+		return true;
+	}
+
+	public function DoCompleteCoverChange() : Bool
+	{
+		m_currentCoverId = m_desiredCoverId;
+		m_canFireFromCover = true;
+		m_canFireOutOfCover = false;
+		return true;
+	}
+
+	public function DoEnableShootingFromCover( context : ScriptExecutionContext ) : Bool
+	{
+		m_canFireFromCover = true;
+		ScriptExecutionContext.InvokeBehaviorCallback( context, 'BackgroundCombat_FireFromCoverChanged' );
+		return true;
+	}
+
+	public function DoDisableShootingFromCover( context : ScriptExecutionContext ) : Bool
+	{
+		m_canFireFromCover = false;
+		ScriptExecutionContext.InvokeBehaviorCallback( context, 'BackgroundCombat_FireFromCoverChanged' );
+		return true;
+	}
+
+	public function DoCompleteTargetChange( context : ScriptExecutionContext ) : Bool
+	{
+		var threatPersistenceSource : AIThreatPersistenceSource_Record;
+		var globalRef : GlobalNodeRef;
+		var game : GameInstance;
+		if( m_hasDesiredTarget )
+		{
+			game = ScriptExecutionContext.GetOwner( context ).GetGame();
+			if( !( GetGameObjectFromEntityReference( m_desiredTarget, game, m_currentTarget ) ) )
+			{
+				globalRef = ResolveNodeRef( m_desiredTarget.reference, GlobalNodeID.GetRoot() );
+				m_currentTarget = ( ( GameObject )( GameInstance.FindEntityByID( game, ( ( EntityID )( globalRef ) ) ) ) );
+			}
+			if( m_currentTarget == ScriptExecutionContext.GetOwner( context ) )
+			{
+				return false;
+			}
+			threatPersistenceSource = TweakDBInterface.GetAIThreatPersistenceSourceRecord( T"AIThreatPersistenceSource.SetNewCombatTarget" );
+			ScriptExecutionContext.SetArgumentObject( context, 'CombatTarget', m_currentTarget );
+			AIActionHelper.SetCommandCombatTarget( context, m_currentTarget, true, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+		}
+		return true;
+	}
+
+}
+
+enum EAIBackgroundCombatStep
+{
+	ChangeCover = 0,
+	ChangeTarget = 1,
+}
+

@@ -1,0 +1,809 @@
+abstract class OldUpperBodyTransition extends DefaultTransition
+{
+
+	protected function CanEquipFirearm( owner : GameObject, stateContext : StateContext ) : Bool
+	{
+		var equipmentSystem : EquipmentSystem;
+		var weaponID : ItemID;
+		var playerData : EquipmentSystemPlayerData;
+		var itemType : gamedataItemType;
+		itemType = gamedataItemType.Invalid;
+		equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( owner.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		if( !( equipmentSystem ) )
+		{
+			return false;
+		}
+		if( IsInEmptyHandsState( stateContext ) )
+		{
+			return false;
+		}
+		playerData = equipmentSystem.GetPlayerData( owner );
+		weaponID = playerData.GetLastUsedOrFirstAvailableOneHandedRangedWeapon();
+		if( ItemID.IsValid( weaponID ) )
+		{
+			itemType = RPGManager.GetItemType( weaponID );
+			if( itemType == gamedataItemType.Wea_Handgun || itemType == gamedataItemType.Wea_Revolver )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function HasRightHandWeaponActiveInSlot( owner : GameObject ) : Bool
+	{
+		var weaponItem : ItemID;
+		if( owner )
+		{
+			weaponItem = GameInstance.GetTransactionSystem( owner.GetGame() ).GetActiveItemInSlot( owner, T"AttachmentSlots.WeaponRight" );
+			if( ItemID.IsValid( weaponItem ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+}
+
+abstract class OldUpperBodyEventsTransition extends OldUpperBodyTransition
+{
+
+	protected virtual function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) {}
+
+	protected virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) {}
+}
+
+abstract class CarriedObject extends OldUpperBodyTransition
+{
+}
+
+abstract class CarriedObjectEvents extends OldUpperBodyEventsTransition
+{
+	var m_animFeature : AnimFeature_Mounting;
+	var m_animCarryFeature : AnimFeature_Carry;
+	var m_leftHandFeature : AnimFeature_LeftHandAnimation;
+	var m_AnimWrapperWeightSetterStrong : AnimWrapperWeightSetter;
+	var m_AnimWrapperWeightSetterFriendly : AnimWrapperWeightSetter;
+	var m_styleName : CName;
+	default m_styleName = 'CarriedObject.Style';
+	var m_forceStyleName : CName;
+	default m_forceStyleName = 'CarriedObject.ForcedStyle';
+	var m_isFriendlyCarry : Bool;
+	var m_forcedCarryStyle : gamePSMBodyCarryingStyle;
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var puppet : gamePuppet;
+		var workspotSystem : WorkspotGameSystem;
+		var mountEvent : MountingRequest;
+		var mountingInfo : MountingInfo;
+		var slotId : MountingSlotId;
+		var isNPCMounted : Bool;
+		var attitude : EAIAttitude;
+		mountingInfo = scriptInterface.GetMountingFacility().GetMountingInfoSingleWithObjects( scriptInterface.owner );
+		isNPCMounted = EntityID.IsDefined( mountingInfo.childId );
+		if( !( isNPCMounted ) && !( IsBodyDisposalOngoing( stateContext, scriptInterface ) ) )
+		{
+			mountEvent = new MountingRequest;
+			slotId.id = 'leftShoulder';
+			mountingInfo.childId = scriptInterface.ownerEntityID;
+			mountingInfo.parentId = scriptInterface.executionOwnerEntityID;
+			mountingInfo.slotId = slotId;
+			mountEvent.lowLevelMountingInfo = mountingInfo;
+			scriptInterface.GetMountingFacility().Mount( mountEvent );
+			( ( NPCPuppet )( scriptInterface.owner ) ).MountingStartDisableComponents();
+		}
+		workspotSystem = scriptInterface.GetWorkspotSystem();
+		m_animFeature = new AnimFeature_Mounting;
+		m_animFeature.mountingState = 2;
+		UpdateCarryStylePickUpAndDropParams( stateContext, scriptInterface, false );
+		m_isFriendlyCarry = false;
+		m_forcedCarryStyle = gamePSMBodyCarryingStyle.Any;
+		puppet = ( ( gamePuppet )( scriptInterface.owner ) );
+		if( puppet )
+		{
+			if( workspotSystem && !( IsBodyDisposalOngoing( stateContext, scriptInterface ) ) )
+			{
+				workspotSystem.StopNpcInWorkspot( puppet );
+			}
+			attitude = GameObject.GetAttitudeBetween( scriptInterface.owner, scriptInterface.executionOwner );
+			m_forcedCarryStyle = ( ( gamePSMBodyCarryingStyle )( puppet.GetBlackboard().GetInt( GetAllBlackboardDefs().Puppet.ForcedCarryStyle ) ) );
+			if( m_forcedCarryStyle == gamePSMBodyCarryingStyle.Friendly || ( attitude == EAIAttitude.AIA_Friendly && m_forcedCarryStyle == gamePSMBodyCarryingStyle.Any ) )
+			{
+				m_isFriendlyCarry = true;
+			}
+			UpdateCarryStylePickUpAndDropParams( stateContext, scriptInterface, m_isFriendlyCarry );
+		}
+		scriptInterface.SetAnimationParameterFeature( 'Mounting', m_animFeature, scriptInterface.executionOwner );
+		scriptInterface.SetAnimationParameterFeature( 'Mounting', m_animFeature );
+		( ( NPCPuppet )( scriptInterface.owner ) ).MountingStartDisableComponents();
+	}
+
+	protected virtual function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		CleanUpCarryState( ECarryState.None, stateContext, scriptInterface );
+	}
+
+	protected function IsBodyDisposalOngoing( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal );
+	}
+
+	protected function UpdateCarryStylePickUpAndDropParams( stateContext : StateContext, scriptInterface : StateGameScriptInterface, isFriendly : Bool )
+	{
+		UpdateGameplayRestrictions( stateContext, scriptInterface );
+		if( isFriendly )
+		{
+			stateContext.SetConditionBoolParameter( 'CarriedObjectPlayPickUp', false, true );
+			SetBodyCarryFriendlyCameraContext( stateContext, scriptInterface, true );
+			ApplyFriendlyCarryGameplayRestrictions( stateContext, scriptInterface );
+		}
+		else
+		{
+			stateContext.SetConditionBoolParameter( 'CarriedObjectPlayPickUp', true, true );
+		}
+	}
+
+	protected function SetCarryState( state : ECarryState, optional pickupAnimation : Int32, instant : Bool, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var lockLeftHand : Bool;
+		var isMultiplayer : Bool;
+		m_animCarryFeature = new AnimFeature_Carry;
+		m_animCarryFeature.state = ( ( Int32 )( state ) );
+		m_animCarryFeature.pickupAnimation = pickupAnimation;
+		m_animCarryFeature.useBothHands = false;
+		m_animCarryFeature.instant = instant;
+		if( state != ECarryState.None && state != ECarryState.Release )
+		{
+			if( GetStyle( stateContext ) == gamePSMBodyCarryingStyle.Strong && state == ECarryState.Carry )
+			{
+				isMultiplayer = GameInstance.GetRuntimeInfo( scriptInterface.executionOwner.GetGame() ).IsMultiplayer();
+				if( isMultiplayer )
+				{
+					m_animCarryFeature.useBothHands = !( HasRightHandWeaponActiveInSlot( scriptInterface.executionOwner ) );
+				}
+				else if( !( isMultiplayer ) && scriptInterface.HasStatFlag( gamedataStatType.CanShootWhileCarryingBody ) )
+				{
+					m_animCarryFeature.useBothHands = !( CanEquipFirearm( scriptInterface.executionOwner, stateContext ) );
+				}
+				else
+				{
+					m_animCarryFeature.useBothHands = true;
+				}
+			}
+			else
+			{
+				m_animCarryFeature.useBothHands = true;
+			}
+		}
+		scriptInterface.SetAnimationParameterFeature( 'Carry', m_animCarryFeature, scriptInterface.executionOwner );
+		scriptInterface.SetAnimationParameterFeature( 'Carry', m_animCarryFeature, scriptInterface.owner );
+		lockLeftHand = !( m_animCarryFeature.useBothHands );
+		LockLeftHandAnimation( scriptInterface, lockLeftHand );
+	}
+
+	protected function SetBodyPickUpCameraContext( stateContext : StateContext, scriptInterface : StateGameScriptInterface, value : Bool, optional skipCameraContextUpdate : Bool )
+	{
+		SetCameraContext( stateContext, scriptInterface, 'setBodyPickUpContext', value, skipCameraContextUpdate );
+	}
+
+	protected function SetBodyCarryCameraContext( stateContext : StateContext, scriptInterface : StateGameScriptInterface, value : Bool, optional skipCameraContextUpdate : Bool )
+	{
+		SetCameraContext( stateContext, scriptInterface, 'setBodyCarryContext', value, skipCameraContextUpdate );
+	}
+
+	protected function SetBodyCarryFriendlyCameraContext( stateContext : StateContext, scriptInterface : StateGameScriptInterface, value : Bool, optional skipCameraContextUpdate : Bool )
+	{
+		SetCameraContext( stateContext, scriptInterface, 'setBodyCarryFriendlyContext', value, skipCameraContextUpdate );
+	}
+
+	protected function SetCameraContext( stateContext : StateContext, scriptInterface : StateGameScriptInterface, varName : CName, value : Bool, skipCameraContextUpdate : Bool )
+	{
+		var oldValue : Bool;
+		if( skipCameraContextUpdate )
+		{
+			stateContext.SetPermanentBoolParameter( varName, value, true );
+		}
+		else
+		{
+			oldValue = stateContext.GetBoolParameter( varName, true );
+			stateContext.SetPermanentBoolParameter( varName, value, true );
+			if( oldValue != value )
+			{
+				UpdateCameraParams( stateContext, scriptInterface );
+			}
+		}
+	}
+
+	protected function SetStyle( style : gamePSMBodyCarryingStyle, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		stateContext.SetPermanentIntParameter( m_styleName, ( ( Int32 )( style ) ), true );
+		EnableAnimSet( style == gamePSMBodyCarryingStyle.Strong, 'carry_strong', scriptInterface );
+		EnableAnimSet( style == gamePSMBodyCarryingStyle.Friendly, 'carry_friendly', scriptInterface );
+	}
+
+	protected function SetForcedStyle( style : gamePSMBodyCarryingStyle, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		stateContext.SetPermanentIntParameter( m_forceStyleName, ( ( Int32 )( style ) ), true );
+		SetStyle( style, stateContext, scriptInterface );
+	}
+
+	protected function ClearForcedStyle( stateContext : StateContext )
+	{
+		stateContext.RemovePermanentIntParameter( m_forceStyleName );
+	}
+
+	protected function LockLeftHandAnimation( scriptInterface : StateGameScriptInterface, lockLeftHand : Bool )
+	{
+		m_leftHandFeature = new AnimFeature_LeftHandAnimation;
+		m_leftHandFeature.lockLeftHandAnimation = lockLeftHand;
+		scriptInterface.SetAnimationParameterFeature( 'LeftHandAnimation', m_leftHandFeature, scriptInterface.executionOwner );
+	}
+
+	protected const function GetStyle( const stateContext : StateContext ) : gamePSMBodyCarryingStyle
+	{
+		return ( ( gamePSMBodyCarryingStyle )( stateContext.GetIntParameter( m_styleName, true ) ) );
+	}
+
+	private function EnableAnimSet( enable : Bool, animSet : CName, scriptInterface : StateGameScriptInterface )
+	{
+		var ev : AnimWrapperWeightSetter;
+		ev = new AnimWrapperWeightSetter;
+		ev.key = animSet;
+		ev.value = ( ( enable ) ? ( 1.0 ) : ( 0.0 ) );
+		scriptInterface.owner.QueueEvent( ev );
+		scriptInterface.executionOwner.QueueEvent( ev );
+	}
+
+	protected function SetCarriedObjectInvulnerable( enable : Bool, scriptInterface : StateGameScriptInterface )
+	{
+		if( enable && !( StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.owner, T"BaseStatusEffect.Invulnerable" ) ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( scriptInterface.owner, T"BaseStatusEffect.Invulnerable" );
+		}
+		else
+		{
+			StatusEffectHelper.RemoveStatusEffect( scriptInterface.owner, T"BaseStatusEffect.Invulnerable" );
+		}
+	}
+
+	protected function CleanUpCarryState( state : ECarryState, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var unmountEvent : UnmountingRequest;
+		var mountingInfo : MountingInfo;
+		var broadcaster : StimBroadcasterComponent;
+		var setPositionEvent : SetBodyPositionEvent;
+		unmountEvent = new UnmountingRequest;
+		mountingInfo.childId = scriptInterface.ownerEntityID;
+		mountingInfo.parentId = scriptInterface.executionOwnerEntityID;
+		unmountEvent.lowLevelMountingInfo = mountingInfo;
+		scriptInterface.GetMountingFacility().Unmount( unmountEvent );
+		SetCarryState( state, 0, false, stateContext, scriptInterface );
+		stateContext.RemovePermanentBoolParameter( 'checkCanShootWhileCarryingBodyStatFlag' );
+		stateContext.SetPermanentCNameParameter( 'ETakedownActionType', '', true );
+		LockLeftHandAnimation( scriptInterface, false );
+		ResetMountingAnimFeature( stateContext, scriptInterface );
+		stateContext.SetPermanentBoolParameter( 'forcedTemporaryUnequip', false, true );
+		SetBlackboardBoolVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Carrying, false );
+		GetPlayer( scriptInterface.owner.GetGame() ).QueueEvent( new DropBodyBreathingEvent );
+		( ( NPCPuppet )( scriptInterface.owner ) ).MountingEndEnableComponents();
+		( ( NPCPuppet )( scriptInterface.owner ) ).SetDisableRagdoll( false );
+		RemoveGameplayRestrictions( scriptInterface );
+		SetBodyPickUpCameraContext( stateContext, scriptInterface, false, true );
+		SetBodyCarryCameraContext( stateContext, scriptInterface, false, true );
+		SetBodyCarryFriendlyCameraContext( stateContext, scriptInterface, false, true );
+		UpdateCameraParams( stateContext, scriptInterface );
+		SetCarriedObjectInvulnerable( false, scriptInterface );
+		broadcaster = scriptInterface.executionOwner.GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.RemoveActiveStimuliByName( scriptInterface.executionOwner, gamedataStimType.CarryBody );
+		}
+		( ( NPCPuppet )( scriptInterface.owner ) ).GetVisibleObjectComponent().Toggle( true );
+		setPositionEvent = new SetBodyPositionEvent;
+		setPositionEvent.bodyPosition = scriptInterface.owner.GetWorldPosition();
+		scriptInterface.owner.QueueEvent( setPositionEvent );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying, ( ( Int32 )( gamePSMBodyCarrying.Default ) ) );
+	}
+
+	protected function ResetMountingAnimFeature( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		m_animFeature = new AnimFeature_Mounting;
+		m_animFeature.mountingState = 0;
+		scriptInterface.SetAnimationParameterFeature( 'Mounting', m_animFeature, scriptInterface.executionOwner );
+		scriptInterface.SetAnimationParameterFeature( 'Mounting', m_animFeature );
+	}
+
+	protected function ApplyInitGameplayRestrictions( scriptInterface : StateGameScriptInterface )
+	{
+		StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.NoJump" );
+		StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingActionRestriction" );
+	}
+
+	protected function EvaluateAutomaticLootPickupFromMountedPuppet( scriptInterface : StateGameScriptInterface )
+	{
+		if( ( ( NPCPuppet )( scriptInterface.owner ) ).HasQuestItems() && !( RPGManager.IsInventoryEmpty( scriptInterface.owner ) ) )
+		{
+			scriptInterface.GetTransactionSystem().TransferAllItems( ( ( weak< weak< NPCPuppet > > )( scriptInterface.owner ) ), scriptInterface.executionOwner );
+		}
+	}
+
+	protected function ApplyFriendlyCarryGameplayRestrictions( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingFriendly" );
+	}
+
+	protected function UpdateGameplayRestrictions( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( scriptInterface.HasStatFlag( gamedataStatType.CanSprintWhileCarryingBody ) && !( m_isFriendlyCarry ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingCanSprint" );
+		}
+		else
+		{
+			StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingGeneric" );
+		}
+	}
+
+	protected function RemoveGameplayRestrictions( scriptInterface : StateGameScriptInterface )
+	{
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingFriendly" );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingNoDrop" );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingGeneric" );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingCanSprint" );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.BodyCarryingActionRestriction" );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.NoJump" );
+	}
+
+	protected function DisableAndResetRagdoll( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		scriptInterface.owner.QueueEvent( CreateDisableRagdollEvent( 'DisableAndResetRagdollScriptFunc' ) );
+		( ( NPCPuppet )( scriptInterface.owner ) ).SetDisableRagdoll( true );
+	}
+
+	protected function EvaluateWeaponUnequipping( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( IsHeavyWeaponEquipped( scriptInterface ) )
+		{
+			SendEquipmentSystemWeaponManipulationRequest( scriptInterface, EquipmentManipulationAction.UnequipWeapon );
+		}
+		else
+		{
+			stateContext.SetPermanentBoolParameter( 'forcedTemporaryUnequip', true, true );
+		}
+	}
+
+	protected function EnableRagdoll( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		( ( NPCPuppet )( scriptInterface.owner ) ).SetDisableRagdoll( false, true );
+		scriptInterface.owner.QueueEvent( CreateForceRagdollNoPowerPoseEvent( 'CarriedObject' ) );
+	}
+
+	protected function EnableRagdollUncontrolledMovement( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var evt : UncontrolledMovementStartEvent;
+		( ( NPCPuppet )( scriptInterface.owner ) ).SetDisableRagdoll( false, true );
+		evt = new UncontrolledMovementStartEvent;
+		evt.ragdollNoGroundThreshold = -1.0;
+		evt.ragdollOnCollision = true;
+		evt.calculateEarlyPositionGroundHeight = true;
+		evt.DebugSetSourceName( 'CarriedObjectUncontrolledMovement' );
+		scriptInterface.owner.QueueEvent( evt );
+	}
+
+}
+
+class PickUpDecisions extends CarriedObject
+{
+
+	public const function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return !( stateContext.GetConditionBool( 'CarriedObjectPlayPickUp' ) ) || ( GetInStateTime() > GetStaticFloatParameterDefault( "durationTime", 1.0 ) );
+	}
+
+	public const function ToRelease( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return !( scriptInterface.owner.IsAttached() );
+	}
+
+}
+
+class PickUpEvents extends CarriedObjectEvents
+{
+	const var stateMachineInstanceData : StateMachineInstanceData;
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var canUseFireArms : Bool;
+		var pickupAnimation : Int32;
+		var broadcaster : StimBroadcasterComponent;
+		var carriedObjectData : CarriedObjectData;
+		var setPositionEvent : SetBodyPositionEvent;
+		var body : EntityID;
+		carriedObjectData = ( ( CarriedObjectData )( stateMachineInstanceData.initData ) );
+		body = scriptInterface.ownerEntityID;
+		pickupAnimation = 0;
+		super.OnEnter( stateContext, scriptInterface );
+		SetBlackboardBoolVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Carrying, true );
+		switch( GetTakedownAction( stateContext ) )
+		{
+			case ETakedownActionType.Takedown:
+				pickupAnimation = 1;
+			break;
+			case ETakedownActionType.TakedownNonLethal:
+				pickupAnimation = 2;
+			break;
+			case ETakedownActionType.AerialTakedown:
+				pickupAnimation = 3;
+			break;
+			default:
+				pickupAnimation = 0;
+			break;
+		}
+		if( IsPickUpFromVehicleTrunk( scriptInterface ) )
+		{
+			pickupAnimation = 4;
+		}
+		SetCarryState( ECarryState.Pickup, pickupAnimation, carriedObjectData.instant, stateContext, scriptInterface );
+		canUseFireArms = scriptInterface.HasStatFlag( gamedataStatType.CanShootWhileCarryingBody );
+		if( GameInstance.GetRuntimeInfo( scriptInterface.executionOwner.GetGame() ).IsMultiplayer() )
+		{
+			canUseFireArms = true;
+		}
+		ClearForcedStyle( stateContext );
+		if( m_forcedCarryStyle != gamePSMBodyCarryingStyle.Any )
+		{
+			SetForcedStyle( m_forcedCarryStyle, stateContext, scriptInterface );
+		}
+		else if( m_isFriendlyCarry )
+		{
+			SetStyle( gamePSMBodyCarryingStyle.Friendly, stateContext, scriptInterface );
+		}
+		else if( canUseFireArms )
+		{
+			SetStyle( gamePSMBodyCarryingStyle.Strong, stateContext, scriptInterface );
+		}
+		else
+		{
+			SetStyle( gamePSMBodyCarryingStyle.Default, stateContext, scriptInterface );
+		}
+		if( GetStyle( stateContext ) != gamePSMBodyCarryingStyle.Friendly )
+		{
+			SetBodyPickUpCameraContext( stateContext, scriptInterface, true );
+		}
+		DisableAndResetRagdoll( stateContext, scriptInterface );
+		EvaluateWeaponUnequipping( stateContext, scriptInterface );
+		GetPlayer( scriptInterface.owner.GetGame() ).QueueEvent( new PickUpBodyBreathingEvent );
+		broadcaster = scriptInterface.executionOwner.GetStimBroadcasterComponent();
+		if( broadcaster )
+		{
+			broadcaster.AddActiveStimuli( scriptInterface.executionOwner, gamedataStimType.CarryBody, -1.0 );
+		}
+		( ( NPCPuppet )( scriptInterface.owner ) ).GetVisibleObjectComponent().Toggle( false );
+		setPositionEvent = new SetBodyPositionEvent;
+		setPositionEvent.bodyPosition = scriptInterface.owner.GetWorldPosition();
+		setPositionEvent.pickedUp = true;
+		setPositionEvent.bodyPositionID = body;
+		scriptInterface.owner.QueueEvent( setPositionEvent );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying, ( ( Int32 )( gamePSMBodyCarrying.PickUp ) ) );
+		ApplyInitGameplayRestrictions( scriptInterface );
+		ScriptedPuppet.EvaluateApplyingStatusEffectsFromMountedObjectToPlayer( scriptInterface.owner, scriptInterface.executionOwner );
+		EvaluateAutomaticLootPickupFromMountedPuppet( scriptInterface );
+		SetCarriedObjectInvulnerable( true, scriptInterface );
+	}
+
+	private function IsPickUpFromVehicleTrunk( scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.owner, T"BaseStatusEffect.VehicleTrunkBodyPickup" ) )
+		{
+			StatusEffectHelper.RemoveStatusEffect( scriptInterface.owner, T"BaseStatusEffect.VehicleTrunkBodyPickup" );
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+}
+
+class CarryDecisions extends CarriedObject
+{
+
+	protected const function IsPlayerAllowedToDropBody( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'BodyCarryingNoDrop' ) && !( IsBodyDropForced( stateContext, scriptInterface ) ) )
+		{
+			return false;
+		}
+		if( IsInInputContextState( stateContext, 'interactionContext' ) || IsInInputContextState( stateContext, 'uiRadialContext' ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	protected const function IsBodyDropForced( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'BodyCarryingForceDrop' ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected const function ToDrop( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var isArmed : Bool;
+		isArmed = HasRightWeaponEquipped( scriptInterface );
+		if( !( IsDoorInteractionActive( scriptInterface ) ) )
+		{
+			if( !( scriptInterface.executionOwner.PlayerLastUsedKBM() ) )
+			{
+				if( !( isArmed ) && ( ( ( GetActionHoldTime( stateContext, scriptInterface, 'DropCarriedObject' ) < 0.30000001 ) && ( stateContext.GetConditionFloat( 'InputHoldTime' ) < 0.30000001 ) ) && scriptInterface.IsActionJustReleased( 'DropCarriedObject' ) ) )
+				{
+					return IsPlayerAllowedToDropBody( stateContext, scriptInterface );
+				}
+				if( isArmed && scriptInterface.IsActionJustHeld( 'DropCarriedObject' ) )
+				{
+					return IsPlayerAllowedToDropBody( stateContext, scriptInterface );
+				}
+			}
+			else if( scriptInterface.IsActionJustReleased( 'DropCarriedObject' ) )
+			{
+				return IsPlayerAllowedToDropBody( stateContext, scriptInterface );
+			}
+		}
+		if( IsBodyDropForced( stateContext, scriptInterface ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected const function ToDispose( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal );
+	}
+
+	public const function ToForceDropBody( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var shouldDropBody : StateResultBool;
+		var player : PlayerPuppet;
+		shouldDropBody = stateContext.GetTemporaryBoolParameter( 'bodyCarryInteractionForceDrop' );
+		if( shouldDropBody.valid )
+		{
+			return shouldDropBody.value;
+		}
+		player = GetPlayerPuppet( scriptInterface );
+		if( player.IsDead() )
+		{
+			return true;
+		}
+		if( ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vitals ) == ( ( Int32 )( gamePSMVitals.Dead ) ) ) || ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vitals ) == ( ( Int32 )( gamePSMVitals.Resurrecting ) ) ) )
+		{
+			return true;
+		}
+		if( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Fall ) == ( ( Int32 )( gamePSMFallStates.FastFall ) ) )
+		{
+			return true;
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectOfType( scriptInterface.executionOwner, gamedataStatusEffectType.Knockdown ) )
+		{
+			return true;
+		}
+		if( ( !( scriptInterface.HasStatFlag( gamedataStatType.CanShootWhileCarryingBody ) ) && !( IsInUpperBodyState( stateContext, 'forceEmptyHands' ) ) ) && ( scriptInterface.GetActionValue( 'RangedAttack' ) > 0.0 ) )
+		{
+			return IsPlayerAllowedToDropBody( stateContext, scriptInterface );
+		}
+		if( IsInHighLevelState( stateContext, 'swimming' ) )
+		{
+			return true;
+		}
+		if( IsForceBodyDropRequested( stateContext, scriptInterface ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected const function IsForceBodyDropRequested( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var isForceDropBody : StateResultBool;
+		isForceDropBody = stateContext.GetTemporaryBoolParameter( 'forceDropBody' );
+		if( isForceDropBody.valid && isForceDropBody.value )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function ToRelease( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return !( scriptInterface.owner.IsAttached() );
+	}
+
+}
+
+class CarryEvents extends CarriedObjectEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		SetBodyPickUpCameraContext( stateContext, scriptInterface, false );
+		if( GameInstance.GetRuntimeInfo( scriptInterface.executionOwner.GetGame() ).IsMultiplayer() || ( CanEquipFirearm( scriptInterface.executionOwner, stateContext ) && GetStyle( stateContext ) == gamePSMBodyCarryingStyle.Strong ) )
+		{
+			stateContext.SetPermanentBoolParameter( 'forcedTemporaryUnequip', false, true );
+		}
+		if( !( m_isFriendlyCarry ) )
+		{
+			SetBodyCarryCameraContext( stateContext, scriptInterface, true );
+			StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.NoJump" );
+		}
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying, ( ( Int32 )( gamePSMBodyCarrying.Carry ) ) );
+		SetCarryState( ECarryState.Carry, , false, stateContext, scriptInterface );
+	}
+
+	protected function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SyncJump( stateContext, scriptInterface );
+		m_animFeature.parentSpeed = Vector4.Length( GetLinearVelocity( scriptInterface ) );
+		scriptInterface.SetAnimationParameterFeature( 'Mounting', m_animFeature );
+		RefreshCarryState( stateContext, scriptInterface );
+	}
+
+	private function RefreshCarryState( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( ( !( m_isFriendlyCarry ) && scriptInterface.HasStatFlag( gamedataStatType.CanShootWhileCarryingBody ) ) && !( stateContext.GetBoolParameter( 'checkCanShootWhileCarryingBodyStatFlag', true ) ) )
+		{
+			UpdateGameplayRestrictions( stateContext, scriptInterface );
+			if( CanEquipFirearm( scriptInterface.executionOwner, stateContext ) )
+			{
+				if( GetStyle( stateContext ) != gamePSMBodyCarryingStyle.Strong )
+				{
+					SetStyle( gamePSMBodyCarryingStyle.Strong, stateContext, scriptInterface );
+				}
+				stateContext.SetPermanentBoolParameter( 'forcedTemporaryUnequip', false, true );
+				SendEquipmentSystemWeaponManipulationRequest( scriptInterface, EquipmentManipulationAction.RequestLastUsedOrFirstAvailableOneHandedRangedWeapon );
+				SetCarryState( ECarryState.Carry, , false, stateContext, scriptInterface );
+				stateContext.SetPermanentBoolParameter( 'checkCanShootWhileCarryingBodyStatFlag', true, true );
+			}
+		}
+	}
+
+	private function SyncJump( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( IsInLocomotionState( stateContext, 'jump' ) && !( stateContext.GetBoolParameter( 'playerJumped', true ) ) )
+		{
+			stateContext.SetPermanentBoolParameter( 'playerJumped', true, true );
+			UpdatePuppetCarryState( ECarryState.Jump, stateContext, scriptInterface );
+		}
+		else if( scriptInterface.IsOnGround() && stateContext.GetBoolParameter( 'playerJumped', true ) )
+		{
+			UpdatePuppetCarryState( ECarryState.Carry, stateContext, scriptInterface );
+			stateContext.RemovePermanentBoolParameter( 'playerJumped' );
+		}
+	}
+
+	private function UpdatePuppetCarryState( state : ECarryState, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		m_animCarryFeature = new AnimFeature_Carry;
+		m_animCarryFeature.state = ( ( Int32 )( state ) );
+		scriptInterface.SetAnimationParameterFeature( 'Carry', m_animCarryFeature, scriptInterface.owner );
+	}
+
+}
+
+class DropDecisions extends CarriedObject
+{
+
+	public const function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return GetInStateTime() > GetStaticFloatParameterDefault( "stateDuration", 1.5 );
+	}
+
+}
+
+class DropEvents extends CarriedObjectEvents
+{
+	var m_ragdollReenabled : Bool;
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		m_ragdollReenabled = false;
+		stateContext.SetPermanentBoolParameter( 'forcedTemporaryUnequip', true, true );
+		SetCarryState( ECarryState.Drop, , false, stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying, ( ( Int32 )( gamePSMBodyCarrying.Drop ) ) );
+		scriptInterface.owner.QueueEvent( new RagdollRequestCollectAnimPoseEvent );
+		EnableRagdollUncontrolledMovement( stateContext, scriptInterface );
+	}
+
+	protected function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( !( m_ragdollReenabled ) )
+		{
+			if( GetInStateTime() > GetStaticFloatParameterDefault( "ragdollActivateTime", 1.0 ) )
+			{
+				EnableRagdoll( stateContext, scriptInterface );
+				m_ragdollReenabled = true;
+			}
+			else if( IsInLocomotionState( stateContext, 'crouch' ) && ( GetInStateTime() > GetStaticFloatParameterDefault( "ragdollActivateTimeCrouch", 1.0 ) ) )
+			{
+				EnableRagdoll( stateContext, scriptInterface );
+				m_ragdollReenabled = true;
+			}
+		}
+	}
+
+	protected override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( !( m_ragdollReenabled ) )
+		{
+			EnableRagdoll( stateContext, scriptInterface );
+			m_ragdollReenabled = true;
+		}
+	}
+
+}
+
+class DisposeDecisions extends CarriedObject
+{
+
+	public constexpr const function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return true;
+	}
+
+}
+
+class DisposeEvents extends CarriedObjectEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying, ( ( Int32 )( gamePSMBodyCarrying.Dispose ) ) );
+		super.OnEnter( stateContext, scriptInterface );
+	}
+
+	protected override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		( ( NPCPuppet )( scriptInterface.owner ) ).GetVisibleObjectComponent().Toggle( false );
+	}
+
+}
+
+class ForceDropBodyEvents extends CarriedObjectEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		EnableRagdoll( stateContext, scriptInterface );
+		CleanUpCarryState( ECarryState.Release, stateContext, scriptInterface );
+	}
+
+}
+
+class ReleaseEvents extends CarriedObjectEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		CleanUpCarryState( ECarryState.Release, stateContext, scriptInterface );
+	}
+
+}
+
+enum ECarryState
+{
+	None = 0,
+	Pickup = 1,
+	Carry = 2,
+	Drop = 3,
+	Release = 4,
+	Dispose = 5,
+	Jump = 6,
+}
+

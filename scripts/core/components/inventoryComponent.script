@@ -1,0 +1,583 @@
+import class InventoryScriptCallback extends IScriptable
+{
+	import var itemID : ItemID;
+
+	public virtual function OnItemNotification( item : ItemID, itemData : weak< gameItemData > );
+	public export virtual function OnItemAdded( item : ItemID, itemData : weak< gameItemData >, flaggedAsSilent : Bool );
+	public export virtual function OnItemRemoved( item : ItemID, difference : Int32, currentQuantity : Int32 );
+	public export virtual function OnItemQuantityChanged( item : ItemID, diff : Int32, total : Uint32, flaggedAsSilent : Bool );
+	public export virtual function OnItemExtracted( item : ItemID );
+	public virtual function OnPartAdded( item : ItemID, partID : ItemID );
+	public export virtual function OnPartRemoved( partID : ItemID, formerItemID : ItemID );
+}
+
+import abstract class InventoryListener extends IScriptable
+{
+}
+
+import class InventoryScriptListener extends InventoryListener
+{
+}
+
+importonly final class OnLootEvent extends Event
+{
+}
+
+importonly final class OnLootAllEvent extends Event
+{
+}
+
+importonly final struct LootChoiceActionWrapper
+{
+	import var removeItem : Bool;
+	import var itemId : ItemID;
+	import var action : CName;
+
+	public import static function IsValid( wrapper : LootChoiceActionWrapper ) : Bool;
+	public import static function IsIllegal( wrapper : LootChoiceActionWrapper ) : Bool;
+	public import static function IsHandledByCode( wrapper : LootChoiceActionWrapper ) : Bool;
+	public import static function Unwrap( choiceEvent : InteractionChoiceEvent ) : LootChoiceActionWrapper;
+}
+
+importonly final struct LootVisualiserControlWrapper
+{
+	public import static function AddOperation( wrapper : ref< LootVisualiserControlWrapper >, controlOperation : gameinteractionsELootVisualiserControlOperation, value : Bool );
+	public import static function Wrap( wrapper : LootVisualiserControlWrapper ) : InteractionSetChoicesEvent;
+}
+
+import final class Inventory extends GameComponent
+{
+	public import function IsAccessible() : Bool;
+	public import function ReinitializeStatsOnAllItems() : Bool;
+	public import static function CreateItemData( itemData : ItemModParams, owner : weak< GameObject > ) : gameItemData;
+
+	public export function IsChoiceAvailable( itemActionRecord : ItemAction_Record, requester : GameObject, ownerEntID : EntityID, itemID : ItemID ) : gameinteractionsELootChoiceType
+	{
+		var action : BaseItemAction;
+		var itemData : weak< gameItemData >;
+		var emptyContext : GetActionsContext;
+		itemData = RPGManager.GetItemData( requester.GetGame(), ( ( GameObject )( GetEntity() ) ), itemID );
+		action = ItemActionsHelper.SetupItemAction( requester.GetGame(), requester, itemData, itemActionRecord.GetID(), false );
+		if( action.IsVisible( emptyContext ) )
+		{
+			return gameinteractionsELootChoiceType.Available;
+		}
+		else
+		{
+			return gameinteractionsELootChoiceType.Invisible;
+		}
+	}
+
+	protected event OnLootAllEvent( evt : OnLootAllEvent )
+	{
+		var gameObject : GameObject;
+		gameObject = ( ( GameObject )( GetEntity() ) );
+		GameInstance.GetAudioSystem( gameObject.GetGame() ).PlayLootAllSound();
+	}
+
+	protected event OnInteractionUsed( evt : InteractionChoiceEvent )
+	{
+		var lootActionWrapper : LootChoiceActionWrapper;
+		var gameObject : GameObject;
+		var broadcaster : StimBroadcasterComponent;
+		var itemData : weak< gameItemData >;
+		var itemQuality : gamedataQuality;
+		gameObject = ( ( GameObject )( GetEntity() ) );
+		lootActionWrapper = LootChoiceActionWrapper.Unwrap( evt );
+		if( LootChoiceActionWrapper.IsValid( lootActionWrapper ) )
+		{
+			if( ( ( PlayerPuppet )( evt.activator ) ).IsInCombat() && TweakDBInterface.GetConsumableItemRecord( ItemID.GetTDBID( lootActionWrapper.itemId ) ) )
+			{
+				return false;
+			}
+			if( LootChoiceActionWrapper.IsIllegal( lootActionWrapper ) )
+			{
+				broadcaster = evt.activator.GetStimBroadcasterComponent();
+				if( broadcaster )
+				{
+					broadcaster.TriggerSingleBroadcast( gameObject, gamedataStimType.IllegalInteraction );
+				}
+			}
+			if( RPGManager.ConsumeItem( gameObject, evt ) )
+			{
+				GameInstance.GetAudioSystem( gameObject.GetGame() ).PlayItemActionSound( lootActionWrapper.action, RPGManager.GetItemData( gameObject.GetGame(), gameObject, lootActionWrapper.itemId ) );
+				return false;
+			}
+			itemData = RPGManager.GetItemData( gameObject.GetGame(), gameObject, lootActionWrapper.itemId );
+			if( lootActionWrapper.action == 'Learn' )
+			{
+				ItemActionsHelper.LearnItem( evt.activator, lootActionWrapper.itemId, false );
+			}
+			else if( lootActionWrapper.action == 'Loot' )
+			{
+				itemQuality = RPGManager.GetItemDataQuality( itemData );
+				if( RPGManager.IsItemIconic( itemData ) || itemQuality == gamedataQuality.Iconic )
+				{
+					GameInstance.GetRazerChromaEffectsSystem( gameObject.GetGame() ).PlayAnimation( 'TakeItem', false );
+				}
+			}
+			if( LootChoiceActionWrapper.IsHandledByCode( lootActionWrapper ) == false )
+			{
+				GameInstance.GetTransactionSystem( gameObject.GetGame() ).RemoveItem( gameObject, lootActionWrapper.itemId, 1 );
+			}
+			GameInstance.GetAudioSystem( gameObject.GetGame() ).PlayItemActionSound( lootActionWrapper.action, itemData );
+		}
+	}
+
+}
+
+import class gameLootObject extends GameObject
+{
+	protected var m_isInIconForcedVisibilityRange : Bool;
+	protected var m_activeQualityRangeInteraction : CName;
+	protected var m_lootQuality : gamedataQuality;
+	default m_lootQuality = gamedataQuality.Common;
+
+	protected event OnInteractionActivated( evt : InteractionActivationEvent )
+	{
+		if( evt.layerData.tag == 'auto' )
+		{
+			PlaySoundEvent( evt.activator, 'ui_loot_ammo' );
+		}
+	}
+
+	protected function IsQualityRangeInteractionLayer( layerTag : CName ) : Bool
+	{
+		return ( layerTag == 'QualityRange_Short' || layerTag == 'QualityRange_Medium' ) || layerTag == 'QualityRange_Max';
+	}
+
+	protected function SetQualityRangeInteractionLayerState( enable : Bool )
+	{
+		var evt : InteractionSetEnableEvent;
+		if( IsNameValid( m_activeQualityRangeInteraction ) )
+		{
+			evt = new InteractionSetEnableEvent;
+			evt.enable = enable;
+			evt.layer = m_activeQualityRangeInteraction;
+			QueueEvent( evt );
+		}
+	}
+
+	protected function ResolveQualityRangeInteractionLayer()
+	{
+		var currentLayer : CName;
+		if( IsNameValid( m_activeQualityRangeInteraction ) )
+		{
+			SetQualityRangeInteractionLayerState( false );
+		}
+		if( m_lootQuality != gamedataQuality.Invalid && m_lootQuality != gamedataQuality.Random )
+		{
+			if( IsQuest() )
+			{
+				currentLayer = 'QualityRange_Max';
+			}
+			else if( m_lootQuality == gamedataQuality.Common )
+			{
+				currentLayer = 'QualityRange_Short';
+			}
+			else if( m_lootQuality == gamedataQuality.Uncommon )
+			{
+				currentLayer = 'QualityRange_Medium';
+			}
+			else if( m_lootQuality == gamedataQuality.Rare )
+			{
+				currentLayer = 'QualityRange_Medium';
+			}
+			else if( m_lootQuality == gamedataQuality.Epic )
+			{
+				currentLayer = 'QualityRange_Max';
+			}
+			else if( m_lootQuality == gamedataQuality.Legendary )
+			{
+				currentLayer = 'QualityRange_Max';
+			}
+			else if( m_lootQuality == gamedataQuality.Iconic )
+			{
+				currentLayer = 'QualityRange_Max';
+			}
+		}
+		else
+		{
+			currentLayer = '';
+		}
+		m_activeQualityRangeInteraction = currentLayer;
+		SetQualityRangeInteractionLayerState( true );
+	}
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'Collider', 'entColliderComponent', false );
+	}
+
+	public const override function IsInIconForcedVisibilityRange() : Bool
+	{
+		return m_isInIconForcedVisibilityRange;
+	}
+
+}
+
+import final class gameItemDropObject extends gameLootObject
+{
+	private var m_isEmpty : Bool;
+	private var m_isIconic : Bool;
+	private var m_hasQuestItems : Bool;
+	private var m_spawnedItemID : ItemID;
+
+	public import const function GetItemEntityID() : EntityID;
+	public import const function GetItemObject() : weak< ItemObject >;
+
+	protected virtual function EvaluateLootQualityByTask()
+	{
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'EvaluateLootQualityTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function EvaluateLootQualityTask( data : ScriptTaskData )
+	{
+		EvaluateLootQuality();
+	}
+
+	protected event OnGameAttached()
+	{
+		var scanningBlockedEvt : SetScanningBlockedEvent;
+		super.OnGameAttached();
+		if( m_scanningComponent )
+		{
+			scanningBlockedEvt = new SetScanningBlockedEvent;
+			scanningBlockedEvt.isBlocked = false;
+			QueueEvent( scanningBlockedEvt );
+		}
+		ResolveInvotoryContent();
+		if( IsEmpty() )
+		{
+			ToggleLootHighlight( false );
+		}
+		else if( IsQuest() )
+		{
+			ToggleLootHighlight( true );
+		}
+	}
+
+	private function ResolveInvotoryContent()
+	{
+		m_isEmpty = GameInstance.GetTransactionSystem( GetGame() ).GetTotalItemQuantity( this ) <= 0;
+	}
+
+	private function HasValidLootQuality() : Bool
+	{
+		return m_lootQuality != gamedataQuality.Invalid && m_lootQuality != gamedataQuality.Random;
+	}
+
+	private function EvaluateLootQuality() : Bool
+	{
+		var newValue : Int32;
+		var lastValue : Int32;
+		var cachedQuality : gamedataQuality;
+		var iteratedQuality : gamedataQuality;
+		var qualityToSet : gamedataQuality;
+		var isCurrentlyQuest : Bool;
+		var isQuest : Bool;
+		var isCurrentlyIconic : Bool;
+		var transactionSystem : TransactionSystem;
+		var i : Int32;
+		var items : array< weak< gameItemData > >;
+		var wasChanged : Bool;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGame() );
+		cachedQuality = m_lootQuality;
+		isCurrentlyQuest = IsQuest();
+		isCurrentlyIconic = GetIsIconic();
+		m_isIconic = false;
+		m_hasQuestItems = false;
+		if( transactionSystem.GetItemList( this, items ) )
+		{
+			if( items.Size() > 0 )
+			{
+				qualityToSet = gamedataQuality.Common;
+				m_isEmpty = false;
+			}
+			for( i = 0; i < items.Size(); i += 1 )
+			{
+				if( !( m_hasQuestItems ) && items[ i ].HasTag( 'Quest' ) )
+				{
+					m_hasQuestItems = true;
+				}
+				iteratedQuality = RPGManager.GetItemDataQuality( items[ i ] );
+				newValue = UIItemsHelper.QualityEnumToInt( iteratedQuality );
+				if( newValue > lastValue )
+				{
+					lastValue = newValue;
+					qualityToSet = iteratedQuality;
+				}
+				m_isIconic = m_isIconic || RPGManager.IsItemIconic( items[ i ] );
+			}
+			m_lootQuality = qualityToSet;
+		}
+		isQuest = IsQuest();
+		if( isCurrentlyQuest != isQuest )
+		{
+			ToggleLootHighlight( isQuest );
+			if( !( isQuest ) )
+			{
+				MarkAsQuest( false );
+			}
+		}
+		wasChanged = ( m_lootQuality != cachedQuality || isCurrentlyQuest != IsQuest() ) || isCurrentlyIconic != m_isIconic;
+		if( wasChanged || !( IsNameValid( m_activeQualityRangeInteraction ) ) )
+		{
+			ResolveQualityRangeInteractionLayer();
+		}
+		return wasChanged;
+	}
+
+	public const override function GetLootQuality() : gamedataQuality
+	{
+		return m_lootQuality;
+	}
+
+	public const override function GetIsIconic() : Bool
+	{
+		return m_isIconic;
+	}
+
+	public const override function DeterminGameplayRoleMappinVisuaState( data : SDeviceMappinData ) : EMappinVisualState
+	{
+		if( IsEmpty() )
+		{
+			return EMappinVisualState.Inactive;
+		}
+		else
+		{
+			return EMappinVisualState.Default;
+		}
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.Loot;
+	}
+
+	public const override function IsQuest() : Bool
+	{
+		return m_hasQuestItems || m_markAsQuest;
+	}
+
+	public const override function IsContainer() : Bool
+	{
+		return !( IsEmpty() );
+	}
+
+	private function ToggleLootHighlight( enable : Bool )
+	{
+		var effectInstance : EffectInstance;
+		effectInstance = GameInstance.GetGameEffectSystem( GetGame() ).CreateEffectStatic( 'loot_highlight', 'container_highlight', this );
+		EffectData.SetEntity( effectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.entity, this );
+		EffectData.SetBool( effectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.renderMaterialOverride, false );
+		EffectData.SetBool( effectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.enable, enable );
+		effectInstance.Run();
+	}
+
+	public const override function GetDefaultHighlight() : FocusForcedHighlightData
+	{
+		var highlight : FocusForcedHighlightData;
+		var outline : EFocusOutlineType;
+		if( IsEmpty() || IsAnyClueEnabled() )
+		{
+			return NULL;
+		}
+		if( m_scanningComponent.IsBraindanceBlocked() || m_scanningComponent.IsPhotoModeBlocked() )
+		{
+			return NULL;
+		}
+		outline = GetCurrentOutline();
+		highlight = new FocusForcedHighlightData;
+		highlight.sourceID = GetEntityID();
+		highlight.sourceName = GetClassName();
+		highlight.priority = EPriority.Low;
+		highlight.outlineType = outline;
+		if( outline == EFocusOutlineType.QUEST )
+		{
+			highlight.highlightType = EFocusForcedHighlightType.QUEST;
+		}
+		else if( outline == EFocusOutlineType.ITEM )
+		{
+			highlight.highlightType = EFocusForcedHighlightType.ITEM;
+		}
+		else
+		{
+			highlight = NULL;
+		}
+		return highlight;
+	}
+
+	public const override function GetCurrentOutline() : EFocusOutlineType
+	{
+		var outlineType : EFocusOutlineType;
+		if( !( IsEmpty() ) )
+		{
+			if( IsQuest() )
+			{
+				outlineType = EFocusOutlineType.QUEST;
+			}
+			else
+			{
+				outlineType = EFocusOutlineType.ITEM;
+			}
+		}
+		else
+		{
+			outlineType = EFocusOutlineType.INVALID;
+		}
+		return outlineType;
+	}
+
+	protected export function OnItemEntitySpawned( entID : EntityID )
+	{
+		SetQualityRangeInteractionLayerState( true );
+		EvaluateLootQualityEvent( entID );
+		m_spawnedItemID = GetItemObject().GetItemID();
+		RequestHUDRefresh();
+	}
+
+	protected event OnInteractionActivated( evt : InteractionActivationEvent )
+	{
+		var actorUpdateData : HUDActorUpdateData;
+		super.OnInteractionActivated( evt );
+		if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate )
+		{
+			if( evt.activator.IsPlayer() )
+			{
+				if( IsQualityRangeInteractionLayer( evt.layerData.tag ) )
+				{
+					m_isInIconForcedVisibilityRange = true;
+					actorUpdateData = new HUDActorUpdateData;
+					actorUpdateData.updateIsInIconForcedVisibilityRange = true;
+					actorUpdateData.isInIconForcedVisibilityRangeValue = true;
+					RequestHUDRefresh( actorUpdateData );
+				}
+			}
+		}
+		else
+		{
+			if( IsQualityRangeInteractionLayer( evt.layerData.tag ) && evt.activator.IsPlayer() )
+			{
+				m_isInIconForcedVisibilityRange = false;
+				actorUpdateData = new HUDActorUpdateData;
+				actorUpdateData.updateIsInIconForcedVisibilityRange = true;
+				actorUpdateData.isInIconForcedVisibilityRangeValue = false;
+				RequestHUDRefresh( actorUpdateData );
+			}
+		}
+	}
+
+	public const function IsEmpty() : Bool
+	{
+		return !( EntityID.IsDefined( GetItemEntityID() ) ) && m_isEmpty;
+	}
+
+	public const override function ShouldRegisterToHUD() : Bool
+	{
+		return true;
+	}
+
+	protected event OnHUDInstruction( evt : HUDInstruction )
+	{
+		if( ItemID.IsValid( m_spawnedItemID ) )
+		{
+			QueueEventForEntityID( GetItemEntityID(), evt );
+		}
+	}
+
+	protected event OnInventoryEmptyEvent( evt : OnInventoryEmptyEvent )
+	{
+		GameObjectEffectHelper.StartEffectEvent( this, 'fx_empty' );
+		m_lootQuality = gamedataQuality.Invalid;
+		m_isEmpty = true;
+		m_spawnedItemID = ItemID.None();
+		UntagObject( this );
+		RegisterToHUDManagerByTask( false );
+		if( IsQuest() )
+		{
+			ToggleLootHighlight( false );
+			MarkAsQuest( false );
+			m_hasQuestItems = false;
+			ResolveQualityRangeInteractionLayer();
+		}
+	}
+
+	protected event OnInventoryChangedEvent( evt : InventoryChangedEvent )
+	{
+		if( HasValidLootQuality() )
+		{
+			if( EvaluateLootQuality() )
+			{
+				RequestHUDRefresh();
+			}
+		}
+	}
+
+	protected event OnItemRemoveddEvent( evt : ItemBeingRemovedEvent )
+	{
+		var evtToSend : ItemLootedEvent;
+		if( HasValidLootQuality() )
+		{
+			if( EvaluateLootQuality() )
+			{
+				RequestHUDRefresh();
+			}
+		}
+		if( m_spawnedItemID == evt.itemID )
+		{
+			evtToSend = new ItemLootedEvent;
+			QueueEventForEntityID( GetItemEntityID(), evtToSend );
+			m_spawnedItemID = ItemID.None();
+		}
+	}
+
+	protected event OnItemAddedEvent( evt : ItemAddedEvent )
+	{
+		m_isEmpty = false;
+		if( HasValidLootQuality() )
+		{
+			EvaluateLootQuality();
+			if( EvaluateLootQuality() )
+			{
+				RequestHUDRefresh();
+			}
+		}
+	}
+
+	private function EvaluateLootQualityEvent( target : EntityID )
+	{
+		var evt : EvaluateLootQualityEvent;
+		if( EntityID.IsDefined( target ) )
+		{
+			evt = new EvaluateLootQualityEvent;
+			GameInstance.GetPersistencySystem( GetGame() ).QueueEntityEvent( target, evt );
+		}
+	}
+
+}
+
+importonly class UILootedItemEvent extends Event
+{
+	import var itemID : ItemID;
+}
+
+import enum gameSharedInventoryTag
+{
+	None,
+	PlayerStash,
+}
+
+import enum gameinteractionsELootChoiceType
+{
+	Available,
+	Unavailable,
+	Invisible,
+}
+
+import enum gameinteractionsELootVisualiserControlOperation
+{
+	Locked,
+}
+

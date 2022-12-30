@@ -1,0 +1,408 @@
+struct SActionTypeForward
+{
+	instanceeditable var qHack : Bool;
+	default qHack = true;
+	instanceeditable var techie : Bool;
+	instanceeditable var master : Bool;
+}
+
+class SequenceCallback extends Event
+{
+	var persistentID : PersistentID;
+	var className : CName;
+	var actionToForward : ScriptableDeviceAction;
+}
+
+class SequencerLock extends Event
+{
+	var shouldLock : Bool;
+}
+
+class ForwardAction extends Event
+{
+	var requester : PersistentID;
+	var actionToForward : ScriptableDeviceAction;
+}
+
+class ActionsSequencerController extends ScriptableDeviceComponent
+{
+
+	public const override function GetPS() : ActionsSequencerControllerPS
+	{
+		return ( ( ActionsSequencerControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+struct ActionsSequence
+{
+	var sequenceInitiator : EntityID;
+	var maxActionsInSequence : Int32;
+	var actionsTriggeredCount : Int32;
+	var delayIDs : array< DelayID >;
+}
+
+class ActionsSequencerControllerPS extends MasterControllerPS
+{
+	default m_revealDevicesGrid = false;
+	default m_drawGridLink = false;
+	[ tooltip = "IMPORTANT: DON'T MAKE THIS VALUE TOO HIGH AS ALL QUICK HACKS ARE BLOCKED UNTIL THIS TIMES PASSES. Time when the last device connected to ActionSequencer will receive the forwarded action. If 0.0 then sequenceMode is forced to AT_THE_SAME_TIME" ]
+	private instanceeditable var m_sequenceDuration : Float;
+	default m_sequenceDuration = 2f;
+	[ tooltip = "Immediate - all devices receive actins immediately, REGULAR - Max Sequence Duration will be divided by the number of devices. Each consecutive device receives event after the same amount of time, ACCELERATING - start slow, end fast DECELARTING - start fast end slow, RANDOM - random" ]
+	private instanceeditable var m_sequencerMode : EActionsSequencerMode;
+	[ tooltip = "Filter actions by source of action. There can be more than 1 srespected source" ]
+	private instanceeditable var m_actionTypeToForward : SActionTypeForward;
+	private var m_ongoingSequence : ActionsSequence;
+
+	protected override function Initialize()
+	{
+		if( m_sequenceDuration == 0.0 )
+		{
+			m_sequencerMode = EActionsSequencerMode.AT_THE_SAME_TIME_TODO;
+		}
+		m_sequencerMode = EActionsSequencerMode.REGULAR_INTERVALS;
+		super.Initialize();
+	}
+
+	private function OnForwardAction( evt : ForwardAction ) : EntityNotificationType
+	{
+		var eligibleSlaves : array< DeviceComponentPS >;
+		if( !( IsActionTypeMachingPreferences( evt ) ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		eligibleSlaves = GetEligibleSlaves( evt.requester );
+		if( eligibleSlaves.Size() <= 1 )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( IsSequenceOngoing() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "Multiple simultanous sequences are not handled", ELogType.WARNING );
+			}
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( evt.actionToForward )
+		{
+			CommenceSequence( evt.actionToForward, eligibleSlaves, GetDelayTimeStamps( eligibleSlaves.Size() ) );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function IsActionTypeMachingPreferences( forwardEvent : ForwardAction ) : Bool
+	{
+		if( forwardEvent.actionToForward.IsQuickHack() && m_actionTypeToForward.qHack )
+		{
+			return true;
+		}
+		if( forwardEvent.actionToForward.IsSpiderbotAction() && m_actionTypeToForward.techie )
+		{
+			return true;
+		}
+		if( WasExecutedByMaster( forwardEvent ) && m_actionTypeToForward.master )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function WasExecutedByMaster( forwardEvent : ForwardAction ) : Bool
+	{
+		return PersistentID.ExtractEntityID( forwardEvent.requester ) != forwardEvent.actionToForward.GetRequesterID();
+	}
+
+	private function CommenceSequence( actionToForward : ScriptableDeviceAction, eligibleSlaves : array< DeviceComponentPS >, delays : array< Float > )
+	{
+		var delaySystem : DelaySystem;
+		var sequenceCallback : SequenceCallback;
+		var i : Int32;
+		delaySystem = GameInstance.GetDelaySystem( GetGameInstance() );
+		if( !( delaySystem ) )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "NO DELAY SYSTEM! Sequence not started", ELogType.ERROR );
+			}
+			return;
+		}
+		m_ongoingSequence.sequenceInitiator = actionToForward.GetRequesterID();
+		m_ongoingSequence.maxActionsInSequence = eligibleSlaves.Size();
+		m_ongoingSequence.actionsTriggeredCount = 0;
+		ForceLockOnAllSlaves();
+		if( m_sequencerMode == EActionsSequencerMode.AT_THE_SAME_TIME_TODO )
+		{
+		}
+		else
+		{
+			if( eligibleSlaves.Size() != delays.Size() )
+			{
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, "delays size and devices size is not the same - debug", ELogType.ERROR );
+				}
+				return;
+			}
+			for( i = 0; i < delays.Size(); i += 1 )
+			{
+				sequenceCallback = new SequenceCallback;
+				sequenceCallback.persistentID = eligibleSlaves[ i ].GetID();
+				sequenceCallback.className = eligibleSlaves[ i ].GetClassName();
+				sequenceCallback.actionToForward = actionToForward;
+				m_ongoingSequence.delayIDs.PushBack( delaySystem.DelayPSEvent( GetID(), GetClassName(), sequenceCallback, delays[ i ] ) );
+			}
+		}
+	}
+
+	public function OnSequenceCallback( evt : SequenceCallback ) : EntityNotificationType
+	{
+		m_ongoingSequence.actionsTriggeredCount += 1;
+		GetPersistencySystem().QueuePSEvent( evt.persistentID, evt.className, evt.actionToForward );
+		ForceUnlockSlave( evt.persistentID, evt.className );
+		if( m_ongoingSequence.actionsTriggeredCount == ( m_ongoingSequence.maxActionsInSequence - 1 ) )
+		{
+			CleanupSequence();
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private const function ForceUnlockSlave( persistentID : PersistentID, className : CName )
+	{
+		var unlockDevice : SequencerLock;
+		unlockDevice = new SequencerLock;
+		unlockDevice.shouldLock = false;
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( persistentID, className, unlockDevice, 0.1 );
+	}
+
+	private const function ForceLockOnAllSlaves()
+	{
+		var eligibleSlaves : array< DeviceComponentPS >;
+		var lock : SequencerLock;
+		var i : Int32;
+		lock = new SequencerLock;
+		lock.shouldLock = true;
+		eligibleSlaves = GetEligibleSlaves( m_ongoingSequence.sequenceInitiator );
+		for( i = 0; i < eligibleSlaves.Size(); i += 1 )
+		{
+			GetPersistencySystem().QueuePSEvent( eligibleSlaves[ i ].GetID(), eligibleSlaves[ i ].GetClassName(), lock );
+		}
+	}
+
+	private function CleanupSequence()
+	{
+		var emptyID : EntityID;
+		m_ongoingSequence.sequenceInitiator = emptyID;
+		m_ongoingSequence.maxActionsInSequence = 0;
+		m_ongoingSequence.actionsTriggeredCount = 0;
+		m_ongoingSequence.delayIDs.Clear();
+	}
+
+	private const function GetEligibleSlaves( sequenceInitiator : PersistentID ) : array< DeviceComponentPS >
+	{
+		var fallbackArray : array< DeviceComponentPS >;
+		var slaves : array< DeviceComponentPS >;
+		var i : Int32;
+		slaves = GetImmediateSlaves();
+		if( sequenceInitiator == GetID() )
+		{
+			return slaves;
+		}
+		for( i = 0; i < slaves.Size(); i += 1 )
+		{
+			if( slaves[ i ].GetID() == sequenceInitiator )
+			{
+				slaves.Erase( i );
+				return slaves;
+			}
+		}
+		if( !( IsFinal() ) )
+		{
+			LogDevices( this, "SequenceInitiator not found in the list of slaves - someone hacked something. Debug", ELogType.ERROR );
+		}
+		return fallbackArray;
+	}
+
+	private const function GetDelayTimeStamps( intervals : Int32 ) : array< Float >
+	{
+		var delays : array< Float >;
+		switch( m_sequencerMode )
+		{
+			case EActionsSequencerMode.REGULAR_INTERVALS:
+				GetRegularDelays( intervals, delays );
+			break;
+			case EActionsSequencerMode.ACCELERATING_INTERVALS_TODO:
+				GetAcceleratingDelays( intervals, delays );
+			break;
+			case EActionsSequencerMode.DECELERATING_INTEVALS_TODO:
+				GetDecceleratingDelays( intervals, delays );
+			break;
+			case EActionsSequencerMode.RANDOM_INTERVALS_TODO:
+				GetRandomDelays( intervals, delays );
+			break;
+			case EActionsSequencerMode.AT_THE_SAME_TIME_TODO:
+				delays.PushBack( m_sequenceDuration );
+			break;
+			default:
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, "Wrong Sequence Mode debug. Using Regular mode" );
+				}
+			GetRegularDelays( intervals, delays );
+			break;
+		}
+		return delays;
+	}
+
+	private const function GetRegularDelays( amountOfIntervals : Int32, out delays : array< Float > )
+	{
+		var interval : Float;
+		var i : Int32;
+		interval = m_sequenceDuration / ( ( Float )( amountOfIntervals ) );
+		for( i = 1; i < ( amountOfIntervals + 1 ); i += 1 )
+		{
+			delays.PushBack( interval * ( ( Float )( i ) ) );
+		}
+	}
+
+	private const function GetAcceleratingDelays( amountOfIntervals : Int32, out delays : array< Float > ) {}
+
+	private const function GetDecceleratingDelays( amountOfIntervals : Int32, out delays : array< Float > ) {}
+
+	private const function GetRandomDelays( amountOfIntervals : Int32, out delays : array< Float > ) {}
+
+	private const function IsSequenceOngoing() : Bool
+	{
+		if( m_ongoingSequence.maxActionsInSequence > 0 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public override function GetQuestActions( out outActions : array< DeviceAction >, context : GetActionsContext )
+	{
+		if( Clearance.IsInRange( context.clearance, DefaultActionsParametersHolder.GetQuestClearance() ) )
+		{
+			outActions.PushBack( ActionQuestForcePower() );
+			outActions.PushBack( ActionQuestForceUnpower() );
+			outActions.PushBack( ActionQuestForceON() );
+			outActions.PushBack( ActionQuestForceOFF() );
+			outActions.PushBack( ActionActivateDevice() );
+			outActions.PushBack( ActionDeactivateDevice() );
+		}
+		return;
+	}
+
+	protected override function OnQuestForceOFF( evt : QuestForceOFF ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnQuestForceON( evt : QuestForceON ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnQuestForceUnpower( evt : QuestForceUnpower ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnQuestForcePower( evt : QuestForcePower ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDeviceON( evt : SetDeviceON ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDeviceOFF( evt : SetDeviceOFF ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDevicePowered( evt : SetDevicePowered ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDeviceUnpowered( evt : SetDeviceUnpowered ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnActivateDevice( evt : ActivateDevice ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnDeactivateDevice( evt : DeactivateDevice ) : EntityNotificationType
+	{
+		var forwarder : ForwardAction;
+		forwarder = new ForwardAction;
+		forwarder.requester = GetID();
+		forwarder.actionToForward = evt;
+		OnForwardAction( forwarder );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+}
+
+enum EActionsSequencerMode
+{
+	REGULAR_INTERVALS = 0,
+	ACCELERATING_INTERVALS_TODO = 1,
+	DECELERATING_INTEVALS_TODO = 2,
+	RANDOM_INTERVALS_TODO = 3,
+	AT_THE_SAME_TIME_TODO = 4,
+}
+

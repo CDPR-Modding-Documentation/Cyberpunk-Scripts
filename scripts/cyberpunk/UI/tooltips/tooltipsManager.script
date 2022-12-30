@@ -1,0 +1,633 @@
+import class gameuiTooltipsManager extends inkLogicController
+{
+	private const editable var m_TooltipRequesters : array< inkWidgetRef >;
+	private const editable var m_GenericTooltipsNames : array< CName >;
+	private const editable var m_TooltipLibrariesReferences : array< TooltipWidgetReference >;
+	private const editable var m_TooltipLibrariesStyledReferences : array< TooltipWidgetStyledReference >;
+	private editable var m_TooltipsLibrary : ResRef;
+	default m_TooltipsLibrary = R"base/gameplay/gui/common/tooltip/tooltipslibrary_4k.inkwidget";
+	private editable var m_MenuTooltipStylePath : ResRef;
+	default m_MenuTooltipStylePath = R"base/gameplay/gui/common/tooltip/tooltip_menu.inkstyle";
+	private editable var m_HudTooltipStylePath : ResRef;
+	default m_HudTooltipStylePath = R"base/gameplay/gui/common/tooltip/tooltip_hud.inkstyle";
+	private var m_IndexedTooltips : array< weak< AGenericTooltipController > >;
+	private var m_NamedTooltips : array< NamedTooltipController >;
+	private var m_TooltipStylePath : ResRef;
+	private editable var m_enableTransitionAnimation : Bool;
+	default m_enableTransitionAnimation = true;
+	private var m_tooltipAnimHideDef : inkAnimDef;
+	private var m_tooltipDelayedShowDef : inkAnimDef;
+	private var m_tooltipAnimHide : inkAnimProxy;
+	private var m_tooltipDelayedShow : inkAnimProxy;
+	private var m_axisDataThreshold : Float;
+	default m_axisDataThreshold = 0.5;
+	private var m_mouseDataThreshold : Float;
+	default m_mouseDataThreshold = 7;
+	private var m_isHidden : Bool;
+
+	private import function SetCustomMargin( margin : inkMargin );
+	private import function SetFollowsCursor( followsCursor : Bool );
+	private import function AttachToWidget( widget : weak< inkWidget >, optional placement : gameuiETooltipPlacement );
+	private import function UnAttachFromWidget();
+	private import function GetTooltipsContainerRef() : inkWidgetRef;
+	private import function RefreshTooltipsPosition();
+	private import function ResetTooltipsPosition();
+	private import function MarkToShow();
+	private import static function FindAttachmentSlot( widget : weak< inkWidget > ) : weak< gameuiTooltipAttachmentSlot >;
+
+	protected event OnInitialize()
+	{
+		var i, limit : Int32;
+		for( i = 0, limit = m_TooltipRequesters.Size(); i < limit; i += 1 )
+		{
+			inkWidgetRef.RegisterToCallback( m_TooltipRequesters[ i ], 'OnRequestTooltip', this, 'OnRequestTooltip' );
+		}
+		if( m_enableTransitionAnimation )
+		{
+			RegisterToGlobalInputCallback( 'OnPostOnAxis', this, 'OnAxisInput' );
+			RegisterToGlobalInputCallback( 'OnPostOnRelative', this, 'OnAxisInput' );
+			m_tooltipDelayedShowDef = GetShowingAnimation();
+			m_tooltipAnimHideDef = GetHidingAnimation();
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		var i, limit : Int32;
+		HideTooltips();
+		for( i = 0, limit = m_TooltipRequesters.Size(); i < limit; i += 1 )
+		{
+			inkWidgetRef.UnregisterFromCallback( m_TooltipRequesters[ i ], 'OnRequestTooltip', this, 'OnRequestTooltip' );
+		}
+		if( m_enableTransitionAnimation )
+		{
+			UnregisterFromGlobalInputCallback( 'OnPostOnAxis', this, 'OnAxisInput' );
+			UnregisterFromGlobalInputCallback( 'OnPostOnRelative', this, 'OnAxisInput' );
+		}
+	}
+
+	public function Setup()
+	{
+		Setup( ETooltipsStyle.Menus );
+	}
+
+	public function Setup( tooltipStyle : ETooltipsStyle )
+	{
+		Setup( tooltipStyle, true );
+	}
+
+	public function Setup( tooltipStyle : ETooltipsStyle, followCursor : Bool )
+	{
+		var tooltipsContainer : weak< inkWidget >;
+		var tooltipsContainerRef : inkWidgetRef;
+		var defaultStyleResRef : ResRef;
+		tooltipsContainerRef = GetTooltipsContainerRef();
+		tooltipsContainer = inkWidgetRef.Get( tooltipsContainerRef );
+		if( !( tooltipsContainer ) )
+		{
+			LogUIError( "[TooltipManager] Tried to setup without valid container for tooltips!" );
+			return;
+		}
+		defaultStyleResRef = GetDefaultStyleResRef( tooltipStyle );
+		tooltipsContainer.SetAffectsLayoutWhenHidden( true );
+		SetupIndexedWidgets( tooltipStyle, tooltipsContainer, defaultStyleResRef );
+		SetupNamedWidgets( tooltipStyle, tooltipsContainer, defaultStyleResRef );
+		SetupStyledNamedWidgets( tooltipStyle, tooltipsContainer );
+		SetFollowsCursor( followCursor );
+		ResetTooltipsPosition();
+	}
+
+	private function GetDefaultStyleResRef( tooltipStyle : ETooltipsStyle ) : ResRef
+	{
+		if( tooltipStyle == ETooltipsStyle.Menus )
+		{
+			return ( ( ResRef.IsValid( m_MenuTooltipStylePath ) ) ? ( m_MenuTooltipStylePath ) : ( R"base/gameplay/gui/common/tooltip/tooltip_menu.inkstyle" ) );
+		}
+		return ( ( ResRef.IsValid( m_HudTooltipStylePath ) ) ? ( m_HudTooltipStylePath ) : ( R"base/gameplay/gui/common/tooltip/tooltip_hud.inkstyle" ) );
+	}
+
+	private function SetupIndexedWidgets( tooltipStyle : ETooltipsStyle, tooltipsContainer : weak< inkWidget >, styleResRef : ResRef )
+	{
+		var i, limit : Int32;
+		var tooltipSpawnedCallbackData : TooltipSpawnedCallbackData;
+		if( !( ResRef.IsValid( m_TooltipsLibrary ) ) )
+		{
+			m_TooltipsLibrary = R"base/gameplay/gui/common/tooltip/tooltipslibrary_4k.inkwidget";
+		}
+		for( i = 0, limit = m_GenericTooltipsNames.Size(); i < limit; i += 1 )
+		{
+			tooltipSpawnedCallbackData = new TooltipSpawnedCallbackData;
+			tooltipSpawnedCallbackData.index = i;
+			tooltipSpawnedCallbackData.tooltipStyle = tooltipStyle;
+			tooltipSpawnedCallbackData.styleResRef = styleResRef;
+			AsyncSpawnFromExternal( tooltipsContainer, m_TooltipsLibrary, m_GenericTooltipsNames[ i ], this, 'OnTooltipWidgetSpawned', tooltipSpawnedCallbackData );
+		}
+	}
+
+	private function SetupNamedWidgets( tooltipStyle : ETooltipsStyle, tooltipsContainer : weak< inkWidget >, styleResRef : ResRef )
+	{
+		var i : Int32;
+		var libraryReference : inkWidgetLibraryReference;
+		var tooltipSpawnedCallbackData : TooltipSpawnedCallbackData;
+		for( i = 0; i < m_TooltipLibrariesReferences.Size(); i += 1 )
+		{
+			libraryReference = m_TooltipLibrariesReferences[ i ].m_widgetLibraryReference;
+			if( inkWidgetLibraryResource.IsValid( libraryReference.widgetLibrary ) )
+			{
+				tooltipSpawnedCallbackData = new TooltipSpawnedCallbackData;
+				tooltipSpawnedCallbackData.identifier = m_TooltipLibrariesReferences[ i ].m_identifier;
+				tooltipSpawnedCallbackData.tooltipStyle = tooltipStyle;
+				tooltipSpawnedCallbackData.styleResRef = styleResRef;
+				AsyncSpawnFromExternal( tooltipsContainer, inkWidgetLibraryResource.GetPath( libraryReference.widgetLibrary ), libraryReference.widgetItem, this, 'OnTooltipWidgetSpawned', tooltipSpawnedCallbackData );
+			}
+		}
+	}
+
+	private function SetupStyledNamedWidgets( tooltipStyle : ETooltipsStyle, tooltipsContainer : weak< inkWidget > )
+	{
+		var i : Int32;
+		var libraryReference : inkWidgetLibraryReference;
+		var styleResRef : ResRef;
+		var tooltipSpawnedCallbackData : TooltipSpawnedCallbackData;
+		for( i = 0; i < m_TooltipLibrariesStyledReferences.Size(); i += 1 )
+		{
+			styleResRef = ( ( tooltipStyle == ETooltipsStyle.HUD ) ? ( m_TooltipLibrariesStyledReferences[ i ].m_hudTooltipStylePath ) : ( m_TooltipLibrariesStyledReferences[ i ].m_menuTooltipStylePath ) );
+			if( !( ResRef.IsValid( styleResRef ) ) )
+			{
+				styleResRef = ( ( tooltipStyle == ETooltipsStyle.HUD ) ? ( R"base/gameplay/gui/common/tooltip/tooltip_menu.inkstyle" ) : ( R"base/gameplay/gui/common/tooltip/tooltip_hud.inkstyle" ) );
+			}
+			libraryReference = m_TooltipLibrariesStyledReferences[ i ].m_widgetLibraryReference;
+			if( inkWidgetLibraryResource.IsValid( libraryReference.widgetLibrary ) )
+			{
+				tooltipSpawnedCallbackData = new TooltipSpawnedCallbackData;
+				tooltipSpawnedCallbackData.identifier = m_TooltipLibrariesReferences[ i ].m_identifier;
+				tooltipSpawnedCallbackData.tooltipStyle = tooltipStyle;
+				tooltipSpawnedCallbackData.styleResRef = styleResRef;
+				AsyncSpawnFromExternal( tooltipsContainer, inkWidgetLibraryResource.GetPath( libraryReference.widgetLibrary ), libraryReference.widgetItem, this, 'OnTooltipWidgetSpawned', tooltipSpawnedCallbackData );
+			}
+		}
+	}
+
+	protected event OnTooltipWidgetSpawned( tooltipWidget : inkWidget, callbackData : TooltipSpawnedCallbackData )
+	{
+		var tooltipController : weak< AGenericTooltipController >;
+		var namedControllerRef : NamedTooltipController;
+		if( !( tooltipWidget ) )
+		{
+			LogUIError( "[TooltipManager] Failed to spawn tooltip widget! Missing import?" );
+			return false;
+		}
+		SetupWidgetAttachment( tooltipWidget, callbackData.tooltipStyle );
+		tooltipController = ( ( AGenericTooltipController )( tooltipWidget.GetController() ) );
+		if( tooltipController )
+		{
+			tooltipController.SetStyle( callbackData.styleResRef );
+			tooltipController.Hide();
+			if( callbackData.index > -1 )
+			{
+				if( m_IndexedTooltips.Size() < callbackData.index )
+				{
+					m_IndexedTooltips.Resize( callbackData.index );
+				}
+				m_IndexedTooltips.Insert( callbackData.index, tooltipController );
+			}
+			else
+			{
+				namedControllerRef = new NamedTooltipController;
+				namedControllerRef.identifier = callbackData.identifier;
+				namedControllerRef.controller = tooltipController;
+				m_NamedTooltips.PushBack( namedControllerRef );
+			}
+		}
+	}
+
+	private function SetupWidgetAttachment( widget : weak< inkWidget >, tooltipStyle : ETooltipsStyle )
+	{
+		if( widget )
+		{
+			if( tooltipStyle == ETooltipsStyle.Menus )
+			{
+				widget.SetVAlign( inkEVerticalAlign.Top );
+				widget.SetHAlign( inkEHorizontalAlign.Left );
+				widget.SetAnchorPoint( 0.0, 0.0 );
+			}
+			else
+			{
+				widget.SetVAlign( inkEVerticalAlign.Bottom );
+				widget.SetHAlign( inkEHorizontalAlign.Right );
+				widget.SetAnchorPoint( 0.0, 1.0 );
+			}
+		}
+	}
+
+	private function GetNamedWidget( identifier : CName ) : weak< AGenericTooltipController >
+	{
+		var i : Int32;
+		for( i = 0; i < m_NamedTooltips.Size(); i += 1 )
+		{
+			if( m_NamedTooltips[ i ].identifier == identifier )
+			{
+				return m_NamedTooltips[ i ].controller;
+			}
+		}
+		return NULL;
+	}
+
+	public function ShowTooltips( tooltipsData : array< ATooltipData > )
+	{
+		ShowTooltips( tooltipsData, inkMargin( 30.0, 20.0, 0.0, 0.0 ) );
+	}
+
+	public function ShowTooltipsAtWidget( tooltipData : array< ATooltipData >, widget : weak< inkWidget > )
+	{
+		SetFollowsCursor( false );
+		ShowTooltips( tooltipData, inkMargin( 0.0, 0.0, 0.0, 0.0 ), true );
+		AttachToWidget( widget, gameuiETooltipPlacement.RightTop );
+	}
+
+	public function ShowTooltipsAtWidget( tooltipData : array< ATooltipData >, widget : weak< inkWidget >, placement : gameuiETooltipPlacement )
+	{
+		SetFollowsCursor( false );
+		ShowTooltips( tooltipData, inkMargin( 0.0, 0.0, 0.0, 0.0 ), true );
+		AttachToWidget( widget, placement );
+	}
+
+	public function ShowTooltips( tooltipData : array< ATooltipData >, margin : inkMargin, optional playAnim : Bool )
+	{
+		var i, limit : Int32;
+		var tooltipController : weak< AGenericTooltipController >;
+		var identifiedData : IdentifiedWrappedTooltipData;
+		HideTooltips();
+		SetCustomMargin( margin );
+		limit = tooltipData.Size();
+		for( i = 0; i < limit; i += 1 )
+		{
+			identifiedData = ( ( IdentifiedWrappedTooltipData )( tooltipData[ i ] ) );
+			if( identifiedData && IsNameValid( identifiedData.m_identifier ) )
+			{
+				tooltipController = GetNamedWidget( identifiedData.m_identifier );
+			}
+			else
+			{
+				if( i >= m_IndexedTooltips.Size() )
+				{
+					LogUIError( "[TooltipManager] Tried to use not spawned tooltip!" );
+					return;
+				}
+				tooltipController = m_IndexedTooltips[ i ];
+			}
+			if( tooltipController )
+			{
+				tooltipController.SetData( ( ( identifiedData ) ? ( identifiedData.m_data ) : ( tooltipData[ i ] ) ) );
+				tooltipController.Show();
+			}
+		}
+		if( limit > 0 )
+		{
+			MarkToShow();
+		}
+	}
+
+	public function ShowTooltip( tooltipData : ATooltipData )
+	{
+		ShowTooltip( 0, tooltipData );
+	}
+
+	public function ShowTooltip( identifier : CName, tooltipData : ATooltipData )
+	{
+		var controller : weak< AGenericTooltipController >;
+		controller = GetNamedWidget( identifier );
+		ShowTooltip( controller, tooltipData );
+	}
+
+	public function ShowTooltip( index : Int32, tooltipData : ATooltipData )
+	{
+		ShowTooltip( m_IndexedTooltips[ index ], tooltipData );
+	}
+
+	public function ShowTooltip( tooltipController : weak< AGenericTooltipController >, tooltipData : ATooltipData )
+	{
+		ShowTooltip( tooltipController, tooltipData, inkMargin( 30.0, 20.0, 0.0, 0.0 ) );
+	}
+
+	public function ShowTooltipAtPosition( index : Int32, position : Vector2, tooltipData : ATooltipData )
+	{
+		ShowTooltipAtPosition( m_IndexedTooltips[ index ], position, tooltipData );
+	}
+
+	public function ShowTooltipAtPosition( identifier : CName, position : Vector2, tooltipData : ATooltipData )
+	{
+		var controller : weak< AGenericTooltipController >;
+		controller = GetNamedWidget( identifier );
+		ShowTooltipAtPosition( controller, position, tooltipData );
+	}
+
+	public function ShowTooltipAtPosition( tooltipController : weak< AGenericTooltipController >, position : Vector2, tooltipData : ATooltipData )
+	{
+		var tooltipWidget : weak< inkWidget >;
+		var newPosition : Vector2;
+		if( tooltipController )
+		{
+			SetFollowsCursor( false );
+			ResetTooltipsPosition();
+			tooltipWidget = tooltipController.GetRootWidget();
+			newPosition = WidgetUtils.GlobalToLocal( tooltipWidget, position );
+			ShowTooltip( tooltipController, tooltipData, inkMargin( 0.0, 0.0, 0.0, 0.0 ) );
+			tooltipWidget.SetTranslation( newPosition );
+		}
+	}
+
+	public function ShowTooltipAtWidget( index : Int32, widget : weak< inkWidget >, tooltipData : ATooltipData, optional placement : gameuiETooltipPlacement, optional playAnim : Bool, optional margin : inkMargin )
+	{
+		ShowTooltipAtWidget( m_IndexedTooltips[ index ], widget, tooltipData, placement, playAnim, margin );
+	}
+
+	public function ShowTooltipAtWidget( identifier : CName, widget : weak< inkWidget >, tooltipData : ATooltipData, optional placement : gameuiETooltipPlacement, optional playAnim : Bool, optional margin : inkMargin )
+	{
+		var controller : weak< AGenericTooltipController >;
+		controller = GetNamedWidget( identifier );
+		ShowTooltipAtWidget( controller, widget, tooltipData, placement, playAnim, margin );
+	}
+
+	public function ShowTooltipAtWidget( tooltipController : weak< AGenericTooltipController >, widget : weak< inkWidget >, tooltipData : ATooltipData, optional placement : gameuiETooltipPlacement, optional playAnim : Bool, optional margin : inkMargin )
+	{
+		if( tooltipController )
+		{
+			SetFollowsCursor( false );
+			ShowTooltip( tooltipController, tooltipData, margin );
+			AttachToWidget( widget, placement );
+		}
+	}
+
+	public function ShowTooltipInSlot( index : Int32, tooltipData : ATooltipData, widget : weak< inkWidget > )
+	{
+		ShowTooltipInSlot( m_IndexedTooltips[ index ], tooltipData, widget );
+	}
+
+	public function ShowTooltipInSlot( identifier : CName, tooltipData : ATooltipData, widget : weak< inkWidget > )
+	{
+		var controller : weak< AGenericTooltipController >;
+		controller = GetNamedWidget( identifier );
+		ShowTooltipInSlot( controller, tooltipData, widget );
+	}
+
+	public function ShowTooltipInSlot( tooltipController : weak< AGenericTooltipController >, tooltipData : ATooltipData, widget : weak< inkWidget > )
+	{
+		var slotController : weak< gameuiTooltipAttachmentSlot >;
+		var tooltipWidget : weak< inkWidget >;
+		slotController = gameuiTooltipsManager.FindAttachmentSlot( widget );
+		if( slotController == NULL )
+		{
+			return;
+		}
+		if( tooltipController )
+		{
+			SetFollowsCursor( false );
+			ResetTooltipsPosition();
+			ShowTooltip( tooltipController, tooltipData, inkMargin( 0.0, 0.0, 0.0, 0.0 ) );
+			tooltipWidget = tooltipController.GetRootWidget();
+			tooltipWidget.Reparent( ( ( inkCompoundWidget )( slotController.GetRootWidget() ) ) );
+		}
+	}
+
+	public function AttachToCursor()
+	{
+		SetFollowsCursor( true );
+		UnAttachFromWidget();
+	}
+
+	public function ShowTooltip( index : Int32, tooltipData : ATooltipData, margin : inkMargin )
+	{
+		if( ( index < 0 ) && ( index >= m_IndexedTooltips.Size() ) )
+		{
+			LogUIError( "[TooltipManager] Tried to use not spawned tooltip!" );
+			return;
+		}
+		ShowTooltip( m_IndexedTooltips[ index ], tooltipData, margin );
+	}
+
+	public function ShowTooltip( identifier : CName, tooltipData : ATooltipData, margin : inkMargin )
+	{
+		var controller : weak< AGenericTooltipController >;
+		controller = GetNamedWidget( identifier );
+		ShowTooltip( controller, tooltipData, margin );
+	}
+
+	public function ShowTooltip( tooltipController : weak< AGenericTooltipController >, tooltipData : ATooltipData, margin : inkMargin )
+	{
+		HideTooltips();
+		if( tooltipController == NULL )
+		{
+			LogUIError( "[TooltipManager] Tried to use not spawned tooltip!" );
+			return;
+		}
+		SetCustomMargin( margin );
+		if( tooltipController )
+		{
+			tooltipController.SetData( tooltipData );
+			tooltipController.Show();
+		}
+		MarkToShow();
+	}
+
+	public function HideTooltips()
+	{
+		var i, previousListEnd, limit : Int32;
+		var tooltipController : weak< AGenericTooltipController >;
+		var tooltipWidget : weak< inkWidget >;
+		ResetTooltipsPosition();
+		for( i = 0, limit = m_IndexedTooltips.Size(); i < limit; i += 1 )
+		{
+			tooltipController = m_IndexedTooltips[ i ];
+			if( tooltipController )
+			{
+				tooltipController.Hide();
+				tooltipWidget = tooltipController.GetRootWidget();
+				tooltipWidget.Reparent( ( ( inkCompoundWidget )( inkWidgetRef.Get( GetTooltipsContainerRef() ) ) ), i );
+				UnAttachFromWidget();
+			}
+		}
+		previousListEnd = i;
+		for( i = 0, limit = m_NamedTooltips.Size(); i < limit; i += 1 )
+		{
+			tooltipController = m_NamedTooltips[ i ].controller;
+			if( tooltipController )
+			{
+				tooltipController.Hide();
+				tooltipWidget = tooltipController.GetRootWidget();
+				tooltipWidget.Reparent( ( ( inkCompoundWidget )( inkWidgetRef.Get( GetTooltipsContainerRef() ) ) ), previousListEnd + i );
+				UnAttachFromWidget();
+			}
+		}
+	}
+
+	public function RefreshTooltip( index : Int32 )
+	{
+		var tooltipController : weak< AGenericTooltipController >;
+		tooltipController = m_IndexedTooltips[ index ];
+		if( tooltipController )
+		{
+			tooltipController.Refresh();
+		}
+	}
+
+	public function RefreshTooltip( identifier : CName )
+	{
+		var tooltipController : weak< AGenericTooltipController >;
+		tooltipController = GetNamedWidget( identifier );
+		if( tooltipController )
+		{
+			tooltipController.Refresh();
+		}
+	}
+
+	private function OnRequestTooltip( widget : weak< inkWidget > ) {}
+
+	public function PlayShowingAnimation()
+	{
+		if( m_tooltipDelayedShow )
+		{
+			m_tooltipDelayedShow.Stop( true );
+			m_tooltipDelayedShow = NULL;
+		}
+		m_tooltipDelayedShow = inkWidgetRef.PlayAnimation( GetTooltipsContainerRef(), m_tooltipDelayedShowDef );
+	}
+
+	public function PlayHidingAnimation()
+	{
+		if( m_tooltipAnimHide )
+		{
+			m_tooltipAnimHide.Stop( true );
+			m_tooltipAnimHide = NULL;
+		}
+		m_tooltipAnimHide = inkWidgetRef.PlayAnimation( GetTooltipsContainerRef(), m_tooltipAnimHideDef );
+	}
+
+	protected event OnAxisInput( evt : inkPointerEvent )
+	{
+		var axisData : Float;
+		axisData = evt.GetAxisData();
+		if( ( ( evt.IsAction( 'left_stick_x' ) || evt.IsAction( 'left_stick_y' ) ) && ( AbsF( axisData ) > m_axisDataThreshold ) ) || ( ( evt.IsAction( 'mouse_x' ) || evt.IsAction( 'mouse_y' ) ) && ( AbsF( axisData ) > m_mouseDataThreshold ) ) )
+		{
+			if( m_tooltipAnimHide && m_tooltipAnimHide.IsPlaying() )
+			{
+			}
+			else if( m_tooltipDelayedShow && m_tooltipDelayedShow.IsPlaying() )
+			{
+				m_tooltipDelayedShow.Stop( true );
+				m_tooltipDelayedShow = inkWidgetRef.PlayAnimation( GetTooltipsContainerRef(), m_tooltipDelayedShowDef );
+				m_tooltipDelayedShow.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnShown' );
+			}
+			else
+			{
+				if( m_tooltipAnimHide )
+				{
+					m_tooltipAnimHide.Stop( true );
+					m_tooltipAnimHide = NULL;
+				}
+				m_tooltipAnimHide = inkWidgetRef.PlayAnimation( GetTooltipsContainerRef(), m_tooltipAnimHideDef );
+				m_tooltipAnimHide.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnHidden' );
+			}
+		}
+	}
+
+	protected event OnHidden( proxy : inkAnimProxy )
+	{
+		if( m_tooltipDelayedShow )
+		{
+			m_tooltipDelayedShow.Stop( true );
+			m_tooltipDelayedShow = NULL;
+		}
+		m_tooltipDelayedShow = inkWidgetRef.PlayAnimation( GetTooltipsContainerRef(), m_tooltipDelayedShowDef );
+		m_tooltipDelayedShow.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnShown' );
+		m_isHidden = true;
+	}
+
+	protected event OnShown( proxy : inkAnimProxy )
+	{
+		m_isHidden = false;
+	}
+
+	private function GetShowingAnimation() : inkAnimDef
+	{
+		var transparencyAnimation : inkAnimDef;
+		var transparencyInterpolator : inkAnimTransparency;
+		transparencyAnimation = new inkAnimDef;
+		transparencyInterpolator = new inkAnimTransparency;
+		transparencyInterpolator.SetDuration( 0.1 );
+		transparencyInterpolator.SetStartDelay( 0.125 );
+		transparencyInterpolator.SetDirection( inkanimInterpolationDirection.FromTo );
+		transparencyInterpolator.SetType( inkanimInterpolationType.Exponential );
+		transparencyInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		transparencyInterpolator.SetStartTransparency( 0.0 );
+		transparencyInterpolator.SetEndTransparency( 1.0 );
+		transparencyAnimation.AddInterpolator( transparencyInterpolator );
+		return transparencyAnimation;
+	}
+
+	private function GetHidingAnimation() : inkAnimDef
+	{
+		var transparencyAnimation : inkAnimDef;
+		var transparencyInterpolator : inkAnimTransparency;
+		transparencyAnimation = new inkAnimDef;
+		transparencyInterpolator = new inkAnimTransparency;
+		transparencyInterpolator.SetDuration( 0.1 );
+		transparencyInterpolator.SetDirection( inkanimInterpolationDirection.To );
+		transparencyInterpolator.SetType( inkanimInterpolationType.Exponential );
+		transparencyInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		transparencyInterpolator.SetEndTransparency( 0.0 );
+		transparencyAnimation.AddInterpolator( transparencyInterpolator );
+		return transparencyAnimation;
+	}
+
+}
+
+import class gameuiTooltipAttachmentSlot extends inkLogicController
+{
+}
+
+struct TooltipWidgetReference
+{
+	editable var m_identifier : CName;
+	editable var m_widgetLibraryReference : inkWidgetLibraryReference;
+}
+
+struct TooltipWidgetStyledReference
+{
+	editable var m_identifier : CName;
+	editable var m_widgetLibraryReference : inkWidgetLibraryReference;
+	editable var m_menuTooltipStylePath : ResRef;
+	default m_menuTooltipStylePath = R"base/gameplay/gui/common/tooltip/tooltip_menu.inkstyle";
+	editable var m_hudTooltipStylePath : ResRef;
+	default m_hudTooltipStylePath = R"base/gameplay/gui/common/tooltip/tooltip_hud.inkstyle";
+}
+
+class NamedTooltipController
+{
+	var identifier : CName;
+	var controller : weak< AGenericTooltipController >;
+}
+
+class TooltipSpawnedCallbackData
+{
+	var index : Int32;
+	default index = -1;
+	var identifier : CName;
+	var tooltipStyle : ETooltipsStyle;
+	var styleResRef : ResRef;
+}
+
+enum ETooltipsStyle
+{
+	Menus = 0,
+	HUD = 1,
+}
+
+import enum gameuiETooltipPlacement : Uint8
+{
+	LeftCenter,
+	RightCenter,
+	LeftTop,
+	RightTop,
+}
+

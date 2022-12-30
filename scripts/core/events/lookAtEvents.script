@@ -1,0 +1,312 @@
+importonly abstract class AnimTargetAddEvent extends Event
+{
+	import var bodyPart : CName;
+
+	public import function SetEntityTarget( targetEntity : weak< Entity >, slotTargetName : CName, targetOffsetEntity : Vector4 );
+	public import function SetEntityTargetFromPast( transformHistoryComponent : weak< TransformHistoryComponent >, timeDelay : Float, targetOffsetEntity : Vector4 );
+	public import function SetStaticTarget( staticTargetPositionWs : Vector4 );
+	public import function SetPositionProvider( provider : IPositionProvider );
+}
+
+import struct LookAtLimits
+{
+	import var softLimitDegrees : Float;
+	import var hardLimitDegrees : Float;
+	import var hardLimitDistance : Float;
+	import var backLimitDegrees : Float;
+}
+
+importonly abstract class IPositionProvider extends IScriptable
+{
+	public import final function CalculatePosition( out outPos : Vector4 ) : Bool;
+	public import final function SetWorldOffset( worldOffset : Vector4 );
+	public import final function GetWorldOffset() : Vector4;
+	public import static function CreateStaticPositionProvider( position : WorldPosition ) : IPositionProvider;
+	public import static function CreateEntityPositionProvider( entity : Entity, optional localOffset : Vector3 ) : IPositionProvider;
+	public import static function CreateEntityHistoryPositionProvider( transformHistoryComp : weak< TransformHistoryComponent >, timeDelay : Float, optional localOffset : Vector3 ) : IPositionProvider;
+	public import static function CreateSlotPositionProvider( entity : Entity, slotName : CName, optional localOffset : Vector3 ) : IPositionProvider;
+	public import static function CreatePlacedComponentPositionProvider( entity : IPlacedComponent, optional localOffset : Vector3 ) : IPositionProvider;
+	public import static function CreateCollisionPredictionPositionProvider( targetPosProvider : IPositionProvider, ownerPosProvider : IPositionProvider, targetVelocityProvider : IVelocityProvider, ownerVelocity : Float ) : IPositionProvider;
+}
+
+import class LookAtFacingPositionProvider extends IPositionProvider
+{
+	public import final function SetCameraComponent( owner : GameObject );
+}
+
+import struct LookAtRef
+{
+	import var id : Int32;
+	import var part : CName;
+}
+
+import struct LookAtPartRequest
+{
+	import var partName : CName;
+	import var weight : Float;
+	import var suppress : Float;
+	import var mode : Int32;
+}
+
+import struct LookAtRequest
+{
+	import var transitionSpeed : Float;
+	import var hasOutTransition : Bool;
+	import var outTransitionSpeed : Float;
+	import var followingSpeedFactorOverride : Float;
+	import var limits : LookAtLimits;
+	import var suppress : Float;
+	import var mode : Int32;
+	import var calculatePositionInParentSpace : Bool;
+	import var priority : Int32;
+	import var invalid : Bool;
+}
+
+import class LookAtAddEvent extends AnimTargetAddEvent
+{
+	import var request : LookAtRequest;
+	import var targetPositionProvider : IPositionProvider;
+	import var outLookAtRef : LookAtRef;
+
+	public import function SetStyle( style : animLookAtStyle );
+	public import function SetOutTransitionStyle( outTransitionStyle : animLookAtStyle );
+	public import function SetLimits( softLimitDegreesType : animLookAtLimitDegreesType, hardLimitDegreesType : animLookAtLimitDegreesType, hardLimitDistanceType : animLookAtLimitDistanceType, backLimitDegreesType : animLookAtLimitDegreesType );
+	public import function SetAdditionalPartsArray( additionalParts : array< LookAtPartRequest > );
+	public import function SetDebugInfo( debugInfo : String );
+}
+
+import class LookAtRemoveEvent extends Event
+{
+	private import var lookAtRef : LookAtRef;
+
+	public static function QueueRemoveLookatEvent( owner : GameObject, addedBeforeEvent : LookAtAddEvent )
+	{
+		var removeLookatEvent : LookAtRemoveEvent;
+		removeLookatEvent = new LookAtRemoveEvent;
+		removeLookatEvent.lookAtRef = addedBeforeEvent.outLookAtRef;
+		addedBeforeEvent.request.invalid = true;
+		owner.QueueEvent( removeLookatEvent );
+	}
+
+	public static function QueueDelayedRemoveLookatEvent( context : ScriptExecutionContext, addedBeforeEvent : LookAtAddEvent, lookAtDeactivationDelay : Float )
+	{
+		var removeLookatEvent : LookAtRemoveEvent;
+		removeLookatEvent = new LookAtRemoveEvent;
+		removeLookatEvent.lookAtRef = addedBeforeEvent.outLookAtRef;
+		addedBeforeEvent.request.invalid = true;
+		GameInstance.GetDelaySystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).DelayEvent( ScriptExecutionContext.GetOwner( context ), removeLookatEvent, lookAtDeactivationDelay );
+	}
+
+}
+
+abstract class AIActionLookat
+{
+
+	public static function Activate( const context : ScriptExecutionContext, record : weak< AIActionLookAtData_Record >, out lookAtEvent : LookAtAddEvent )
+	{
+		var lookAtTarget : weak< GameObject >;
+		var lookAtPosition : Vector4;
+		var lookAtPartRequests : array< LookAtPartRequest >;
+		var lookatPreset : weak< LookAtPreset_Record >;
+		var lookAtOffset : Vector4;
+		var lookAtTargetSP : weak< ScriptedPuppet >;
+		var ownerSP : weak< ScriptedPuppet >;
+		var tmpPositionProvider : IPositionProvider;
+		var trackingMode : gamedataTrackingMode;
+		var targetSlot : CName;
+		var realPositionProvider : IPositionProvider;
+		lookAtOffset = Vector4.Vector3To4( record.Offset() );
+		lookatPreset = record.Preset();
+		ownerSP = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( !( lookatPreset ) )
+		{
+			return;
+		}
+		AIActionTarget.Get( context, record.Target(), false, lookAtTarget, lookAtPosition );
+		if( !( lookAtTarget ) && Vector4.IsZero( lookAtPosition ) )
+		{
+			return;
+		}
+		lookAtEvent = new LookAtAddEvent;
+		lookAtTargetSP = ( ( ScriptedPuppet )( lookAtTarget ) );
+		if( record.Target().TrackingMode() )
+		{
+			trackingMode = record.Target().TrackingMode().Type();
+		}
+		else
+		{
+			trackingMode = gamedataTrackingMode.RealPosition;
+		}
+		targetSlot = record.Target().TargetSlot();
+		if( targetSlot != '' )
+		{
+			realPositionProvider = IPositionProvider.CreateSlotPositionProvider( lookAtTarget, targetSlot, record.Offset() );
+		}
+		else
+		{
+			realPositionProvider = IPositionProvider.CreateEntityPositionProvider( lookAtTarget, record.Offset() );
+		}
+		if( lookAtTargetSP || ( ( Device )( lookAtTarget ) ) )
+		{
+			if( ( lookAtTargetSP && ( record.TimeDelay() > 0.0 ) ) && lookAtTargetSP.GetTransformHistoryComponent() )
+			{
+				lookAtEvent.SetEntityTargetFromPast( lookAtTargetSP.GetTransformHistoryComponent(), record.TimeDelay(), lookAtOffset );
+			}
+			else
+			{
+				switch( trackingMode )
+				{
+					case gamedataTrackingMode.RealPosition:
+						lookAtEvent.SetEntityTarget( lookAtTarget, targetSlot, lookAtOffset );
+					break;
+					case gamedataTrackingMode.LastKnownPosition:
+						tmpPositionProvider = ownerSP.GetTargetTrackerComponent().GetThreatBeliefPositionProvider( lookAtTarget, record.Offset(), true, targetSlot, realPositionProvider );
+					lookAtEvent.SetPositionProvider( ownerSP.GetTargetTrackerComponent().GetThreatLastKnownPositionProvider( lookAtTarget, record.Offset(), true, targetSlot, tmpPositionProvider ) );
+					break;
+					case gamedataTrackingMode.BeliefPosition:
+						lookAtEvent.SetPositionProvider( ownerSP.GetTargetTrackerComponent().GetThreatBeliefPositionProvider( lookAtTarget, record.Offset(), true, targetSlot, realPositionProvider ) );
+					break;
+					case gamedataTrackingMode.SharedLastKnownPosition:
+						tmpPositionProvider = ownerSP.GetTargetTrackerComponent().GetThreatBeliefPositionProvider( lookAtTarget, record.Offset(), true, targetSlot, realPositionProvider );
+					lookAtEvent.SetPositionProvider( ownerSP.GetTargetTrackerComponent().GetThreatSharedLastKnownPositionProvider( lookAtTarget, record.Offset(), true, targetSlot, tmpPositionProvider ) );
+					break;
+					case gamedataTrackingMode.SharedBeliefPosition:
+						lookAtEvent.SetPositionProvider( ownerSP.GetTargetTrackerComponent().GetThreatSharedBeliefPositionProvider( lookAtTarget, record.Offset(), true, targetSlot, realPositionProvider ) );
+					break;
+				}
+			}
+		}
+		else
+		{
+			lookAtEvent.SetStaticTarget( lookAtPosition + lookAtOffset );
+		}
+		lookAtEvent.bodyPart = lookatPreset.BodyPart();
+		lookAtEvent.request.transitionSpeed = lookatPreset.TransitionSpeed();
+		lookAtEvent.request.hasOutTransition = lookatPreset.HasOutTransition();
+		lookAtEvent.request.outTransitionSpeed = lookatPreset.OutTransitionSpeed();
+		lookAtEvent.request.followingSpeedFactorOverride = lookatPreset.FollowingSpeedFactorOverride();
+		lookAtEvent.request.limits.softLimitDegrees = lookatPreset.SoftLimitDegrees();
+		lookAtEvent.request.limits.hardLimitDegrees = lookatPreset.HardLimitDegrees();
+		lookAtEvent.request.limits.hardLimitDistance = lookatPreset.HardLimitDistance();
+		lookAtEvent.request.limits.backLimitDegrees = lookatPreset.BackLimitDegrees();
+		lookAtEvent.request.calculatePositionInParentSpace = lookatPreset.CalculatePositionInParentSpace();
+		if( !( IsFinal() ) )
+		{
+			lookAtEvent.SetDebugInfo( "Gameplay " + TDBID.ToStringDEBUG( lookatPreset.GetID() ) );
+		}
+		GetLookatPartsRequests( lookatPreset, lookAtPartRequests );
+		lookAtEvent.SetAdditionalPartsArray( lookAtPartRequests );
+		ScriptExecutionContext.GetOwner( context ).QueueEvent( lookAtEvent );
+		AnimationControllerComponent.SetInputFloatToReplicate( ScriptExecutionContext.GetOwner( context ), 'pla_left_hand_attach', ( ( lookatPreset.AttachLeftHandtoRightHand() ) ? ( 1.0 ) : ( 0.0 ) ) );
+		AnimationControllerComponent.SetInputFloatToReplicate( ScriptExecutionContext.GetOwner( context ), 'pla_right_hand_attach', ( ( lookatPreset.AttachRightHandtoLeftHand() ) ? ( 1.0 ) : ( 0.0 ) ) );
+	}
+
+	public static function GetLookatPartsRequests( lookatPresetRecord : weak< LookAtPreset_Record >, out lookAtParts : array< LookAtPartRequest > )
+	{
+		var i : Int32;
+		var partRecords : array< weak< LookAtPart_Record > >;
+		var lookAtPartRequest : LookAtPartRequest;
+		lookatPresetRecord.LookAtParts( partRecords );
+		for( i = 0; i < partRecords.Size(); i += 1 )
+		{
+			lookAtPartRequest.partName = partRecords[ i ].PartName();
+			lookAtPartRequest.weight = partRecords[ i ].Weight();
+			lookAtPartRequest.suppress = partRecords[ i ].Suppress();
+			lookAtPartRequest.mode = partRecords[ i ].Mode();
+			lookAtParts.PushBack( lookAtPartRequest );
+		}
+	}
+
+	public static function Deactivate( owner : weak< GameObject >, out lookAtAddEvents : array< LookAtAddEvent > )
+	{
+		var lookAtEvent : LookAtAddEvent;
+		var i : Int32;
+		for( i = lookAtAddEvents.Size() - 1; i >= 0; i -= 1 )
+		{
+			lookAtEvent = lookAtAddEvents[ i ];
+			if( !( lookAtEvent ) )
+			{
+				continue;
+			}
+			LookAtRemoveEvent.QueueRemoveLookatEvent( owner, lookAtEvent );
+			lookAtAddEvents.Erase( i );
+		}
+	}
+
+}
+
+import enum animLookAtStyle
+{
+	VerySlow,
+	Slow,
+	Normal,
+	Fast,
+	VeryFast,
+}
+
+import enum animLookAtLimitDegreesType
+{
+	Narrow,
+	Normal,
+	Wide,
+	None,
+}
+
+import enum animLookAtLimitDistanceType
+{
+	Short,
+	Normal,
+	Long,
+	None,
+}
+
+import enum animLookAtChestMode
+{
+	Default,
+	NoHips,
+	Horizontal,
+	HorizontalNoHips,
+}
+
+import enum animLookAtHeadMode
+{
+	Default,
+	Horizontal,
+}
+
+import enum animLookAtEyesMode
+{
+	Default,
+	Horizontal,
+}
+
+import enum animLookAtLeftHandedMode
+{
+	Default,
+	Horizontal,
+}
+
+import enum animLookAtRightHandedMode
+{
+	Default,
+	Horizontal,
+}
+
+import enum animLookAtTwoHandedMode
+{
+	Default,
+	Horizontal,
+}
+
+import enum animLookAtStatus
+{
+	Active,
+	LimitReached,
+	TransitionInProgress,
+}
+
+import function GetLookAtTransitionSpeed( style : animLookAtStyle ) : Float;
+import function GetLookAtLimitDegreesValue( limitType : animLookAtLimitDegreesType ) : Float;
+import function GetLookAtLimitDistanceValue( limitType : animLookAtLimitDistanceType ) : Float;
+import function GetLookAtLimits( softLimitDegreesType : animLookAtLimitDegreesType, hardLimitDegreesType : animLookAtLimitDegreesType, hardLimitDistanceType : animLookAtLimitDistanceType, backLimitDegreesType : animLookAtLimitDegreesType ) : LookAtLimits;
+import function GetLookAtStatus( status : animLookAtStatus, currentStatus : Float ) : Bool;

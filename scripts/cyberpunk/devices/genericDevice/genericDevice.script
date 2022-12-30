@@ -1,0 +1,323 @@
+struct SDeviceActionData
+{
+	instanceeditable persistent var hasInteraction : Bool;
+	instanceeditable persistent var hasUI : Bool;
+	instanceeditable persistent var isQuickHack : Bool;
+	instanceeditable persistent var isSpiderbotAction : Bool;
+	instanceeditable var spiderbotLocationOverrideReference : NodeRef;
+	instanceeditable persistent var attachedToSkillCheck : EDeviceChallengeSkill;
+	[ customEditor = "TweakDBGroupInheritance;ActionWidgetDefinition" ]
+	instanceeditable editable var widgetRecord : TweakDBID;
+	[ customEditor = "TweakDBGroupInheritance;ObjectAction" ]
+	instanceeditable editable var objectActionRecord : TweakDBID;
+	persistent var currentDisplayName : CName;
+	var interactionRecord : String;
+
+	public static function GetCurrentDisplayName( self : SDeviceActionData ) : String
+	{
+		return NameToString( self.currentDisplayName );
+	}
+
+}
+
+struct SDeviceActionBoolData extends SDeviceActionData
+{
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice;Interactions.MountChoice" ]
+	instanceeditable persistent var nameOnTrueRecord : TweakDBID;
+	var nameOnTrue : String;
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice;Interactions.MountChoice" ]
+	instanceeditable persistent var nameOnFalseRecord : TweakDBID;
+	var nameOnFalse : String;
+
+	public static function GetCurrentDisplayName( self : SDeviceActionBoolData ) : String
+	{
+		return NameToString( self.currentDisplayName );
+	}
+
+}
+
+struct SDeviceActionCustomData extends SDeviceActionData
+{
+	instanceeditable persistent var actionID : CName;
+	[ category = "States Availability" ]
+	instanceeditable persistent var On : Bool;
+	default On = true;
+	[ category = "States Availability" ]
+	instanceeditable persistent var Off : Bool;
+	default Off = true;
+	[ category = "States Availability" ]
+	instanceeditable persistent var Unpowered : Bool;
+	default Unpowered = false;
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice;Interactions.MountChoice" ]
+	instanceeditable persistent var displayNameRecord : TweakDBID;
+	var displayName : String;
+	instanceeditable var customClearance : Int32;
+	default customClearance = 3;
+	instanceeditable persistent var isEnabled : Bool;
+	instanceeditable var disableOnUse : Bool;
+	instanceeditable var factToEnableName : CName;
+	[ rangeMin = "0" ][ rangeMax = "5" ]
+	instanceeditable var quickHackCost : Int32;
+	var callbackID : Uint32;
+
+	public static function GetCurrentDisplayName( self : SDeviceActionCustomData ) : String
+	{
+		return NameToString( self.currentDisplayName );
+	}
+
+}
+
+struct SCustomDeviceActionsData
+{
+	const instanceeditable persistent var actions : array< SDeviceActionCustomData >;
+}
+
+struct SGenericDeviceActionsData
+{
+	instanceeditable persistent var toggleON : SDeviceActionBoolData;
+	instanceeditable persistent var togglePower : SDeviceActionBoolData;
+}
+
+class GenericDevice extends InteractiveDevice
+{
+	default m_controllerTypeName = 'GenericDeviceController';
+	protected var m_offMeshConnectionComponent : OffMeshConnectionComponent;
+	private var m_currentSpiderbotAction : CustomDeviceAction;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'offMeshConnection', 'OffMeshConnectionComponent', false );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_offMeshConnectionComponent = ( ( OffMeshConnectionComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'offMeshConnection' ) ) );
+		m_controller = ( ( GenericDeviceController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		super.ResolveGameplayState();
+		InitializeQuestDBCallbacks();
+		RestoreCustomActionOperations();
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		UnInitializeQuestDBCallbacks();
+	}
+
+	protected event OnCustomAction( evt : CustomDeviceAction )
+	{
+		var locationOverrideRef : NodeRef;
+		var locationOverrideID : EntityID;
+		var locationOverride : GameObject;
+		var locationOverrideGlobalRef : GlobalNodeRef;
+		if( evt.IsSpiderbotAction() )
+		{
+			locationOverrideRef = evt.GetSpiderbotLocationOverrideReference();
+			locationOverrideGlobalRef = ResolveNodeRefWithEntityID( locationOverrideRef, GetEntityID() );
+			if( GlobalNodeRef.IsDefined( locationOverrideGlobalRef ) )
+			{
+				locationOverrideID = ( ( EntityID )( locationOverrideGlobalRef ) );
+				locationOverride = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), locationOverrideID ) ) );
+				SendSpiderbotOrderEvent( evt.GetExecutor(), locationOverride );
+			}
+			else
+			{
+				SendSpiderbotOrderEvent( evt.GetExecutor() );
+			}
+			SaveCurrentSpiderbotAction( evt );
+		}
+		else
+		{
+			ResolveCustomAction( evt.GetActionName() );
+		}
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestToggleCustomAction( evt : QuestToggleCustomAction )
+	{
+		UpdateDeviceState();
+	}
+
+	protected event OnToggleCustomActionEvent( evt : ToggleCustomActionEvent )
+	{
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestCustomAction( evt : QuestCustomAction )
+	{
+		var action : DeviceAction;
+		var actionName : CName;
+		var context : GetActionsContext;
+		context = GetDevicePS().GenerateContext( gamedeviceRequestType.Internal, GetDevicePS().GetTotalClearanceValue(), NULL, GetEntityID() );
+		if( IsNameValid( ( ( CName )evt.prop.first ) ) )
+		{
+			actionName = ( ( CName )evt.prop.first );
+			action = GetDevicePS().GetActionByName( actionName, context );
+			if( action != NULL )
+			{
+				ExecuteAction( action );
+			}
+		}
+	}
+
+	protected event OnActivateDevice( evt : ActivateDevice )
+	{
+		GetDevicePS().GetDeviceOperationsContainer().EvaluateActivatorTriggers( this );
+	}
+
+	private function InitializeQuestDBCallbacks()
+	{
+		if( GetDevicePS().GetDeviceOperationsContainer() != NULL )
+		{
+			GetDevicePS().InitializeQuestDBCallbacksForCustomActions();
+		}
+	}
+
+	private function UnInitializeQuestDBCallbacks()
+	{
+		if( GetDevicePS().GetDeviceOperationsContainer() != NULL )
+		{
+			GetDevicePS().UnInitializeQuestDBCallbacksForCustomActions();
+		}
+	}
+
+	public const override function GetDevicePS() : GenericDeviceControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	private const override function GetController() : GenericDeviceController
+	{
+		return ( ( GenericDeviceController )( m_controller ) );
+	}
+
+	protected event OnFactChanged( evt : FactChangedEvent )
+	{
+		var factName : CName;
+		super.OnFactChanged( evt );
+		factName = evt.GetFactName();
+		if( GetDevicePS().GetDeviceOperationsContainer() != NULL )
+		{
+			if( GetDevicePS().ResolveFactOnCustomAction( factName ) )
+			{
+				UpdateDeviceState();
+				if( IsReadyForUI() )
+				{
+					RefreshUI();
+				}
+				if( GetDevicePS().HasActiveContext( gamedeviceRequestType.Direct ) )
+				{
+					RefreshInteraction( gamedeviceRequestType.Direct, GetPlayer( GetGame() ) );
+				}
+			}
+		}
+	}
+
+	private function ResolveCustomAction( actionID : CName )
+	{
+		if( GetDevicePS().GetDeviceOperationsContainer() != NULL )
+		{
+			GetDevicePS().GetDeviceOperationsContainer().EvaluateCustomActionTriggers( actionID, this );
+		}
+	}
+
+	private function RestoreCustomActionOperations()
+	{
+		var customActionsIDs : array< CName >;
+		var i : Int32;
+		if( GetDevicePS().GetDeviceOperationsContainer() == NULL )
+		{
+			return;
+		}
+		customActionsIDs = GetDevicePS().GetPerformedCustomActionsStorage();
+		for( i = 0; i < customActionsIDs.Size(); i += 1 )
+		{
+			GetDevicePS().GetDeviceOperationsContainer().RestoreCustomActionOperations( customActionsIDs[ i ], this );
+		}
+	}
+
+	protected function SendSpiderbotOrderEvent( player : GameObject, optional locationOverride : GameObject )
+	{
+		var spiderbotOrderDeviceEvent : SpiderbotOrderDeviceEvent;
+		SendSetIsSpiderbotInteractionOrderedEvent( true );
+		spiderbotOrderDeviceEvent = new SpiderbotOrderDeviceEvent;
+		spiderbotOrderDeviceEvent.target = this;
+		if( locationOverride )
+		{
+			spiderbotOrderDeviceEvent.overrideMovementTarget = locationOverride;
+		}
+		player.QueueEvent( spiderbotOrderDeviceEvent );
+	}
+
+	protected function SaveCurrentSpiderbotAction( evt : CustomDeviceAction )
+	{
+		m_currentSpiderbotAction = evt;
+	}
+
+	protected event OnSpiderbotOrderCompletedEvent( evt : SpiderbotOrderCompletedEvent )
+	{
+		SendSetIsSpiderbotInteractionOrderedEvent( false );
+		GameInstance.GetActivityLogSystem( GetGame() ).AddLog( "SPIDERBOT HAS FINISHED USING GENERIC DEVICE " + GetDisplayName() );
+		ResolveCustomAction( m_currentSpiderbotAction.GetActionName() );
+		UpdateDeviceState();
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		var controller : GenericDeviceControllerPS;
+		controller = GetDevicePS();
+		if( controller && controller.GetDeviceOperationsContainer() )
+		{
+			if( controller.GetDeviceOperationsContainer().HasOperation( 'ApplyDamageDeviceOperation' ) )
+			{
+				return EGameplayRole.ExplodeLethal;
+			}
+		}
+		if( HasAnyDistractions() )
+		{
+			return EGameplayRole.Distract;
+		}
+		else
+		{
+			return super.DeterminGameplayRole();
+		}
+	}
+
+	protected override function EnableOffMeshConnections( player : Bool, npc : Bool )
+	{
+		if( m_offMeshConnectionComponent != NULL )
+		{
+			if( player )
+			{
+				m_offMeshConnectionComponent.EnableForPlayer();
+			}
+			if( npc )
+			{
+				m_offMeshConnectionComponent.EnableOffMeshConnection();
+			}
+		}
+	}
+
+	protected override function DisableOffMeshConnections( player : Bool, npc : Bool )
+	{
+		if( m_offMeshConnectionComponent != NULL )
+		{
+			if( player )
+			{
+				m_offMeshConnectionComponent.DisableForPlayer();
+			}
+			if( npc )
+			{
+				m_offMeshConnectionComponent.DisableOffMeshConnection();
+			}
+		}
+	}
+
+}
+

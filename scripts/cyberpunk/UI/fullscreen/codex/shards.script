@@ -1,0 +1,336 @@
+class ShardForceSelectionEvent extends Event
+{
+	var m_selectionIndex : Int32;
+	var m_hash : Int32;
+}
+
+class ShardsMenuGameController extends gameuiMenuGameController
+{
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_entryViewRef : inkCompoundRef;
+	private editable var m_virtualList : inkWidgetRef;
+	private editable var m_emptyPlaceholderRef : inkWidgetRef;
+	private editable var m_leftBlockControllerRef : inkWidgetRef;
+	private editable var m_crackHint : inkWidgetRef;
+	private var m_journalManager : weak< JournalManager >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_entryViewController : weak< CodexEntryViewController >;
+	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_listController : weak< ShardsVirtualNestedListController >;
+	private var m_InventoryManager : InventoryDataManagerV2;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_activeData : CodexListSyncData;
+	private var m_hasNewCryptedEntries : Bool;
+	private var m_isEncryptedEntrySelected : Bool;
+	private var m_selectedData : ShardEntryData;
+	private var m_mingameBB : weak< IBlackboard >;
+	private var m_userDataEntry : Int32;
+	private var m_doubleInputPreventionFlag : Bool;
+	private var m_animationProxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		var hintsWidget : inkWidget;
+		hintsWidget = SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' );
+		m_buttonHintsController = ( ( ButtonHints )( hintsWidget.GetController() ) );
+		RefreshButtonHints();
+		m_entryViewController = ( ( CodexEntryViewController )( inkCompoundRef.GetController( m_entryViewRef ) ) );
+		m_listController = ( ( ShardsVirtualNestedListController )( inkWidgetRef.GetController( m_virtualList ) ) );
+		m_activeData = new CodexListSyncData;
+		inkCompoundRef.SetVisible( m_entryViewRef, false );
+		PlayLibraryAnimation( 'shards_intro' );
+	}
+
+	private function RefreshButtonHints()
+	{
+		m_buttonHintsController.ClearButtonHints();
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		if( m_isEncryptedEntrySelected )
+		{
+			PlaySound( 'MapPin', 'OnDisable' );
+			inkWidgetRef.SetVisible( m_crackHint, true );
+			PlayAnim( 'hint_show' );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_crackHint, false );
+			PlayAnim( 'hint_hide' );
+		}
+	}
+
+	public function PlayAnim( animName : CName )
+	{
+		if( m_animationProxy && m_animationProxy.IsPlaying() )
+		{
+			m_animationProxy.Stop();
+		}
+		m_animationProxy = PlayLibraryAnimation( animName );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_journalManager = GameInstance.GetJournalManager( playerPuppet.GetGame() );
+		m_journalManager.RegisterScriptCallback( this, 'OnEntryVisitedUpdate', gameJournalListenerType.Visited );
+		m_InventoryManager = new InventoryDataManagerV2;
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		m_InventoryManager.Initialize( m_player );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+		PopulateData();
+		SelectEntry();
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		m_journalManager.UnregisterScriptCallback( this, 'OnJournalUpdate' );
+	}
+
+	protected event OnButtonRelease( e : inkPointerEvent )
+	{
+		if( !( e.IsHandled() ) )
+		{
+			if( ( e.IsAction( 'world_map_menu_open_quest' ) && m_isEncryptedEntrySelected ) && !( m_doubleInputPreventionFlag ) )
+			{
+				PlaySound( 'Button', 'OnPress' );
+				m_mingameBB = GameInstance.GetBlackboardSystem( m_player.GetGame() ).Get( GetAllBlackboardDefs().HackingMinigame );
+				m_mingameBB.SetBool( GetAllBlackboardDefs().HackingMinigame.IsJournalTarget, false );
+				ItemActionsHelper.PerformItemAction( m_player, m_selectedData.m_itemID );
+				m_doubleInputPreventionFlag = true;
+			}
+			e.Handle();
+		}
+	}
+
+	protected event OnSetUserData( userData : IScriptable )
+	{
+		m_userDataEntry = ( ( ShardForceSelectionEvent )( userData ) ).m_hash;
+		SelectEntry();
+	}
+
+	private function SelectEntry()
+	{
+		var itemIndex : Int32;
+		if( ( m_userDataEntry != 0 ) && ( m_listController.GetDataSize() != 0 ) )
+		{
+			itemIndex = FindItem( m_userDataEntry );
+			if( itemIndex >= 0 )
+			{
+				ForceSelectIndex( ( ( Uint32 )( itemIndex ) ) );
+			}
+		}
+	}
+
+	public virtual function FindItem( hash : Int32 ) : Int32
+	{
+		var entryData : ShardEntryData;
+		var i : Int32;
+		for( i = 0; i < m_listController.GetDataSize(); i += 1 )
+		{
+			entryData = ( ( ShardEntryData )( m_listController.GetItem( ( ( Uint32 )( i ) ) ) ) );
+			if( entryData.m_hash == hash )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	protected event OnUninitialize()
+	{
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		m_menuEventDispatcher = menuEventDispatcher;
+		m_menuEventDispatcher.RegisterToEvent( 'OnBack', this, 'OnBack' );
+		m_menuEventDispatcher.RegisterToEvent( 'OnAccept', this, 'OnAccept' );
+	}
+
+	protected event OnBack( userData : IScriptable )
+	{
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) )
+		{
+			m_menuEventDispatcher.SpawnEvent( 'OnCloseHubMenu' );
+		}
+	}
+
+	protected event OnEntryVisitedUpdate( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		var selectedEvent : ShardEntrySelectedEvent;
+		if( className == 'gameJournalOnscreen' )
+		{
+			ForceSelectIndex( m_listController.GetSelectedIndex() );
+			selectedEvent = new ShardEntrySelectedEvent;
+			selectedEvent.m_hash = entryHash;
+			QueueEvent( selectedEvent );
+		}
+	}
+
+	protected event OnContactActivated( evt : ShardSelectedEvent )
+	{
+		var syncEvent : ShardSyncBackEvent;
+		var selectedEntry : weak< JournalEntry >;
+		if( evt.m_group )
+		{
+			m_listController.ToggleLevel( evt.m_level );
+		}
+		else
+		{
+			PlaySound( 'Button', 'OnPress' );
+			inkCompoundRef.SetVisible( m_entryViewRef, true );
+			m_entryViewController.ShowEntry( evt.m_data );
+			m_isEncryptedEntrySelected = evt.m_data.m_isCrypted;
+			m_selectedData = evt.m_data;
+			RefreshButtonHints();
+		}
+		m_activeData.m_entryHash = evt.m_entryHash;
+		m_activeData.m_level = evt.m_level;
+		selectedEntry = m_journalManager.GetEntry( ( ( Uint32 )( m_activeData.m_entryHash ) ) );
+		if( !( m_journalManager.IsEntryVisited( selectedEntry ) ) )
+		{
+			m_journalManager.SetEntryVisited( selectedEntry, true );
+		}
+		syncEvent = new ShardSyncBackEvent;
+		QueueEvent( syncEvent );
+	}
+
+	protected event OnShardForceSelectionEvent( evt : ShardForceSelectionEvent )
+	{
+		if( evt.m_selectionIndex != -1 )
+		{
+			m_listController.SelectItem( ( ( Uint32 )( evt.m_selectionIndex ) ) );
+			m_listController.ToggleItem( ( ( Uint32 )( evt.m_selectionIndex ) ) );
+		}
+	}
+
+	private function ForceSelectIndex( idx : Uint32 )
+	{
+		var initEvent : ShardForceSelectionEvent;
+		initEvent = new ShardForceSelectionEvent;
+		initEvent.m_selectionIndex = ( ( Int32 )( idx ) );
+		QueueEvent( initEvent );
+	}
+
+	private function PopulateData()
+	{
+		var data : array< VirutalNestedListData >;
+		var items : array< InventoryItemData >;
+		var tagsFilter : array< CName >;
+		var groupData : ShardEntryData;
+		var groupVirtualListData : VirutalNestedListData;
+		var i : Int32;
+		var counter : Int32;
+		var level : Int32;
+		var newEntries : array< Int32 >;
+		data = CodexUtils.GetShardsDataArray( m_journalManager, m_activeData );
+		tagsFilter.PushBack( 'HideInBackpackUI' );
+		items = m_InventoryManager.GetPlayerItemsByType( gamedataItemType.Gen_Misc, , tagsFilter );
+		counter = 0;
+		level = data.Size();
+		m_hasNewCryptedEntries = false;
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			if( ProcessItem( items[ i ], data, level, newEntries ) )
+			{
+				counter += 1;
+			}
+		}
+		if( counter >= 1 )
+		{
+			groupData = new ShardEntryData;
+			groupData.m_title = GetLocalizedText( "Story-base-gameplay-static_data-database-scanning-scanning-quest_clue_template_04_localizedDescription" );
+			groupData.m_activeDataSync = m_activeData;
+			groupData.m_counter = counter;
+			groupData.m_isNew = m_hasNewCryptedEntries;
+			groupData.m_newEntries = newEntries;
+			groupVirtualListData = new VirutalNestedListData;
+			groupVirtualListData.m_level = level;
+			groupVirtualListData.m_widgetType = 1;
+			groupVirtualListData.m_isHeader = true;
+			groupVirtualListData.m_data = groupData;
+			data.PushBack( groupVirtualListData );
+		}
+		if( data.Size() <= 0 )
+		{
+			ShowNodataWarning();
+		}
+		else
+		{
+			HideNodataWarning();
+			m_listController.SetData( data, true, true );
+		}
+		RefreshButtonHints();
+	}
+
+	private function ProcessItem( item : InventoryItemData, out data : array< VirutalNestedListData >, level : Int32, optional newEntries : ref< array< Int32 > > ) : Bool
+	{
+		var effect : weak< TriggerHackingMinigameEffector_Record >;
+		var entryString : String;
+		var journalEntry : weak< JournalOnscreen >;
+		if( ItemActionsHelper.GetCrackAction( InventoryItemData.GetID( item ) ) == NULL )
+		{
+			return false;
+		}
+		effect = ( ( TriggerHackingMinigameEffector_Record )( ( ( CrackAction_Record )( ItemActionsHelper.GetCrackAction( InventoryItemData.GetID( item ) ) ) ).Effector() ) );
+		if( effect == NULL )
+		{
+			return false;
+		}
+		entryString = effect.JournalEntry();
+		if( !( IsStringValid( entryString ) ) )
+		{
+			return false;
+		}
+		journalEntry = ( ( JournalOnscreen )( m_journalManager.GetEntryByString( entryString, "gameJournalOnscreen" ) ) );
+		if( m_journalManager.GetEntryState( journalEntry ) != gameJournalEntryState.Inactive )
+		{
+			return false;
+		}
+		data.PushBack( GetVirtualDataForCrypted( item, journalEntry, level, newEntries ) );
+		return true;
+	}
+
+	private function GetVirtualDataForCrypted( item : InventoryItemData, curShard : weak< JournalOnscreen >, level : Int32, optional newEntries : ref< array< Int32 > > ) : VirutalNestedListData
+	{
+		var shardData : ShardEntryData;
+		var shardVirtualListData : VirutalNestedListData;
+		shardData = new ShardEntryData;
+		shardData.m_title = CodexUtils.GetShardTitleString( true, curShard.GetTitle() );
+		shardData.m_description = CodexUtils.GetShardTextString( true, curShard.GetDescription() );
+		shardData.m_imageId = curShard.GetIconID();
+		shardData.m_hash = m_journalManager.GetEntryHash( ( ( JournalEntry )( curShard ) ) );
+		shardData.m_timeStamp = m_journalManager.GetEntryTimestamp( ( ( JournalEntry )( curShard ) ) );
+		shardData.m_activeDataSync = m_activeData;
+		shardData.m_isNew = !( m_journalManager.IsEntryVisited( ( ( JournalEntry )( curShard ) ) ) );
+		shardData.m_isCrypted = true;
+		shardData.m_itemID = InventoryItemData.GetID( item );
+		if( shardData.m_isNew )
+		{
+			m_hasNewCryptedEntries = true;
+			shardData.m_newEntries.PushBack( shardData.m_hash );
+			newEntries.PushBack( shardData.m_hash );
+		}
+		shardVirtualListData = new VirutalNestedListData;
+		shardVirtualListData.m_level = level;
+		shardVirtualListData.m_widgetType = 0;
+		shardVirtualListData.m_isHeader = false;
+		shardVirtualListData.m_data = shardData;
+		return shardVirtualListData;
+	}
+
+	private function ShowNodataWarning()
+	{
+		inkWidgetRef.SetVisible( m_emptyPlaceholderRef, true );
+		inkCompoundRef.SetVisible( m_entryViewRef, false );
+		inkWidgetRef.SetVisible( m_leftBlockControllerRef, false );
+	}
+
+	private function HideNodataWarning()
+	{
+		inkWidgetRef.SetVisible( m_emptyPlaceholderRef, false );
+		inkCompoundRef.SetVisible( m_entryViewRef, true );
+		inkWidgetRef.SetVisible( m_leftBlockControllerRef, true );
+	}
+
+}
+

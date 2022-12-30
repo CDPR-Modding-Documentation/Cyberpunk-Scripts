@@ -1,0 +1,442 @@
+class ActionCooldownEvent extends Event
+{
+	var storageID : CooldownStorageID;
+}
+
+struct CooldownStorageID
+{
+	var ID : Uint32;
+	var isValid : EBOOL;
+}
+
+class CooldownRequest
+{
+	private var m_action : BaseScriptableAction;
+	private var m_contactBook : array< PSOwnerData >;
+	private var m_requestTriggerType : RequestType;
+
+	public function SetUp( action : BaseScriptableAction, shouldTriggerCooldownImmediately : Bool )
+	{
+		var data : PSOwnerData;
+		m_action = action;
+		data.id = m_action.GetPersistentID();
+		data.className = m_action.GetDeviceClassName();
+		SetUpTriggerType( shouldTriggerCooldownImmediately );
+		if( PersistentID.IsDefined( data.id ) && IsNameValid( data.className ) )
+		{
+			m_contactBook.PushBack( data );
+		}
+	}
+
+	public function SetUp( action : BaseScriptableAction, go : weak< GameObject >, shouldTriggerCooldownImmediately : Bool )
+	{
+		m_action = action;
+		SetUpTriggerType( shouldTriggerCooldownImmediately );
+		if( go )
+		{
+			m_contactBook.PushBack( go.GetPSOwnerData() );
+		}
+	}
+
+	public function SetUp( action : BaseScriptableAction, ps : weak< PersistentState >, shouldTriggerCooldownImmediately : Bool )
+	{
+		var ownerData : PSOwnerData;
+		m_action = action;
+		SetUpTriggerType( shouldTriggerCooldownImmediately );
+		if( ps )
+		{
+			ownerData.id = ps.GetID();
+			ownerData.className = ps.GetClassName();
+			m_contactBook.PushBack( ownerData );
+		}
+	}
+
+	public function SetUpAdvanced( action : BaseScriptableAction, addressees : array< PSOwnerData >, shouldTriggerCooldownImmediately : Bool )
+	{
+		m_action = action;
+		m_contactBook = addressees;
+		SetUpTriggerType( shouldTriggerCooldownImmediately );
+	}
+
+	public function GetAction() : BaseScriptableAction
+	{
+		return m_action;
+	}
+
+	public function GetContactBook() : array< PSOwnerData >
+	{
+		return m_contactBook;
+	}
+
+	public const function GetTriggerRequestType() : RequestType
+	{
+		return m_requestTriggerType;
+	}
+
+	private function SetUpTriggerType( shouldTriggerImmediately : Bool )
+	{
+		if( shouldTriggerImmediately )
+		{
+			m_requestTriggerType = RequestType.INSTANTLY_TRIGGER;
+		}
+		else
+		{
+			m_requestTriggerType = RequestType.MANUALLY_TRIGGERED;
+		}
+	}
+
+}
+
+class CooldownPackage
+{
+	private var m_actionID : TweakDBID;
+	private var m_addressees : array< PSOwnerData >;
+	private var m_initialCooldown : Float;
+	private var m_label : CooldownStorageID;
+	private var m_packageStatus : PackageStatus;
+
+	public function InitializePackage( request : CooldownRequest, label : CooldownStorageID )
+	{
+		m_initialCooldown = request.GetAction().GetCooldownDuration();
+		m_actionID = request.GetAction().GetObjectActionRecord().GetID();
+		m_addressees = request.GetContactBook();
+		SetUpInitialPackageStatus( request.GetTriggerRequestType() );
+		m_label = label;
+	}
+
+	public const function GetActionID() : TweakDBID
+	{
+		return m_actionID;
+	}
+
+	public const function GetInitialCooldown() : Float
+	{
+		return m_initialCooldown;
+	}
+
+	public const function GetAddressees() : array< PSOwnerData >
+	{
+		return m_addressees;
+	}
+
+	public const function GetLabel() : CooldownStorageID
+	{
+		return m_label;
+	}
+
+	public const function GetPackageStatus() : PackageStatus
+	{
+		return m_packageStatus;
+	}
+
+	public function UpdatePackageStatus( newStatus : PackageStatus )
+	{
+		m_packageStatus = newStatus;
+	}
+
+	private function SetUpInitialPackageStatus( requestType : RequestType )
+	{
+		if( requestType == RequestType.INSTANTLY_TRIGGER )
+		{
+			m_packageStatus = PackageStatus.FOR_IMMEDIATE_TRIGGER;
+		}
+		if( requestType == RequestType.MANUALLY_TRIGGERED )
+		{
+			m_packageStatus = PackageStatus.ON_HOLD;
+		}
+	}
+
+}
+
+struct CooldownPackageDelayIDs
+{
+	var packageID : CooldownStorageID;
+	var delayIDs : array< DelayID >;
+}
+
+class CooldownStorage extends IScriptable
+{
+	private var m_owner : PSOwnerData;
+	private var m_initialized : EBOOL;
+	private var m_gameInstanceHack : GameInstance;
+	private var m_packages : array< CooldownPackage >;
+	private var m_currentID : Uint32;
+	private var m_map : array< CooldownPackageDelayIDs >;
+
+	public function Initialize( id : PersistentID, className : CName, gameInstanceHack : GameInstance )
+	{
+		m_owner.id = id;
+		m_owner.className = className;
+		m_gameInstanceHack = gameInstanceHack;
+		m_initialized = EBOOL.TRUE;
+	}
+
+	public function StartSimpleCooldown( action : BaseScriptableAction ) : CooldownStorageID
+	{
+		var cdRequest : CooldownRequest;
+		cdRequest = new CooldownRequest;
+		cdRequest.SetUp( action, true );
+		return StartCooldownRequest( cdRequest );
+	}
+
+	public function StartCooldownRequest( request : CooldownRequest ) : CooldownStorageID
+	{
+		var invalidID : CooldownStorageID;
+		if( IsActionReady( request.GetAction().GetObjectActionRecord().GetID() ) )
+		{
+			return ProcessNewPackage( request );
+		}
+		invalidID.ID = 0;
+		invalidID.isValid = EBOOL.FALSE;
+		Log( "Request not valid. This action is already on cooldown" );
+		return invalidID;
+	}
+
+	public function IsInitialized() : EBOOL
+	{
+		return m_initialized;
+	}
+
+	public function IsActionReady( action : TweakDBID ) : Bool
+	{
+		var index : Int32;
+		index = FindPackageIndexByAction( action );
+		return IsActionReady( index );
+	}
+
+	public function IsActionReady( id : CooldownStorageID ) : Bool
+	{
+		var index : Int32;
+		index = FindPackageIndexByID( id );
+		return IsActionReady( index );
+	}
+
+	private function IsActionReady( index : Int32 ) : Bool
+	{
+		if( index == -1 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public function CancelCooldown( id : CooldownStorageID ) : Bool
+	{
+		CancelDelayEvents( GetPackage( id ) );
+		return RemoveCooldown( id );
+	}
+
+	public function CancelCooldown( action : TweakDBID ) : Bool
+	{
+		return RemoveCooldown( action );
+	}
+
+	public function ResolveCooldownEvent( evt : ActionCooldownEvent )
+	{
+		var label : CooldownStorageID;
+		label = evt.storageID;
+		if( GetPackage( label ).GetInitialCooldown() >= 0.0 )
+		{
+			RemoveCooldown( label );
+		}
+	}
+
+	private function RemoveCooldown( label : CooldownStorageID ) : Bool
+	{
+		var index : Int32;
+		index = FindPackageIndexByID( label );
+		return RemoveCooldown( index );
+	}
+
+	private function RemoveCooldown( action : TweakDBID ) : Bool
+	{
+		var index : Int32;
+		index = FindPackageIndexByAction( action );
+		return RemoveCooldown( index );
+	}
+
+	private function RemoveCooldown( index : Int32 ) : Bool
+	{
+		if( ( index >= 0 ) && ( index < m_packages.Size() ) )
+		{
+			RemoveMapEntry( FindMapEntry( m_packages[ index ] ) );
+			m_packages.Erase( index );
+			return true;
+		}
+		return false;
+	}
+
+	public function GetPackage( label : CooldownStorageID ) : CooldownPackage
+	{
+		var foundPackage : CooldownPackage;
+		foundPackage = m_packages[ FindPackageIndexByID( label ) ];
+		return foundPackage;
+	}
+
+	public function ManuallyTriggerCooldown( actionID : TweakDBID ) : Bool
+	{
+		var foundPackage : CooldownPackage;
+		foundPackage = m_packages[ FindPackageIndexByAction( actionID ) ];
+		if( foundPackage.GetPackageStatus() == PackageStatus.ON_HOLD )
+		{
+			TriggerPackageListeners( foundPackage );
+			return true;
+		}
+		LogWarning( "Cooldown Storage \\ Cooldown not found or cooldown was not viable for manual trigger" );
+		return false;
+	}
+
+	private function GetPackage( action : TweakDBID ) : CooldownPackage
+	{
+		var foundPackage : CooldownPackage;
+		foundPackage = m_packages[ FindPackageIndexByAction( action ) ];
+		return foundPackage;
+	}
+
+	private function FindPackageIndexByID( label : CooldownStorageID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_packages.Size(); i += 1 )
+		{
+			if( m_packages[ i ].GetLabel() == label )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private function FindPackageIndexByAction( actionID : TweakDBID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_packages.Size(); i += 1 )
+		{
+			if( m_packages[ i ].GetActionID() == actionID )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private function ProcessNewPackage( request : CooldownRequest ) : CooldownStorageID
+	{
+		var package : CooldownPackage;
+		package = new CooldownPackage;
+		package.InitializePackage( request, AttachUniqueLabel() );
+		if( package.GetPackageStatus() == PackageStatus.FOR_IMMEDIATE_TRIGGER )
+		{
+			TriggerPackageListeners( package );
+		}
+		m_packages.PushBack( package );
+		return package.GetLabel();
+	}
+
+	private function TriggerPackageListeners( package : CooldownPackage )
+	{
+		var addressees : array< PSOwnerData >;
+		var cooldownEvent : ActionCooldownEvent;
+		var delayIDs : array< DelayID >;
+		var i : Int32;
+		cooldownEvent = new ActionCooldownEvent;
+		cooldownEvent.storageID = package.GetLabel();
+		addressees = package.GetAddressees();
+		addressees.PushBack( m_owner );
+		for( i = 0; i < addressees.Size(); i += 1 )
+		{
+			delayIDs.PushBack( GameInstance.GetDelaySystem( m_gameInstanceHack ).DelayPSEvent( addressees[ i ].id, addressees[ i ].className, cooldownEvent, package.GetInitialCooldown() ) );
+		}
+		package.UpdatePackageStatus( PackageStatus.TRIGGERED );
+		UpdateMap( package.GetLabel(), delayIDs );
+	}
+
+	private function UpdateMap( label : CooldownStorageID, ids : array< DelayID > )
+	{
+		var mapEntry : CooldownPackageDelayIDs;
+		mapEntry.packageID = label;
+		mapEntry.delayIDs = ids;
+		m_map.PushBack( mapEntry );
+	}
+
+	private function AttachUniqueLabel() : CooldownStorageID
+	{
+		var label : CooldownStorageID;
+		m_currentID += ( ( Uint32 )( 1 ) );
+		if( m_currentID == ( ( Uint32 )( 0 ) ) )
+		{
+			m_currentID += ( ( Uint32 )( 1 ) );
+		}
+		label = GenerateLabel( m_currentID );
+		return label;
+	}
+
+	private function GenerateLabel( id : Uint32 ) : CooldownStorageID
+	{
+		var label : CooldownStorageID;
+		label.ID = id;
+		label.isValid = EBOOL.TRUE;
+		return label;
+	}
+
+	private function CancelDelayEvents( package : CooldownPackage )
+	{
+		var ids : array< DelayID >;
+		var i : Int32;
+		for( i = 0; i < m_map.Size(); i += 1 )
+		{
+			if( m_map[ i ].packageID == package.GetLabel() )
+			{
+				ids = m_map[ i ].delayIDs;
+				break;
+			}
+		}
+		for( i = 0; i < ids.Size(); i += 1 )
+		{
+			GameInstance.GetDelaySystem( m_gameInstanceHack ).CancelDelay( ids[ i ] );
+		}
+	}
+
+	private function RemoveMapEntry( index : Int32 ) : Bool
+	{
+		if( ( index >= 0 ) && ( index < m_map.Size() ) )
+		{
+			m_map.Erase( index );
+			return true;
+		}
+		return false;
+	}
+
+	private function FindMapEntry( id : CooldownStorageID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_map.Size(); i += 1 )
+		{
+			if( m_map[ i ].packageID == id )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private function FindMapEntry( package : CooldownPackage ) : Int32
+	{
+		return FindMapEntry( package.GetLabel() );
+	}
+
+}
+
+enum PackageStatus
+{
+	UNINITIALIZED = 0,
+	ON_HOLD = 1,
+	FOR_IMMEDIATE_TRIGGER = 2,
+	TRIGGERED = 3,
+}
+
+enum RequestType
+{
+	INSTANTLY_TRIGGER = 0,
+	MANUALLY_TRIGGERED = 1,
+}
+

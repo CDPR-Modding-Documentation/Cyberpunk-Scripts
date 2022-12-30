@@ -1,0 +1,399 @@
+import class BaseGOGProfileController extends inkGameController
+{
+	protected import function RequestStop();
+	protected import function OpenProfileUrl( url : String );
+	protected import function CanSignOut() : Bool;
+}
+
+importonly class RefreshGOGState extends Event
+{
+	import var status : GOGRewardsSystemStatus;
+	import var error : GOGRewardsSystemErrors;
+	import var registerURL : String;
+	import var qrCodePNGBlob : array< Uint8 >;
+}
+
+class GOGProfileLogicController extends inkLogicController
+{
+	var m_gogMenuState : EGOGMenuState;
+
+	public function SetMenuState( menuState : EGOGMenuState )
+	{
+		m_gogMenuState = menuState;
+	}
+
+}
+
+class GOGProfileGameController extends BaseGOGProfileController
+{
+	editable var m_retryButton : inkWidgetRef;
+	editable var m_parentContainerWidget : inkWidgetRef;
+	private var isFirstLogin : Bool;
+	private var showingFirstLogin : Bool;
+	private var canRetry : Bool;
+
+	protected event OnInitialize()
+	{
+		isFirstLogin = false;
+		showingFirstLogin = false;
+		canRetry = false;
+		inkWidgetRef.RegisterToCallback( m_retryButton, 'OnRelease', this, 'OnRetry' );
+		GetRootWidget().RegisterToCallback( 'OnRelease', this, 'OnButtonRelease' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+		ShowRetryButton( false );
+	}
+
+	protected event OnUninitialize()
+	{
+		inkWidgetRef.UnregisterFromCallback( m_retryButton, 'OnRelease', this, 'OnRetry' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+		GetRootWidget().UnregisterFromCallback( 'OnRelease', this, 'OnButtonRelease' );
+	}
+
+	protected event OnRetry( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			e.Handle();
+			HandleRetry();
+		}
+	}
+
+	protected event OnButtonRelease( evt : inkPointerEvent )
+	{
+		if( evt.IsHandled() )
+		{
+			return false;
+		}
+		if( evt.IsAction( 'next_menu' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			HandleClose( evt );
+		}
+		else if( canRetry && evt.IsAction( 'activate' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			evt.Handle();
+			HandleRetry();
+		}
+	}
+
+	private function HandleClose( evt : inkPointerEvent )
+	{
+		if( showingFirstLogin && isFirstLogin )
+		{
+			evt.Handle();
+			HidePreviousWidget();
+			ShowRewards();
+			showingFirstLogin = false;
+			isFirstLogin = false;
+		}
+	}
+
+	private function HandleRetry()
+	{
+		canRetry = false;
+		GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ).RequestInitialStatus();
+	}
+
+	private function HidePreviousWidget()
+	{
+		var compoundParent : weak< inkCompoundWidget >;
+		compoundParent = ( ( inkCompoundWidget )( inkWidgetRef.Get( m_parentContainerWidget ) ) );
+		compoundParent.RemoveAllChildren();
+		ShowRetryButton( false );
+	}
+
+	protected event OnRefreshGOGState( evt : RefreshGOGState )
+	{
+		HidePreviousWidget();
+		if( evt.error != GOGRewardsSystemErrors.None )
+		{
+			ShowError( evt.error );
+		}
+		else if( evt.status == GOGRewardsSystemStatus.Registered )
+		{
+			if( GetMenuState() == EGOGMenuState.LoadGame )
+			{
+				ShowFeatureInfo();
+			}
+			else
+			{
+				if( isFirstLogin )
+				{
+					ShowThanks();
+					showingFirstLogin = true;
+				}
+				ShowRewards();
+			}
+		}
+		else if( evt.status == GOGRewardsSystemStatus.RegistrationPending )
+		{
+			ShowRegister( evt.registerURL, evt.qrCodePNGBlob );
+		}
+		else
+		{
+			ShowLoading();
+		}
+	}
+
+	protected event OnLinkClicked( evt : LinkClickedEvent ) {}
+
+	protected event OnDisconnectClickedEvent( evt : DisconnectClickedEvent )
+	{
+		var onlineSystem : weak< IOnlineSystem >;
+		onlineSystem = GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() );
+		if( onlineSystem )
+		{
+			onlineSystem.SignOut();
+			RequestStop();
+		}
+	}
+
+	private function IsErrorRetryable( error : GOGRewardsSystemErrors ) : Bool
+	{
+		switch( error )
+		{
+			case GOGRewardsSystemErrors.RequestFailed:
+				return false;
+			case GOGRewardsSystemErrors.TemporaryFailure:
+			case GOGRewardsSystemErrors.NoInternetConnection:
+				return true;
+		}
+		return false;
+	}
+
+	private function ShowError( error : GOGRewardsSystemErrors )
+	{
+		var controller : GogErrorNotificationController;
+		controller = ( ( GogErrorNotificationController )( SpawnFromLocal( inkWidgetRef.Get( m_parentContainerWidget ), 'ErrorNotification' ).GetController() ) );
+		controller.ShowErrorMessage( error );
+		canRetry = IsErrorRetryable( error );
+		ShowRetryButton( canRetry );
+	}
+
+	private function ShowThanks()
+	{
+		SpawnFromLocal( inkWidgetRef.Get( m_parentContainerWidget ), 'ThanksWidget' );
+	}
+
+	private function ShowFeatureInfo()
+	{
+		var infoWidget : weak< inkWidget >;
+		var infoController : weak< CrossplayInfoPanelController >;
+		infoWidget = SpawnFromLocal( inkWidgetRef.Get( m_parentContainerWidget ), 'FeatureInfoWidget' );
+		infoController = ( ( CrossplayInfoPanelController )( infoWidget.GetController() ) );
+		infoController.EnableSignOut( CanSignOut() );
+	}
+
+	private function ShowLoading()
+	{
+		SpawnFromLocal( inkWidgetRef.Get( m_parentContainerWidget ), 'LoadingWidget' );
+	}
+
+	private function ShowRewards()
+	{
+		var rewardsController : weak< GogRewardsController >;
+		var rewardsWidget : weak< inkWidget >;
+		var rewards : array< GOGRewardPack >;
+		rewardsWidget = SpawnFromLocal( inkWidgetRef.Get( m_parentContainerWidget ), 'GOGRewardsWidget' );
+		rewardsController = ( ( GogRewardsController )( rewardsWidget.GetController() ) );
+		if( rewardsController )
+		{
+			rewards = GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ).GetUnlockedRewardPacks();
+			rewardsController.UpdateRewardsList( rewards );
+		}
+	}
+
+	private function ShowRegister( registerUrl : String, qrCodePNGBlob : array< Uint8 > )
+	{
+		var registerController : weak< GogRegisterController >;
+		var registerWidget : weak< inkWidget >;
+		registerWidget = SpawnFromLocal( inkWidgetRef.Get( m_parentContainerWidget ), 'RegisterWidget' );
+		registerController = ( ( GogRegisterController )( registerWidget.GetController() ) );
+		registerController.DisplayDiscription( GetMenuState() == EGOGMenuState.MainMenu );
+		if( registerController )
+		{
+			registerController.UpdateRegistrationData( registerUrl, qrCodePNGBlob );
+			registerController.RegisterToCallback( 'OnLinkClickedEvent', this, 'OnLinkClicked' );
+		}
+		isFirstLogin = true;
+	}
+
+	private function ShowRetryButton( show : Bool )
+	{
+		var widget : inkWidget;
+		widget = ( ( inkWidget )( inkWidgetRef.Get( m_retryButton ) ) );
+		widget.SetVisible( show );
+	}
+
+	private function GetMenuState() : EGOGMenuState
+	{
+		var controller : GOGProfileLogicController;
+		controller = ( ( GOGProfileLogicController )( GetRootWidget().GetController() ) );
+		if( controller != NULL )
+		{
+			return controller.m_gogMenuState;
+		}
+		return EGOGMenuState.None;
+	}
+
+}
+
+importonly class BaseGOGRegisterController extends inkLogicController
+{
+	protected import function SetupQRCodeWidget( widget : inkImage, qrCodePNGBlob : array< Uint8 > );
+}
+
+class GogRegisterController extends BaseGOGRegisterController
+{
+	editable var m_linkWidget : inkWidgetRef;
+	editable var m_qrImageWidget : inkWidgetRef;
+	editable var m_textDescription : inkTextRef;
+
+	protected event OnInitialize()
+	{
+		inkWidgetRef.RegisterToCallback( m_linkWidget, 'OnRelease', this, 'OnLinkClicked' );
+	}
+
+	protected event OnUninitialize()
+	{
+		inkWidgetRef.UnregisterFromCallback( m_linkWidget, 'OnRelease', this, 'OnLinkClicked' );
+	}
+
+	protected event OnLinkClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			QueueEvent( new LinkClickedEvent );
+		}
+	}
+
+	public function DisplayDiscription( isInMainMenu : Bool )
+	{
+		inkTextRef.SetText( m_textDescription, ( ( isInMainMenu ) ? ( "UI-Menus-GOGProfile-ConnectMessage" ) : ( "UI-CrossProgression-Explanation" ) ) );
+	}
+
+	public function UpdateRegistrationData( registerUrl : String, qrCodePNGBlob : array< Uint8 > )
+	{
+		var linkWidget : inkText;
+		var qrImageWidget : inkImage;
+		linkWidget = ( ( inkText )( inkWidgetRef.Get( m_linkWidget ) ) );
+		if( linkWidget )
+		{
+			linkWidget.SetText( registerUrl );
+		}
+		qrImageWidget = ( ( inkImage )( inkWidgetRef.Get( m_qrImageWidget ) ) );
+		if( qrImageWidget )
+		{
+			SetupQRCodeWidget( qrImageWidget, qrCodePNGBlob );
+		}
+	}
+
+}
+
+class GogRewardsController extends inkLogicController
+{
+	editable var m_containerWidget : inkWidgetRef;
+
+	public function UpdateRewardsList( rewards : array< GOGRewardPack > )
+	{
+		var compoundParent : weak< inkCompoundWidget >;
+		var entryController : weak< GogRewardEntryController >;
+		var i : Int32;
+		var count : Int32;
+		compoundParent = ( ( inkCompoundWidget )( inkWidgetRef.Get( m_containerWidget ) ) );
+		compoundParent.RemoveAllChildren();
+		count = rewards.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			entryController = ( ( GogRewardEntryController )( SpawnFromLocal( compoundParent, 'RewardEntry' ).GetController() ) );
+			entryController.UpdateRewardDetails( rewards[ i ].title, rewards[ i ].reason, rewards[ i ].iconSlot );
+		}
+	}
+
+}
+
+class GogRewardEntryController extends inkLogicController
+{
+	editable var m_nameWidget : inkWidgetRef;
+	editable var m_descriptionWidget : inkWidgetRef;
+	editable var m_iconImage : inkImageRef;
+
+	public function UpdateRewardDetails( rewardTitle : String, rewardDescription : String, iconSlot : CName )
+	{
+		var nameWidget : inkText;
+		var descriptionWidget : inkText;
+		nameWidget = ( ( inkText )( inkWidgetRef.Get( m_nameWidget ) ) );
+		if( nameWidget )
+		{
+			nameWidget.SetText( rewardTitle );
+		}
+		descriptionWidget = ( ( inkText )( inkWidgetRef.Get( m_descriptionWidget ) ) );
+		if( descriptionWidget )
+		{
+			descriptionWidget.SetText( rewardDescription );
+		}
+		if( inkImageRef.Get( m_iconImage ) )
+		{
+			inkImageRef.SetTexturePart( m_iconImage, iconSlot );
+		}
+	}
+
+}
+
+class CrossplayInfoPanelController extends inkLogicController
+{
+	private var m_signOutEnabled : Bool;
+	editable var m_disconnectBtn : inkWidgetRef;
+
+	protected event OnInitialize()
+	{
+		inkWidgetRef.RegisterToCallback( m_disconnectBtn, 'OnRelease', this, 'OnDisconnectClicked' );
+	}
+
+	public function EnableSignOut( value : Bool )
+	{
+		m_signOutEnabled = value;
+		inkWidgetRef.SetVisible( m_disconnectBtn, m_signOutEnabled );
+	}
+
+	protected event OnDisconnectClicked( evt : inkPointerEvent )
+	{
+		if( m_signOutEnabled && evt.IsAction( 'click' ) )
+		{
+			QueueEvent( new DisconnectClickedEvent );
+		}
+	}
+
+}
+
+class GogErrorNotificationController extends inkLogicController
+{
+	editable var m_errorMessageWidget : inkWidgetRef;
+
+	public function ShowErrorMessage( error : GOGRewardsSystemErrors )
+	{
+		var errorMessageText : inkText;
+		errorMessageText = ( ( inkText )( inkWidgetRef.Get( m_errorMessageWidget ) ) );
+		errorMessageText.SetLocalizedText( StringToName( GOGRewardSystemErrorToDisplayString( error ) ) );
+	}
+
+}
+
+class LinkClickedEvent extends Event
+{
+}
+
+class DisconnectClickedEvent extends Event
+{
+}
+
+enum EGOGMenuState
+{
+	None = 0,
+	LoadGame = 1,
+	MainMenu = 2,
+}
+

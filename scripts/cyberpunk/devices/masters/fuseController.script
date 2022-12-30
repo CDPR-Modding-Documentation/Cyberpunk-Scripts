@@ -1,0 +1,646 @@
+class DelayedTimetableEvent extends Event
+{
+	var eventToForward : DeviceTimetableEvent;
+	var targetPS : weak< ScriptableDeviceComponentPS >;
+}
+
+class RefreshCLSOnSlavesEvent extends Event
+{
+	var slaves : array< DeviceComponentPS >;
+	var state : EDeviceStatus;
+	var restorePower : Bool;
+}
+
+class RefreshPowerOnSlavesEvent extends ProcessDevicesEvent
+{
+}
+
+class InitializeCLSEvent extends Event
+{
+}
+
+class FuseController extends MasterController
+{
+
+	public const override function GetPS() : FuseControllerPS
+	{
+		return ( ( FuseControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class FuseControllerPS extends MasterControllerPS
+{
+	default m_deviceName = "LocKey#116";
+	default m_tweakDBRecord = T"Devices.Fuse";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.Fuse";
+	default m_revealDevicesGrid = false;
+	default m_drawGridLink = false;
+	[ category = "City Light System" ]
+	protected instanceeditable inlined persistent var m_timeTableSetup : DeviceTimeTableManager;
+	[ category = "City Light System" ]
+	protected instanceeditable persistent var m_maxLightsSwitchedAtOnce : Int32;
+	default m_maxLightsSwitchedAtOnce = 5;
+	[ category = "City Light System" ][ rangeMin = "0.0f" ][ rangeMax = "1.0f" ]
+	protected instanceeditable persistent var m_timeToNextSwitch : Float;
+	default m_timeToNextSwitch = 1.0f;
+	[ category = "City Light System" ]
+	protected instanceeditable persistent var m_lightSwitchRandomizerType : ELightSwitchRandomizerType;
+	default m_lightSwitchRandomizerType = ELightSwitchRandomizerType.RANDOM_PROGRESSIVE;
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice" ]
+	private instanceeditable var m_alternativeNameForON : TweakDBID;
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice" ]
+	private instanceeditable var m_alternativeNameForOFF : TweakDBID;
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice" ]
+	private instanceeditable var m_alternativeNameForPower : TweakDBID;
+	[ customEditor = "TweakDBGroupInheritance;Interactions.InteractionChoice" ]
+	private instanceeditable var m_alternativeNameForUnpower : TweakDBID;
+	private var m_isCLSInitialized : Bool;
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+		if( !( IsStringValid( m_deviceName ) ) )
+		{
+			m_deviceName = "LocKey#116";
+		}
+	}
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+		InitializeCLS();
+		if( IsUnpowered() )
+		{
+			RefreshPowerOnSlaves_Event();
+		}
+		else if( ( m_timeTableSetup == NULL ) || !( m_timeTableSetup.IsValid() ) )
+		{
+			RefreshSlaves_Event();
+		}
+	}
+
+	public const override function GetExpectedSlaveState() : EDeviceStatus
+	{
+		return GetDeviceState();
+	}
+
+	public const function GetTimetableSetup() : DeviceTimeTableManager
+	{
+		return m_timeTableSetup;
+	}
+
+	protected const override function GetClearance() : Clearance
+	{
+		return Clearance.CreateClearance( 29, 29 );
+	}
+
+	public override function ActionToggleON() : ToggleON
+	{
+		var action : ToggleON;
+		action = new ToggleON;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOnClearance();
+		action.SetUp( this );
+		action.SetProperties( m_deviceState, m_alternativeNameForON, m_alternativeNameForOFF );
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	protected override function ActionTogglePower() : TogglePower
+	{
+		var action : TogglePower;
+		action = new TogglePower;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetTogglePowerClearance();
+		action.SetUp( this );
+		action.SetProperties( m_deviceState, m_alternativeNameForPower, m_alternativeNameForUnpower );
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public override function GetActions( out outActions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		super.GetActions( outActions, context );
+		if( IsDisabled() )
+		{
+			return false;
+		}
+		if( ToggleON.IsDefaultConditionMet( this, context ) && context.requestType == gamedeviceRequestType.External )
+		{
+			outActions.PushBack( ActionToggleON() );
+		}
+		if( TogglePower.IsDefaultConditionMet( this, context ) && context.requestType == gamedeviceRequestType.External )
+		{
+			outActions.PushBack( ActionTogglePower() );
+		}
+		SetActionIllegality( outActions, m_illegalActions.regularActions );
+		return true;
+	}
+
+	protected override function OnQuestForceON( evt : QuestForceON ) : EntityNotificationType
+	{
+		super.OnQuestForceON( evt );
+		RefreshSlaves_Event( false, true );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnQuestForceOFF( evt : QuestForceOFF ) : EntityNotificationType
+	{
+		super.OnQuestForceOFF( evt );
+		RefreshSlaves_Event( false, true );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export override function OnSetDeviceON( evt : SetDeviceON ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		if( IsDisabled() || IsUnpowered() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Unpowered or Disabled" );
+		}
+		SetDeviceState( EDeviceStatus.ON );
+		RefreshSlaves_Event();
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export override function OnSetDeviceOFF( evt : SetDeviceOFF ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		if( IsDisabled() || IsUnpowered() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Unpowered or Disabled" );
+		}
+		SetDeviceState( EDeviceStatus.OFF );
+		RefreshSlaves_Event();
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDeviceUnpowered( evt : SetDeviceUnpowered ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		if( IsDisabled() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Unpowered or Disabled" );
+		}
+		UnpowerDevice();
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnSetDevicePowered( evt : SetDevicePowered ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		if( IsDisabled() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Disabled" );
+		}
+		PowerDevice();
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public override function OnToggleON( evt : ToggleON ) : EntityNotificationType
+	{
+		super.OnToggleON( evt );
+		RefreshSlaves_Event();
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function PowerDevice()
+	{
+		var stateFromCLS : EDeviceStatus;
+		stateFromCLS = EDeviceStatus.DISABLED;
+		if( IsConnectedToCLS() )
+		{
+			stateFromCLS = GetCityLightSystem().GetFuseStateByID( GetID() );
+		}
+		if( stateFromCLS != EDeviceStatus.DISABLED )
+		{
+			SetDeviceState( stateFromCLS );
+		}
+		else
+		{
+			SetDeviceState( EDeviceStatus.ON );
+		}
+		RefreshPowerOnSlaves_Event();
+	}
+
+	public override function UnpowerDevice()
+	{
+		super.UnpowerDevice();
+		RefreshPowerOnSlaves_Event();
+	}
+
+	private function RefreshSlaves( devices : array< DeviceComponentPS >, optional force : Bool )
+	{
+		var i : Int32;
+		var action : ScriptableDeviceAction;
+		var device : ScriptableDeviceComponentPS;
+		if( IsUnpowered() )
+		{
+			RefreshPowerOnSlaves( devices );
+			return;
+		}
+		if( IsConnectedToCLS() )
+		{
+			RefreshCLSoNslaves( GetDeviceState(), false, devices );
+			return;
+		}
+		devices = GetImmediateSlaves();
+		for( i = 0; i < devices.Size(); i = i + 1 )
+		{
+			if( devices[ i ] == this )
+			{
+				continue;
+			}
+			device = ( ( ScriptableDeviceComponentPS )( devices[ i ] ) );
+			if( !( device ) )
+			{
+				continue;
+			}
+			if( IsON() )
+			{
+				if( force )
+				{
+					action = device.ActionQuestForceON();
+				}
+				else
+				{
+					action = device.ActionSetDeviceON();
+				}
+			}
+			else
+			{
+				if( force )
+				{
+					action = device.ActionQuestForceOFF();
+				}
+				else
+				{
+					action = device.ActionSetDeviceOFF();
+				}
+			}
+			if( action )
+			{
+				action.RegisterAsRequester( PersistentID.ExtractEntityID( GetID() ) );
+				GetPersistencySystem().QueuePSDeviceEvent( action );
+			}
+		}
+	}
+
+	private function RefreshPowerOnSlaves( devices : array< DeviceComponentPS > )
+	{
+		var restorePower : Bool;
+		if( IsConnectedToCLS() )
+		{
+			restorePower = IsON();
+			RefreshCLSoNslaves( GetDeviceState(), restorePower, devices );
+			return;
+		}
+		if( !( IsON() ) )
+		{
+			CutPowerOnSlaveDevices( devices );
+		}
+		else
+		{
+			RestorePowerOnSlaveDevices( devices );
+		}
+	}
+
+	private function RestorePowerOnSlaveDevices( devices : array< DeviceComponentPS > )
+	{
+		var i : Int32;
+		var action : ScriptableDeviceAction;
+		var device : ScriptableDeviceComponentPS;
+		devices = GetImmediateSlaves();
+		for( i = 0; i < devices.Size(); i = i + 1 )
+		{
+			if( devices[ i ] == this )
+			{
+				continue;
+			}
+			device = ( ( ScriptableDeviceComponentPS )( devices[ i ] ) );
+			if( device )
+			{
+				action = ( ( ScriptableDeviceAction )( device.ActionSetDevicePowered() ) );
+			}
+			if( action )
+			{
+				ExecutePSAction( action, device );
+			}
+		}
+	}
+
+	private function CutPowerOnSlaveDevices( devices : array< DeviceComponentPS > )
+	{
+		var i : Int32;
+		var action : ScriptableDeviceAction;
+		var device : ScriptableDeviceComponentPS;
+		devices = GetImmediateSlaves();
+		for( i = 0; i < devices.Size(); i = i + 1 )
+		{
+			if( devices[ i ] == this )
+			{
+				continue;
+			}
+			device = ( ( ScriptableDeviceComponentPS )( devices[ i ] ) );
+			if( device )
+			{
+				action = ( ( ScriptableDeviceAction )( device.ActionSetDeviceUnpowered() ) );
+			}
+			if( action )
+			{
+				ExecutePSAction( action, device );
+			}
+		}
+	}
+
+	protected export override function OnRefreshSlavesEvent( evt : RefreshSlavesEvent ) : EntityNotificationType
+	{
+		RefreshSlaves( evt.devices, evt.force );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function OnRefreshPowerOnSlavesEvent( evt : RefreshPowerOnSlavesEvent ) : EntityNotificationType
+	{
+		RefreshPowerOnSlaves( evt.devices );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const function IsCLSInitialized() : Bool
+	{
+		return m_isCLSInitialized;
+	}
+
+	protected export function OnInitializeCLSEvent( evt : InitializeCLSEvent ) : EntityNotificationType
+	{
+		InitializeCLS();
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export function OnDeviceTimetableEvent( evt : DeviceTimetableEvent ) : EntityNotificationType
+	{
+		if( evt.state == EDeviceStatus.ON )
+		{
+			ExecutePSAction( ActionSetDeviceON(), this );
+		}
+		else if( evt.state == EDeviceStatus.OFF )
+		{
+			ExecutePSAction( ActionSetDeviceOFF(), this );
+		}
+		else if( evt.state == EDeviceStatus.UNPOWERED )
+		{
+			ExecutePSAction( ActionSetDeviceUnpowered(), this );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export function OnRefreshCLSoNslaves( evt : RefreshCLSOnSlavesEvent ) : EntityNotificationType
+	{
+		if( evt.state != GetDeviceState() )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		else
+		{
+			RefreshCLSoNslaves( evt.state, evt.restorePower, evt.slaves );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function RefreshCLSoNslaves( state : EDeviceStatus, restorePower : Bool, devices : array< DeviceComponentPS > )
+	{
+		var i : Int32;
+		var id : EntityID;
+		var totalEventsSent : Int32;
+		var excessDevices : array< DeviceComponentPS >;
+		var delay : Float;
+		for( i = 0; i < devices.Size(); i += 1 )
+		{
+			if( ( devices[ i ] == NULL ) || !( devices[ i ].IsAttachedToGame() ) )
+			{
+				continue;
+			}
+			if( totalEventsSent >= m_maxLightsSwitchedAtOnce )
+			{
+				excessDevices.PushBack( devices[ i ] );
+			}
+			else
+			{
+				id = PersistentID.ExtractEntityID( devices[ i ].GetID() );
+				if( EntityID.IsDefined( id ) )
+				{
+					SendDeviceTimeTableEvent( id, state, restorePower );
+					totalEventsSent += 1;
+				}
+			}
+		}
+		if( excessDevices.Size() > 0 )
+		{
+			if( m_lightSwitchRandomizerType == ELightSwitchRandomizerType.NONE )
+			{
+				delay = m_timeToNextSwitch;
+			}
+			else if( m_lightSwitchRandomizerType == ELightSwitchRandomizerType.RANDOM_PROGRESSIVE )
+			{
+				delay += GetLightSwitchDelayValue();
+			}
+			else
+			{
+				delay = GetLightSwitchDelayValue();
+			}
+			SendCLSRefreshByEvent( excessDevices, state, restorePower, delay );
+		}
+	}
+
+	private function GetLightSwitchDelayValue() : Float
+	{
+		var delay : Float;
+		if( m_timeToNextSwitch == 0.0 )
+		{
+			delay = 0.0;
+		}
+		else
+		{
+			delay = RandRangeF( 0.0, m_timeToNextSwitch );
+		}
+		return delay;
+	}
+
+	private function SendCLSRefreshByEvent( devices : array< DeviceComponentPS >, state : EDeviceStatus, restorePower : Bool, delay : Float )
+	{
+		var evt : RefreshCLSOnSlavesEvent;
+		evt = new RefreshCLSOnSlavesEvent;
+		evt.state = state;
+		evt.slaves = devices;
+		evt.restorePower = restorePower;
+		if( delay > 0.0 )
+		{
+			QueuePSEventWithDelay( this, evt, delay );
+		}
+		else
+		{
+			QueuePSEvent( this, evt );
+		}
+	}
+
+	private function SendDeviceTimeTableEvent( targetID : EntityID, state : EDeviceStatus, restorePower : Bool )
+	{
+		var evt : DeviceTimetableEvent;
+		evt = new DeviceTimetableEvent;
+		evt.state = state;
+		evt.requesterID = PersistentID.ExtractEntityID( GetID() );
+		evt.restorePower = restorePower;
+		GetPersistencySystem().QueueEntityEvent( targetID, evt );
+	}
+
+	private function SendDeviceTimeTableEventWithDelay( targetID : EntityID, state : EDeviceStatus, restorePower : Bool, delay : Float )
+	{
+		var evt : DeviceTimetableEvent;
+		evt = new DeviceTimetableEvent;
+		evt.state = state;
+		evt.requesterID = PersistentID.ExtractEntityID( GetID() );
+		evt.restorePower = restorePower;
+		QueuePSEventWithDelay( this, evt, delay );
+	}
+
+	protected function OnDealyedTimetableEvent( evt : DelayedTimetableEvent ) : EntityNotificationType
+	{
+		var id : EntityID;
+		if( ( evt.eventToForward != NULL ) && ( evt.targetPS != NULL ) )
+		{
+			if( evt.targetPS.IsAttachedToGame() )
+			{
+				id = PersistentID.ExtractEntityID( evt.targetPS.GetID() );
+				if( EntityID.IsDefined( id ) )
+				{
+					GetPersistencySystem().QueueEntityEvent( id, evt );
+				}
+			}
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const function GetDeviceStateByCLS() : EDeviceStatus
+	{
+		var cls : CityLightSystem;
+		var clsState : ECLSForcedState;
+		var deviceState : EDeviceStatus;
+		if( !( IsDisabled() ) && !( IsUnpowered() ) )
+		{
+			deviceState = m_deviceState;
+		}
+		else if( IsConnectedToCLS() && !( m_isCLSInitialized ) )
+		{
+			cls = GetCityLightSystem();
+			if( cls )
+			{
+				clsState = cls.GetState();
+				if( clsState == ECLSForcedState.DEFAULT )
+				{
+					deviceState = m_timeTableSetup.GetDeviceStateForActiveEntry( GetGameInstance() );
+				}
+				else if( clsState == ECLSForcedState.ForcedON )
+				{
+					deviceState = EDeviceStatus.ON;
+				}
+				else if( clsState == ECLSForcedState.ForcedOFF )
+				{
+					deviceState = EDeviceStatus.OFF;
+				}
+			}
+			else
+			{
+				deviceState = m_deviceState;
+			}
+		}
+		else
+		{
+			deviceState = m_deviceState;
+		}
+		return deviceState;
+	}
+
+	private function InitializeCLS()
+	{
+		var request : RegisterTimetableRequest;
+		var requesterData : PSOwnerData;
+		var lights : array< LazyDevice >;
+		var cls : CityLightSystem;
+		var clsState : ECLSForcedState;
+		if( m_isCLSInitialized )
+		{
+			return;
+		}
+		m_isCLSInitialized = true;
+		if( ( m_timeTableSetup != NULL ) && m_timeTableSetup.IsValid() )
+		{
+			request = new RegisterTimetableRequest;
+			request.timeTable = m_timeTableSetup.GetTimeTable();
+			requesterData.id = GetID();
+			requesterData.className = GetClassName();
+			request.requesterData = requesterData;
+			if( !( IsFinal() ) )
+			{
+				GetLazyChildren( lights );
+				request.lights = lights.Size();
+			}
+			cls = GetCityLightSystem();
+			if( cls )
+			{
+				cls.QueueRequest( request );
+				clsState = cls.GetState();
+			}
+			if( !( IsDisabled() ) && !( IsUnpowered() ) )
+			{
+				if( clsState == ECLSForcedState.DEFAULT )
+				{
+					SetDeviceState( m_timeTableSetup.GetDeviceStateForActiveEntry( GetGameInstance() ) );
+				}
+				else if( clsState == ECLSForcedState.ForcedON )
+				{
+					SetDeviceState( EDeviceStatus.ON );
+				}
+				else if( clsState == ECLSForcedState.ForcedOFF )
+				{
+					SetDeviceState( EDeviceStatus.OFF );
+				}
+			}
+		}
+	}
+
+	public const override function IsConnectedToCLS() : Bool
+	{
+		return ( m_timeTableSetup != NULL ) && m_timeTableSetup.IsValid();
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.GeneratorDeviceIcon";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.GeneratorDeviceBackground";
+	}
+
+}
+
+enum ELightSwitchRandomizerType
+{
+	RANDOM = 0,
+	RANDOM_PROGRESSIVE = 1,
+	NONE = 2,
+}
+

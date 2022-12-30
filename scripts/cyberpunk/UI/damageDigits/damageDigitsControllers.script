@@ -1,0 +1,1603 @@
+struct AccumulatedDamageDigitsNode
+{
+	var m_used : Bool;
+	var m_entityID : EntityID;
+	var m_controller : weak< AccumulatedDamageDigitLogicController >;
+	var m_isDamageOverTime : Bool;
+}
+
+struct DamageEntry
+{
+	var m_damageInfo : DamageInfo;
+	var m_damageOverTimeInfo : DamageInfo;
+	var m_hasDamageInfo : Bool;
+	var m_hasDamageOverTimeInfo : Bool;
+	var m_oneInstance : Bool;
+	var m_oneDotInstance : Bool;
+	var m_hasDotAccumulator : Bool;
+}
+
+class DamageDigitUserData extends IScriptable
+{
+	var m_controllerIndex : Int32;
+}
+
+class DamageDigitsGameController extends inkProjectedHUDGameController
+{
+	editable var m_maxVisible : Int32;
+	default m_maxVisible = 50;
+	editable var m_maxAccumulatedVisible : Int32;
+	default m_maxAccumulatedVisible = 10;
+	private var m_realOwner : weak< GameObject >;
+	private var m_digitsQueue : inkFIFOQueue;
+	private var m_isBeingUsed : Bool;
+	private var m_ActiveWeapon : SlotWeaponData;
+	private var m_BufferedRosterData : SlotDataHolder;
+	private var m_individualControllerArray : array< weak< DamageDigitLogicController > >;
+	private var m_accumulatedControllerArray : array< AccumulatedDamageDigitsNode >;
+	private var m_damageDigitsMode : gameuiDamageDigitsMode;
+	private var m_showDigitsIndividual : Bool;
+	private var m_showDigitsAccumulated : Bool;
+	private var m_damageDigitsStickingMode : gameuiDamageDigitsStickingMode;
+	private var m_spawnedDigits : Int32;
+	private var m_spawnedAccumulatedDigitsDigits : Int32;
+	private var m_damageInfoBB : weak< IBlackboard >;
+	private var m_UIBlackboard : weak< IBlackboard >;
+	private var m_damageListBlackboardId : CallbackHandle;
+	private var m_BBWeaponListBlackboardId : CallbackHandle;
+	private var m_damageDigitsModeBlackboardId : CallbackHandle;
+	private var m_damageDigitsStickingModeBlackboardId : CallbackHandle;
+
+	protected event OnInitialize()
+	{
+		m_damageInfoBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_DamageInfo );
+		m_damageListBlackboardId = m_damageInfoBB.RegisterListenerVariant( GetAllBlackboardDefs().UI_DamageInfo.DamageList, this, 'OnDamageAdded' );
+		m_damageDigitsModeBlackboardId = m_damageInfoBB.RegisterListenerVariant( GetAllBlackboardDefs().UI_DamageInfo.DigitsMode, this, 'OnDamageDigitsModeChanged' );
+		m_damageDigitsStickingModeBlackboardId = m_damageInfoBB.RegisterListenerVariant( GetAllBlackboardDefs().UI_DamageInfo.DigitsStickingMode, this, 'OnDigitsStickingModeChanged' );
+		m_UIBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_EquipmentData );
+		m_BBWeaponListBlackboardId = m_UIBlackboard.RegisterListenerVariant( GetAllBlackboardDefs().UI_EquipmentData.EquipmentData, this, 'OnWeaponDataChanged' );
+		m_UIBlackboard.SignalVariant( GetAllBlackboardDefs().UI_EquipmentData.EquipmentData );
+		m_damageDigitsMode = ( ( gameuiDamageDigitsMode )( m_damageInfoBB.GetVariant( GetAllBlackboardDefs().UI_DamageInfo.DigitsMode ) ) );
+		m_damageDigitsStickingMode = ( ( gameuiDamageDigitsStickingMode )( m_damageInfoBB.GetVariant( GetAllBlackboardDefs().UI_DamageInfo.DigitsStickingMode ) ) );
+		m_realOwner = ( ( GameObject )( GetOwnerEntity() ) );
+		CreateDigitsQueue();
+		CreateAccumulatedDamageDigitsArray();
+		UpdateDamageDigitsMode();
+		UpdateDamageDigitsStickingMode();
+		SetShouldNotifyProjections( false );
+		EnableSleeping( true );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_damageInfoBB.UnregisterListenerVariant( GetAllBlackboardDefs().UI_DamageInfo.DamageList, m_damageListBlackboardId );
+		m_damageInfoBB.UnregisterListenerVariant( GetAllBlackboardDefs().UI_DamageInfo.DigitsMode, m_damageDigitsModeBlackboardId );
+		m_damageInfoBB.UnregisterListenerVariant( GetAllBlackboardDefs().UI_DamageInfo.DigitsStickingMode, m_damageDigitsStickingModeBlackboardId );
+		m_UIBlackboard.UnregisterListenerVariant( GetAllBlackboardDefs().UI_EquipmentData.EquipmentData, m_BBWeaponListBlackboardId );
+		m_UIBlackboard = NULL;
+	}
+
+	protected event OnPlayerAttach( player : GameObject )
+	{
+		var i : Int32;
+		m_realOwner = player;
+		for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+		{
+			m_accumulatedControllerArray[ i ].m_controller.m_owner = player;
+		}
+	}
+
+	private function CreateDigitsQueue()
+	{
+		var rootWidget : weak< inkWidget >;
+		var i : Int32;
+		rootWidget = GetRootWidget();
+		m_digitsQueue = new inkFIFOQueue;
+		for( i = 0; i < m_maxVisible; i += 1 )
+		{
+			AsyncSpawnFromLocal( rootWidget, 'Digit', this, 'OnDamageDigitSpawned' );
+		}
+	}
+
+	protected event OnDamageDigitSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var controller : weak< DamageDigitLogicController >;
+		var projectionData : inkScreenProjectionData;
+		var projection : inkScreenProjection;
+		if( widget == NULL )
+		{
+			m_maxVisible -= 1;
+			return true;
+		}
+		controller = ( ( DamageDigitLogicController )( widget.GetController() ) );
+		projectionData.userData = controller;
+		projectionData.slotComponentName = 'UI_Slots';
+		projectionData.slotName = 'roleMappin';
+		projection = RegisterScreenProjection( projectionData );
+		projection.SetEnabled( false );
+		controller.SetProjection( projection, this );
+		controller.RegisterToCallback( 'OnReadyToRemove', this, 'OnHideDigit' );
+		m_individualControllerArray.PushBack( controller );
+		m_spawnedDigits += 1;
+		if( m_spawnedDigits == m_maxVisible )
+		{
+			RegisterDigitsToQueue();
+		}
+	}
+
+	private function RegisterDigitsToQueue()
+	{
+		var controllerList : array< weak< IScriptable > >;
+		var i : Int32;
+		for( i = 0; i < m_maxVisible; i += 1 )
+		{
+			controllerList.PushBack( m_individualControllerArray[ i ] );
+		}
+		m_digitsQueue.Init( controllerList );
+	}
+
+	protected event OnAccumulatedDamageDigitSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var projectionData : inkScreenProjectionData;
+		var projection : inkScreenProjection;
+		var digitsUserData : DamageDigitUserData;
+		var controller : weak< AccumulatedDamageDigitLogicController >;
+		var index : Int32;
+		digitsUserData = ( ( DamageDigitUserData )( userData ) );
+		index = digitsUserData.m_controllerIndex;
+		controller = ( ( AccumulatedDamageDigitLogicController )( widget.GetController() ) );
+		m_accumulatedControllerArray[ index ].m_controller = controller;
+		m_accumulatedControllerArray[ index ].m_controller.m_arrayPosition = index;
+		m_accumulatedControllerArray[ index ].m_controller.m_owner = GetPlayerControlledObject();
+		m_accumulatedControllerArray[ index ].m_isDamageOverTime = false;
+		projectionData.userData = m_accumulatedControllerArray[ index ].m_controller;
+		projectionData.slotComponentName = 'UI_Slots';
+		projectionData.slotName = 'roleMappin';
+		projection = RegisterScreenProjection( projectionData );
+		projection.SetEnabled( false );
+		m_accumulatedControllerArray[ index ].m_controller.SetProjection( projection, this );
+		m_accumulatedControllerArray[ index ].m_controller.RegisterToCallback( 'OnReadyToRemoveAccumulatedDigit', this, 'OnHideAccumulatedDigit' );
+	}
+
+	private function CreateAccumulatedDamageDigitsArray()
+	{
+		var rootWidget : weak< inkWidget >;
+		var i : Int32;
+		var userData : DamageDigitUserData;
+		rootWidget = GetRootWidget();
+		m_accumulatedControllerArray.Resize( m_maxAccumulatedVisible );
+		for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+		{
+			userData = new DamageDigitUserData;
+			userData.m_controllerIndex = i;
+			m_accumulatedControllerArray[ i ].m_used = false;
+			AsyncSpawnFromLocal( rootWidget, 'AccumulatedDamageDigit', this, 'OnAccumulatedDamageDigitSpawned', userData );
+		}
+	}
+
+	private function ShowDamageFloater( damageInfo : DamageInfo ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < damageInfo.userData.flags.Size(); i += 1 )
+		{
+			if( ( damageInfo.userData.flags[ i ].flag == hitFlag.DontShowDamageFloater || damageInfo.userData.flags[ i ].flag == hitFlag.ImmortalTarget ) || damageInfo.userData.flags[ i ].flag == hitFlag.DealNoDamage )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private function IsDamageOverTime( damageInfo : DamageInfo ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < damageInfo.userData.flags.Size(); i += 1 )
+		{
+			if( damageInfo.userData.flags[ i ].flag == hitFlag.DamageOverTime )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected event OnDamageAdded( value : Variant )
+	{
+		var damageList : array< DamageInfo >;
+		var damageListIndividual : array< DamageInfo >;
+		var controller : weak< DamageDigitLogicController >;
+		var i, k, listPosition : Int32;
+		var damageInfo : DamageInfo;
+		var entityID : EntityID;
+		var entityIDList : array< EntityID >;
+		var entityDamageEntryList : array< DamageEntry >;
+		var showingBoth, showingBothSecondary, oneInstance, damageOverTime, individualDigitsSticking, accumulatedDigitsSticking, controllerFound, dotControllerFound : Bool;
+		damageList = ( ( array< DamageInfo > )value );
+		showingBoth = ( m_showDigitsIndividual && m_showDigitsAccumulated ) && ( m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.None || m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Both );
+		individualDigitsSticking = m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Individual || m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Both;
+		accumulatedDigitsSticking = m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Accumulated || m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Both;
+		for( i = 0; i < damageList.Size(); i += 1 )
+		{
+			damageInfo = damageList[ i ];
+			if( m_realOwner == damageInfo.instigator )
+			{
+				if( ShowDamageFloater( damageInfo ) )
+				{
+					damageOverTime = IsDamageOverTime( damageInfo );
+					if( m_showDigitsAccumulated )
+					{
+						if( !( EntityID.IsDefined( entityID ) ) || ( entityID != damageInfo.entityHit.GetEntityID() ) )
+						{
+							entityID = damageInfo.entityHit.GetEntityID();
+							listPosition = entityIDList.FindFirst( entityID );
+							if( listPosition == -1 )
+							{
+								listPosition = entityIDList.Size();
+								entityIDList.PushBack( entityID );
+								entityDamageEntryList.Grow( 1 );
+							}
+						}
+						if( damageOverTime && !( accumulatedDigitsSticking ) )
+						{
+							if( entityDamageEntryList[ listPosition ].m_hasDamageOverTimeInfo )
+							{
+								entityDamageEntryList[ listPosition ].m_damageOverTimeInfo.damageValue += damageInfo.damageValue;
+								entityDamageEntryList[ listPosition ].m_damageOverTimeInfo.hitPosition += damageInfo.hitPosition;
+								entityDamageEntryList[ listPosition ].m_damageOverTimeInfo.hitPosition *= 0.5;
+								entityDamageEntryList[ listPosition ].m_oneDotInstance = false;
+							}
+							else
+							{
+								entityDamageEntryList[ listPosition ].m_damageOverTimeInfo = damageInfo;
+								entityDamageEntryList[ listPosition ].m_hasDamageOverTimeInfo = true;
+								entityDamageEntryList[ listPosition ].m_oneDotInstance = true;
+							}
+						}
+						else
+						{
+							if( entityDamageEntryList[ listPosition ].m_hasDamageInfo )
+							{
+								entityDamageEntryList[ listPosition ].m_damageInfo.damageValue += damageInfo.damageValue;
+								entityDamageEntryList[ listPosition ].m_damageInfo.hitPosition += damageInfo.hitPosition;
+								entityDamageEntryList[ listPosition ].m_damageInfo.hitPosition *= 0.5;
+								entityDamageEntryList[ listPosition ].m_oneInstance = false;
+							}
+							else
+							{
+								entityDamageEntryList[ listPosition ].m_damageInfo = damageInfo;
+								entityDamageEntryList[ listPosition ].m_hasDamageInfo = true;
+								entityDamageEntryList[ listPosition ].m_oneInstance = true;
+							}
+						}
+					}
+					if( m_showDigitsIndividual )
+					{
+						if( m_showDigitsAccumulated )
+						{
+							damageListIndividual.PushBack( damageInfo );
+						}
+						else
+						{
+							controller = ( ( DamageDigitLogicController )( m_digitsQueue.Dequeue() ) );
+							controller.Show( damageInfo, false, damageOverTime );
+						}
+					}
+				}
+			}
+		}
+		if( m_showDigitsAccumulated )
+		{
+			for( i = 0; i < entityIDList.Size(); i += 1 )
+			{
+				entityID = entityIDList[ i ];
+				controllerFound = !( entityDamageEntryList[ i ].m_hasDamageInfo );
+				dotControllerFound = !( entityDamageEntryList[ i ].m_hasDamageOverTimeInfo );
+				for( k = 0; k < m_maxAccumulatedVisible; k += 1 )
+				{
+					if( m_accumulatedControllerArray[ k ].m_used && ( m_accumulatedControllerArray[ k ].m_entityID == entityID ) )
+					{
+						if( entityDamageEntryList[ i ].m_hasDamageInfo && ( !( m_accumulatedControllerArray[ k ].m_isDamageOverTime ) || accumulatedDigitsSticking ) )
+						{
+							if( !( controllerFound ) )
+							{
+								m_accumulatedControllerArray[ k ].m_controller.UpdateDamageInfo( entityDamageEntryList[ i ].m_damageInfo, showingBoth );
+								entityDamageEntryList[ i ].m_oneInstance = false;
+								controllerFound = true;
+							}
+						}
+						else if( entityDamageEntryList[ i ].m_hasDamageOverTimeInfo && m_accumulatedControllerArray[ k ].m_isDamageOverTime )
+						{
+							if( !( dotControllerFound ) )
+							{
+								m_accumulatedControllerArray[ k ].m_controller.UpdateDamageInfo( entityDamageEntryList[ i ].m_damageOverTimeInfo, m_showDigitsIndividual );
+								entityDamageEntryList[ i ].m_oneDotInstance = false;
+								dotControllerFound = true;
+							}
+						}
+						if( m_accumulatedControllerArray[ k ].m_isDamageOverTime )
+						{
+							entityDamageEntryList[ i ].m_hasDotAccumulator = true;
+						}
+					}
+				}
+				if( !( controllerFound ) )
+				{
+					oneInstance = entityDamageEntryList[ i ].m_oneInstance;
+					for( k = 0; k < m_maxAccumulatedVisible; k += 1 )
+					{
+						if( !( m_accumulatedControllerArray[ k ].m_used ) )
+						{
+							m_accumulatedControllerArray[ k ].m_used = true;
+							m_accumulatedControllerArray[ k ].m_entityID = entityID;
+							m_accumulatedControllerArray[ k ].m_isDamageOverTime = false;
+							m_accumulatedControllerArray[ k ].m_controller.Show( entityDamageEntryList[ i ].m_damageInfo, showingBoth, oneInstance, false );
+							break;
+						}
+					}
+				}
+				if( !( dotControllerFound ) )
+				{
+					oneInstance = entityDamageEntryList[ i ].m_oneDotInstance;
+					for( k = 0; k < m_maxAccumulatedVisible; k += 1 )
+					{
+						if( !( m_accumulatedControllerArray[ k ].m_used ) )
+						{
+							m_accumulatedControllerArray[ k ].m_used = true;
+							m_accumulatedControllerArray[ k ].m_entityID = entityID;
+							m_accumulatedControllerArray[ k ].m_isDamageOverTime = true;
+							m_accumulatedControllerArray[ k ].m_controller.Show( entityDamageEntryList[ i ].m_damageOverTimeInfo, m_showDigitsIndividual, oneInstance, true );
+							entityDamageEntryList[ i ].m_hasDotAccumulator = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+		if( m_showDigitsIndividual && m_showDigitsAccumulated )
+		{
+			for( i = 0; i < damageListIndividual.Size(); i += 1 )
+			{
+				damageInfo = damageListIndividual[ i ];
+				damageOverTime = IsDamageOverTime( damageInfo );
+				if( ( ( i == 0 ) || !( EntityID.IsDefined( entityID ) ) ) || ( entityID != damageInfo.entityHit.GetEntityID() ) )
+				{
+					entityID = damageInfo.entityHit.GetEntityID();
+					listPosition = entityIDList.FindFirst( entityID );
+				}
+				if( damageOverTime && !( accumulatedDigitsSticking ) )
+				{
+					oneInstance = entityDamageEntryList[ listPosition ].m_oneDotInstance;
+				}
+				else
+				{
+					oneInstance = entityDamageEntryList[ listPosition ].m_oneInstance;
+				}
+				if( !( oneInstance ) )
+				{
+					if( !( showingBoth ) )
+					{
+						showingBothSecondary = damageOverTime || ( entityDamageEntryList[ listPosition ].m_hasDotAccumulator && individualDigitsSticking );
+					}
+					controller = ( ( DamageDigitLogicController )( m_digitsQueue.Dequeue() ) );
+					controller.Show( damageInfo, showingBoth || showingBothSecondary, damageOverTime );
+				}
+			}
+		}
+		WakeUp();
+	}
+
+	protected event OnWeaponDataChanged( value : Variant )
+	{
+		var currentData : SlotWeaponData;
+		m_BufferedRosterData = ( ( SlotDataHolder )value );
+		currentData = m_BufferedRosterData.weapon;
+		if( ItemID.IsValid( currentData.weaponID ) )
+		{
+			m_ActiveWeapon = currentData;
+		}
+	}
+
+	protected event OnDamageDigitsModeChanged( value : Variant )
+	{
+		m_damageDigitsMode = ( ( gameuiDamageDigitsMode )value );
+		UpdateDamageDigitsMode();
+	}
+
+	private function UpdateDamageDigitsMode()
+	{
+		if( m_damageDigitsMode == gameuiDamageDigitsMode.Off )
+		{
+			m_showDigitsIndividual = false;
+			m_showDigitsAccumulated = false;
+		}
+		else if( m_damageDigitsMode == gameuiDamageDigitsMode.Individual )
+		{
+			m_showDigitsIndividual = true;
+			m_showDigitsAccumulated = false;
+		}
+		else if( m_damageDigitsMode == gameuiDamageDigitsMode.Accumulated )
+		{
+			m_showDigitsIndividual = false;
+			m_showDigitsAccumulated = true;
+		}
+		else if( m_damageDigitsMode == gameuiDamageDigitsMode.Both )
+		{
+			m_showDigitsIndividual = true;
+			m_showDigitsAccumulated = true;
+		}
+	}
+
+	protected event OnDigitsStickingModeChanged( value : Variant )
+	{
+		m_damageDigitsStickingMode = ( ( gameuiDamageDigitsStickingMode )value );
+		UpdateDamageDigitsStickingMode();
+	}
+
+	private function UpdateDamageDigitsStickingMode()
+	{
+		var i : Int32;
+		if( m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.None )
+		{
+			for( i = 0; i < m_maxVisible; i += 1 )
+			{
+				m_individualControllerArray[ i ].m_stickToTarget = false;
+			}
+			for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+			{
+				m_accumulatedControllerArray[ i ].m_controller.m_stickToTarget = false;
+			}
+		}
+		else if( m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Individual )
+		{
+			for( i = 0; i < m_maxVisible; i += 1 )
+			{
+				m_individualControllerArray[ i ].m_stickToTarget = true;
+			}
+			for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+			{
+				m_accumulatedControllerArray[ i ].m_controller.m_stickToTarget = false;
+			}
+		}
+		else if( m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Accumulated )
+		{
+			for( i = 0; i < m_maxVisible; i += 1 )
+			{
+				m_individualControllerArray[ i ].m_stickToTarget = false;
+			}
+			for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+			{
+				m_accumulatedControllerArray[ i ].m_controller.m_stickToTarget = true;
+			}
+		}
+		else if( m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Both )
+		{
+			for( i = 0; i < m_maxVisible; i += 1 )
+			{
+				m_individualControllerArray[ i ].m_stickToTarget = true;
+			}
+			for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+			{
+				m_accumulatedControllerArray[ i ].m_controller.m_stickToTarget = true;
+			}
+		}
+		for( i = 0; i < m_maxAccumulatedVisible; i += 1 )
+		{
+			if( m_accumulatedControllerArray[ i ].m_used && m_accumulatedControllerArray[ i ].m_controller.m_currentlySticking )
+			{
+				m_accumulatedControllerArray[ i ].m_isDamageOverTime = m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.None || m_damageDigitsStickingMode == gameuiDamageDigitsStickingMode.Individual;
+			}
+		}
+	}
+
+	protected event OnHideDigit( digitWidget : weak< inkWidget > )
+	{
+		m_digitsQueue.Enqueue();
+	}
+
+	protected event OnHideAccumulatedDigit( digitWidget : weak< inkWidget > )
+	{
+		var accumulatedDamageDigitController : weak< AccumulatedDamageDigitLogicController >;
+		accumulatedDamageDigitController = ( ( AccumulatedDamageDigitLogicController )( digitWidget.GetController() ) );
+		if( accumulatedDamageDigitController )
+		{
+			m_accumulatedControllerArray[ accumulatedDamageDigitController.m_arrayPosition ].m_used = false;
+		}
+	}
+
+	private function IsUsingAutoWeapon() : Bool
+	{
+		var pistolTweakRecord : TweakDBID;
+		var weaponType : gamedataTriggerMode;
+		weaponType = m_ActiveWeapon.triggerModeCurrent;
+		pistolTweakRecord = T"Items.Preset_Overture_Default";
+		if( ItemID.GetTDBID( m_ActiveWeapon.weaponID ) == pistolTweakRecord )
+		{
+			return false;
+		}
+		switch( weaponType )
+		{
+			case gamedataTriggerMode.SemiAuto:
+			case gamedataTriggerMode.FullAuto:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+}
+
+class DamageDigitLogicController extends inkLogicController
+{
+	private editable var m_critWidget : inkTextRef;
+	private editable var m_headshotWidget : inkTextRef;
+	private var m_rootWidget : weak< inkWidget >;
+	private var m_panelWidget : weak< inkWidget >;
+	private var m_textWidget : weak< inkText >;
+	private var m_gameController : weak< DamageDigitsGameController >;
+	private var m_active : Bool;
+	private var m_successful : Bool;
+	private var m_successfulCritical : Bool;
+	private var m_showingBothDigits : Bool;
+	private var m_distanceModifier : Float;
+	private var m_calculatedDistanceHeightBias : Float;
+	private var m_stickingDistanceHeightBias : Float;
+	var m_stickToTarget : Bool;
+	private var m_forceStickToTarget : Bool;
+	private var m_projection : inkScreenProjection;
+	private var m_showPositiveAnimDef : inkAnimDef;
+	private var m_showPositiveAnimFadeInInterpolator : inkAnimTransparency;
+	private var m_showPositiveAnimFadeOutInterpolator : inkAnimTransparency;
+	private var m_showPositiveAnimMarginInterpolator : inkAnimMargin;
+	private var m_showPositiveAnimScaleInterpolator : inkAnimScale;
+	private var m_showNegativeAnimDef : inkAnimDef;
+	private var m_showNegativeAnimFadeInInterpolator : inkAnimTransparency;
+	private var m_showNegativeAnimFadeOutInterpolator : inkAnimTransparency;
+	private var m_showNegativeAnimMarginInterpolator : inkAnimMargin;
+	private var m_showNegativeAnimScaleInterpolator : inkAnimScale;
+	private var m_animStickTargetOffset : Vector4;
+	private const var m_animTimeFadeIn : Float;
+	default m_animTimeFadeIn = 0.1f;
+	private const var m_animTimeFadeOut : Float;
+	default m_animTimeFadeOut = 0.4f;
+	private const var m_animBothTimeFadeIn : Float;
+	default m_animBothTimeFadeIn = 0.1f;
+	private const var m_animBothTimeFadeOut : Float;
+	default m_animBothTimeFadeOut = 0.2f;
+	private const var m_animTimeDelay : Float;
+	default m_animTimeDelay = 0.8f;
+	private const var m_animTimeCritDelay : Float;
+	default m_animTimeCritDelay = 1.25f;
+	private const var m_animBothTimeDelay : Float;
+	default m_animBothTimeDelay = 0.5f;
+	private const var m_animBothTimeCritDelay : Float;
+	default m_animBothTimeCritDelay = 0.8f;
+	private const var m_animStartHeight : Float;
+	default m_animStartHeight = -30.0f;
+	private const var m_animAngleMin1 : Float;
+	default m_animAngleMin1 = -45.f;
+	private const var m_animAngleMin2 : Float;
+	default m_animAngleMin2 = 140.f;
+	private const var m_animAngleMax1 : Float;
+	default m_animAngleMax1 = 40.f;
+	private const var m_animAngleMax2 : Float;
+	default m_animAngleMax2 = 225.f;
+	private const var m_animBothAngleMin1 : Float;
+	default m_animBothAngleMin1 = -20.f;
+	private const var m_animBothAngleMin2 : Float;
+	default m_animBothAngleMin2 = 140.f;
+	private const var m_animBothAngleMax1 : Float;
+	default m_animBothAngleMax1 = 40.f;
+	private const var m_animBothAngleMax2 : Float;
+	default m_animBothAngleMax2 = 200.f;
+	private const var m_animDistanceMin : Float;
+	default m_animDistanceMin = 70.f;
+	private const var m_animDistanceMax : Float;
+	default m_animDistanceMax = 90.f;
+	private const var m_animDistanceMin_Crit : Float;
+	default m_animDistanceMin_Crit = 110.f;
+	private const var m_animDistanceMax_Crit : Float;
+	default m_animDistanceMax_Crit = 140.f;
+	private const var m_animBothOffsetX : Float;
+	default m_animBothOffsetX = 0.0f;
+	private const var m_animBothOffsetY : Float;
+	default m_animBothOffsetY = 0.0f;
+	private const var m_animBothStickingOffsetY : Float;
+	default m_animBothStickingOffsetY = -70.0f;
+	private const var m_animStickTargetWorldZOffset : Float;
+	default m_animStickTargetWorldZOffset = 0.5f;
+	private const var m_animStickingOffsetY : Float;
+	default m_animStickingOffsetY = -70.0f;
+	private const var m_animDistanceModifierMinDistance : Float;
+	default m_animDistanceModifierMinDistance = 7.0f;
+	private const var m_animDistanceModifierMaxDistance : Float;
+	default m_animDistanceModifierMaxDistance = 25.0f;
+	private const var m_animDistanceModifierMinValue : Float;
+	default m_animDistanceModifierMinValue = 0.6f;
+	private const var m_animDistanceModifierMaxValue : Float;
+	default m_animDistanceModifierMaxValue = 1.0f;
+	private const var m_animDistanceHeightBias : Float;
+	default m_animDistanceHeightBias = 50.0f;
+	private const var m_animStickingDistanceHeightBias : Float;
+	default m_animStickingDistanceHeightBias = 70.0f;
+	private const var m_animPositiveOpacity : Float;
+	default m_animPositiveOpacity = 0.95f;
+	private const var m_animNegativeOpacity : Float;
+	default m_animNegativeOpacity = 0.9f;
+	private var m_animDynamicDuration : Float;
+	private var m_animDynamicDelay : Float;
+	private var m_animDynamicCritDuration : Float;
+	private var m_animDynamicCritDelay : Float;
+
+	protected event OnInitialize()
+	{
+		var strCrit, strHead : String;
+		m_rootWidget = GetRootWidget();
+		m_panelWidget = GetWidget( 'panel' );
+		m_textWidget = ( ( inkText )( GetWidget( 'panel/text_panel/text' ) ) );
+		m_rootWidget.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+		inkTextRef.SetVisible( m_critWidget, false );
+		inkTextRef.SetVisible( m_headshotWidget, false );
+		strCrit = GetLocalizedText( "LocKey#25999" );
+		inkTextRef.SetText( m_critWidget, strCrit );
+		strHead = GetLocalizedText( "LocKey#23394" );
+		inkTextRef.SetText( m_headshotWidget, strHead );
+		m_animStickTargetOffset = Vector4( 0.0, 0.0, m_animStickTargetWorldZOffset, 0.0 );
+		SetActive( false );
+		CreateShowAnimation();
+	}
+
+	protected event OnUninitialize() {}
+
+	public function SetProjection( projection : inkScreenProjection, gameController : weak< DamageDigitsGameController > )
+	{
+		m_projection = projection;
+		m_gameController = gameController;
+	}
+
+	private function SetActive( active : Bool )
+	{
+		m_active = active;
+		m_rootWidget.SetVisible( active );
+	}
+
+	public function Show( damageInfo : DamageInfo, showingBothDigits : Bool, forceStickToTarget : Bool )
+	{
+		var state : CName;
+		var desiredOpacity : Float;
+		m_forceStickToTarget = forceStickToTarget;
+		CalculateDistanceModifier( damageInfo.instigator.GetWorldPosition(), damageInfo.entityHit.GetWorldPosition() );
+		UpdatePositionAndScale( showingBothDigits );
+		UpdateDuration( showingBothDigits );
+		if( m_stickToTarget || m_forceStickToTarget )
+		{
+			if( damageInfo.entityHit.IsDevice() )
+			{
+				m_projection.ResetFixedWorldOffset();
+			}
+			else
+			{
+				m_projection.SetFixedWorldOffset( m_animStickTargetOffset );
+			}
+			m_projection.SetEntity( damageInfo.entityHit );
+		}
+		else
+		{
+			m_projection.ResetFixedWorldOffset();
+			m_projection.ResetEntity();
+			m_projection.SetStaticWorldPosition( damageInfo.hitPosition );
+		}
+		m_projection.RegisterListener( this, 'OnScreenProjectionUpdate' );
+		m_projection.SetEnabled( true );
+		if( ( ( ( Int32 )( damageInfo.damageValue ) ) > 0 ) && damageInfo.userData.hitShapeType == EHitShapeType.Flesh )
+		{
+			m_successful = true;
+			desiredOpacity = m_animPositiveOpacity;
+		}
+		else
+		{
+			m_successful = false;
+			desiredOpacity = m_animNegativeOpacity;
+		}
+		m_successfulCritical = damageInfo.hitType == gameuiHitType.CriticalHit || AttackData.HasFlag( damageInfo.userData.flags, hitFlag.Headshot );
+		m_textWidget.SetText( " " + ( ( Int32 )( damageInfo.damageValue ) ) );
+		m_textWidget.SetOpacity( desiredOpacity );
+		inkTextRef.SetOpacity( m_critWidget, desiredOpacity );
+		inkTextRef.SetOpacity( m_headshotWidget, desiredOpacity );
+		state = BuildStateName( damageInfo.damageType, damageInfo.hitType );
+		m_textWidget.SetState( state );
+		inkTextRef.SetState( m_critWidget, state );
+		inkTextRef.SetState( m_headshotWidget, state );
+		inkTextRef.SetVisible( m_critWidget, damageInfo.hitType == gameuiHitType.CriticalHit );
+		inkTextRef.SetVisible( m_headshotWidget, AttackData.HasFlag( damageInfo.userData.flags, hitFlag.Headshot ) );
+	}
+
+	private function CalculateDistanceModifier( fromVec : Vector4, toVec : Vector4 )
+	{
+		var distance, distanceAdjusted : Float;
+		distance = Vector4.Distance( fromVec, toVec );
+		distanceAdjusted = MinF( distance, m_animDistanceModifierMaxDistance );
+		distanceAdjusted = MaxF( distanceAdjusted - m_animDistanceModifierMinDistance, 0.0 );
+		m_distanceModifier = m_animDistanceModifierMinValue + ( ( m_animDistanceModifierMaxValue - m_animDistanceModifierMinValue ) * ( 1.0 - ( distanceAdjusted / ( m_animDistanceModifierMaxDistance - m_animDistanceModifierMinDistance ) ) ) );
+		m_calculatedDistanceHeightBias = ( m_animDistanceHeightBias * ( m_animDistanceModifierMaxValue - m_distanceModifier ) ) / ( m_animDistanceModifierMaxValue - m_animDistanceModifierMinValue );
+		m_stickingDistanceHeightBias = ( ( MinF( distance, 50.0 ) / 50.0 ) * m_animStickingDistanceHeightBias ) * m_distanceModifier;
+	}
+
+	private function UpdatePositionAndScale( showingBothDigits : Bool )
+	{
+		if( showingBothDigits )
+		{
+			if( m_stickToTarget || m_forceStickToTarget )
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( m_animBothStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( m_animBothStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+			}
+			else
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothOffsetY * m_distanceModifier ) + m_animStartHeight ) + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothOffsetY * m_distanceModifier ) + m_animStartHeight ) + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+			}
+		}
+		else
+		{
+			if( m_stickToTarget || m_forceStickToTarget )
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, ( m_animStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, ( m_animStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+			}
+			else
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+			}
+		}
+		m_showPositiveAnimScaleInterpolator.SetStartScale( Vector2( 1.0 * m_distanceModifier, 1.0 * m_distanceModifier ) );
+		m_showPositiveAnimScaleInterpolator.SetEndScale( Vector2( 1.0 * m_distanceModifier, 1.0 * m_distanceModifier ) );
+		m_showNegativeAnimScaleInterpolator.SetStartScale( Vector2( 1.0 * m_distanceModifier, 1.0 * m_distanceModifier ) );
+		m_showNegativeAnimScaleInterpolator.SetEndScale( Vector2( 1.0 * m_distanceModifier, 1.0 * m_distanceModifier ) );
+	}
+
+	private function UpdateDuration( showingBothDigits : Bool )
+	{
+		if( m_showingBothDigits != showingBothDigits )
+		{
+			if( showingBothDigits )
+			{
+				m_showPositiveAnimFadeInInterpolator.SetDuration( m_animBothTimeFadeIn );
+				m_showPositiveAnimFadeOutInterpolator.SetDuration( m_animBothTimeFadeOut );
+				m_showNegativeAnimFadeInInterpolator.SetDuration( m_animBothTimeFadeIn );
+				m_showNegativeAnimFadeOutInterpolator.SetDuration( m_animBothTimeFadeOut );
+				m_animDynamicDuration = m_animBothTimeFadeOut + m_animBothTimeDelay;
+				m_animDynamicDelay = m_animBothTimeDelay;
+				m_animDynamicCritDuration = m_animBothTimeFadeOut + m_animBothTimeCritDelay;
+				m_animDynamicCritDelay = m_animBothTimeCritDelay;
+			}
+			else
+			{
+				m_showPositiveAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+				m_showPositiveAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+				m_showNegativeAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+				m_showNegativeAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+				m_animDynamicDuration = m_animTimeFadeOut + m_animTimeDelay;
+				m_animDynamicDelay = m_animTimeDelay;
+				m_animDynamicCritDuration = m_animTimeFadeOut + m_animTimeCritDelay;
+				m_animDynamicCritDelay = m_animTimeCritDelay;
+			}
+			m_showingBothDigits = showingBothDigits;
+		}
+	}
+
+	protected event OnScreenProjectionUpdate( projection : inkScreenProjection )
+	{
+		var showAnimProxy : inkAnimProxy;
+		var margin : inkMargin;
+		margin.left = projection.currentPosition.X;
+		margin.top = projection.currentPosition.Y;
+		m_gameController.ApplyProjectionMarginOnWidget( m_rootWidget, margin );
+		m_rootWidget.SetVisible( !( ( AbsF( projection.uvPosition.X ) >= 1.20000005 ) || ( AbsF( projection.uvPosition.Y ) >= 1.20000005 ) ) );
+		if( !( m_active ) )
+		{
+			SetActive( true );
+			GenerateRandomMarginInterpolator( m_successful, m_successfulCritical, m_showingBothDigits );
+			showAnimProxy = m_panelWidget.PlayAnimation( ( ( m_successful ) ? ( m_showPositiveAnimDef ) : ( m_showNegativeAnimDef ) ) );
+			showAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnHide' );
+		}
+	}
+
+	protected event OnHide( anim : inkAnimProxy )
+	{
+		SetActive( false );
+		m_projection.UnregisterListener( this, 'OnScreenProjectionUpdate' );
+		m_projection.SetEnabled( false );
+		CallCustomCallback( 'OnReadyToRemove' );
+	}
+
+	private function GenerateRandomMarginInterpolator( positive : Bool, isCritical : Bool, showingBothDigits : Bool )
+	{
+		var angleRad, distance : Float;
+		var endMargin : Vector2;
+		distance = ( ( isCritical ) ? ( RandRangeF( m_animDistanceMin_Crit, m_animDistanceMax_Crit ) ) : ( RandRangeF( m_animDistanceMin, m_animDistanceMax ) ) );
+		distance *= m_distanceModifier;
+		if( !( positive ) )
+		{
+			distance *= 0.5;
+		}
+		if( showingBothDigits )
+		{
+			if( RandRange( 0, 2 ) == 0 )
+			{
+				angleRad = Deg2Rad( RandRangeF( m_animBothAngleMin1, m_animBothAngleMax1 ) );
+			}
+			else
+			{
+				angleRad = Deg2Rad( RandRangeF( m_animBothAngleMin2, m_animBothAngleMax2 ) );
+			}
+			endMargin.X = ( CosF( angleRad ) * distance ) + ( m_animBothOffsetX * m_distanceModifier );
+		}
+		else
+		{
+			if( RandRange( 0, 2 ) == 0 )
+			{
+				angleRad = Deg2Rad( RandRangeF( m_animAngleMin1, m_animAngleMax1 ) );
+			}
+			else
+			{
+				angleRad = Deg2Rad( RandRangeF( m_animAngleMin2, m_animAngleMax2 ) );
+			}
+			endMargin.X = CosF( angleRad ) * distance;
+		}
+		endMargin.Y = SinF( angleRad ) * distance;
+		if( m_stickToTarget || m_forceStickToTarget )
+		{
+			endMargin.Y += ( ( showingBothDigits ) ? ( ( m_animBothStickingOffsetY * m_distanceModifier ) ) : ( ( m_animStickingOffsetY * m_distanceModifier ) ) );
+			endMargin.Y -= m_stickingDistanceHeightBias;
+		}
+		else
+		{
+			if( showingBothDigits )
+			{
+				endMargin.Y += ( m_animBothOffsetY * m_distanceModifier );
+			}
+			endMargin.Y += ( m_animStartHeight + m_calculatedDistanceHeightBias );
+		}
+		if( positive )
+		{
+			m_showPositiveAnimFadeOutInterpolator.SetStartDelay( ( ( isCritical ) ? ( m_animDynamicCritDelay ) : ( m_animDynamicDelay ) ) );
+			m_showPositiveAnimMarginInterpolator.SetEndMargin( inkMargin( endMargin.X, endMargin.Y, 0.0, 0.0 ) );
+			m_showPositiveAnimMarginInterpolator.SetDuration( ( ( isCritical ) ? ( m_animDynamicCritDuration ) : ( m_animDynamicDuration ) ) );
+		}
+		else
+		{
+			m_showNegativeAnimFadeOutInterpolator.SetStartDelay( ( ( isCritical ) ? ( m_animDynamicCritDelay ) : ( m_animDynamicDelay ) ) );
+			m_showNegativeAnimMarginInterpolator.SetEndMargin( inkMargin( endMargin.X, endMargin.Y, 0.0, 0.0 ) );
+			m_showNegativeAnimMarginInterpolator.SetDuration( ( ( isCritical ) ? ( m_animDynamicCritDuration ) : ( m_animDynamicDuration ) ) );
+		}
+	}
+
+	private function CreateShowAnimation()
+	{
+		m_animDynamicDuration = m_animTimeFadeOut + m_animTimeDelay;
+		m_animDynamicDelay = m_animTimeDelay;
+		m_animDynamicCritDuration = m_animTimeFadeOut + m_animTimeCritDelay;
+		m_animDynamicCritDelay = m_animTimeCritDelay;
+		m_showPositiveAnimDef = new inkAnimDef;
+		m_showPositiveAnimFadeInInterpolator = new inkAnimTransparency;
+		m_showPositiveAnimFadeInInterpolator.SetStartTransparency( 0.0 );
+		m_showPositiveAnimFadeInInterpolator.SetEndTransparency( 1.0 );
+		m_showPositiveAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+		m_showPositiveAnimFadeInInterpolator.SetMode( inkanimInterpolationMode.EasyOut );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimFadeInInterpolator );
+		m_showPositiveAnimFadeOutInterpolator = new inkAnimTransparency;
+		m_showPositiveAnimFadeOutInterpolator.SetStartDelay( m_animDynamicDelay );
+		m_showPositiveAnimFadeOutInterpolator.SetStartTransparency( 1.0 );
+		m_showPositiveAnimFadeOutInterpolator.SetEndTransparency( 0.0 );
+		m_showPositiveAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+		m_showPositiveAnimFadeOutInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimFadeOutInterpolator );
+		m_showPositiveAnimMarginInterpolator = new inkAnimMargin;
+		m_showPositiveAnimMarginInterpolator.SetDuration( m_animDynamicDuration );
+		m_showPositiveAnimMarginInterpolator.SetMode( inkanimInterpolationMode.EasyOut );
+		m_showPositiveAnimMarginInterpolator.SetType( inkanimInterpolationType.Quadratic );
+		m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight, 0.0, 0.0 ) );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimMarginInterpolator );
+		m_showPositiveAnimScaleInterpolator = new inkAnimScale;
+		m_showPositiveAnimScaleInterpolator.SetDuration( 0.1 );
+		m_showPositiveAnimScaleInterpolator.SetStartScale( Vector2( 1.0, 1.0 ) );
+		m_showPositiveAnimScaleInterpolator.SetEndScale( Vector2( 1.0, 1.0 ) );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimScaleInterpolator );
+		m_showNegativeAnimDef = new inkAnimDef;
+		m_showNegativeAnimFadeInInterpolator = new inkAnimTransparency;
+		m_showNegativeAnimFadeInInterpolator.SetStartTransparency( 0.0 );
+		m_showNegativeAnimFadeInInterpolator.SetEndTransparency( 1.0 );
+		m_showNegativeAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+		m_showNegativeAnimFadeInInterpolator.SetMode( inkanimInterpolationMode.EasyOut );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimFadeInInterpolator );
+		m_showNegativeAnimFadeOutInterpolator = new inkAnimTransparency;
+		m_showNegativeAnimFadeOutInterpolator.SetStartDelay( m_animDynamicDelay );
+		m_showNegativeAnimFadeOutInterpolator.SetStartTransparency( 1.0 );
+		m_showNegativeAnimFadeOutInterpolator.SetEndTransparency( 0.0 );
+		m_showNegativeAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+		m_showNegativeAnimFadeOutInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimFadeOutInterpolator );
+		m_showNegativeAnimMarginInterpolator = new inkAnimMargin;
+		m_showNegativeAnimMarginInterpolator.SetDuration( m_animDynamicDuration );
+		m_showNegativeAnimMarginInterpolator.SetMode( inkanimInterpolationMode.EasyOut );
+		m_showNegativeAnimMarginInterpolator.SetType( inkanimInterpolationType.Quadratic );
+		m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight, 0.0, 0.0 ) );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimMarginInterpolator );
+		m_showNegativeAnimScaleInterpolator = new inkAnimScale;
+		m_showNegativeAnimScaleInterpolator.SetDuration( 0.1 );
+		m_showNegativeAnimScaleInterpolator.SetStartScale( Vector2( 1.0, 1.0 ) );
+		m_showNegativeAnimScaleInterpolator.SetEndScale( Vector2( 1.0, 1.0 ) );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimScaleInterpolator );
+	}
+
+	private function BuildStateName( damageType : gamedataDamageType, hitType : gameuiHitType ) : CName
+	{
+		var damageTypeStr : String;
+		var hitTypeStr : String;
+		var isCritical : Bool;
+		if( !( m_successful ) )
+		{
+			damageTypeStr = "Cyberware";
+		}
+		else
+		{
+			switch( damageType )
+			{
+				case gamedataDamageType.Chemical:
+					damageTypeStr = "Chemical";
+				break;
+				case gamedataDamageType.Electric:
+					damageTypeStr = "EMP";
+				break;
+				case gamedataDamageType.Physical:
+					damageTypeStr = "Physical";
+				break;
+				case gamedataDamageType.Thermal:
+					damageTypeStr = "Thermal";
+				break;
+			}
+		}
+		switch( hitType )
+		{
+			case gameuiHitType.Miss:
+				hitTypeStr = "Miss";
+			break;
+			case gameuiHitType.Glance:
+				hitTypeStr = "Glance";
+			break;
+			case gameuiHitType.Hit:
+				hitTypeStr = "Hit";
+			break;
+			case gameuiHitType.CriticalHit:
+				hitTypeStr = "CriticalHit";
+			isCritical = true;
+			break;
+			case gameuiHitType.CriticalHit_x2:
+				hitTypeStr = "CriticalHit_x2";
+			isCritical = true;
+			break;
+		}
+		if( isCritical )
+		{
+			return StringToName( hitTypeStr );
+		}
+		else
+		{
+			return StringToName( ( damageTypeStr + "_" ) + hitTypeStr );
+		}
+	}
+
+}
+
+class AccumulatedDamageDigitLogicController extends inkLogicController
+{
+	private editable var m_critWidget : inkTextRef;
+	private editable var m_headshotWidget : inkTextRef;
+	private var m_rootWidget : weak< inkWidget >;
+	private var m_panelWidget : weak< inkWidget >;
+	private var m_textWidget : weak< inkText >;
+	var m_owner : weak< GameObject >;
+	private var m_gameController : weak< DamageDigitsGameController >;
+	private var m_active : Bool;
+	private var m_successful : Bool;
+	private var m_successfulCritical : Bool;
+	private var m_damageAccumulated : Float;
+	private var m_showingBothDigits : Bool;
+	var m_stickToTarget : Bool;
+	var m_currentlySticking : Bool;
+	private var m_projection : inkScreenProjection;
+	private var m_showAnimProxy : inkAnimProxy;
+	private var m_critAnimProxy : inkAnimProxy;
+	private var m_blinkProxy : inkAnimProxy;
+	private var m_headshotAnimProxy : inkAnimProxy;
+	private var m_distanceModifier : Float;
+	private var m_calculatedDistanceHeightBias : Float;
+	private var m_stickingDistanceHeightBias : Float;
+	private var m_projectionInterpolationOffset : inkMargin;
+	private var m_projectionInterpolationOffsetTotal : inkMargin;
+	private var m_projectionInterpolationProgress : Float;
+	private var m_projectionFreezePosition : Bool;
+	private var m_positionUpdated : Bool;
+	private var m_currentEngineTime : Float;
+	private var m_lastEngineTime : Float;
+	var m_arrayPosition : Int32;
+	private var m_showPositiveAnimDef : inkAnimDef;
+	private var m_showPositiveAnimFadeInInterpolator : inkAnimTransparency;
+	private var m_showPositiveAnimFadeOutInterpolator : inkAnimTransparency;
+	private var m_showPositiveAnimMarginInterpolator : inkAnimMargin;
+	private var m_showPositiveAnimScaleUpInterpolator : inkAnimScale;
+	private var m_showPositiveAnimScaleDownInterpolator : inkAnimScale;
+	private var m_showNegativeAnimDef : inkAnimDef;
+	private var m_showNegativeAnimFadeInInterpolator : inkAnimTransparency;
+	private var m_showNegativeAnimFadeOutInterpolator : inkAnimTransparency;
+	private var m_showNegativeAnimMarginInterpolator : inkAnimMargin;
+	private var m_showCritAnimDef : inkAnimDef;
+	private var m_showCritAnimFadeOutInterpolator : inkAnimTransparency;
+	private var m_animStickTargetOffset : Vector4;
+	private const var m_animTimeFadeIn : Float;
+	default m_animTimeFadeIn = 0.1f;
+	private const var m_animTimeFadeOut : Float;
+	default m_animTimeFadeOut = 0.4f;
+	private const var m_animBothTimeFadeIn : Float;
+	default m_animBothTimeFadeIn = 0.1f;
+	private const var m_animBothTimeFadeOut : Float;
+	default m_animBothTimeFadeOut = 0.25f;
+	private const var m_animTimeDelay : Float;
+	default m_animTimeDelay = 1.3f;
+	private const var m_animBothTimeDelay : Float;
+	default m_animBothTimeDelay = 1.75f;
+	private const var m_animStartHeight : Float;
+	default m_animStartHeight = -80.0f;
+	private const var m_animEndHeight : Float;
+	default m_animEndHeight = -140.0f;
+	private const var m_animPopScale : Float;
+	default m_animPopScale = 1.5f;
+	private const var m_animPopEndScale : Float;
+	default m_animPopEndScale = 1.2f;
+	private const var m_animPopInDuration : Float;
+	default m_animPopInDuration = 0.05f;
+	private const var m_animPopOutDuration : Float;
+	default m_animPopOutDuration = 0.15f;
+	private const var m_animBothOffsetX : Float;
+	default m_animBothOffsetX = 0.0f;
+	private const var m_animBothOffsetY : Float;
+	default m_animBothOffsetY = -50.0f;
+	private const var m_animBothStickingOffsetY : Float;
+	default m_animBothStickingOffsetY = -105.0f;
+	private const var m_animTimeCritDelay : Float;
+	default m_animTimeCritDelay = 1.3f;
+	private const var m_animBothTimeCritDelay : Float;
+	default m_animBothTimeCritDelay = 1.75f;
+	private const var m_animTimeCritFade : Float;
+	default m_animTimeCritFade = 0.4f;
+	private const var m_animBothTimeCritFade : Float;
+	default m_animBothTimeCritFade = 0.25f;
+	private const var m_animMaxScreenDistanceFromLast : Float;
+	default m_animMaxScreenDistanceFromLast = 500.0f;
+	private const var m_animScreenInterpolationTime : Float;
+	default m_animScreenInterpolationTime = 0.08f;
+	private const var m_animMinScreenDistanceFromLast : Float;
+	default m_animMinScreenDistanceFromLast = 60.0f;
+	private const var m_animStickTargetWorldZOffset : Float;
+	default m_animStickTargetWorldZOffset = 0.5f;
+	private const var m_animStickingOffsetY : Float;
+	default m_animStickingOffsetY = -85.0f;
+	private const var m_animDistanceModifierMinDistance : Float;
+	default m_animDistanceModifierMinDistance = 7.0f;
+	private const var m_animDistanceModifierMaxDistance : Float;
+	default m_animDistanceModifierMaxDistance = 25.0f;
+	private const var m_animDistanceModifierMinValue : Float;
+	default m_animDistanceModifierMinValue = 0.6f;
+	private const var m_animDistanceModifierMaxValue : Float;
+	default m_animDistanceModifierMaxValue = 1.0f;
+	private const var m_animDistanceHeightBias : Float;
+	default m_animDistanceHeightBias = 70.0f;
+	private const var m_animStickingDistanceHeightBias : Float;
+	default m_animStickingDistanceHeightBias = 70.0f;
+	private const var m_animPositiveOpacity : Float;
+	default m_animPositiveOpacity = 1.0f;
+	private const var m_animNegativeOpacity : Float;
+	default m_animNegativeOpacity = 0.8f;
+	private var m_animDynamicFadeInDuration : Float;
+
+	protected event OnInitialize()
+	{
+		var strCrit : String;
+		m_rootWidget = GetRootWidget();
+		m_panelWidget = GetWidget( 'panel' );
+		m_textWidget = ( ( inkText )( GetWidget( 'panel/text' ) ) );
+		m_rootWidget.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+		inkTextRef.SetVisible( m_critWidget, false );
+		inkTextRef.SetVisible( m_headshotWidget, false );
+		strCrit = GetLocalizedText( "LocKey#25999" );
+		inkTextRef.SetText( m_critWidget, strCrit );
+		inkTextRef.SetText( m_headshotWidget, GetLocalizedText( "LocKey#23394" ) );
+		m_animStickTargetOffset = Vector4( 0.0, 0.0, m_animStickTargetWorldZOffset, 0.0 );
+		SetActive( false );
+		CreateShowAnimation();
+	}
+
+	protected event OnUninitialize() {}
+
+	public function IsProjectedEntity( entity : weak< GameObject > ) : Bool
+	{
+		return m_projection.GetEntity() == entity;
+	}
+
+	public function SetProjection( projection : inkScreenProjection, gameController : weak< DamageDigitsGameController > )
+	{
+		m_projection = projection;
+		m_gameController = gameController;
+	}
+
+	private function SetActive( active : Bool )
+	{
+		m_active = active;
+		m_rootWidget.SetVisible( active );
+	}
+
+	public function Show( damageInfo : DamageInfo, showingBothDigits : Bool, oneInstance : Bool, forceStickToTarget : Bool )
+	{
+		var state : CName;
+		var desiredOpacity : Float;
+		m_damageAccumulated = damageInfo.damageValue;
+		m_currentlySticking = m_stickToTarget || forceStickToTarget;
+		CalculateDistanceModifier( damageInfo.instigator.GetWorldPosition(), damageInfo.entityHit.GetWorldPosition() );
+		UpdatePositionAndScale( showingBothDigits );
+		UpdateDuration( showingBothDigits );
+		if( m_currentlySticking )
+		{
+			if( damageInfo.entityHit.IsDevice() )
+			{
+				m_projection.ResetFixedWorldOffset();
+			}
+			else
+			{
+				m_projection.SetFixedWorldOffset( m_animStickTargetOffset );
+			}
+			m_projection.SetEntity( damageInfo.entityHit );
+		}
+		else
+		{
+			m_projection.ResetFixedWorldOffset();
+			m_projection.ResetEntity();
+			m_projection.SetStaticWorldPosition( damageInfo.hitPosition );
+		}
+		m_projection.RegisterListener( this, 'OnScreenProjectionUpdate' );
+		m_projection.SetEnabled( true );
+		m_projectionInterpolationOffset.left = 0.0;
+		m_projectionInterpolationOffset.top = 0.0;
+		m_projectionFreezePosition = false;
+		if( ( ( ( Int32 )( damageInfo.damageValue ) ) > 0 ) && damageInfo.userData.hitShapeType == EHitShapeType.Flesh )
+		{
+			m_successful = true;
+			desiredOpacity = m_animPositiveOpacity;
+		}
+		else
+		{
+			m_successful = false;
+			desiredOpacity = m_animNegativeOpacity;
+		}
+		if( ( !( showingBothDigits ) || oneInstance ) && ( damageInfo.hitType == gameuiHitType.CriticalHit || damageInfo.hitType == gameuiHitType.CriticalHit_x2 ) )
+		{
+			m_successfulCritical = true;
+			inkTextRef.SetVisible( m_critWidget, true );
+			if( m_critAnimProxy && m_critAnimProxy.IsPlaying() )
+			{
+				m_critAnimProxy.Stop();
+			}
+			m_critAnimProxy = inkTextRef.PlayAnimation( m_critWidget, m_showCritAnimDef );
+			inkTextRef.SetOpacity( m_critWidget, desiredOpacity );
+		}
+		else
+		{
+			m_successfulCritical = false;
+			inkTextRef.SetVisible( m_critWidget, false );
+		}
+		if( ( !( showingBothDigits ) || oneInstance ) && AttackData.HasFlag( damageInfo.userData.flags, hitFlag.Headshot ) )
+		{
+			inkTextRef.SetVisible( m_headshotWidget, true );
+			if( m_headshotAnimProxy && m_headshotAnimProxy.IsPlaying() )
+			{
+				m_headshotAnimProxy.Stop();
+			}
+			m_headshotAnimProxy = inkTextRef.PlayAnimation( m_headshotWidget, m_showCritAnimDef );
+			inkTextRef.SetOpacity( m_headshotWidget, desiredOpacity );
+		}
+		else
+		{
+			inkTextRef.SetVisible( m_headshotWidget, false );
+		}
+		m_textWidget.SetText( ( ( String )( ( ( Int32 )( m_damageAccumulated ) ) ) ) );
+		m_textWidget.SetOpacity( desiredOpacity );
+		state = BuildStateName( damageInfo.damageType, damageInfo.hitType, ( ( oneInstance ) ? ( false ) : ( showingBothDigits ) ) );
+		m_textWidget.SetState( state );
+		inkTextRef.SetState( m_critWidget, state );
+		inkTextRef.SetState( m_headshotWidget, state );
+	}
+
+	private function CalculateDistanceModifier( fromVec : Vector4, toVec : Vector4 )
+	{
+		var distance, distanceAdjusted : Float;
+		distance = Vector4.Distance( fromVec, toVec );
+		distanceAdjusted = MinF( distance, m_animDistanceModifierMaxDistance );
+		distanceAdjusted = MaxF( distanceAdjusted - m_animDistanceModifierMinDistance, 0.0 );
+		m_distanceModifier = m_animDistanceModifierMinValue + ( ( m_animDistanceModifierMaxValue - m_animDistanceModifierMinValue ) * ( 1.0 - ( distanceAdjusted / ( m_animDistanceModifierMaxDistance - m_animDistanceModifierMinDistance ) ) ) );
+		m_calculatedDistanceHeightBias = ( m_animDistanceHeightBias * ( m_animDistanceModifierMaxValue - m_distanceModifier ) ) / ( m_animDistanceModifierMaxValue - m_animDistanceModifierMinValue );
+		m_stickingDistanceHeightBias = ( ( MinF( distance, 50.0 ) / 50.0 ) * m_animStickingDistanceHeightBias ) * m_distanceModifier;
+	}
+
+	private function UpdatePositionAndScale( showingBothDigits : Bool )
+	{
+		var heightDifference : Float;
+		heightDifference = ( m_animEndHeight - m_animStartHeight ) * m_distanceModifier;
+		if( showingBothDigits )
+		{
+			if( m_currentlySticking )
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias ) + 10.0, 0.0, 0.0 ) );
+				m_showPositiveAnimMarginInterpolator.SetEndMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias ) + heightDifference, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( m_animBothStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetEndMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias ) + ( heightDifference * 0.25 ), 0.0, 0.0 ) );
+			}
+			else
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothOffsetY * m_distanceModifier ) + m_animStartHeight ) + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+				m_showPositiveAnimMarginInterpolator.SetEndMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( ( m_animBothOffsetY * m_distanceModifier ) + m_animStartHeight ) + m_calculatedDistanceHeightBias ) + heightDifference, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( m_animBothOffsetY * m_distanceModifier ) + m_animStartHeight ) + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetEndMargin( inkMargin( m_animBothOffsetX * m_distanceModifier, ( ( ( m_animBothOffsetY * m_distanceModifier ) + m_animStartHeight ) + m_calculatedDistanceHeightBias ) + ( heightDifference * 0.25 ), 0.0, 0.0 ) );
+			}
+		}
+		else
+		{
+			if( m_currentlySticking )
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, ( m_animStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+				m_showPositiveAnimMarginInterpolator.SetEndMargin( inkMargin( 0.0, ( ( m_animStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias ) + heightDifference, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, ( m_animStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetEndMargin( inkMargin( 0.0, ( ( m_animStickingOffsetY * m_distanceModifier ) - m_stickingDistanceHeightBias ) + ( heightDifference * 0.25 ), 0.0, 0.0 ) );
+			}
+			else
+			{
+				m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+				m_showPositiveAnimMarginInterpolator.SetEndMargin( inkMargin( 0.0, ( m_animStartHeight + m_calculatedDistanceHeightBias ) + heightDifference, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight + m_calculatedDistanceHeightBias, 0.0, 0.0 ) );
+				m_showNegativeAnimMarginInterpolator.SetEndMargin( inkMargin( 0.0, ( m_animStartHeight + m_calculatedDistanceHeightBias ) + ( heightDifference * 0.25 ), 0.0, 0.0 ) );
+			}
+		}
+		m_showPositiveAnimScaleUpInterpolator.SetStartScale( Vector2( 1.0 * m_distanceModifier, 1.0 * m_distanceModifier ) );
+		m_showPositiveAnimScaleUpInterpolator.SetEndScale( Vector2( m_animPopScale * m_distanceModifier, m_animPopScale * m_distanceModifier ) );
+		m_showPositiveAnimScaleDownInterpolator.SetStartScale( Vector2( m_animPopScale * m_distanceModifier, m_animPopScale * m_distanceModifier ) );
+		m_showPositiveAnimScaleDownInterpolator.SetEndScale( Vector2( m_animPopEndScale * m_distanceModifier, m_animPopEndScale * m_distanceModifier ) );
+	}
+
+	private function UpdateDuration( showingBothDigits : Bool )
+	{
+		if( m_showingBothDigits != showingBothDigits )
+		{
+			if( showingBothDigits )
+			{
+				m_showPositiveAnimMarginInterpolator.SetDuration( m_animBothTimeFadeOut + m_animBothTimeDelay );
+				m_showPositiveAnimFadeInInterpolator.SetDuration( m_animBothTimeFadeIn );
+				m_showPositiveAnimFadeOutInterpolator.SetDuration( m_animBothTimeFadeOut );
+				m_showPositiveAnimFadeOutInterpolator.SetStartDelay( m_animBothTimeDelay );
+				m_showNegativeAnimMarginInterpolator.SetDuration( m_animBothTimeFadeOut + m_animBothTimeDelay );
+				m_showNegativeAnimFadeInInterpolator.SetDuration( m_animBothTimeFadeIn );
+				m_showNegativeAnimFadeOutInterpolator.SetDuration( m_animBothTimeFadeOut );
+				m_showNegativeAnimFadeOutInterpolator.SetStartDelay( m_animBothTimeDelay );
+				m_showCritAnimFadeOutInterpolator.SetStartDelay( m_animBothTimeCritDelay );
+				m_showCritAnimFadeOutInterpolator.SetDuration( m_animBothTimeCritFade );
+				m_animDynamicFadeInDuration = m_animBothTimeFadeIn;
+			}
+			else
+			{
+				m_showPositiveAnimMarginInterpolator.SetDuration( m_animTimeFadeOut + m_animTimeDelay );
+				m_showPositiveAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+				m_showPositiveAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+				m_showPositiveAnimFadeOutInterpolator.SetStartDelay( m_animTimeDelay );
+				m_showNegativeAnimMarginInterpolator.SetDuration( m_animTimeFadeOut + m_animTimeDelay );
+				m_showNegativeAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+				m_showNegativeAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+				m_showNegativeAnimFadeOutInterpolator.SetStartDelay( m_animTimeDelay );
+				m_showCritAnimFadeOutInterpolator.SetStartDelay( m_animTimeCritDelay );
+				m_showCritAnimFadeOutInterpolator.SetDuration( m_animTimeCritFade );
+				m_animDynamicFadeInDuration = m_animTimeFadeIn;
+			}
+			m_showingBothDigits = showingBothDigits;
+		}
+	}
+
+	public function UpdateDamageInfo( damageInfo : DamageInfo, showingBothDigits : Bool )
+	{
+		var state : CName;
+		var animationCurrentPlayTime, desiredOpacity : Float;
+		m_damageAccumulated += damageInfo.damageValue;
+		CalculateDistanceModifier( damageInfo.instigator.GetWorldPosition(), damageInfo.entityHit.GetWorldPosition() );
+		UpdatePositionAndScale( showingBothDigits );
+		UpdateDuration( showingBothDigits );
+		if( !( m_currentlySticking ) )
+		{
+			m_projection.SetStaticWorldPosition( damageInfo.hitPosition );
+		}
+		m_positionUpdated = true;
+		if( ( ( ( Int32 )( damageInfo.damageValue ) ) > 0 ) && damageInfo.userData.hitShapeType == EHitShapeType.Flesh )
+		{
+			m_successful = true;
+			desiredOpacity = m_animPositiveOpacity;
+		}
+		else
+		{
+			m_successful = false;
+			desiredOpacity = m_animNegativeOpacity;
+		}
+		if( !( showingBothDigits ) && ( damageInfo.hitType == gameuiHitType.CriticalHit || damageInfo.hitType == gameuiHitType.CriticalHit_x2 ) )
+		{
+			m_successfulCritical = true;
+			inkTextRef.SetVisible( m_critWidget, true );
+			if( m_critAnimProxy && m_critAnimProxy.IsPlaying() )
+			{
+				m_critAnimProxy.Stop();
+			}
+			m_critAnimProxy = inkTextRef.PlayAnimation( m_critWidget, m_showCritAnimDef );
+			inkTextRef.SetOpacity( m_critWidget, desiredOpacity );
+		}
+		else
+		{
+			m_successfulCritical = false;
+		}
+		if( !( showingBothDigits ) && AttackData.HasFlag( damageInfo.userData.flags, hitFlag.Headshot ) )
+		{
+			inkTextRef.SetVisible( m_headshotWidget, true );
+			if( m_headshotAnimProxy && m_headshotAnimProxy.IsPlaying() )
+			{
+				m_headshotAnimProxy.Stop();
+			}
+			m_headshotAnimProxy = inkTextRef.PlayAnimation( m_headshotWidget, m_showCritAnimDef );
+			inkTextRef.SetOpacity( m_headshotWidget, desiredOpacity );
+		}
+		if( showingBothDigits )
+		{
+			inkTextRef.SetVisible( m_critWidget, false );
+			inkTextRef.SetVisible( m_headshotWidget, false );
+		}
+		m_textWidget.SetText( ( ( String )( ( ( Int32 )( m_damageAccumulated ) ) ) ) );
+		m_textWidget.SetOpacity( desiredOpacity );
+		state = BuildStateName( damageInfo.damageType, damageInfo.hitType, showingBothDigits );
+		m_textWidget.SetState( state );
+		inkTextRef.SetState( m_critWidget, state );
+		inkTextRef.SetState( m_headshotWidget, state );
+		if( m_blinkProxy && m_blinkProxy.IsPlaying() )
+		{
+			m_blinkProxy.Stop();
+		}
+		m_blinkProxy = PlayLibraryAnimation( 'blink_anim' );
+		m_showAnimProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnHide' );
+		animationCurrentPlayTime = m_showAnimProxy.GetTime();
+		m_showAnimProxy.Stop();
+		m_showPositiveAnimFadeInInterpolator.SetDuration( ClampF( m_showPositiveAnimFadeInInterpolator.GetDuration() - animationCurrentPlayTime, 0.0, m_animDynamicFadeInDuration ) );
+		m_showNegativeAnimFadeInInterpolator.SetDuration( ClampF( m_showNegativeAnimFadeInInterpolator.GetDuration() - animationCurrentPlayTime, 0.0, m_animDynamicFadeInDuration ) );
+		m_showAnimProxy = m_panelWidget.PlayAnimation( ( ( m_successful ) ? ( m_showPositiveAnimDef ) : ( m_showNegativeAnimDef ) ) );
+		m_showAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnHide' );
+	}
+
+	protected event OnScreenProjectionUpdate( projection : inkScreenProjection )
+	{
+		var margin : inkMargin;
+		var distanceX, distanceY : Float;
+		var distanceSquared : Float;
+		var interpolationFactor : Float;
+		var interpolationStartTime, interpolationEndTime : Float;
+		var dt : Float;
+		m_lastEngineTime = m_currentEngineTime;
+		m_currentEngineTime = EngineTime.ToFloat( GameInstance.GetEngineTime( m_owner.GetGame() ) );
+		if( m_projectionFreezePosition )
+		{
+			margin.left = projection.currentPosition.X + m_projectionInterpolationOffset.left;
+			margin.top = projection.currentPosition.Y + m_projectionInterpolationOffset.top;
+		}
+		else
+		{
+			margin.left = projection.currentPosition.X;
+			margin.top = projection.currentPosition.Y;
+		}
+		if( m_active && !( m_currentlySticking ) )
+		{
+			dt = m_currentEngineTime - m_lastEngineTime;
+			if( m_positionUpdated )
+			{
+				m_projectionInterpolationOffset.left += ( projection.previousPosition.X - projection.currentPosition.X );
+				m_projectionInterpolationOffset.top += ( projection.previousPosition.Y - projection.currentPosition.Y );
+				m_projectionInterpolationOffsetTotal = m_projectionInterpolationOffset;
+				m_projectionInterpolationProgress = 0.0;
+				m_positionUpdated = false;
+				distanceSquared = ( m_projectionInterpolationOffset.left * m_projectionInterpolationOffset.left ) + ( m_projectionInterpolationOffset.top * m_projectionInterpolationOffset.top );
+				if( distanceSquared < ( m_animMinScreenDistanceFromLast * m_animMinScreenDistanceFromLast ) )
+				{
+					m_projectionFreezePosition = true;
+					margin.left = projection.currentPosition.X + m_projectionInterpolationOffset.left;
+					margin.top = projection.currentPosition.Y + m_projectionInterpolationOffset.top;
+				}
+				else
+				{
+					m_projectionFreezePosition = false;
+				}
+			}
+			if( !( m_projectionFreezePosition ) )
+			{
+				if( ( AbsF( m_projectionInterpolationOffset.left ) > 0.001 ) || ( AbsF( m_projectionInterpolationOffset.top ) > 0.001 ) )
+				{
+					distanceX = m_projectionInterpolationOffsetTotal.left;
+					distanceY = m_projectionInterpolationOffsetTotal.top;
+					distanceSquared = ( distanceX * distanceX ) + ( distanceY * distanceY );
+					if( distanceSquared <= ( m_animMaxScreenDistanceFromLast * m_animMaxScreenDistanceFromLast ) )
+					{
+						if( ( m_projectionInterpolationProgress + dt ) >= m_animScreenInterpolationTime )
+						{
+							m_projectionInterpolationOffset.left = 0.0;
+							m_projectionInterpolationOffset.top = 0.0;
+						}
+						else
+						{
+							interpolationStartTime = m_projectionInterpolationProgress;
+							interpolationEndTime = interpolationStartTime + dt;
+							interpolationFactor = ( ( ( ( m_animScreenInterpolationTime - interpolationStartTime ) + ( m_animScreenInterpolationTime - interpolationEndTime ) ) * dt ) / m_animScreenInterpolationTime ) / m_animScreenInterpolationTime;
+							m_projectionInterpolationOffset.left -= ( distanceX * interpolationFactor );
+							m_projectionInterpolationOffset.top -= ( distanceY * interpolationFactor );
+							m_projectionInterpolationProgress += dt;
+						}
+						margin.left = projection.currentPosition.X + m_projectionInterpolationOffset.left;
+						margin.top = projection.currentPosition.Y + m_projectionInterpolationOffset.top;
+					}
+					else
+					{
+						m_projectionInterpolationOffset.left = 0.0;
+						m_projectionInterpolationOffset.top = 0.0;
+					}
+				}
+			}
+		}
+		m_gameController.ApplyProjectionMarginOnWidget( m_rootWidget, margin );
+		m_rootWidget.SetVisible( !( ( AbsF( projection.uvPosition.X ) >= 1.20000005 ) || ( AbsF( projection.uvPosition.Y ) >= 1.20000005 ) ) );
+		if( !( m_active ) )
+		{
+			SetActive( true );
+			m_showPositiveAnimFadeInInterpolator.SetDuration( m_animDynamicFadeInDuration );
+			m_showNegativeAnimFadeInInterpolator.SetDuration( m_animDynamicFadeInDuration );
+			m_showAnimProxy = m_panelWidget.PlayAnimation( ( ( m_successful ) ? ( m_showPositiveAnimDef ) : ( m_showNegativeAnimDef ) ) );
+			m_showAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnHide' );
+		}
+	}
+
+	protected event OnHide( anim : inkAnimProxy )
+	{
+		SetActive( false );
+		m_projection.UnregisterListener( this, 'OnScreenProjectionUpdate' );
+		m_projection.SetEnabled( false );
+		CallCustomCallback( 'OnReadyToRemoveAccumulatedDigit' );
+	}
+
+	private function CreateShowAnimation()
+	{
+		m_animDynamicFadeInDuration = m_animTimeFadeIn;
+		m_showPositiveAnimDef = new inkAnimDef;
+		m_showPositiveAnimFadeInInterpolator = new inkAnimTransparency;
+		m_showPositiveAnimFadeInInterpolator.SetStartTransparency( 0.0 );
+		m_showPositiveAnimFadeInInterpolator.SetEndTransparency( 1.0 );
+		m_showPositiveAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+		m_showPositiveAnimFadeInInterpolator.SetMode( inkanimInterpolationMode.EasyOut );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimFadeInInterpolator );
+		m_showPositiveAnimFadeOutInterpolator = new inkAnimTransparency;
+		m_showPositiveAnimFadeOutInterpolator.SetStartDelay( m_animTimeDelay );
+		m_showPositiveAnimFadeOutInterpolator.SetStartTransparency( 1.0 );
+		m_showPositiveAnimFadeOutInterpolator.SetEndTransparency( 0.0 );
+		m_showPositiveAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+		m_showPositiveAnimFadeOutInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimFadeOutInterpolator );
+		m_showPositiveAnimMarginInterpolator = new inkAnimMargin;
+		m_showPositiveAnimMarginInterpolator.SetDuration( m_animTimeFadeOut + m_animTimeDelay );
+		m_showPositiveAnimMarginInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_showPositiveAnimMarginInterpolator.SetType( inkanimInterpolationType.Qubic );
+		m_showPositiveAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight, 0.0, 0.0 ) );
+		m_showPositiveAnimMarginInterpolator.SetEndMargin( inkMargin( 0.0, m_animEndHeight, 0.0, 0.0 ) );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimMarginInterpolator );
+		m_showPositiveAnimScaleUpInterpolator = new inkAnimScale;
+		m_showPositiveAnimScaleUpInterpolator.SetDuration( m_animPopInDuration );
+		m_showPositiveAnimScaleUpInterpolator.SetStartScale( Vector2( 1.0, 1.0 ) );
+		m_showPositiveAnimScaleUpInterpolator.SetEndScale( Vector2( m_animPopScale, m_animPopScale ) );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimScaleUpInterpolator );
+		m_showPositiveAnimScaleDownInterpolator = new inkAnimScale;
+		m_showPositiveAnimScaleDownInterpolator.SetDuration( m_animPopOutDuration );
+		m_showPositiveAnimScaleDownInterpolator.SetStartDelay( m_animPopInDuration );
+		m_showPositiveAnimScaleDownInterpolator.SetStartScale( Vector2( m_animPopScale, m_animPopScale ) );
+		m_showPositiveAnimScaleDownInterpolator.SetEndScale( Vector2( m_animPopEndScale, m_animPopEndScale ) );
+		m_showPositiveAnimDef.AddInterpolator( m_showPositiveAnimScaleDownInterpolator );
+		m_showNegativeAnimDef = new inkAnimDef;
+		m_showNegativeAnimFadeInInterpolator = new inkAnimTransparency;
+		m_showNegativeAnimFadeInInterpolator.SetStartTransparency( 0.0 );
+		m_showNegativeAnimFadeInInterpolator.SetEndTransparency( 1.0 );
+		m_showNegativeAnimFadeInInterpolator.SetDuration( m_animTimeFadeIn );
+		m_showNegativeAnimFadeInInterpolator.SetMode( inkanimInterpolationMode.EasyOut );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimFadeInInterpolator );
+		m_showNegativeAnimFadeOutInterpolator = new inkAnimTransparency;
+		m_showNegativeAnimFadeOutInterpolator.SetStartDelay( m_animTimeDelay );
+		m_showNegativeAnimFadeOutInterpolator.SetStartTransparency( 1.0 );
+		m_showNegativeAnimFadeOutInterpolator.SetEndTransparency( 0.0 );
+		m_showNegativeAnimFadeOutInterpolator.SetDuration( m_animTimeFadeOut );
+		m_showNegativeAnimFadeOutInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimFadeOutInterpolator );
+		m_showNegativeAnimMarginInterpolator = new inkAnimMargin;
+		m_showNegativeAnimMarginInterpolator.SetDuration( m_animTimeFadeOut + m_animTimeDelay );
+		m_showNegativeAnimMarginInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_showNegativeAnimMarginInterpolator.SetType( inkanimInterpolationType.Qubic );
+		m_showNegativeAnimMarginInterpolator.SetStartMargin( inkMargin( 0.0, m_animStartHeight, 0.0, 0.0 ) );
+		m_showNegativeAnimMarginInterpolator.SetEndMargin( inkMargin( 0.0, m_animEndHeight, 0.0, 0.0 ) );
+		m_showNegativeAnimDef.AddInterpolator( m_showNegativeAnimMarginInterpolator );
+		m_showCritAnimDef = new inkAnimDef;
+		m_showCritAnimFadeOutInterpolator = new inkAnimTransparency;
+		m_showCritAnimFadeOutInterpolator.SetStartTransparency( 1.0 );
+		m_showCritAnimFadeOutInterpolator.SetEndTransparency( 0.0 );
+		m_showCritAnimFadeOutInterpolator.SetStartDelay( m_animTimeCritDelay );
+		m_showCritAnimFadeOutInterpolator.SetDuration( m_animTimeCritFade );
+		m_showCritAnimDef.AddInterpolator( m_showCritAnimFadeOutInterpolator );
+	}
+
+	private function BuildStateName( damageType : gamedataDamageType, hitType : gameuiHitType, showingBothDigits : Bool ) : CName
+	{
+		var damageTypeStr : String;
+		var hitTypeStr : String;
+		var isCritical : Bool;
+		if( !( m_successful ) )
+		{
+			damageTypeStr = "Cyberware";
+		}
+		else
+		{
+			switch( damageType )
+			{
+				case gamedataDamageType.Chemical:
+					damageTypeStr = "Chemical";
+				break;
+				case gamedataDamageType.Electric:
+					damageTypeStr = "EMP";
+				break;
+				case gamedataDamageType.Physical:
+					damageTypeStr = "Physical";
+				break;
+				case gamedataDamageType.Thermal:
+					damageTypeStr = "Thermal";
+				break;
+			}
+		}
+		switch( hitType )
+		{
+			case gameuiHitType.Miss:
+				hitTypeStr = "Miss";
+			break;
+			case gameuiHitType.Glance:
+				hitTypeStr = "Glance";
+			break;
+			case gameuiHitType.Hit:
+				hitTypeStr = "Hit";
+			break;
+			case gameuiHitType.CriticalHit:
+				hitTypeStr = "CriticalHit";
+			isCritical = true;
+			break;
+			case gameuiHitType.CriticalHit_x2:
+				hitTypeStr = "CriticalHit_x2";
+			isCritical = true;
+			break;
+		}
+		if( isCritical && !( showingBothDigits ) )
+		{
+			return StringToName( hitTypeStr );
+		}
+		else
+		{
+			return StringToName( ( damageTypeStr + "_" ) + hitTypeStr );
+		}
+	}
+
+}
+

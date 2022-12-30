@@ -1,0 +1,242 @@
+struct DiodeLightPreset
+{
+	var state : Bool;
+	default state = true;
+	var colorMax : array< Int32 >;
+	var colorMin : array< Int32 >;
+	var overrideColorMin : Bool;
+	default overrideColorMin = true;
+	var strength : Float;
+	default strength = 1.f;
+	var curve : CName;
+	var time : Float;
+	default time = 0.f;
+	var loop : Bool;
+	default loop = false;
+	var duration : Float;
+	default duration = 0.f;
+	var force : Bool;
+	default force = false;
+}
+
+class DiodeControlComponent extends ScriptableComponent
+{
+	private const editable var m_affectedLights : array< CName >;
+	private var m_lightsState : Bool;
+	default m_lightsState = false;
+	private var m_primaryLightPreset : DiodeLightPreset;
+	private var m_secondaryLightPreset : DiodeLightPreset;
+	private var m_secondaryPresetActive : Bool;
+	private var m_secondaryPresetRemovalID : DelayID;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		var i : Int32;
+		for( i = 0; i < m_affectedLights.Size(); i += 1 )
+		{
+			if( IsNameValid( m_affectedLights[ i ] ) )
+			{
+				EntityRequestComponentsInterface.RequestComponent( ri, m_affectedLights[ i ], 'gameLightComponent', true );
+			}
+		}
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		var owner : GameObject;
+		owner = GetOwner();
+		if( ( ( ( ScriptedPuppet )( owner ) ) && ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Drone ) && !( StatusEffectSystem.ObjectHasStatusEffect( owner, T"BaseStatusEffect.SystemCollapse" ) ) )
+		{
+			ActivateLightPreset( owner, TweakDBInterface.GetLightPresetRecord( T"MechanicalLightPreset.Reset" ) );
+		}
+		else
+		{
+			ActivateLightPreset( owner, TweakDBInterface.GetLightPresetRecord( T"MechanicalLightPreset.TurnOff" ) );
+			ActivateLightPreset( owner, TweakDBInterface.GetLightPresetRecord( T"MechanicalLightPreset.Reset" ), 0.2 );
+		}
+	}
+
+	public static function ActivateLightPreset( owner : GameObject, lightPreset : weak< LightPreset_Record >, optional delay : Float )
+	{
+		var applyPresetEvent : ApplyDiodeLightPresetEvent;
+		var preset : DiodeLightPreset;
+		preset.state = lightPreset.On();
+		preset.colorMax = lightPreset.ColorMax();
+		preset.colorMin = lightPreset.ColorMin();
+		preset.overrideColorMin = lightPreset.OverrideColorMin();
+		preset.strength = lightPreset.Strength();
+		preset.curve = lightPreset.Curve();
+		preset.time = lightPreset.Time();
+		preset.loop = lightPreset.Loop();
+		preset.duration = lightPreset.Duration();
+		preset.force = lightPreset.Force();
+		applyPresetEvent = new ApplyDiodeLightPresetEvent;
+		applyPresetEvent.preset = preset;
+		if( delay <= 0.0 )
+		{
+			owner.QueueEvent( applyPresetEvent );
+		}
+		else
+		{
+			GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( owner, applyPresetEvent, delay, true );
+		}
+	}
+
+	protected event OnApplyDiodeLightPresetEvent( evt : ApplyDiodeLightPresetEvent )
+	{
+		if( ( evt.preset.duration <= 0.0 ) && ( ( evt.preset.time <= 0.0 ) || evt.preset.loop ) )
+		{
+			ApplyPrimaryPreset( evt.preset, evt.delay, evt.preset.force );
+		}
+		else
+		{
+			if( ( ( evt.preset.duration <= 0.0 ) && ( evt.preset.time > 0.0 ) ) && !( evt.preset.loop ) )
+			{
+				evt.preset.duration = evt.preset.time;
+			}
+			ApplySecondaryPreset( evt.preset, evt.delay, evt.preset.duration );
+		}
+	}
+
+	private function ApplyPrimaryPreset( preset : DiodeLightPreset, delay : Float, force : Bool )
+	{
+		if( m_secondaryPresetActive && force )
+		{
+			GetDelaySystem().CancelDelay( m_secondaryPresetRemovalID );
+			m_secondaryLightPreset = DiodeLightPreset();
+			m_secondaryPresetActive = false;
+		}
+		if( !( m_secondaryPresetActive ) || force )
+		{
+			ApplyPreset( preset, delay );
+		}
+		m_primaryLightPreset = preset;
+	}
+
+	private function ApplySecondaryPreset( preset : DiodeLightPreset, delay : Float, duration : Float )
+	{
+		var removeSecondaryPresetEvent : RemoveSecondaryDiodeLightPresetEvent;
+		if( m_secondaryPresetActive )
+		{
+			GetDelaySystem().CancelDelay( m_secondaryPresetRemovalID );
+		}
+		ApplyPreset( preset, delay );
+		m_secondaryLightPreset = preset;
+		m_secondaryPresetActive = true;
+		removeSecondaryPresetEvent = new RemoveSecondaryDiodeLightPresetEvent;
+		m_secondaryPresetRemovalID = GetDelaySystem().DelayEvent( GetOwner(), removeSecondaryPresetEvent, duration, true );
+	}
+
+	protected event OnRemoveSecondaryDiodeLightPresetEvent( evt : RemoveSecondaryDiodeLightPresetEvent )
+	{
+		ApplyPreset( m_primaryLightPreset );
+		m_secondaryLightPreset = DiodeLightPreset();
+		m_secondaryPresetActive = false;
+	}
+
+	private function ApplyPreset( preset : DiodeLightPreset, optional delay : Float )
+	{
+		if( preset.state != m_lightsState )
+		{
+			ToggleDiodes( preset.state );
+		}
+		if( preset.colorMax.Size() == 0 )
+		{
+			preset.colorMax = ( ( m_secondaryPresetActive ) ? ( m_secondaryLightPreset.colorMax ) : ( m_primaryLightPreset.colorMax ) );
+			preset.overrideColorMin = true;
+		}
+		if( preset.overrideColorMin )
+		{
+			QueueLightSettings( preset.colorMin, 1.0, 0.0, '', false, delay );
+			QueueLightSettings( preset.colorMax, preset.strength, preset.time, preset.curve, preset.loop, delay + 0.01 );
+		}
+		else
+		{
+			QueueLightSettings( preset.colorMax, preset.strength, preset.time, preset.curve, preset.loop, delay );
+		}
+	}
+
+	private function QueueLightSettings( colorValues : array< Int32 >, strength : Float, time : Float, curve : CName, loop : Bool, delay : Float )
+	{
+		var changeSettingsEvent : ChangeDiodeLightSettingsEvent;
+		if( delay <= 0.0 )
+		{
+			ChangeLightSettings( colorValues, strength, time, curve, loop );
+		}
+		else
+		{
+			changeSettingsEvent = new ChangeDiodeLightSettingsEvent;
+			changeSettingsEvent.colorValues = colorValues;
+			changeSettingsEvent.strength = strength;
+			changeSettingsEvent.time = time;
+			changeSettingsEvent.curve = curve;
+			changeSettingsEvent.loop = loop;
+			if( delay < 0.1 )
+			{
+				GetDelaySystem().DelayEventNextFrame( GetOwner(), changeSettingsEvent );
+			}
+			else
+			{
+				GetDelaySystem().DelayEvent( GetOwner(), changeSettingsEvent, delay, true );
+			}
+		}
+	}
+
+	protected event OnChangeDiodeLightSettingsEvent( evt : ChangeDiodeLightSettingsEvent )
+	{
+		ChangeLightSettings( evt.colorValues, evt.strength, evt.time, evt.curve, evt.loop );
+	}
+
+	private function ChangeLightSettings( colorValues : array< Int32 >, strength : Float, time : Float, curve : CName, loop : Bool )
+	{
+		var changeSettingsEvent : ChangeLightByNameEvent;
+		var i : Int32;
+		for( i = 0; i < m_affectedLights.Size(); i += 1 )
+		{
+			changeSettingsEvent = new ChangeLightByNameEvent;
+			changeSettingsEvent.componentName = m_affectedLights[ i ];
+			changeSettingsEvent.settings = ScriptLightSettings( strength, Color( ( ( Uint8 )( colorValues[ 0 ] ) ), ( ( Uint8 )( colorValues[ 1 ] ) ), ( ( Uint8 )( colorValues[ 2 ] ) ), ( ( Uint8 )( colorValues[ 3 ] ) ) ) );
+			changeSettingsEvent.time = time;
+			changeSettingsEvent.curve = curve;
+			changeSettingsEvent.loop = loop;
+			GetOwner().QueueEvent( changeSettingsEvent );
+		}
+	}
+
+	private function ToggleDiodes( state : Bool )
+	{
+		var i : Int32;
+		var toggleLightEvent : ToggleLightByNameEvent;
+		for( i = 0; i < m_affectedLights.Size(); i += 1 )
+		{
+			toggleLightEvent = new ToggleLightByNameEvent;
+			toggleLightEvent.componentName = m_affectedLights[ i ];
+			toggleLightEvent.toggle = state;
+			GetOwner().QueueEvent( toggleLightEvent );
+		}
+		m_lightsState = state;
+	}
+
+}
+
+class ApplyDiodeLightPresetEvent extends Event
+{
+	var preset : DiodeLightPreset;
+	var delay : Float;
+	var duration : Float;
+	var force : Bool;
+}
+
+class ChangeDiodeLightSettingsEvent extends Event
+{
+	var colorValues : array< Int32 >;
+	var strength : Float;
+	var time : Float;
+	var curve : CName;
+	var loop : Bool;
+}
+
+class RemoveSecondaryDiodeLightPresetEvent extends Event
+{
+}
+

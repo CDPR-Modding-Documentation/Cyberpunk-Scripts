@@ -1,0 +1,314 @@
+class MessageMenuAttachmentData extends IScriptable
+{
+	var m_entryHash : Int32;
+}
+
+class PhoneMessagePopupGameController extends inkGameController
+{
+	private editable var m_content : inkWidgetRef;
+	private editable var m_title : inkTextRef;
+	private editable var m_avatarImage : inkImageRef;
+	private editable var m_menuBackgrouns : inkWidgetRef;
+	private editable var m_hintTrack : inkWidgetRef;
+	private editable var m_hintClose : inkWidgetRef;
+	private editable var m_hintReply : inkWidgetRef;
+	private editable var m_hintMessenger : inkWidgetRef;
+	private var m_blackboard : weak< IBlackboard >;
+	private var m_blackboardDef : UI_ComDeviceDef;
+	private var m_uiSystem : UISystem;
+	private var m_player : weak< GameObject >;
+	private var m_journalMgr : weak< JournalManager >;
+	private var m_data : JournalNotificationData;
+	private var m_entry : weak< JournalPhoneMessage >;
+	private var m_contactEntry : weak< JournalContact >;
+	private var m_attachment : weak< JournalEntry >;
+	private var m_attachmentState : gameJournalEntryState;
+	private var m_attachmentHash : Uint32;
+	private var m_activeEntry : weak< JournalEntry >;
+	private var m_dialogViewController : weak< MessengerDialogViewController >;
+	private var m_proxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		m_player = GetPlayerControlledObject();
+		m_journalMgr = GameInstance.GetJournalManager( m_player.GetGame() );
+		m_uiSystem = GameInstance.GetUISystem( m_player.GetGame() );
+		m_blackboardDef = GetAllBlackboardDefs().UI_ComDevice;
+		m_blackboard = GetBlackboardSystem().Get( m_blackboardDef );
+		m_blackboard.SetBool( m_blackboardDef.isDisplayingMessage, true, true );
+		PlayLibraryAnimation( 'Intro' );
+		SetupData();
+	}
+
+	private function SetupData()
+	{
+		var messageState : gameJournalEntryState;
+		var messageHash : Uint32;
+		var conversationEntry : weak< JournalEntry >;
+		var conversations : array< weak< JournalEntry > >;
+		m_data = ( ( JournalNotificationData )( GetRootWidget().GetUserData( 'JournalNotificationData' ) ) );
+		m_contactEntry = ( ( JournalContact )( m_data.journalEntry ) );
+		if( m_contactEntry == NULL )
+		{
+			m_entry = ( ( JournalPhoneMessage )( m_data.journalEntry ) );
+			conversationEntry = m_journalMgr.GetParentEntry( m_entry );
+			m_contactEntry = ( ( JournalContact )( m_journalMgr.GetParentEntry( conversationEntry ) ) );
+		}
+		m_attachmentHash = m_entry.GetAttachmentPathHash();
+		m_attachment = m_journalMgr.GetEntry( m_attachmentHash );
+		inkWidgetRef.SetVisible( m_menuBackgrouns, m_data.menuMode );
+		messageState = m_journalMgr.GetEntryState( m_entry );
+		if( messageState != gameJournalEntryState.Active )
+		{
+			messageHash = ( ( Uint32 )( m_journalMgr.GetEntryHash( m_entry ) ) );
+			m_journalMgr.ChangeEntryStateByHash( messageHash, gameJournalEntryState.Active, JournalNotifyOption.Notify );
+		}
+		m_attachmentState = m_journalMgr.GetEntryState( m_attachment );
+		if( m_attachmentState != gameJournalEntryState.Active && m_attachmentState != gameJournalEntryState.Succeeded )
+		{
+			m_journalMgr.ChangeEntryStateByHash( m_attachmentHash, gameJournalEntryState.Active, JournalNotifyOption.DoNotNotify );
+		}
+		inkWidgetRef.SetVisible( m_hintTrack, m_attachment && ( m_attachmentState != gameJournalEntryState.Succeeded && m_attachmentState != gameJournalEntryState.Failed ) );
+		m_dialogViewController = ( ( MessengerDialogViewController )( inkWidgetRef.GetController( m_content ) ) );
+		m_dialogViewController.AttachJournalManager( m_journalMgr );
+		if( TDBID.IsValid( m_contactEntry.GetAvatarID( m_journalMgr ) ) )
+		{
+			InkImageUtils.RequestSetImage( this, m_avatarImage, m_contactEntry.GetAvatarID( m_journalMgr ) );
+		}
+		m_journalMgr.GetConversations( m_contactEntry, conversations );
+		if( conversationEntry )
+		{
+			m_activeEntry = conversationEntry;
+			m_dialogViewController.ShowThread( m_activeEntry );
+		}
+		else
+		{
+			m_activeEntry = m_contactEntry;
+			m_dialogViewController.ShowDialog( m_activeEntry );
+		}
+		inkWidgetRef.SetVisible( m_hintReply, m_dialogViewController.HasReplyOptions() );
+		inkTextRef.SetText( m_title, m_contactEntry.GetLocalizedName( m_journalMgr ) );
+		if( m_data.menuMode )
+		{
+			RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnHandleMenuInput' );
+			inkWidgetRef.SetVisible( m_hintMessenger, false );
+		}
+		else
+		{
+			PopupStateUtils.SetBackgroundBlurBlendTime( this, 0.1 );
+			m_uiSystem.PushGameContext( UIGameContext.ModalPopup );
+			m_uiSystem.RequestNewVisualState( 'inkModalPopupState' );
+			SetTimeDilatation( true );
+			inkWidgetRef.SetVisible( m_hintMessenger, true );
+			m_player.RegisterInputListener( this, 'cancel' );
+			m_player.RegisterInputListener( this, 'popup_goto_messenger' );
+			m_player.RegisterInputListener( this, 'track_quest' );
+			m_player.RegisterInputListener( this, 'one_click_confirm' );
+			m_player.RegisterInputListener( this, 'popup_moveUp' );
+			m_player.RegisterInputListener( this, 'popup_moveDown' );
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		m_blackboard.SetBool( m_blackboardDef.isDisplayingMessage, false, true );
+		m_journalMgr.SetEntryVisited( m_entry, true );
+		if( m_data.menuMode )
+		{
+			UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnHandleMenuInput' );
+		}
+		else
+		{
+			m_uiSystem.PopGameContext( UIGameContext.ModalPopup );
+			m_uiSystem.RestorePreviousVisualState( 'inkModalPopupState' );
+			SetTimeDilatation( false );
+		}
+	}
+
+	protected event OnDelayedJournalUpdate( evt : DelayedJournalUpdate )
+	{
+		inkWidgetRef.SetVisible( m_hintReply, m_dialogViewController.HasReplyOptions() );
+	}
+
+	protected event OnPopupHidden( evt : inkAnimProxy )
+	{
+		m_data.token.TriggerCallback( m_data );
+	}
+
+	protected event OnHandleMenuInput( evt : inkPointerEvent )
+	{
+		var inputHandled : Bool;
+		if( evt.IsAction( 'cancel' ) )
+		{
+			inputHandled = HandleCommonInputActions( 'cancel' );
+		}
+		else if( evt.IsAction( 'track_quest' ) )
+		{
+			inputHandled = HandleCommonInputActions( 'track_quest' );
+		}
+		else if( evt.IsAction( 'up_button' ) )
+		{
+			NavigateChoices( true );
+		}
+		else if( evt.IsAction( 'down_button' ) )
+		{
+			NavigateChoices( false );
+		}
+		else if( evt.IsAction( 'one_click_confirm' ) )
+		{
+			ActivateChoice();
+		}
+		if( !( inputHandled ) )
+		{
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : CName;
+		var isPressed : Bool;
+		var isAxis : Bool;
+		isPressed = ListenerAction.GetType( action ) == gameinputActionType.BUTTON_PRESSED;
+		isAxis = ListenerAction.GetType( action ) == gameinputActionType.AXIS_CHANGE;
+		if( isPressed || isAxis )
+		{
+			actionName = ListenerAction.GetName( action );
+			if( !( HandleCommonInputActions( actionName ) ) )
+			{
+				switch( actionName )
+				{
+					case 'one_click_confirm':
+						ActivateChoice();
+					break;
+					case 'popup_moveUp':
+						NavigateChoices( true );
+					break;
+					case 'popup_moveDown':
+						NavigateChoices( false );
+					break;
+				}
+			}
+		}
+	}
+
+	private function HandleCommonInputActions( actionName : CName ) : Bool
+	{
+		switch( actionName )
+		{
+			case 'cancel':
+				ClosePopup();
+			return true;
+			break;
+			case 'popup_goto_messenger':
+				GotoMessengerMenu();
+			m_data.token.TriggerCallback( m_data );
+			return true;
+			break;
+			case 'track_quest':
+				if( m_attachment && ( m_attachmentState != gameJournalEntryState.Succeeded && m_attachmentState != gameJournalEntryState.Failed ) )
+				{
+					TrackQuest();
+					m_data.token.TriggerCallback( m_data );
+				}
+			return true;
+			break;
+		}
+		return false;
+	}
+
+	private function ClosePopup()
+	{
+		if( ( m_proxy == NULL ) || !( m_proxy.IsPlaying() ) )
+		{
+			m_proxy = PlayLibraryAnimation( 'Outro' );
+			m_proxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPopupHidden' );
+		}
+	}
+
+	private function TrackQuest()
+	{
+		var objective : weak< JournalQuestObjective >;
+		objective = ( ( JournalQuestObjective )( m_attachment ) );
+		if( objective )
+		{
+			m_journalMgr.TrackEntry( objective );
+		}
+		else
+		{
+			objective = GetFirstObjectiveFromQuest( ( ( JournalQuest )( m_attachment ) ) );
+			m_journalMgr.TrackEntry( objective );
+		}
+	}
+
+	private function GetFirstObjectiveFromQuest( journalQuest : weak< JournalQuest > ) : weak< JournalQuestObjective >
+	{
+		var i : Int32;
+		var unpackedData : array< weak< JournalEntry > >;
+		QuestLogUtils.UnpackRecursive( m_journalMgr, journalQuest, unpackedData );
+		for( i = 0; i < unpackedData.Size(); i += 1 )
+		{
+			if( ( ( JournalQuestObjective )( unpackedData[ i ] ) ) )
+			{
+				return ( ( JournalQuestObjective )( unpackedData[ i ] ) );
+			}
+		}
+		return NULL;
+	}
+
+	private function GotoJournalMenu()
+	{
+		var userData : MessageMenuAttachmentData;
+		userData = new MessageMenuAttachmentData;
+		userData.m_entryHash = m_journalMgr.GetEntryHash( m_attachment );
+		GotoHubMenu( 'quest_log', userData );
+	}
+
+	private function GotoMessengerMenu()
+	{
+		var userData : MessageMenuAttachmentData;
+		userData = new MessageMenuAttachmentData;
+		userData.m_entryHash = m_journalMgr.GetEntryHash( m_activeEntry );
+		GotoHubMenu( 'phone', userData );
+	}
+
+	private function GotoHubMenu( menuName : CName, optional userData : IScriptable )
+	{
+		var evt : StartHubMenuEvent;
+		evt = new StartHubMenuEvent;
+		evt.SetStartMenu( menuName, , userData );
+		QueueBroadcastEvent( evt );
+	}
+
+	private function NavigateChoices( isUp : Bool )
+	{
+		m_dialogViewController.NavigateReplyOptions( isUp );
+		GameInstance.GetAudioSystem( GetPlayerControlledObject().GetGame() ).Play( 'ui_menu_hover' );
+	}
+
+	private function ActivateChoice()
+	{
+		m_dialogViewController.ActivateSelectedReplyOption();
+	}
+
+	protected function SetTimeDilatation( enable : Bool )
+	{
+		var timeSystem : TimeSystem;
+		var timeDilationReason : CName;
+		timeDilationReason = 'MessengerPopup';
+		timeSystem = GameInstance.GetTimeSystem( m_player.GetGame() );
+		if( enable )
+		{
+			timeSystem.SetTimeDilation( timeDilationReason, 0.01, , 'Linear', 'Linear' );
+			timeSystem.SetTimeDilationOnLocalPlayerZero( timeDilationReason, 0.01, , 'Linear', 'Linear' );
+			PopupStateUtils.SetBackgroundBlur( this, true );
+		}
+		else
+		{
+			timeSystem.UnsetTimeDilation( timeDilationReason );
+			timeSystem.UnsetTimeDilationOnLocalPlayerZero();
+			PopupStateUtils.SetBackgroundBlur( this, false );
+		}
+	}
+
+}
+

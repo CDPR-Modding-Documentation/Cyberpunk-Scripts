@@ -1,0 +1,2992 @@
+class PlayerDevelopmentData
+{
+	var m_owner : weak< GameObject >;
+	private persistent var m_ownerID : EntityID;
+	private persistent var m_queuedCombatExp : array< SExperiencePoints >;
+	private persistent var m_proficiencies : array< SProficiency >;
+	private persistent var m_attributes : array< SAttribute >;
+	private persistent var m_perkAreas : array< SPerkArea >;
+	private persistent var m_traits : array< STrait >;
+	private persistent var m_devPoints : array< SDevelopmentPoints >;
+	private persistent var m_skillPrereqs : array< SkillCheckPrereqState >;
+	private persistent var m_statPrereqs : array< StatCheckPrereqState >;
+	private persistent var m_knownRecipes : array< ItemRecipe >;
+	private persistent var m_highestCompletedMinigameLevel : Int32;
+	private const var m_startingLevel : Int32;
+	default m_startingLevel = 1;
+	private const var m_startingExperience : Int32;
+	default m_startingExperience = 0;
+	private persistent var m_lifePath : gamedataLifePath;
+	private var m_displayActivityLog : Bool;
+	default m_displayActivityLog = true;
+
+	public function OnAttach() {}
+
+	public function OnDetach() {}
+
+	public function OnNewGame()
+	{
+		SetProficiencies();
+		InitializePerkAreas();
+		InitializeTraits();
+		SetDevelopmentPoints();
+		UpdateUIBB();
+	}
+
+	public function OnRestored( gameInstance : GameInstance )
+	{
+		var i, j : Int32;
+		var statSys : StatsSystem;
+		var statMod : gameConstantStatModifierData;
+		var type : gamedataProficiencyType;
+		var traitIndex : Int32;
+		var traitType : gamedataTraitType;
+		var shouldTraitUnlock : Bool;
+		if( !( EntityID.IsDefined( m_ownerID ) ) )
+		{
+			m_owner = GetPlayer( gameInstance );
+			m_ownerID = m_owner.GetEntityID();
+		}
+		else
+		{
+			m_owner = ( ( GameObject )( GameInstance.FindEntityByID( gameInstance, m_ownerID ) ) );
+		}
+		statSys = GameInstance.GetStatsSystem( gameInstance );
+		for( i = 0; i < m_proficiencies.Size(); i += 1 )
+		{
+			type = m_proficiencies[ i ].type;
+			if( GetRemainingExpForLevelUp( type ) <= 0 )
+			{
+				if( CanGainNextProficiencyLevel( i ) )
+				{
+					ModifyProficiencyLevel( type );
+					UpdateUIBB();
+				}
+			}
+			AddProficiencyStat( m_proficiencies[ i ].type, m_proficiencies[ i ].currentLevel );
+			m_proficiencies[ i ].maxLevel = GetProficiencyMaxLevel( m_proficiencies[ i ].type );
+			m_proficiencies[ i ].isAtMaxLevel = m_proficiencies[ i ].maxLevel == m_proficiencies[ i ].currentLevel;
+			m_proficiencies[ i ].expToLevel = GetRemainingExpForLevelUp( m_proficiencies[ i ].type );
+			traitType = RPGManager.GetProficiencyRecord( type ).Trait().Type();
+			traitIndex = GetTraitIndex( traitType );
+			if( traitIndex >= 0 )
+			{
+				shouldTraitUnlock = IsTraitReqMet( m_traits[ traitIndex ].type );
+				if( m_traits[ traitIndex ].unlocked && !( shouldTraitUnlock ) )
+				{
+					AddDevelopmentPoints( m_traits[ traitIndex ].currLevel, gamedataDevelopmentPointType.Primary );
+					m_traits[ traitIndex ].currLevel = 0;
+				}
+				m_traits[ traitIndex ].unlocked = shouldTraitUnlock;
+				if( m_traits[ traitIndex ].unlocked )
+				{
+					ActivateTraitBase( m_traits[ traitIndex ].type );
+					EvaluateTraitInfiniteData( traitIndex );
+				}
+			}
+		}
+		GameInstance.GetLevelAssignmentSystem( gameInstance ).MarkPlayerLevelRestored();
+		for( i = 0; i < m_attributes.Size(); i += 1 )
+		{
+			statMod = new gameConstantStatModifierData;
+			statMod.statType = m_attributes[ i ].attributeName;
+			statMod.value = ( ( Float )( m_attributes[ i ].value ) );
+			statMod.modifierType = gameStatModifierType.Additive;
+			statSys.AddModifier( m_owner.GetEntityID(), statMod );
+		}
+		for( i = 0; i < m_perkAreas.Size(); i += 1 )
+		{
+			for( j = 0; j < m_perkAreas[ i ].boughtPerks.Size(); j += 1 )
+			{
+				ActivatePerkLevelData( i, GetPerkIndex( m_perkAreas[ i ].boughtPerks[ j ].type ) );
+			}
+		}
+	}
+
+	public function SetOwner( owner : GameObject )
+	{
+		m_owner = owner;
+		m_ownerID = owner.GetEntityID();
+	}
+
+	public function GetOwner() : weak< GameObject >
+	{
+		return m_owner;
+	}
+
+	public function GetOwnerID() : EntityID
+	{
+		return m_ownerID;
+	}
+
+	public const function GetLifePath() : gamedataLifePath
+	{
+		return m_lifePath;
+	}
+
+	public const function GetProficiencyLevel( type : gamedataProficiencyType ) : Int32
+	{
+		var profIndex : Int32;
+		profIndex = GetProficiencyIndexByType( type );
+		if( profIndex >= 0 )
+		{
+			return m_proficiencies[ profIndex ].currentLevel;
+		}
+		else
+		{
+			return -1;
+		}
+	}
+
+	public const function GetProficiencyAbsoluteMaxLevel( type : gamedataProficiencyType ) : Int32
+	{
+		return RPGManager.GetProficiencyRecord( type ).MaxLevel();
+	}
+
+	public const function GetCurrentLevelProficiencyExp( type : gamedataProficiencyType ) : Int32
+	{
+		var profIndex : Int32;
+		profIndex = GetProficiencyIndexByType( type );
+		if( profIndex >= 0 )
+		{
+			return m_proficiencies[ profIndex ].currentExp;
+		}
+		else
+		{
+			return -1;
+		}
+	}
+
+	public const function GetTotalProfExperience( type : gamedataProficiencyType ) : Int32
+	{
+		var i : Int32;
+		var maxLvl : Int32;
+		var totalExp : Int32;
+		var pIndex : Int32;
+		var curvName : CName;
+		var colName : CName;
+		var statDataSys : StatsDataSystem;
+		statDataSys = GameInstance.GetStatsDataSystem( m_owner.GetGame() );
+		pIndex = GetProficiencyIndexByType( type );
+		if( pIndex < 0 )
+		{
+			LogDM( "GetTotalProfExperience(): Given type doesn't exist! Return value equals -1 !" );
+			return -1;
+		}
+		GetProficiencyExpCurveNames( type, curvName, colName );
+		if( !( IsNameValid( curvName ) ) || !( IsNameValid( colName ) ) )
+		{
+			LogDM( "GetTotalProfExperience(): Empty curve name OR column name ! Return value equals - 1 !" );
+			return -1;
+		}
+		maxLvl = GetProficiencyMaxLevel( type );
+		for( i = 0; i <= maxLvl; i += 1 )
+		{
+			totalExp += ( ( Int32 )( statDataSys.GetValueFromCurve( curvName, ( ( Float )( i ) ), colName ) ) );
+		}
+		return totalExp;
+	}
+
+	public const function GetRemainingExpForLevelUp( type : gamedataProficiencyType ) : Int32
+	{
+		var pIndex : Int32;
+		var exp : Int32;
+		pIndex = GetProficiencyIndexByType( type );
+		if( pIndex >= 0 )
+		{
+			if( !( IsProficiencyMaxLvl( type ) ) )
+			{
+				exp = GetExperienceForNextLevel( type );
+				return exp - m_proficiencies[ pIndex ].currentExp;
+			}
+			else
+			{
+				LogDM( "GetRemainingExpForLevelUp(): Maximum level has been reached. Return value equals to -1 !" );
+				return -1;
+			}
+		}
+		else
+		{
+			LogDM( "GetRemainingExpForLevelUp(): No proficiency has been found! Return value equals -1 !" );
+			return -1;
+		}
+	}
+
+	public const function GetDominatingCombatProficiency() : gamedataProficiencyType
+	{
+		var i : Int32;
+		var profsToCheck : array< gamedataProficiencyType >;
+		var highestLevel : Int32;
+		var dominatingProf : gamedataProficiencyType;
+		profsToCheck.PushBack( gamedataProficiencyType.Assault );
+		profsToCheck.PushBack( gamedataProficiencyType.Gunslinger );
+		profsToCheck.PushBack( gamedataProficiencyType.Kenjutsu );
+		profsToCheck.PushBack( gamedataProficiencyType.Brawling );
+		profsToCheck.PushBack( gamedataProficiencyType.Demolition );
+		profsToCheck.PushBack( gamedataProficiencyType.Stealth );
+		profsToCheck.PushBack( gamedataProficiencyType.CombatHacking );
+		for( i = 0; i < m_proficiencies.Size(); i += 1 )
+		{
+			if( profsToCheck.Contains( m_proficiencies[ i ].type ) )
+			{
+				if( m_proficiencies[ i ].currentLevel > highestLevel )
+				{
+					highestLevel = m_proficiencies[ i ].currentLevel;
+					dominatingProf = m_proficiencies[ i ].type;
+				}
+			}
+		}
+		return dominatingProf;
+	}
+
+	public const function GetHighestCompletedMinigameLevel() : Int32
+	{
+		return m_highestCompletedMinigameLevel;
+	}
+
+	public const function GetProficiencyRecordByIndex( index : Int32 ) : Proficiency_Record
+	{
+		var type : gamedataProficiencyType;
+		type = m_proficiencies[ index ].type;
+		return TweakDBInterface.GetProficiencyRecord( TDBID.Create( "Proficiencies." + EnumValueToString( "gamedataProficiencyType", ( ( Int32 )( type ) ) ) ) );
+	}
+
+	private function SetProficiencies()
+	{
+		var i : Int32;
+		if( m_proficiencies.Size() == ( ( Int32 )( gamedataProficiencyType.Count ) ) )
+		{
+			LogDM( " All m_proficiencies are set!" );
+			return;
+		}
+		else
+		{
+			for( i = 0; i < ( ( Int32 )( gamedataProficiencyType.Count ) ); i += 1 )
+			{
+				if( GetProficiencyIndexByType( ( ( gamedataProficiencyType )( i ) ) ) < 0 )
+				{
+					AddProficiency( ( ( gamedataProficiencyType )( i ) ) );
+				}
+			}
+		}
+	}
+
+	public const function GetProficiencyIndexByType( type : gamedataProficiencyType ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_proficiencies.Size(); i += 1 )
+		{
+			if( m_proficiencies[ i ].type == type )
+			{
+				return i;
+			}
+		}
+		LogDM( "GetProficiencyIndexByType(): No proficiency found! Return value equals -1!" );
+		return -1;
+	}
+
+	private const function ResetProficiencyLevel( type : gamedataProficiencyType )
+	{
+		var pIndex : Int32;
+		pIndex = GetProficiencyIndexByType( type );
+		if( pIndex < 0 )
+		{
+			LogDM( "ResetProficiencyLevel(): Proficiency of given type doesn't exist!" );
+			return;
+		}
+		m_proficiencies[ pIndex ].currentLevel = m_startingLevel;
+		m_proficiencies[ pIndex ].currentExp = m_startingExperience;
+		RemoveProficiencyStat( type );
+		AddProficiencyStat( type, m_startingLevel );
+	}
+
+	private const function GetProficiencyMaxLevel( type : gamedataProficiencyType ) : Int32
+	{
+		var pIndex : Int32;
+		var absoluteMaxLevel : Int32;
+		var attributeMaxLevel : Int32;
+		var curveSetName : CName;
+		var colName : CName;
+		var proficiencyRec : Proficiency_Record;
+		var attributeRec : Stat_Record;
+		var attributeInt : Int32;
+		var attributeType : gamedataStatType;
+		var attributeValue : Int32;
+		pIndex = GetProficiencyIndexByType( type );
+		if( pIndex < 0 )
+		{
+			LogDM( "GetProficiencyMaxLevel(): Proficiency of given type doesn't exist!! Return value equals -1 !!" );
+			return -1;
+		}
+		GetProficiencyExpCurveNames( type, curveSetName, colName );
+		if( curveSetName == '' )
+		{
+			LogDM( "GetProficiencyMaxLevel: Curve name is empty ! return value equals -1 !" );
+			return -1;
+		}
+		proficiencyRec = RPGManager.GetProficiencyRecord( type );
+		absoluteMaxLevel = proficiencyRec.MaxLevel();
+		attributeRec = proficiencyRec.TiedAttribute();
+		attributeInt = -1;
+		if( attributeRec )
+		{
+			attributeInt = ( ( Int32 )( EnumValueFromString( "gamedataStatType", attributeRec.EnumName() ) ) );
+		}
+		if( attributeInt >= 0 )
+		{
+			attributeType = ( ( gamedataStatType )( attributeInt ) );
+			attributeValue = m_attributes[ GetAttributeIndex( attributeType ) ].value;
+			attributeMaxLevel = attributeValue;
+			return Max( Min( absoluteMaxLevel, attributeMaxLevel ), 1 );
+		}
+		else
+		{
+			return absoluteMaxLevel;
+		}
+	}
+
+	private const function GetProficiencyExpCurveNames( type : gamedataProficiencyType, out curvName : CName, out colName : CName )
+	{
+		var pIndex : Int32;
+		var proficiencyRecord : weak< Proficiency_Record >;
+		pIndex = GetProficiencyIndexByType( type );
+		if( pIndex < 0 )
+		{
+			LogDM( "GetProficiencyExpCurve(): Given proficiency type doesn't exist! Both names will be returned empty!" );
+			curvName = '';
+			return;
+		}
+		proficiencyRecord = RPGManager.GetProficiencyRecord( type );
+		colName = proficiencyRecord.CurveName();
+		curvName = proficiencyRecord.CurveSetName();
+	}
+
+	private const function ModifyProficiencyLevel( type : gamedataProficiencyType )
+	{
+		var i : Int32;
+		i = GetProficiencyIndexByType( type );
+		if( i >= 0 )
+		{
+			ModifyProficiencyLevel( i );
+			EvaluateTrait( type );
+		}
+		else
+		{
+			LogDM( "ModifyProficiencyLevel(): Given proficiency type doesn't exist !" );
+		}
+	}
+
+	private const function ModifyProficiencyLevel( proficiencyIndex : Int32 )
+	{
+		var i : Int32;
+		var Blackboard : IBlackboard;
+		var levelIncrease : Int32;
+		var level : LevelUpData;
+		var statusEffectSys : StatusEffectSystem;
+		var effects : array< StatusEffect >;
+		var effectTags : array< CName >;
+		levelIncrease = 1;
+		m_proficiencies[ proficiencyIndex ].currentLevel += levelIncrease;
+		m_proficiencies[ proficiencyIndex ].currentExp = 0;
+		m_proficiencies[ proficiencyIndex ].expToLevel = GetRemainingExpForLevelUp( m_proficiencies[ proficiencyIndex ].type );
+		ModifyDevPoints( m_proficiencies[ proficiencyIndex ].type, m_proficiencies[ proficiencyIndex ].currentLevel );
+		level.lvl = m_proficiencies[ proficiencyIndex ].currentLevel;
+		level.type = m_proficiencies[ proficiencyIndex ].type;
+		level.perkPoints = GetDevPoints( gamedataDevelopmentPointType.Primary );
+		level.attributePoints = GetDevPoints( gamedataDevelopmentPointType.Attribute );
+		AddProficiencyStat( m_proficiencies[ proficiencyIndex ].type, levelIncrease );
+		ProcessProficiencyPassiveBonus( proficiencyIndex );
+		Blackboard = GameInstance.GetBlackboardSystem( m_owner.GetGame() ).Get( GetAllBlackboardDefs().UI_LevelUp );
+		if( Blackboard && ( m_owner == GameInstance.GetPlayerSystem( m_owner.GetGame() ).GetLocalPlayerMainGameObject() ) )
+		{
+			Blackboard.SetVariant( GetAllBlackboardDefs().UI_LevelUp.level, level );
+			Blackboard.SignalVariant( GetAllBlackboardDefs().UI_LevelUp.level );
+		}
+		SetAchievementProgress( proficiencyIndex );
+		if( m_proficiencies[ proficiencyIndex ].currentLevel == RPGManager.GetProficiencyRecord( m_proficiencies[ proficiencyIndex ].type ).MaxLevel() )
+		{
+			if( m_proficiencies[ proficiencyIndex ].type == gamedataProficiencyType.StreetCred )
+			{
+				SendMaxStreetCredLevelReachedTrackingRequest();
+			}
+			else if( m_proficiencies[ proficiencyIndex ].type != gamedataProficiencyType.Level )
+			{
+				CheckSpecialistAchievement( proficiencyIndex );
+			}
+		}
+		if( m_proficiencies[ proficiencyIndex ].type == gamedataProficiencyType.Level )
+		{
+			ProcessTutorialFacts();
+			if( GameInstance.GetStatsDataSystem( m_owner.GetGame() ).GetDifficulty() == gameDifficulty.Story )
+			{
+				GameInstance.GetStatPoolsSystem( m_owner.GetGame() ).RequestSettingStatPoolValue( m_owner.GetEntityID(), gamedataStatPoolType.Health, 100.0, m_owner );
+				statusEffectSys = GameInstance.GetStatusEffectSystem( m_owner.GetGame() );
+				statusEffectSys.GetAppliedEffects( m_owner.GetEntityID(), effects );
+				for( i = 0; i < effects.Size(); i += 1 )
+				{
+					effectTags = effects[ i ].GetRecord().GameplayTags();
+					if( ( effects[ i ].GetRemainingDuration() > 0.0 ) && effectTags.Contains( 'Debuff' ) )
+					{
+						statusEffectSys.RemoveStatusEffect( m_owner.GetEntityID(), effects[ i ].GetRecord().GetID(), effects[ i ].GetStackCount() );
+					}
+				}
+			}
+		}
+	}
+
+	private const function ProcessTutorialFacts()
+	{
+		var questSys : QuestsSystem;
+		questSys = GameInstance.GetQuestsSystem( m_owner.GetGame() );
+		if( ( questSys.GetFact( 'levelup_tutorial' ) == 0 ) && ( questSys.GetFact( 'disable_tutorials' ) == 0 ) )
+		{
+			questSys.SetFact( 'levelup_tutorial', 1 );
+		}
+	}
+
+	private const function SendMaxStreetCredLevelReachedTrackingRequest()
+	{
+		var achievementRequest : AddAchievementRequest;
+		var dataTrackingSystem : DataTrackingSystem;
+		var achievement : gamedataAchievement;
+		achievement = gamedataAchievement.YouKnowWhoIAm;
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( m_owner.GetGame() ).Get( 'DataTrackingSystem' ) ) );
+		if( !( dataTrackingSystem.IsAchievementUnlocked( achievement ) ) )
+		{
+			achievementRequest = new AddAchievementRequest;
+			achievementRequest.achievement = achievement;
+			dataTrackingSystem.QueueRequest( achievementRequest );
+		}
+	}
+
+	public const function CheckSpecialistAchievement( index : Int32 )
+	{
+		var achievementRequest : AddAchievementRequest;
+		var dataTrackingSystem : DataTrackingSystem;
+		var achievement : gamedataAchievement;
+		achievement = gamedataAchievement.Specialist;
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( m_owner.GetGame() ).Get( 'DataTrackingSystem' ) ) );
+		if( dataTrackingSystem.IsAchievementUnlocked( achievement ) )
+		{
+			return;
+		}
+		achievementRequest = new AddAchievementRequest;
+		achievementRequest.achievement = achievement;
+		dataTrackingSystem.QueueRequest( achievementRequest );
+	}
+
+	private const function SetAchievementProgress( index : Int32 )
+	{
+		var setAchievementRequest : SetAchievementProgressRequest;
+		var dataTrackingSystem : DataTrackingSystem;
+		var achievement : gamedataAchievement;
+		var maxLevel : Int32;
+		setAchievementRequest = new SetAchievementProgressRequest;
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( m_owner.GetGame() ).Get( 'DataTrackingSystem' ) ) );
+		if( m_proficiencies[ index ].type == gamedataProficiencyType.StreetCred )
+		{
+			achievement = gamedataAchievement.YouKnowWhoIAm;
+		}
+		else if( m_proficiencies[ index ].type != gamedataProficiencyType.StreetCred && m_proficiencies[ index ].type != gamedataProficiencyType.Level )
+		{
+			achievement = gamedataAchievement.Specialist;
+		}
+		else
+		{
+			return;
+		}
+		maxLevel = RPGManager.GetProficiencyRecord( m_proficiencies[ index ].type ).MaxLevel();
+		setAchievementRequest.achievement = achievement;
+		setAchievementRequest.currentValue = m_proficiencies[ index ].currentLevel;
+		setAchievementRequest.maxValue = maxLevel;
+		dataTrackingSystem.QueueRequest( setAchievementRequest );
+	}
+
+	private const function AddProficiencyStat( type : gamedataProficiencyType, level : Int32 )
+	{
+		var newMod : gameStatModifierData;
+		var statString : String;
+		var statType : gamedataStatType;
+		var gi : GameInstance;
+		gi = m_owner.GetGame();
+		statString = EnumValueToString( "gamedataProficiencyType", ( ( Int32 )( type ) ) );
+		statType = ( ( gamedataStatType )( ( ( Int32 )( EnumValueFromString( "gamedataStatType", statString ) ) ) ) );
+		newMod = RPGManager.CreateStatModifier( statType, gameStatModifierType.Additive, ( ( Float )( level ) ) );
+		GameInstance.GetStatsSystem( gi ).AddModifier( m_owner.GetEntityID(), newMod );
+	}
+
+	private const function ProcessProficiencyPassiveBonus( profIndex : Int32 )
+	{
+		var effectorRecord : Effector_Record;
+		var bonusRecord : PassiveProficiencyBonus_Record;
+		if( GetProficiencyRecordByIndex( profIndex ).GetPassiveBonusesCount() > 0 )
+		{
+			bonusRecord = GetProficiencyRecordByIndex( profIndex ).GetPassiveBonusesItem( m_proficiencies[ profIndex ].currentLevel - 1 );
+			effectorRecord = bonusRecord.EffectorToTrigger();
+			if( effectorRecord )
+			{
+				GameInstance.GetEffectorSystem( m_owner.GetGame() ).ApplyEffector( m_owner.GetEntityID(), m_owner, effectorRecord.GetID() );
+			}
+		}
+	}
+
+	private const function RemoveProficiencyStat( type : gamedataProficiencyType )
+	{
+		var newMod : gameStatModifierData;
+		var statString : String;
+		var statType : gamedataStatType;
+		var level : Float;
+		var gi : GameInstance;
+		gi = m_owner.GetGame();
+		statString = EnumValueToString( "gamedataProficiencyType", ( ( Int32 )( type ) ) );
+		statType = ( ( gamedataStatType )( ( ( Int32 )( EnumValueFromString( "gamedataStatType", statString ) ) ) ) );
+		level = GameInstance.GetStatsSystem( gi ).GetStatValue( m_owner.GetEntityID(), statType );
+		newMod = RPGManager.CreateStatModifier( statType, gameStatModifierType.Additive, -( level ) );
+		GameInstance.GetStatsSystem( gi ).AddModifier( m_owner.GetEntityID(), newMod );
+	}
+
+	private const function RefreshProficiencyStats()
+	{
+		var i : Int32;
+		var pIndex : Int32;
+		var profType : gamedataProficiencyType;
+		for( i = 0; i < ( ( Int32 )( gamedataProficiencyType.Count ) ); i += 1 )
+		{
+			profType = ( ( gamedataProficiencyType )( i ) );
+			pIndex = GetProficiencyIndexByType( profType );
+			if( profType != gamedataProficiencyType.Level && ( pIndex >= 0 ) )
+			{
+				AddProficiencyStat( profType, m_proficiencies[ pIndex ].currentLevel );
+			}
+		}
+	}
+
+	private const function UpdateProficiencyMaxLevels()
+	{
+		var i : Int32;
+		for( i = 0; i < m_proficiencies.Size(); i += 1 )
+		{
+			m_proficiencies[ i ].maxLevel = GetProficiencyMaxLevel( m_proficiencies[ i ].type );
+		}
+	}
+
+	private function AddProficiency( type : gamedataProficiencyType )
+	{
+		var newProf : SProficiency;
+		newProf.type = type;
+		newProf.currentLevel = m_startingLevel;
+		newProf.currentExp = m_startingExperience;
+		newProf.maxLevel = GetProficiencyMaxLevel( type );
+		newProf.expToLevel = GetRemainingExpForLevelUp( type );
+		m_proficiencies.PushBack( newProf );
+	}
+
+	public const function AddExperience( amount : Int32, type : gamedataProficiencyType, telemetryGainReason : telemetryLevelGainReason )
+	{
+		var pIndex : Int32;
+		var reqExp : Int32;
+		var awardedAmount : Int32;
+		var telemetryEvt : TelemetryLevelGained;
+		var proficiencyProgress : ProficiencyProgressEvent;
+		pIndex = GetProficiencyIndexByType( type );
+		if( ( pIndex >= 0 ) && !( IsProficiencyMaxLvl( type ) ) )
+		{
+			while( ( amount > 0 ) && !( IsProficiencyMaxLvl( type ) ) )
+			{
+				reqExp = GetRemainingExpForLevelUp( type );
+				if( ( amount - reqExp ) >= 0 )
+				{
+					awardedAmount += reqExp;
+					amount -= reqExp;
+					m_proficiencies[ pIndex ].currentExp += reqExp;
+					m_proficiencies[ pIndex ].expToLevel = GetRemainingExpForLevelUp( type );
+					if( CanGainNextProficiencyLevel( pIndex ) )
+					{
+						ModifyProficiencyLevel( type );
+						UpdateUIBB();
+						if( m_owner.IsPlayerControlled() && telemetryGainReason != telemetryLevelGainReason.Ignore )
+						{
+							telemetryEvt.playerPuppet = m_owner;
+							telemetryEvt.proficiencyType = type;
+							telemetryEvt.proficiencyValue = m_proficiencies[ pIndex ].currentLevel;
+							telemetryEvt.isDebugEvt = telemetryGainReason == telemetryLevelGainReason.IsDebug;
+							telemetryEvt.perkPointsAwarded = GetDevPointsForLevel( m_proficiencies[ pIndex ].currentLevel, type, gamedataDevelopmentPointType.Primary );
+							telemetryEvt.attributePointsAwarded = GetDevPointsForLevel( m_proficiencies[ pIndex ].currentLevel, type, gamedataDevelopmentPointType.Attribute );
+							GameInstance.GetTelemetrySystem( m_owner.GetGame() ).LogLevelGained( telemetryEvt );
+						}
+					}
+					else
+					{
+						return;
+					}
+				}
+				else
+				{
+					m_proficiencies[ pIndex ].currentExp += amount;
+					m_proficiencies[ pIndex ].expToLevel = GetRemainingExpForLevelUp( type );
+					awardedAmount += amount;
+					amount -= amount;
+				}
+			}
+			if( awardedAmount > 0 )
+			{
+				if( m_displayActivityLog )
+				{
+					if( ( ( ( type == gamedataProficiencyType.StreetCred && ( GameInstance.GetQuestsSystem( m_owner.GetGame() ).GetFact( 'street_cred_tutorial' ) == 0 ) ) && ( GameInstance.GetQuestsSystem( m_owner.GetGame() ).GetFact( 'disable_tutorials' ) == 0 ) ) && telemetryGainReason == telemetryLevelGainReason.Gameplay ) && ( GameInstance.GetQuestsSystem( m_owner.GetGame() ).GetFact( 'q001_show_sts_tut' ) > 0 ) )
+					{
+						GameInstance.GetQuestsSystem( m_owner.GetGame() ).SetFact( 'street_cred_tutorial', 1 );
+					}
+				}
+				proficiencyProgress = new ProficiencyProgressEvent;
+				proficiencyProgress.type = type;
+				proficiencyProgress.expValue = GetCurrentLevelProficiencyExp( type );
+				proficiencyProgress.delta = awardedAmount;
+				proficiencyProgress.remainingXP = GetRemainingExpForLevelUp( type );
+				proficiencyProgress.currentLevel = GetProficiencyLevel( type );
+				proficiencyProgress.isLevelMaxed = ( GetProficiencyLevel( type ) + 1 ) == GetProficiencyAbsoluteMaxLevel( type );
+				GameInstance.GetUISystem( m_owner.GetGame() ).QueueEvent( proficiencyProgress );
+				if( type == gamedataProficiencyType.Level )
+				{
+					UpdatePlayerXP();
+				}
+			}
+		}
+	}
+
+	private const function UpdatePlayerXP()
+	{
+		var m_ownerStatsBB : IBlackboard;
+		var gi : GameInstance;
+		gi = m_owner.GetGame();
+		m_ownerStatsBB = GameInstance.GetBlackboardSystem( gi ).Get( GetAllBlackboardDefs().UI_PlayerStats );
+		m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.CurrentXP, GetCurrentLevelProficiencyExp( gamedataProficiencyType.Level ), true );
+	}
+
+	public function QueueCombatExperience( amount : Float, type : gamedataProficiencyType, entity : EntityID )
+	{
+		var expPackage : SExperiencePoints;
+		expPackage.amount = amount;
+		expPackage.forType = type;
+		expPackage.entity = entity;
+		m_queuedCombatExp.PushBack( expPackage );
+	}
+
+	public function ProcessQueuedCombatExperience( entity : EntityID )
+	{
+		var i, j : Int32;
+		var toRemove : array< Int32 >;
+		var removeIndex : Int32;
+		var expAwarded : Bool;
+		var expAmount : Float;
+		for( i = 0; i < ( ( Int32 )( gamedataProficiencyType.Count ) ); i += 1 )
+		{
+			expAwarded = false;
+			expAmount = 0.0;
+			for( j = 0; j < m_queuedCombatExp.Size(); j += 1 )
+			{
+				if( ( m_queuedCombatExp[ j ].entity == entity ) && ( ( ( Int32 )( m_queuedCombatExp[ j ].forType ) ) == i ) )
+				{
+					expAmount += m_queuedCombatExp[ j ].amount;
+					expAwarded = true;
+					toRemove.PushBack( j );
+				}
+			}
+			for( j = 0; j < toRemove.Size(); j += 1 )
+			{
+				removeIndex = toRemove.PopBack();
+				m_queuedCombatExp.Erase( removeIndex );
+			}
+			if( expAwarded )
+			{
+				AddExperience( ( ( Int32 )( expAmount ) ), ( ( gamedataProficiencyType )( i ) ), telemetryLevelGainReason.Gameplay );
+			}
+		}
+	}
+
+	private const function CanGainNextProficiencyLevel( pIndex : Int32 ) : Bool
+	{
+		var tempString : String;
+		if( pIndex >= 0 )
+		{
+			if( GetProficiencyMaxLevel( m_proficiencies[ pIndex ].type ) > m_proficiencies[ pIndex ].currentLevel )
+			{
+				return true;
+			}
+			else
+			{
+				tempString = IntToString( ( ( Int32 )( m_proficiencies[ pIndex ].type ) ) );
+				LogDM( ( "CanGainNextProfLevel(): Proficiency " + tempString ) + " has reached max level!" );
+				return false;
+			}
+		}
+		else
+		{
+			LogDM( "CanGainNextProfLevel() : No proficiency found! Cannot gain experience to non-existant proficiency!!! Return value equals FALSE" );
+			return false;
+		}
+	}
+
+	private const function GetExperienceForNextLevel( type : gamedataProficiencyType ) : Int32
+	{
+		var pIndex : Int32;
+		var val : Int32;
+		var curveSetName : CName;
+		var colName : CName;
+		var statDataSys : StatsDataSystem;
+		statDataSys = GameInstance.GetStatsDataSystem( m_owner.GetGame() );
+		if( IsProficiencyMaxLvl( type ) )
+		{
+			LogDM( "GetExperienceForNextLevel(): Maximum level has been reached! Return value equals -1 !" );
+			return -1;
+		}
+		pIndex = GetProficiencyIndexByType( type );
+		if( pIndex < 0 )
+		{
+			LogDM( "GetExperienceForNextLevel(): There is no proficiency of given type!! Return value equals -1 !!" );
+			return -1;
+		}
+		GetProficiencyExpCurveNames( type, curveSetName, colName );
+		if( curveSetName == '' || colName == '' )
+		{
+			LogDM( "GetTotalProfExperience(): Empty curve name OR column name ! Return value equals - 1 !" );
+			return -1;
+		}
+		val = ( ( Int32 )( statDataSys.GetValueFromCurve( curveSetName, ( ( Float )( m_proficiencies[ pIndex ].currentLevel + 1 ) ), colName ) ) );
+		return val;
+	}
+
+	public const function GetExperiencePercentage() : Int32
+	{
+		var pIndex : Int32;
+		var maxExp : Int32;
+		var expPerc : Int32;
+		pIndex = GetProficiencyIndexByType( gamedataProficiencyType.Level );
+		maxExp = m_proficiencies[ pIndex ].currentExp + m_proficiencies[ pIndex ].expToLevel;
+		expPerc = ( m_proficiencies[ pIndex ].currentExp * 100 ) / maxExp;
+		return expPerc;
+	}
+
+	private const function AddLevels( type : gamedataProficiencyType, optional amount : Int32 )
+	{
+		var pIndex : Int32;
+		var i : Int32;
+		pIndex = GetProficiencyIndexByType( type );
+		if( amount == 0 )
+		{
+			amount = 1;
+		}
+		if( pIndex >= 0 )
+		{
+			for( i = 0; i <= amount; i += 1 )
+			{
+				AddExperience( GetRemainingExpForLevelUp( type ), type, telemetryLevelGainReason.IsDebug );
+			}
+		}
+	}
+
+	public const function SetLevel( type : gamedataProficiencyType, lvl : Int32, telemetryGainReason : telemetryLevelGainReason )
+	{
+		var pIndex : Int32;
+		var i : Int32;
+		var toAdd : Int32;
+		var tempGainReason : telemetryLevelGainReason;
+		pIndex = GetProficiencyIndexByType( type );
+		if( ( pIndex >= 0 ) && ( m_proficiencies[ pIndex ].currentLevel != lvl ) )
+		{
+			if( lvl < m_proficiencies[ pIndex ].currentLevel )
+			{
+				ResetProficiencyLevel( type );
+			}
+			toAdd = lvl - m_proficiencies[ pIndex ].currentLevel;
+			for( i = 0; i < toAdd; i += 1 )
+			{
+				tempGainReason = ( ( i == ( toAdd - 1 ) ) ? ( telemetryGainReason ) : ( telemetryLevelGainReason.Ignore ) );
+				AddExperience( GetRemainingExpForLevelUp( type ), type, tempGainReason );
+			}
+		}
+	}
+
+	public function BumpNetrunnerMinigameLevel( value : Int32 )
+	{
+		if( value > m_highestCompletedMinigameLevel )
+		{
+			m_highestCompletedMinigameLevel = value;
+		}
+	}
+
+	public const function IsProficiencyMaxLvl( type : gamedataProficiencyType ) : Bool
+	{
+		var pIndex : Int32;
+		pIndex = GetProficiencyIndexByType( type );
+		if( ( pIndex != -1 ) && ( m_proficiencies[ pIndex ].currentLevel == GetProficiencyMaxLevel( type ) ) )
+		{
+			LogDM( ( " IsProficiencyMaxLvl(): Proficiency " + IntToString( ( ( Int32 )( type ) ) ) ) + " has reached max level!" );
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public const function GetDevPoints( type : gamedataDevelopmentPointType ) : Int32
+	{
+		return m_devPoints[ GetDevPointsIndex( type ) ].unspent;
+	}
+
+	private const function GetDevPointsIndex( type : gamedataDevelopmentPointType ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_devPoints.Size(); i += 1 )
+		{
+			if( m_devPoints[ i ].type == type )
+			{
+				return i;
+			}
+		}
+		LogDM( "GetDevPointsIndex(): Dev points of given type don't exist ! Return value equals -1 !" );
+		return -1;
+	}
+
+	private function SetDevelopmentPoints()
+	{
+		var i : Int32;
+		var devPts : SDevelopmentPoints;
+		for( i = 0; i < ( ( Int32 )( gamedataDevelopmentPointType.Count ) ); i += 1 )
+		{
+			devPts.type = ( ( gamedataDevelopmentPointType )( i ) );
+			devPts.spent = 0;
+			devPts.unspent = 0;
+			m_devPoints.PushBack( devPts );
+		}
+	}
+
+	private const function ModifyDevPoints( type : gamedataProficiencyType, level : Int32 )
+	{
+		var i : Int32;
+		var val : Int32;
+		for( i = 0; i <= ( ( Int32 )( gamedataDevelopmentPointType.Count ) ); i += 1 )
+		{
+			val = GetDevPointsForLevel( level, type, ( ( gamedataDevelopmentPointType )( i ) ) );
+			if( val > 0 )
+			{
+				AddDevelopmentPoints( val, ( ( gamedataDevelopmentPointType )( i ) ) );
+			}
+		}
+	}
+
+	private const function GetDevPointsForLevel( level : Int32, profType : gamedataProficiencyType, devPtsType : gamedataDevelopmentPointType ) : Int32
+	{
+		var curve : CName;
+		var col : CName;
+		var dIndex : Int32;
+		var statDataSys : StatsDataSystem;
+		var awardFloat : Float;
+		statDataSys = GameInstance.GetStatsDataSystem( m_owner.GetGame() );
+		dIndex = GetDevPointsIndex( devPtsType );
+		if( dIndex < 0 )
+		{
+			LogDM( " GetDevPointsForLevel(): Error ! Given type doesn't exist ! Return value equals -1 !" );
+			return -1;
+		}
+		GetProficiencyExpCurveNames( profType, curve, col );
+		if( curve == '' || col == '' )
+		{
+			return -1;
+		}
+		if( profType == gamedataProficiencyType.Level )
+		{
+			if( devPtsType == gamedataDevelopmentPointType.Attribute && ( ( level % 2 ) == 0 ) )
+			{
+				return 1;
+			}
+			awardFloat = statDataSys.GetValueFromCurve( 'player_levelToXP', ( ( Float )( level ) ), 'perk_point_award_from_level' );
+			return ( ( Int32 )( awardFloat ) );
+		}
+		return -1;
+	}
+
+	public const function AddDevelopmentPoints( amount : Int32, type : gamedataDevelopmentPointType )
+	{
+		var dIndex : Int32;
+		dIndex = GetDevPointsIndex( type );
+		if( dIndex < 0 )
+		{
+			LogDM( " AddDevelopmentPoints(): Error ! Given type doesn't exist !" );
+			return;
+		}
+		m_devPoints[ dIndex ].unspent += amount;
+	}
+
+	private const function SpendDevelopmentPoint( type : gamedataDevelopmentPointType )
+	{
+		var dIndex : Int32;
+		dIndex = GetDevPointsIndex( type );
+		if( dIndex < 0 )
+		{
+			LogDM( " SpendDevelopmentPoint(): Given type doesn't exist! " );
+			return;
+		}
+		m_devPoints[ dIndex ].unspent -= 1;
+		m_devPoints[ dIndex ].spent += 1;
+	}
+
+	private const function ResetDevelopmentPoints( type : gamedataDevelopmentPointType )
+	{
+		var dIndex : Int32;
+		dIndex = GetDevPointsIndex( type );
+		if( dIndex < 0 )
+		{
+			LogDM( "ResetDevelopmentPoints(): Given type doesn't exist!" );
+			return;
+		}
+		m_devPoints[ dIndex ].unspent += m_devPoints[ dIndex ].spent;
+		m_devPoints[ dIndex ].spent = 0;
+	}
+
+	private const function ResetAllDevPoints()
+	{
+		var i : Int32;
+		for( i = 1; i < m_devPoints.Size(); i += 1 )
+		{
+			ResetDevelopmentPoints( ( ( gamedataDevelopmentPointType )( i ) ) );
+		}
+	}
+
+	private const function ClearAllDevPoints()
+	{
+		var i : Int32;
+		for( i = 0; i < m_devPoints.Size(); i += 1 )
+		{
+			m_devPoints[ i ].spent = 0;
+			m_devPoints[ i ].unspent = 0;
+		}
+	}
+
+	private function InitializePerkAreas()
+	{
+		var i : Int32;
+		for( i = 0; i <= ( ( Int32 )( gamedataPerkArea.Count ) ); i += 1 )
+		{
+			InitializePerkArea( ( ( gamedataPerkArea )( i ) ) );
+		}
+	}
+
+	private function InitializePerkArea( areaType : gamedataPerkArea )
+	{
+		var newPerkArea : SPerkArea;
+		if( IsPerkAreaValid( areaType ) )
+		{
+			newPerkArea.type = areaType;
+			newPerkArea.unlocked = ShouldPerkAreaBeAvailable( areaType );
+			newPerkArea.boughtPerks.Clear();
+			m_perkAreas.PushBack( newPerkArea );
+		}
+	}
+
+	private const function InitializePerk( perkType : gamedataPerkType ) : SPerk
+	{
+		var newPerk : SPerk;
+		newPerk.type = perkType;
+		newPerk.currLevel = 0;
+		return newPerk;
+	}
+
+	private const function IncreasePerkLevel( areaIndex : Int32, perkIndex : Int32 )
+	{
+		m_perkAreas[ areaIndex ].boughtPerks[ perkIndex ].currLevel += 1;
+	}
+
+	public const function RefreshPerkAreas()
+	{
+		var i : Int32;
+		for( i = 0; i < m_proficiencies.Size(); i += 1 )
+		{
+			EvaluatePerkAreas( m_proficiencies[ i ].type );
+		}
+	}
+
+	private const function EvaluatePerkAreas( prof : gamedataProficiencyType )
+	{
+		var i : Int32;
+		var pIndex : Int32;
+		var aIndex : Int32;
+		var perkAreas : array< weak< PerkArea_Record > >;
+		pIndex = GetProficiencyIndexByType( prof );
+		if( pIndex < 0 )
+		{
+			return;
+		}
+		RPGManager.GetProficiencyRecord( prof ).PerkAreas( perkAreas );
+		for( i = 0; i < perkAreas.Size(); i += 1 )
+		{
+			aIndex = GetPerkAreaIndex( perkAreas[ i ].Type() );
+			if( aIndex < 0 )
+			{
+				continue;
+			}
+			m_perkAreas[ aIndex ].unlocked = IsPerkAreaReqMet( perkAreas[ i ] );
+		}
+	}
+
+	public const function GetPerkAreaIndex( areaType : gamedataPerkArea ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_perkAreas.Size(); i += 1 )
+		{
+			if( m_perkAreas[ i ].type == areaType )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function GetPerkIndex( areaIndex : Int32, perkType : gamedataPerkType ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_perkAreas[ areaIndex ].boughtPerks.Size(); i += 1 )
+		{
+			if( m_perkAreas[ areaIndex ].boughtPerks[ i ].type == perkType )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	public const function GetPerkIndex( areaType : gamedataPerkArea, perkType : gamedataPerkType ) : Int32
+	{
+		var i : Int32;
+		var pAreaIndex : Int32;
+		pAreaIndex = GetPerkAreaIndex( areaType );
+		if( pAreaIndex < 0 )
+		{
+			return -1;
+		}
+		for( i = 0; i < m_perkAreas[ pAreaIndex ].boughtPerks.Size(); i += 1 )
+		{
+			if( m_perkAreas[ pAreaIndex ].boughtPerks[ i ].type == perkType )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function GetPerkIndex( perkType : gamedataPerkType ) : Int32
+	{
+		var pIndex : Int32;
+		pIndex = GetPerkIndex( GetPerkAreaFromPerk( perkType ), perkType );
+		return pIndex;
+	}
+
+	public const function UnlockPerkArea( areaType : gamedataPerkArea )
+	{
+		var pAreaIndex : Int32;
+		pAreaIndex = GetPerkAreaIndex( areaType );
+		if( pAreaIndex < 0 )
+		{
+			return;
+		}
+		m_perkAreas[ pAreaIndex ].unlocked = true;
+	}
+
+	public const function LockPerkArea( areaType : gamedataPerkArea )
+	{
+		var pAreaIndex : Int32;
+		pAreaIndex = GetPerkAreaIndex( areaType );
+		if( pAreaIndex < 0 )
+		{
+			return;
+		}
+		m_perkAreas[ pAreaIndex ].unlocked = false;
+	}
+
+	public const function BuyPerk( perkType : gamedataPerkType ) : Bool
+	{
+		var profIndex : Int32;
+		var pIndex : Int32;
+		var pAreaIndex : Int32;
+		var newPerk : SPerk;
+		var canBeBought : Bool;
+		pAreaIndex = GetPerkAreaIndex( GetPerkAreaFromPerk( perkType ) );
+		if( pAreaIndex < 0 )
+		{
+			return false;
+		}
+		pIndex = GetPerkIndex( perkType );
+		canBeBought = CanPerkBeBought( perkType );
+		if( ( pIndex < 0 ) && canBeBought )
+		{
+			newPerk = InitializePerk( perkType );
+			m_perkAreas[ pAreaIndex ].boughtPerks.PushBack( newPerk );
+			pIndex = GetPerkIndex( perkType );
+		}
+		if( !( IsPerkMaxLevel( perkType ) ) && canBeBought )
+		{
+			profIndex = GetProficiencyIndexFromPerkArea( m_perkAreas[ pAreaIndex ].type );
+			DeactivatePerkLevelData( pAreaIndex, pIndex );
+			IncreasePerkLevel( pAreaIndex, pIndex );
+			ActivatePerkLevelData( pAreaIndex, pIndex );
+			SpendDevelopmentPoint( gamedataDevelopmentPointType.Primary );
+			m_proficiencies[ profIndex ].spentPerkPoints += 1;
+			EvaluatePerkAreas( m_proficiencies[ profIndex ].type );
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public const function RemovePerk( perkType : gamedataPerkType ) : Bool
+	{
+		var pIndex : Int32;
+		var pAreaIndex : Int32;
+		var profIndex : Int32;
+		var dIndex : Int32;
+		var tempPDevPts : Int32;
+		var areaType : gamedataPerkArea;
+		var currentPerkLevel : Int32;
+		areaType = GetPerkAreaFromPerk( perkType );
+		pAreaIndex = GetPerkAreaIndex( areaType );
+		if( pAreaIndex < 0 )
+		{
+			return false;
+		}
+		pIndex = GetPerkIndex( perkType );
+		if( pIndex >= 0 )
+		{
+			DeactivatePerkLevelData( pAreaIndex, pIndex );
+			currentPerkLevel = m_perkAreas[ pAreaIndex ].boughtPerks[ pIndex ].currLevel;
+			tempPDevPts = ( ( Int32 )( GameInstance.GetStatsDataSystem( m_owner.GetGame() ).GetValueFromCurve( GetPerkAreaRecord( areaType ).Curve().CurveSetName(), ( ( Float )( currentPerkLevel ) ), 'Primary' ) ) );
+			if( tempPDevPts > 0 )
+			{
+				profIndex = GetProficiencyIndexFromPerkArea( m_perkAreas[ pAreaIndex ].type );
+				dIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Primary );
+				m_devPoints[ dIndex ].unspent += tempPDevPts;
+				m_devPoints[ dIndex ].spent -= tempPDevPts;
+				m_proficiencies[ profIndex ].spentPerkPoints -= tempPDevPts;
+				RemovePerkRecipes( perkType );
+			}
+			m_perkAreas[ pAreaIndex ].boughtPerks.EraseFast( pIndex );
+			return true;
+		}
+		return false;
+	}
+
+	public const function RemoveAllPerks( free : Bool )
+	{
+		var i : Int32;
+		var perkType : gamedataPerkType;
+		var perkResetEvent : PerkResetEvent;
+		var respecCost : Int32;
+		var perksRemoved : array< gamedataPerkType >;
+		respecCost = 0;
+		if( !( free ) )
+		{
+			respecCost = GetTotalRespecCost();
+			GameInstance.GetTransactionSystem( m_owner.GetGame() ).RemoveItem( m_owner, MarketSystem.Money(), respecCost );
+		}
+		for( i = 0; i < ( ( Int32 )( gamedataPerkType.Count ) ); i += 1 )
+		{
+			perkType = ( ( gamedataPerkType )( i ) );
+			if( HasPerk( perkType ) )
+			{
+				RemovePerk( perkType );
+				perksRemoved.PushBack( perkType );
+			}
+		}
+		for( i = 0; i < ( ( Int32 )( gamedataTraitType.Count ) ); i += 1 )
+		{
+			RemoveTrait( ( ( gamedataTraitType )( i ) ) );
+		}
+		GameInstance.GetTelemetrySystem( m_owner.GetGame() ).LogPerksRemoved( respecCost, perksRemoved );
+		perkResetEvent = new PerkResetEvent;
+		GameInstance.GetUISystem( m_owner.GetGame() ).QueueEvent( perkResetEvent );
+	}
+
+	public const function GetTotalRespecCost() : Int32
+	{
+		var cost : Int32;
+		var basePrice : Int32;
+		var singlePerkPrice : Int32;
+		basePrice = ( ( Int32 )( TweakDBInterface.GetConstantStatModifierRecord( T"Price.RespecBase" ).Value() ) );
+		singlePerkPrice = ( ( Int32 )( TweakDBInterface.GetConstantStatModifierRecord( T"Price.RespecSinglePerk" ).Value() ) );
+		cost = basePrice + ( singlePerkPrice * ( GetSpentPerkPoints() + GetSpentTraitPoints() ) );
+		return cost;
+	}
+
+	public function CheckPlayerRespecCost() : Bool
+	{
+		var resetCost : Int32;
+		var userMoney : Int32;
+		resetCost = GetTotalRespecCost();
+		userMoney = GameInstance.GetTransactionSystem( m_owner.GetGame() ).GetItemQuantity( m_owner, MarketSystem.Money() );
+		return userMoney >= resetCost;
+	}
+
+	private const function RemovePerkRecipes( perkType : gamedataPerkType )
+	{
+		var perkLevels : array< weak< PerkLevelData_Record > >;
+		var perkLevelEffectors : array< weak< Effector_Record > >;
+		var addItemsEffector : AddItemsEffector_Record;
+		var itemsToAdd : array< weak< InventoryItem_Record > >;
+		var hideRecipeRequest : HideRecipeRequest;
+		var craftingSystem : CraftingSystem;
+		var i, j, k : Int32;
+		GetPerkRecord( perkType ).Levels( perkLevels );
+		for( i = 0; i < perkLevels.Size(); i += 1 )
+		{
+			perkLevels[ i ].DataPackage().Effectors( perkLevelEffectors );
+			for( j = 0; j < perkLevelEffectors.Size(); j += 1 )
+			{
+				addItemsEffector = ( ( AddItemsEffector_Record )( perkLevelEffectors[ j ] ) );
+				if( addItemsEffector )
+				{
+					addItemsEffector.ItemsToAdd( itemsToAdd );
+					for( k = 0; k < itemsToAdd.Size(); k += 1 )
+					{
+						craftingSystem = ( ( CraftingSystem )( GameInstance.GetScriptableSystemsContainer( m_owner.GetGame() ).Get( 'CraftingSystem' ) ) );
+						hideRecipeRequest = new HideRecipeRequest;
+						hideRecipeRequest.recipe = ( ( ItemRecipe_Record )( itemsToAdd[ k ].Item() ) ).CraftingResult().Item().GetID();
+						craftingSystem.QueueRequest( hideRecipeRequest );
+					}
+				}
+			}
+		}
+	}
+
+	public const function GetPerkRecord( perkType : gamedataPerkType ) : Perk_Record
+	{
+		return TweakDBInterface.GetPerkRecord( TDBID.Create( "Perks." + EnumValueToString( "gamedataPerkType", ( ( Int32 )( perkType ) ) ) ) );
+	}
+
+	public const function GetPerkAreaRecord( areaType : gamedataPerkArea ) : PerkArea_Record
+	{
+		return TweakDBInterface.GetPerkAreaRecord( TDBID.Create( "Perks." + EnumValueToString( "gamedataPerkArea", ( ( Int32 )( areaType ) ) ) ) );
+	}
+
+	public const function GetPerkPackageTDBID( areaIndex : Int32, perkIndex : Int32 ) : TweakDBID
+	{
+		var packageID : TweakDBID;
+		packageID = GetPerkPackageTDBID( m_perkAreas[ areaIndex ].boughtPerks[ perkIndex ].type );
+		return packageID;
+	}
+
+	public const function GetPerkPackageTDBID( perkType : gamedataPerkType ) : TweakDBID
+	{
+		var pAreaIndex : Int32;
+		var pIndex : Int32;
+		var packageID : TweakDBID;
+		var levelsData : array< weak< PerkLevelData_Record > >;
+		GetPerkRecord( perkType ).Levels( levelsData );
+		pAreaIndex = GetPerkAreaIndex( GetPerkAreaFromPerk( perkType ) );
+		if( pAreaIndex < 0 )
+		{
+			return TDBID.None();
+		}
+		pIndex = GetPerkIndex( pAreaIndex, perkType );
+		if( pIndex < 0 )
+		{
+			return TDBID.None();
+		}
+		packageID = levelsData[ m_perkAreas[ pAreaIndex ].boughtPerks[ pIndex ].currLevel - 1 ].DataPackage().GetID();
+		return packageID;
+	}
+
+	public const function HasPerk( perkType : gamedataPerkType ) : Bool
+	{
+		var pIndex : Int32;
+		pIndex = GetPerkIndex( GetPerkAreaFromPerk( perkType ), perkType );
+		return pIndex >= 0;
+	}
+
+	public const function GetInvestedPerkPoints( profType : gamedataProficiencyType ) : Int32
+	{
+		var pIndex : Int32;
+		pIndex = GetProficiencyIndexByType( profType );
+		return m_proficiencies[ pIndex ].spentPerkPoints;
+	}
+
+	public const function ShouldPerkAreaBeAvailable( areaType : gamedataPerkArea ) : Bool
+	{
+		var areaRecord : PerkArea_Record;
+		areaRecord = GetPerkAreaRecord( areaType );
+		if( TDBID.IsValid( areaRecord.GetID() ) )
+		{
+			if( IsPerkAreaReqMet( areaRecord ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function IsPerkAreaUnlocked( area : gamedataPerkArea ) : Bool
+	{
+		var aIndex : Int32;
+		aIndex = GetPerkAreaIndex( area );
+		if( aIndex < 0 )
+		{
+			return false;
+		}
+		return m_perkAreas[ aIndex ].unlocked;
+	}
+
+	public const function IsPerkAreaUnlocked( aIndex : Int32 ) : Bool
+	{
+		if( aIndex < 0 )
+		{
+			return false;
+		}
+		return m_perkAreas[ aIndex ].unlocked;
+	}
+
+	private const function IsPerkAreaValid( areaType : gamedataPerkArea ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < ( ( Int32 )( gamedataPerkArea.Count ) ); i += 1 )
+		{
+			if( areaType == ( ( gamedataPerkArea )( i ) ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private const function IsPerkMaxLevel( perkType : gamedataPerkType ) : Bool
+	{
+		return GetPerkLevel( perkType ) >= GetPerkMaxLevel( perkType );
+	}
+
+	public const function GetPerkMaxLevel( perkType : gamedataPerkType ) : Int32
+	{
+		return GetPerkAreaRecord( GetPerkAreaFromPerk( perkType ) ).MaxLevel();
+	}
+
+	public const function GetPerkLevel( perkType : gamedataPerkType ) : Int32
+	{
+		var pIndex : Int32;
+		var pAreaIndex : Int32;
+		pAreaIndex = GetPerkAreaIndex( GetPerkAreaFromPerk( perkType ) );
+		if( pAreaIndex < 0 )
+		{
+			return -1;
+		}
+		pIndex = GetPerkIndex( pAreaIndex, perkType );
+		if( pIndex < 0 )
+		{
+			return -1;
+		}
+		return m_perkAreas[ pAreaIndex ].boughtPerks[ pIndex ].currLevel;
+	}
+
+	private const function CanPerkBeBought( perkType : gamedataPerkType ) : Bool
+	{
+		var pIndex : Int32;
+		var pAreaIndex : Int32;
+		var primDevIndex : Int32;
+		pAreaIndex = GetPerkAreaIndex( GetPerkAreaFromPerk( perkType ) );
+		if( pAreaIndex < 0 )
+		{
+			return false;
+		}
+		pIndex = GetPerkIndex( pAreaIndex, perkType );
+		if( ( pIndex >= 0 ) && ( GetPerkMaxLevel( perkType ) <= m_perkAreas[ pAreaIndex ].boughtPerks[ pIndex ].currLevel ) )
+		{
+			LogDM( "CanPerkBeBought(): Maximum level reached !" );
+			return false;
+		}
+		primDevIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Primary );
+		if( primDevIndex < 0 )
+		{
+			LogDM( " CanPerkBeBought(): Development points not found!" );
+			return false;
+		}
+		if( m_devPoints[ primDevIndex ].unspent <= 0 )
+		{
+			LogDM( "CanPerkBeBought(): Not enough development points!!" );
+			return false;
+		}
+		return true;
+	}
+
+	public const function CanTraitBeBought() : Bool
+	{
+		var primDevIndex : Int32;
+		primDevIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Primary );
+		if( primDevIndex < 0 )
+		{
+			LogDM( " CanPerkBeBought(): Development points not found!" );
+			return false;
+		}
+		if( m_devPoints[ primDevIndex ].unspent <= 0 )
+		{
+			LogDM( "CanPerkBeBought(): Not enough development points!!" );
+			return false;
+		}
+		return true;
+	}
+
+	public const function IsPerkAreaReqMet( areaRecord : PerkArea_Record ) : Bool
+	{
+		return IsPerkAreaBaseReqMet( areaRecord );
+	}
+
+	public const function IsPerkAreaMasteryReqMet( areaRecord : PerkArea_Record ) : Bool
+	{
+		var prereqID : TweakDBID;
+		var prereq : StatPrereq;
+		prereqID = areaRecord.MasteryLevel().GetID();
+		prereq = ( ( StatPrereq )( StatPrereq.CreatePrereq( prereqID ) ) );
+		return prereq.IsFulfilled( m_owner.GetGame(), m_owner );
+	}
+
+	private const function IsPerkAreaBaseReqMet( areaRecord : PerkArea_Record ) : Bool
+	{
+		var prereqID : TweakDBID;
+		var prereq : IPrereq;
+		prereqID = areaRecord.Requirement().GetID();
+		prereq = IPrereq.CreatePrereq( prereqID );
+		return prereq.IsFulfilled( m_owner.GetGame(), m_owner );
+	}
+
+	public const function GetRemainingRequiredPerkPoints( areaRecord : PerkArea_Record, out amount : Int32 ) : Bool
+	{
+		var required : Int32;
+		var invested : Int32;
+		var prereq : InvestedPerksPrereq;
+		prereq = ( ( InvestedPerksPrereq )( IPrereq.CreatePrereq( areaRecord.Requirement().GetID() ) ) );
+		if( prereq )
+		{
+			required = prereq.GetRequiredAmount();
+			invested = GetInvestedPerkPoints( prereq.GetProficiencyType() );
+			amount = required - invested;
+			if( amount > 0 )
+			{
+				return true;
+			}
+			return false;
+		}
+		amount = -1;
+		return false;
+	}
+
+	public const function GetRemainingRequiredPerkPoints( traitRecord : Trait_Record, out amount : Int32 ) : Bool
+	{
+		var required : Int32;
+		var invested : Int32;
+		var prereq : InvestedPerksPrereq;
+		prereq = ( ( InvestedPerksPrereq )( IPrereq.CreatePrereq( traitRecord.Requirement().GetID() ) ) );
+		if( prereq )
+		{
+			required = prereq.GetRequiredAmount();
+			invested = GetInvestedPerkPoints( prereq.GetProficiencyType() );
+			amount = required - invested;
+			if( amount > 0 )
+			{
+				return true;
+			}
+			return false;
+		}
+		amount = -1;
+		return false;
+	}
+
+	public const function GetPerkAreaFromPerk( perkType : gamedataPerkType ) : gamedataPerkArea
+	{
+		var areaString : String;
+		areaString = EnumValueToString( "gamedataPerkType", ( ( Int32 )( perkType ) ) );
+		areaString = StrBeforeFirst( areaString, "_Perk" );
+		return ( ( gamedataPerkArea )( ( ( Int32 )( EnumValueFromString( "gamedataPerkArea", areaString ) ) ) ) );
+	}
+
+	public const function GetProficiencyFromPerkArea( perkArea : gamedataPerkArea ) : gamedataProficiencyType
+	{
+		var proficiencyString : String;
+		proficiencyString = EnumValueToString( "gamedataPerkArea", ( ( Int32 )( perkArea ) ) );
+		proficiencyString = StrBeforeFirst( proficiencyString, "_Area" );
+		return ( ( gamedataProficiencyType )( ( ( Int32 )( EnumValueFromString( "gamedataProficiencyType", proficiencyString ) ) ) ) );
+	}
+
+	public const function GetProficiencyIndexFromPerkArea( perkArea : gamedataPerkArea ) : Int32
+	{
+		var pIndex : Int32;
+		pIndex = GetProficiencyIndexByType( GetProficiencyFromPerkArea( perkArea ) );
+		return pIndex;
+	}
+
+	private const function ActivatePerkLevelData( areaIndex : Int32, perkIndex : Int32 )
+	{
+		var packageID : TweakDBID;
+		var GLPS : GameplayLogicPackageSystem;
+		GLPS = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		packageID = GetPerkPackageTDBID( areaIndex, perkIndex );
+		GLPS.ApplyPackage( m_owner, m_owner, packageID );
+	}
+
+	private const function DeactivatePerkLevelData( areaIndex : Int32, perkIndex : Int32 )
+	{
+		var packageID : TweakDBID;
+		var GLPS : GameplayLogicPackageSystem;
+		GLPS = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		packageID = GetPerkPackageTDBID( areaIndex, perkIndex );
+		GLPS.RemovePackage( m_owner, packageID );
+	}
+
+	public const function GetSpentPerkPoints() : Int32
+	{
+		var i, count : Int32;
+		var sum : Int32;
+		count = m_proficiencies.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			sum += m_proficiencies[ i ].spentPerkPoints;
+		}
+		return sum;
+	}
+
+	public const function GetPerks() : array< SPerk >
+	{
+		var i, j : Int32;
+		var allPerks : array< SPerk >;
+		for( i = 0; i < m_perkAreas.Size(); i += 1 )
+		{
+			for( j = 0; j < m_perkAreas[ i ].boughtPerks.Size(); j += 1 )
+			{
+				allPerks.PushBack( m_perkAreas[ i ].boughtPerks[ j ] );
+			}
+		}
+		return allPerks;
+	}
+
+	private function InitializeTraits()
+	{
+		var i : Int32;
+		for( i = 0; i < ( ( Int32 )( gamedataTraitType.Count ) ); i += 1 )
+		{
+			AddTrait( ( ( gamedataTraitType )( i ) ) );
+		}
+	}
+
+	private function AddTrait( traitType : gamedataTraitType )
+	{
+		var newTrait : STrait;
+		newTrait.type = traitType;
+		newTrait.unlocked = false;
+		newTrait.currLevel = 0;
+		m_traits.PushBack( newTrait );
+	}
+
+	public const function IncreaseTraitLevel( traitType : gamedataTraitType ) : Bool
+	{
+		var primDevIndex : Int32;
+		var traitIndex : Int32;
+		traitIndex = GetTraitIndex( traitType );
+		if( ( traitIndex < 0 ) || !( IsTraitUnlocked( traitIndex ) ) )
+		{
+			return false;
+		}
+		if( CanTraitBeBought() )
+		{
+			m_traits[ traitIndex ].currLevel += 1;
+			primDevIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Primary );
+			m_devPoints[ primDevIndex ].unspent -= 1;
+			m_devPoints[ primDevIndex ].spent += 1;
+			EvaluateTraitInfiniteData( traitIndex );
+			return true;
+		}
+		return false;
+	}
+
+	private const function RemoveTrait( traitType : gamedataTraitType ) : Bool
+	{
+		var primDevIndex : Int32;
+		var traitIndex : Int32;
+		var traitLevel : Int32;
+		traitIndex = GetTraitIndex( traitType );
+		if( ( traitIndex < 0 ) || !( IsTraitUnlocked( traitIndex ) ) )
+		{
+			return false;
+		}
+		traitLevel = m_traits[ traitIndex ].currLevel;
+		if( m_traits[ traitIndex ].currLevel > 0 )
+		{
+			ClearTraitInfiniteData( traitIndex );
+			m_traits[ traitIndex ].currLevel = 0;
+			primDevIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Primary );
+			m_devPoints[ primDevIndex ].unspent += traitLevel;
+			m_devPoints[ primDevIndex ].spent -= traitLevel;
+			return true;
+		}
+		return false;
+	}
+
+	public const function GetSpentTraitPoints() : Int32
+	{
+		var i : Int32;
+		var spentPoints : Int32;
+		for( i = 0; i < ( ( Int32 )( gamedataTraitType.Count ) ); i += 1 )
+		{
+			if( IsTraitUnlocked( i ) )
+			{
+				spentPoints += GetTraitLevel( i );
+			}
+		}
+		return spentPoints;
+	}
+
+	private const function EvaluateTraitInfiniteData( traitIndex : Int32 )
+	{
+		var traitPackage : TweakDBID;
+		var GLPS : GameplayLogicPackageSystem;
+		var traitLevel : Uint32;
+		GLPS = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		traitPackage = RPGManager.GetTraitRecord( m_traits[ traitIndex ].type ).InfiniteTraitData().DataPackage().GetID();
+		traitLevel = ( ( Uint32 )( m_traits[ traitIndex ].currLevel ) );
+		GLPS.RemovePackages( m_owner, traitPackage, traitLevel );
+		GLPS.ApplyPackages( m_owner, m_owner, traitPackage, traitLevel );
+	}
+
+	private const function ClearTraitInfiniteData( traitIndex : Int32 )
+	{
+		var traitPackage : TweakDBID;
+		var GLPS : GameplayLogicPackageSystem;
+		var traitLevel : Uint32;
+		GLPS = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		traitPackage = RPGManager.GetTraitRecord( m_traits[ traitIndex ].type ).InfiniteTraitData().DataPackage().GetID();
+		traitLevel = ( ( Uint32 )( m_traits[ traitIndex ].currLevel ) );
+		GLPS.RemovePackages( m_owner, traitPackage, traitLevel );
+	}
+
+	private const function EvaluateTrait( profType : gamedataProficiencyType )
+	{
+		var traitIndex : Int32;
+		var traitType : gamedataTraitType;
+		traitType = RPGManager.GetProficiencyRecord( profType ).Trait().Type();
+		traitIndex = GetTraitIndex( traitType );
+		if( ( traitIndex < 0 ) || IsTraitUnlocked( traitIndex ) )
+		{
+			return;
+		}
+		if( IsTraitReqMet( m_traits[ traitIndex ].type ) )
+		{
+			m_traits[ traitIndex ].unlocked = true;
+			ActivateTraitBase( m_traits[ traitIndex ].type );
+		}
+	}
+
+	private const function ActivateTraitBase( traitType : gamedataTraitType )
+	{
+		var traitPackage : TweakDBID;
+		traitPackage = RPGManager.GetTraitRecord( traitType ).BaseTraitData().DataPackage().GetID();
+		GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() ).ApplyPackage( m_owner, m_owner, traitPackage );
+	}
+
+	public const function IsTraitUnlocked( traitType : gamedataTraitType ) : Bool
+	{
+		return IsTraitUnlocked( GetTraitIndex( traitType ) );
+	}
+
+	private const function IsTraitUnlocked( traitIndex : Int32 ) : Bool
+	{
+		if( traitIndex < 0 )
+		{
+			return false;
+		}
+		return m_traits[ traitIndex ].unlocked;
+	}
+
+	private const function IsTraitReqMet( traitType : gamedataTraitType ) : Bool
+	{
+		var prereqID : TweakDBID;
+		var prereq : StatPrereq;
+		var traitRecord : Trait_Record;
+		traitRecord = GetTraitRecord( traitType );
+		prereqID = traitRecord.Requirement().GetID();
+		prereq = ( ( StatPrereq )( StatPrereq.CreatePrereq( prereqID ) ) );
+		return prereq.IsFulfilled( m_owner.GetGame(), m_owner );
+	}
+
+	public const function GetTraitLevel( traitType : gamedataTraitType ) : Int32
+	{
+		return GetTraitLevel( GetTraitIndex( traitType ) );
+	}
+
+	private const function GetTraitLevel( traitIndex : Int32 ) : Int32
+	{
+		if( traitIndex < 0 )
+		{
+			return 0;
+		}
+		return m_traits[ traitIndex ].currLevel;
+	}
+
+	private const function GetTraitIndex( traitType : gamedataTraitType ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; m_traits.Size(); i += 1 )
+		{
+			if( m_traits[ i ].type == traitType )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function GetTraitRecord( traitType : gamedataTraitType ) : Trait_Record
+	{
+		return TweakDBInterface.GetTraitRecord( TDBID.Create( "Traits." + EnumValueToString( "gamedataTraitType", ( ( Int32 )( traitType ) ) ) ) );
+	}
+
+	public const function BuyAttribute( type : gamedataStatType ) : Bool
+	{
+		var cost : Int32;
+		var dIndex : Int32;
+		dIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Attribute );
+		if( dIndex < 0 )
+		{
+			return false;
+		}
+		if( !( CanAttributeBeBought( type ) ) )
+		{
+			return false;
+		}
+		else
+		{
+			cost = GetAttributeNextLevelCost( type );
+			ModifyAttribute( type, 1.0 );
+			m_devPoints[ dIndex ].unspent -= cost;
+			m_devPoints[ dIndex ].spent += cost;
+		}
+		return true;
+	}
+
+	public const function SetAttribute( type : gamedataStatType, amount : Float )
+	{
+		var statSys : StatsSystem;
+		if( !( IsStatValid( type ) ) )
+		{
+			LogDM( "SetStat(): Given stat type doesn't exist!!" );
+			return;
+		}
+		if( !( IsAttribute( type ) ) )
+		{
+			LogDM( "SetAttribute(): Given type is not an attribute!" );
+			return;
+		}
+		statSys = GameInstance.GetStatsSystem( m_owner.GetGame() );
+		ModifyAttribute( type, -( statSys.GetStatValue( m_owner.GetEntityID(), type ) ) );
+		ModifyAttribute( type, amount );
+	}
+
+	public const function GetAttributes() : array< SAttribute >
+	{
+		return m_attributes;
+	}
+
+	private function SetAttributes()
+	{
+		var i : Int32;
+		var attVal : Float;
+		var ss : StatsSystem;
+		var attribute : SAttribute;
+		ss = GameInstance.GetStatsSystem( m_owner.GetGame() );
+		for( i = 0; i < ( ( Int32 )( gamedataStatType.Count ) ); i += 1 )
+		{
+			if( IsAttribute( ( ( gamedataStatType )( i ) ) ) )
+			{
+				if( m_owner )
+				{
+					attVal = ss.GetStatValue( m_owner.GetEntityID(), ( ( gamedataStatType )( i ) ) );
+				}
+				else
+				{
+					attVal = 2.0;
+				}
+				attribute.value = ( ( Int32 )( attVal ) );
+				attribute.attributeName = ( ( gamedataStatType )( i ) );
+				attribute.id = TDBID.Create( "BaseStats." + ( ( String )( attribute.attributeName ) ) );
+				m_attributes.PushBack( attribute );
+			}
+		}
+	}
+
+	private const function ModifyAttribute( type : gamedataStatType, amount : Float )
+	{
+		var statSys : StatsSystem;
+		var newMod : gameStatModifierData;
+		var aIndex : Int32;
+		if( !( IsStatValid( type ) ) )
+		{
+			LogDM( "AddStat(): Given stat type doesn't exist!!" );
+			return;
+		}
+		statSys = GameInstance.GetStatsSystem( m_owner.GetGame() );
+		UpdateStatPrereqs( type, amount );
+		newMod = RPGManager.CreateStatModifier( type, gameStatModifierType.Additive, amount );
+		statSys.AddModifier( m_owner.GetEntityID(), newMod );
+		aIndex = GetAttributeIndex( type );
+		m_attributes[ aIndex ].value = ( ( Int32 )( GameInstance.GetStatsSystem( m_owner.GetGame() ).GetStatValue( m_owner.GetEntityID(), type ) ) );
+		UpdateProficiencyMaxLevels();
+		RefreshPerkAreas();
+	}
+
+	private const function GetAttributeIndex( type : gamedataStatType ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_attributes.Size(); i += 1 )
+		{
+			if( m_attributes[ i ].attributeName == type )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function GetAttributeDevCap( type : gamedataStatType ) : Int32
+	{
+		var value : Int32;
+		value = ( ( Int32 )( GetAttributeRecord( type ).Max() ) );
+		return value;
+	}
+
+	private const function CanAttributeBeBought( type : gamedataStatType ) : Bool
+	{
+		var dIndex : Int32;
+		var currVal : Int32;
+		var enoughPoints : Bool;
+		var maxLvlNotReached : Bool;
+		var objectID : StatsObjectID;
+		objectID = m_owner.GetEntityID();
+		dIndex = GetDevPointsIndex( gamedataDevelopmentPointType.Attribute );
+		if( dIndex < 0 )
+		{
+			LogDM( "CanAttributeBeBought(): Attribute development points don't exist! Big error! Returns false!" );
+			return false;
+		}
+		currVal = ( ( Int32 )( GameInstance.GetStatsSystem( m_owner.GetGame() ).GetStatValue( objectID, type ) ) );
+		enoughPoints = m_devPoints[ dIndex ].unspent >= GetAttributeNextLevelCost( type );
+		maxLvlNotReached = GetAttributeDevCap( type ) > currVal;
+		if( enoughPoints && maxLvlNotReached )
+		{
+			return true;
+		}
+		else
+		{
+			if( !( enoughPoints ) )
+			{
+				LogDM( "CanAttributeBeBought(): Not enough dev points!" );
+			}
+			else
+			{
+				LogDM( ( "CanAttributeBeBought(): Attribute " + EnumValueToString( "gamedataStatType", ( ( Int64 )( type ) ) ) ) + " has reached max level!" );
+			}
+			return false;
+		}
+	}
+
+	private const function IsStatValid( type : gamedataStatType ) : Bool
+	{
+		if( ( ( Int32 )( type ) ) >= ( ( Int32 )( gamedataStatType.Count ) ) )
+		{
+			LogDM( "IsStatValid(): Given stat type isn't valid!!" );
+			return false;
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	public static function IsAttribute( type : gamedataStatType ) : Bool
+	{
+		switch( type )
+		{
+			case gamedataStatType.Strength:
+			case gamedataStatType.Intelligence:
+			case gamedataStatType.Cool:
+			case gamedataStatType.TechnicalAbility:
+			case gamedataStatType.Reflexes:
+			case gamedataStatType.Gunslinger:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private const function GetAttributeNextLevelCost( type : gamedataStatType ) : Int32
+	{
+		var cost : Int32;
+		var level : Float;
+		var statName : CName;
+		var statSystem : StatsSystem;
+		var statDataSystem : StatsDataSystem;
+		var objectID : StatsObjectID;
+		statSystem = GameInstance.GetStatsSystem( m_owner.GetGame() );
+		statDataSystem = GameInstance.GetStatsDataSystem( m_owner.GetGame() );
+		objectID = m_owner.GetEntityID();
+		level = statSystem.GetStatValue( objectID, type );
+		statName = EnumValueToName( 'gamedataStatType', ( ( Int64 )( type ) ) );
+		cost = ( ( Int32 )( statDataSystem.GetValueFromCurve( 'player_attributeLevelToCostIncrease', level + 1.0, statName ) ) );
+		return cost;
+	}
+
+	public const function GetAttributeRecord( type : gamedataStatType ) : Stat_Record
+	{
+		if( IsAttribute( type ) )
+		{
+			return TweakDBInterface.GetStatRecord( TDBID.Create( "BaseStats." + EnumValueToString( "gamedataStatType", ( ( Int32 )( type ) ) ) ) );
+		}
+		else
+		{
+			return NULL;
+		}
+	}
+
+	public function RegisterSkillCheckPrereq( skillPrereq : SkillCheckPrereqState )
+	{
+		if( !( m_skillPrereqs.Contains( skillPrereq ) ) )
+		{
+			m_skillPrereqs.PushBack( skillPrereq );
+		}
+	}
+
+	public function RegisterStatCheckPrereq( statPrereq : StatCheckPrereqState )
+	{
+		if( !( m_statPrereqs.Contains( statPrereq ) ) )
+		{
+			m_statPrereqs.PushBack( statPrereq );
+		}
+	}
+
+	public function UnregisterSkillCheckPrereq( skillPrereq : SkillCheckPrereqState )
+	{
+		m_skillPrereqs.Remove( skillPrereq );
+	}
+
+	public function UnregisterStatCheckPrereq( statPrereq : StatCheckPrereqState )
+	{
+		m_statPrereqs.Remove( statPrereq );
+	}
+
+	private const function UpdateSkillPrereqs( changedSkill : gamedataProficiencyType, newLevel : Int32 )
+	{
+		var i : Int32;
+		for( i = 0; i < m_skillPrereqs.Size(); i += 1 )
+		{
+			if( m_skillPrereqs[ i ].GetSkillToCheck() == changedSkill )
+			{
+			}
+		}
+	}
+
+	private const function UpdateStatPrereqs( changedStat : gamedataStatType, newValue : Float )
+	{
+		var i : Int32;
+		for( i = 0; i < m_statPrereqs.Size(); i += 1 )
+		{
+			if( m_statPrereqs[ i ].GetStatToCheck() == changedStat )
+			{
+			}
+		}
+	}
+
+	public function SetProgressionBuild( build : gamedataBuildType )
+	{
+		var buildString : String;
+		buildString = EnumValueToString( "gamedataBuildType", ( ( Int32 )( build ) ) );
+		ProcessProgressionBuild( TweakDBInterface.GetProgressionBuildRecord( TDBID.Create( "ProgressionBuilds." + buildString ) ) );
+	}
+
+	public function SetProgressionBuild( buildID : TweakDBID )
+	{
+		ProcessProgressionBuild( TweakDBInterface.GetProgressionBuildRecord( buildID ) );
+	}
+
+	public function SetLifePath( lifePath : TweakDBID )
+	{
+		ProcessLifePath( TweakDBInterface.GetLifePathRecord( lifePath ) );
+	}
+
+	public function UpdateAttributes( attributes : array< CharacterCustomizationAttribute > )
+	{
+		var i : Int32;
+		for( i = 0; i < attributes.Size(); i += 1 )
+		{
+			SetAttribute( attributes[ i ].type, ( ( Float )( attributes[ i ].value ) ) );
+		}
+	}
+
+	private function ProcessProgressionBuild( buildRecord : ProgressionBuild_Record )
+	{
+		var buildAttributes : array< weak< BuildAttribute_Record > >;
+		var buildProficiencies : array< weak< BuildProficiency_Record > >;
+		var buildPerks : array< weak< BuildPerk_Record > >;
+		var buildItems : array< weak< InventoryItem_Record > >;
+		var buildEquipmentItems : array< weak< BuildEquipment_Record > >;
+		var buildCyberwareItems : array< weak< BuildCyberware_Record > >;
+		var buildCraftableItems : weak< Craftable_Record >;
+		var buildPerkSet : weak< BuildPerkSet_Record >;
+		var buildProficiencySet : weak< BuildProficiencySet_Record >;
+		var buildCyberwareSet : weak< BuildCyberwareSet_Record >;
+		var buildAttributeSet : weak< BuildAttributeSet_Record >;
+		var buildEquipmentSet : weak< BuildEquipmentSet_Record >;
+		var inventoryItemSet : weak< InventoryItemSet_Record >;
+		var randomizeClothing : Bool;
+		var i : Int32;
+		m_displayActivityLog = false;
+		randomizeClothing = buildRecord.RandomizeClothing();
+		FlushDevelopment();
+		buildAttributeSet = buildRecord.AttributeSet();
+		buildProficiencySet = buildRecord.ProficiencySet();
+		buildPerkSet = buildRecord.PerkSet();
+		inventoryItemSet = buildRecord.InventorySet();
+		buildEquipmentSet = buildRecord.EquipmentSet();
+		buildCyberwareSet = buildRecord.CyberwareSet();
+		if( buildAttributeSet )
+		{
+			buildAttributeSet.Attributes( buildAttributes );
+		}
+		if( buildProficiencySet )
+		{
+			buildProficiencySet.Proficiencies( buildProficiencies );
+		}
+		if( buildPerkSet )
+		{
+			buildPerkSet.Perks( buildPerks );
+		}
+		for( i = 0; i < buildRecord.GetPerkSetsCount(); i += 1 )
+		{
+			buildRecord.GetPerkSetsItem( i ).Perks( buildPerks );
+		}
+		if( inventoryItemSet )
+		{
+			inventoryItemSet.Items( buildItems );
+		}
+		if( buildEquipmentSet )
+		{
+			buildEquipmentSet.Equipment( buildEquipmentItems );
+		}
+		if( buildCyberwareSet )
+		{
+			buildCyberwareSet.Cyberware( buildCyberwareItems );
+		}
+		ProcessBuildItems( buildItems );
+		ProcessBuildAttributes( buildAttributes );
+		ProcessBuildProficiencies( buildProficiencies );
+		ProcessBuildPerks( buildPerks );
+		ProcessBuildEquipment( buildEquipmentItems, randomizeClothing );
+		ProcessBuildCyberware( buildCyberwareItems );
+		buildRecord.StartingAttributes( buildAttributes );
+		buildRecord.StartingProficiencies( buildProficiencies );
+		buildRecord.StartingPerks( buildPerks );
+		buildRecord.StartingItems( buildItems );
+		buildRecord.StartingEquipment( buildEquipmentItems );
+		buildRecord.StartingCyberware( buildCyberwareItems );
+		ProcessBuildItems( buildItems );
+		ProcessBuildAttributes( buildAttributes );
+		ProcessBuildProficiencies( buildProficiencies );
+		ProcessBuildPerks( buildPerks );
+		ProcessBuildEquipment( buildEquipmentItems, randomizeClothing );
+		ProcessBuildCyberware( buildCyberwareItems );
+		buildCraftableItems = buildRecord.CraftBook();
+		ProcessCraftbook( buildCraftableItems );
+		if( randomizeClothing )
+		{
+			RandomizeClothing();
+		}
+		ScaleItems();
+		m_displayActivityLog = true;
+	}
+
+	private function ScaleItems()
+	{
+		var statMod : gameStatModifierData;
+		var inventory : array< weak< gameItemData > >;
+		var i : Int32;
+		var itemData : weak< gameItemData >;
+		statMod = RPGManager.CreateStatModifier( gamedataStatType.PowerLevel, gameStatModifierType.Additive, ( ( Float )( GetProficiencyLevel( gamedataProficiencyType.Level ) ) ) );
+		GameInstance.GetTransactionSystem( m_owner.GetGame() ).GetItemList( m_owner, inventory );
+		for( i = 0; i < inventory.Size(); i += 1 )
+		{
+			itemData = inventory[ i ];
+			if( !( RPGManager.GetItemRecord( itemData.GetID() ).IsSingleInstance() ) && ( ItemID.GetTDBID( itemData.GetID() ) != T"Items.Preset_V_Unity_Cutscene" ) )
+			{
+				GameInstance.GetStatsSystem( m_owner.GetGame() ).RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.PowerLevel );
+				GameInstance.GetStatsSystem( m_owner.GetGame() ).AddSavedModifier( itemData.GetStatsObjectID(), statMod );
+			}
+		}
+	}
+
+	private function FlushDevelopment()
+	{
+		var i : Int32;
+		var attributeType : gamedataStatType;
+		var proficiencyType : gamedataProficiencyType;
+		var perkType : gamedataPerkType;
+		var gi : GameInstance;
+		var statsSystem : StatsSystem;
+		var clearRequest : ClearEquipmentRequest;
+		var es : EquipmentSystem;
+		var playerItems : array< weak< gameItemData > >;
+		gi = m_owner.GetGame();
+		statsSystem = GameInstance.GetStatsSystem( gi );
+		for( i = 0; i < ( ( Int32 )( gamedataStatType.Count ) ); i += 1 )
+		{
+			attributeType = ( ( gamedataStatType )( i ) );
+			if( IsAttribute( attributeType ) )
+			{
+				ModifyAttribute( attributeType, -( statsSystem.GetStatValue( m_owner.GetEntityID(), attributeType ) ) );
+			}
+		}
+		GameInstance.GetStatsSystem( m_owner.GetGame() ).RemoveAllModifiers( m_owner.GetEntityID(), gamedataStatType.Level );
+		for( i = 0; i < ( ( Int32 )( gamedataProficiencyType.Count ) ); i += 1 )
+		{
+			proficiencyType = ( ( gamedataProficiencyType )( i ) );
+			SetLevel( proficiencyType, 0, telemetryLevelGainReason.Ignore );
+		}
+		for( i = 0; i < ( ( Int32 )( gamedataPerkType.Count ) ); i += 1 )
+		{
+			perkType = ( ( gamedataPerkType )( i ) );
+			if( HasPerk( perkType ) )
+			{
+				RemovePerk( perkType );
+			}
+		}
+		es = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( gi ).Get( 'EquipmentSystem' ) ) );
+		clearRequest = new ClearEquipmentRequest;
+		clearRequest.owner = m_owner;
+		es.QueueRequest( clearRequest );
+		GameInstance.GetTransactionSystem( gi ).GetItemList( m_owner, playerItems );
+		for( i = 0; i < playerItems.Size(); i += 1 )
+		{
+			if( playerItems[ i ].HasTag( 'base_fists' ) )
+			{
+			}
+			else if( !( playerItems[ i ].HasTag( 'Quest' ) ) )
+			{
+				GameInstance.GetTransactionSystem( gi ).RemoveItem( m_owner, playerItems[ i ].GetID(), playerItems[ i ].GetQuantity() );
+			}
+		}
+	}
+
+	private const function ProcessBuildEquipment( equipment : array< weak< BuildEquipment_Record > >, randomizeClothing : Bool )
+	{
+		var i : Int32;
+		var gi : GameInstance;
+		var es : EquipmentSystem;
+		var transactionSystem : TransactionSystem;
+		var itemID : ItemID;
+		var equipRequest : GameplayEquipRequest;
+		var drawItemRequest : DrawItemRequest;
+		var isWeaponEquipped : Bool;
+		var skipThisItemQuery : ItemID;
+		var skipEquip : Bool;
+		var currentEquipArea : SEquipArea;
+		gi = m_owner.GetGame();
+		isWeaponEquipped = false;
+		transactionSystem = GameInstance.GetTransactionSystem( gi );
+		es = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( gi ).Get( 'EquipmentSystem' ) ) );
+		for( i = 0; i < equipment.Size(); i += 1 )
+		{
+			itemID = ItemID.FromTDBID( equipment[ i ].Equipment().GetID() );
+			if( randomizeClothing && EquipmentSystem.IsClothing( itemID ) )
+			{
+				continue;
+			}
+			currentEquipArea = es.GetEquipAreaFromItemID( m_owner, itemID );
+			if( currentEquipArea.areaType == gamedataEquipmentArea.BaseFists || currentEquipArea.areaType == gamedataEquipmentArea.VDefaultHandgun )
+			{
+				skipThisItemQuery = ItemID.CreateQuery( ItemID.GetTDBID( itemID ) );
+				skipEquip = es.GetPlayerData( m_owner ).IsEquipped( skipThisItemQuery );
+			}
+			if( !( skipEquip ) )
+			{
+				transactionSystem.GiveItem( m_owner, itemID, 1 );
+				equipRequest = new GameplayEquipRequest;
+				equipRequest.owner = m_owner;
+				equipRequest.itemID = itemID;
+				equipRequest.blockUpdateWeaponActiveSlots = true;
+				es.QueueRequest( equipRequest );
+			}
+			if( IsMultiplayer() && !( isWeaponEquipped ) )
+			{
+				if( TweakDBInterface.GetItemRecord( equipment[ i ].Equipment().GetID() ).ItemCategory().Type() == gamedataItemCategory.Weapon )
+				{
+					isWeaponEquipped = true;
+					drawItemRequest = new DrawItemRequest;
+					drawItemRequest.owner = m_owner;
+					drawItemRequest.itemID = itemID;
+					es.QueueRequest( drawItemRequest );
+				}
+			}
+		}
+	}
+
+	private const function ProcessBuildCyberware( cyberware : array< weak< BuildCyberware_Record > > )
+	{
+		var i : Int32;
+		var ts : TransactionSystem;
+		var es : EquipmentSystem;
+		var gi : GameInstance;
+		var installModuleRequest : EquipRequest;
+		gi = m_owner.GetGame();
+		ts = GameInstance.GetTransactionSystem( m_owner.GetGame() );
+		es = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( gi ).Get( 'EquipmentSystem' ) ) );
+		for( i = 0; i < cyberware.Size(); i += 1 )
+		{
+			installModuleRequest = new EquipRequest;
+			installModuleRequest.owner = m_owner;
+			installModuleRequest.itemID = ItemID.FromTDBID( cyberware[ i ].Cyberware().GetID() );
+			if( !( ts.HasItem( m_owner, ItemID.CreateQuery( cyberware[ i ].Cyberware().GetID() ) ) ) )
+			{
+				installModuleRequest.addToInventory = true;
+			}
+			es.QueueRequest( installModuleRequest );
+		}
+	}
+
+	private const function ProcessBuildAttributes( attributes : array< weak< BuildAttribute_Record > > )
+	{
+		var i : Int32;
+		for( i = 0; i < attributes.Size(); i += 1 )
+		{
+			ModifyAttribute( attributes[ i ].Attribute().StatType(), ( ( Float )( attributes[ i ].Level() ) ) );
+		}
+	}
+
+	private const function ProcessBuildProficiencies( proficiencies : array< weak< BuildProficiency_Record > > )
+	{
+		var i, level : Int32;
+		var type : gamedataProficiencyType;
+		for( i = 0; i < proficiencies.Size(); i += 1 )
+		{
+			type = proficiencies[ i ].Proficiency().Type();
+			level = proficiencies[ i ].Level();
+			SetLevel( type, level, telemetryLevelGainReason.Ignore );
+		}
+	}
+
+	private function ProcessBuildPerks( perks : array< weak< BuildPerk_Record > > )
+	{
+		var i, j : Int32;
+		for( i = 0; i < perks.Size(); i += 1 )
+		{
+			for( j = 0; j < perks[ i ].Level(); j += 1 )
+			{
+				BuyPerk( perks[ i ].Perk().Type() );
+			}
+		}
+	}
+
+	private const function ProcessBuildItems( items : array< weak< InventoryItem_Record > > )
+	{
+		var i : Int32;
+		var transactionSystem : TransactionSystem;
+		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
+		for( i = 0; i < items.Size(); i += 1 )
+		{
+			transactionSystem.GiveItemByTDBID( m_owner, items[ i ].Item().GetID(), items[ i ].Quantity() );
+		}
+	}
+
+	private const function ProcessCraftbook( recipes : weak< Craftable_Record > )
+	{
+		var craftingSystem : CraftingSystem;
+		craftingSystem = ( ( CraftingSystem )( GameInstance.GetScriptableSystemsContainer( m_owner.GetGame() ).Get( 'CraftingSystem' ) ) );
+		craftingSystem.GetPlayerCraftBook().InitializeCraftBook( m_owner, recipes );
+	}
+
+	private function ProcessLifePath( lifePath : weak< LifePath_Record > )
+	{
+		m_lifePath = lifePath.Type();
+	}
+
+	private function RandomizeClothing()
+	{
+		var i : Int32;
+		var random : Int32;
+		var tdbid : TweakDBID;
+		var slots : array< gamedataEquipmentArea >;
+		var setRecord : weak< BuildEquipmentSet_Record >;
+		var items : array< weak< BuildEquipment_Record > >;
+		var itemID : ItemID;
+		var equipRequest : EquipRequest;
+		var es : EquipmentSystem;
+		slots = EquipmentSystem.GetClothingEquipmentAreas();
+		es = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( m_owner.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		for( i = 0; i < slots.Size(); i += 1 )
+		{
+			items.Clear();
+			tdbid = TDBID.Create( "BuildSets." + EnumValueToString( "gamedataEquipmentArea", ( ( Int32 )( slots[ i ] ) ) ) );
+			setRecord = TweakDBInterface.GetBuildEquipmentSetRecord( tdbid );
+			setRecord.Equipment( items );
+			if( items.Size() > 0 )
+			{
+				random = RandRange( 0, items.Size() );
+				itemID = ItemID.FromTDBID( items[ random ].Equipment().GetID() );
+				equipRequest = new EquipRequest;
+				equipRequest.owner = m_owner;
+				equipRequest.itemID = itemID;
+				equipRequest.addToInventory = true;
+				es.QueueRequest( equipRequest );
+			}
+		}
+	}
+
+	public function RefreshDevelopmentSystemOnNewGameStarted()
+	{
+		var playerPuppet : PlayerPuppet;
+		var charCreationAttributes : array< CharacterCustomizationAttribute >;
+		playerPuppet = ( ( PlayerPuppet )( m_owner ) );
+		RefreshDevelopmentSystem();
+		charCreationAttributes = GameInstance.GetCharacterCustomizationSystem( playerPuppet.GetGame() ).GetState().GetAttributes();
+		UpdateAttributes( charCreationAttributes );
+		GameInstance.GetCharacterCustomizationSystem( playerPuppet.GetGame() ).ClearState();
+	}
+
+	public function RefreshDevelopmentSystem()
+	{
+		RefreshProficiencyStats();
+		SetAttributes();
+		UpdateProficiencyMaxLevels();
+		if( GetLifePath() == gamedataLifePath.StreetKid )
+		{
+			SetProgressionBuild( gamedataBuildType.StreetKidStarting );
+		}
+		else if( GetLifePath() == gamedataLifePath.Nomad )
+		{
+			SetProgressionBuild( gamedataBuildType.NomadStarting );
+		}
+		else if( GetLifePath() == gamedataLifePath.Corporate )
+		{
+			SetProgressionBuild( gamedataBuildType.CorporateStarting );
+		}
+		else
+		{
+			SetProgressionBuild( gamedataBuildType.StartingBuild );
+		}
+	}
+
+	public const function UpdatePerkAreaBB( areaIndex : Int32 )
+	{
+		var m_ownerStatsBB : IBlackboard;
+		var gi : GameInstance;
+		gi = m_owner.GetGame();
+		if( m_owner == GameInstance.GetPlayerSystem( gi ).GetLocalPlayerMainGameObject() )
+		{
+			m_ownerStatsBB = GameInstance.GetBlackboardSystem( gi ).Get( GetAllBlackboardDefs().UI_PlayerStats );
+			m_ownerStatsBB.SetVariant( GetAllBlackboardDefs().UI_PlayerStats.ModifiedPerkArea, m_perkAreas[ areaIndex ], true );
+		}
+	}
+
+	public const function UpdateUIBB()
+	{
+		var m_ownerStatsBB : IBlackboard;
+		var gi : GameInstance;
+		gi = m_owner.GetGame();
+		m_ownerStatsBB = GameInstance.GetBlackboardSystem( gi ).Get( GetAllBlackboardDefs().UI_PlayerStats );
+		if( m_ownerStatsBB && ( m_owner == GameInstance.GetPlayerSystem( gi ).GetLocalPlayerMainGameObject() ) )
+		{
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.Level, GetProficiencyLevel( gamedataProficiencyType.Level ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.CurrentXP, GetCurrentLevelProficiencyExp( gamedataProficiencyType.Level ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.StreetCredLevel, GetProficiencyLevel( gamedataProficiencyType.StreetCred ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.StreetCredPoints, GetCurrentLevelProficiencyExp( gamedataProficiencyType.StreetCred ), true );
+			m_ownerStatsBB.SetVariant( GetAllBlackboardDefs().UI_PlayerStats.DevelopmentPoints, m_devPoints, true );
+			m_ownerStatsBB.SetVariant( GetAllBlackboardDefs().UI_PlayerStats.Proficiency, m_proficiencies, true );
+			m_ownerStatsBB.SetVariant( GetAllBlackboardDefs().UI_PlayerStats.Perks, m_perkAreas, true );
+			m_ownerStatsBB.SetVariant( GetAllBlackboardDefs().UI_PlayerStats.Attributes, m_attributes, true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.PhysicalResistance, ( ( Int32 )( GameInstance.GetStatsSystem( gi ).GetStatValue( m_owner.GetEntityID(), gamedataStatType.PhysicalResistance ) ) ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.ThermalResistance, ( ( Int32 )( GameInstance.GetStatsSystem( gi ).GetStatValue( m_owner.GetEntityID(), gamedataStatType.ThermalDamage ) ) ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.EnergyResistance, ( ( Int32 )( GameInstance.GetStatsSystem( gi ).GetStatValue( m_owner.GetEntityID(), gamedataStatType.ElectricResistance ) ) ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.ChemicalResistance, ( ( Int32 )( GameInstance.GetStatsSystem( gi ).GetStatValue( m_owner.GetEntityID(), gamedataStatType.ChemicalResistance ) ) ), true );
+			m_ownerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.weightMax, ( ( Int32 )( GameInstance.GetStatsSystem( gi ).GetStatValue( m_owner.GetEntityID(), gamedataStatType.CarryCapacity ) ) ), true );
+		}
+	}
+
+}
+
+class PlayerDevelopmentSystem extends ScriptableSystem
+{
+	private persistent var m_playerData : array< PlayerDevelopmentData >;
+	private persistent var m_ownerData : array< PlayerDevelopmentData >;
+
+	public static function GetInstance( owner : GameObject ) : PlayerDevelopmentSystem
+	{
+		var PDS : PlayerDevelopmentSystem;
+		PDS = ( ( PlayerDevelopmentSystem )( GameInstance.GetScriptableSystemsContainer( owner.GetGame() ).Get( 'PlayerDevelopmentSystem' ) ) );
+		return PDS;
+	}
+
+	private export function OnPlayerAttach( request : PlayerAttachRequest )
+	{
+		var data : PlayerDevelopmentData;
+		var updatePDS : UpdatePlayerDevelopment;
+		LogAssert( GetDevelopmentData( request.owner ) == NULL, "[PlayerDevelopmentSystem::OnPlayerAttach] Player already attached!" );
+		if( !( GetDevelopmentData( request.owner ) ) )
+		{
+			data = new PlayerDevelopmentData;
+			data.SetOwner( request.owner );
+			data.SetLifePath( GameInstance.GetCharacterCustomizationSystem( request.owner.GetGame() ).GetState().GetLifePath() );
+			updatePDS = new UpdatePlayerDevelopment;
+			updatePDS.Set( request.owner );
+			GameInstance.GetScriptableSystemsContainer( request.owner.GetGame() ).Get( 'PlayerDevelopmentSystem' ).QueueRequest( updatePDS );
+			m_playerData.PushBack( data );
+			data.OnNewGame();
+		}
+		else
+		{
+			data = GetDevelopmentData( request.owner );
+		}
+		data.OnAttach();
+	}
+
+	private function OnPlayerDetach( request : PlayerDetachRequest )
+	{
+		var i : Int32;
+		for( i = 0; i < m_playerData.Size(); i += 1 )
+		{
+			if( m_playerData[ i ].GetOwner() == request.owner )
+			{
+				m_playerData[ i ].OnDetach();
+				return;
+			}
+		}
+		for( i = 0; i < m_ownerData.Size(); i += 1 )
+		{
+			if( m_ownerData[ i ].GetOwner() == request.owner )
+			{
+				m_ownerData[ i ].OnDetach();
+				return;
+			}
+		}
+		LogAssert( false, "[PlayerDevelopmentSystem::OnPlayerDetach] Can't find player!" );
+	}
+
+	private const function GetDevelopmentData( owner : GameObject ) : PlayerDevelopmentData
+	{
+		var i : Int32;
+		LogAssert( owner != NULL, "[PlayerDevelopmentSystem::GetDevelopmentData] Owner not defined!" );
+		for( i = 0; i < m_playerData.Size(); i += 1 )
+		{
+			if( m_playerData[ i ].GetOwner() == owner )
+			{
+				return m_playerData[ i ];
+			}
+		}
+		for( i = 0; i < m_ownerData.Size(); i += 1 )
+		{
+			if( m_ownerData[ i ].GetOwner() == owner )
+			{
+				return m_ownerData[ i ];
+			}
+		}
+		LogAssert( false, "[PlayerDevelopmentSystem::GetDevelopmentData] Unable to find player data!" );
+		return NULL;
+	}
+
+	public static function GetData( owner : GameObject ) : PlayerDevelopmentData
+	{
+		var playerDevSystem : PlayerDevelopmentSystem;
+		playerDevSystem = ( ( PlayerDevelopmentSystem )( GameInstance.GetScriptableSystemsContainer( owner.GetGame() ).Get( 'PlayerDevelopmentSystem' ) ) );
+		return playerDevSystem.GetDevelopmentData( owner );
+	}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		var i : Int32;
+		var gameInstance : GameInstance;
+		var factVal : Int32;
+		gameInstance = GetGameInstance();
+		for( i = 0; i < m_playerData.Size(); i += 1 )
+		{
+			m_playerData[ i ].OnRestored( gameInstance );
+		}
+		for( i = 0; i < m_ownerData.Size(); i += 1 )
+		{
+			m_ownerData[ i ].OnRestored( gameInstance );
+		}
+		factVal = GetFact( GetGameInstance(), 'FreePerkRespec' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1500 ) )
+		{
+			GrantFreeRespec();
+			SetFactValue( GetGameInstance(), 'FreePerkRespec', 1 );
+		}
+	}
+
+	private function GrantFreeRespec()
+	{
+		var removeAllPerks : RemoveAllPerks;
+		var player : GameObject;
+		removeAllPerks = new RemoveAllPerks;
+		player = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		removeAllPerks.Set( player, true, true );
+		QueueRequest( removeAllPerks );
+	}
+
+	public const function IsProficiencyMaxLvl( owner : GameObject, type : gamedataProficiencyType ) : Bool
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.IsProficiencyMaxLvl( type );
+	}
+
+	public const function GetProficiencyLevel( owner : GameObject, type : gamedataProficiencyType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetProficiencyLevel( type );
+	}
+
+	public const function GetProficiencyAbsoluteMaxLevel( owner : GameObject, type : gamedataProficiencyType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetProficiencyAbsoluteMaxLevel( type );
+	}
+
+	public const function GetCurrentLevelProficiencyExp( owner : GameObject, type : gamedataProficiencyType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetCurrentLevelProficiencyExp( type );
+	}
+
+	public const function GetTotalProfExperience( owner : GameObject, type : gamedataProficiencyType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetTotalProfExperience( type );
+	}
+
+	public const function GetRemainingExpForLevelUp( owner : GameObject, type : gamedataProficiencyType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetRemainingExpForLevelUp( type );
+	}
+
+	public const function GetDominatingCombatProficiency( owner : GameObject ) : gamedataProficiencyType
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetDominatingCombatProficiency();
+	}
+
+	public const function GetDevPoints( owner : GameObject, type : gamedataDevelopmentPointType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetDevPoints( type );
+	}
+
+	public const function GetPerkLevel( owner : GameObject, type : gamedataPerkType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetPerkLevel( type );
+	}
+
+	public const function GetPerkMaxLevel( owner : GameObject, type : gamedataPerkType ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetPerkMaxLevel( type );
+	}
+
+	public const function HasPerk( owner : GameObject, type : gamedataPerkType ) : Bool
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.HasPerk( type );
+	}
+
+	public const function GetPerks( owner : GameObject ) : array< SPerk >
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetPerks();
+	}
+
+	public const function IsPerkImplemented( owner : GameObject, perk : gamedataPerkType ) : Bool
+	{
+		var developmentData : PlayerDevelopmentData;
+		var levelsData : array< weak< PerkLevelData_Record > >;
+		developmentData = GetDevelopmentData( owner );
+		developmentData.GetPerkRecord( perk ).Levels( levelsData );
+		return levelsData.Size() > 0;
+	}
+
+	public const function BuyAttribute( owner : GameObject, obj : GameObject, type : gamedataStatType ) : Bool
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.BuyAttribute( type );
+	}
+
+	public const function SetAttribute( owner : GameObject, obj : GameObject, type : gamedataStatType, amount : Float )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.SetAttribute( type, amount );
+	}
+
+	public const function GetAttributes( owner : GameObject ) : array< SAttribute >
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetAttributes();
+	}
+
+	public const function GetHighestCompletedMinigameLevel( owner : GameObject ) : Int32
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return developmentData.GetHighestCompletedMinigameLevel();
+	}
+
+	public export const function GetLifePath( owner : GameObject ) : gamedataLifePath
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( owner );
+		return ( ( developmentData ) ? ( developmentData.GetLifePath() ) : ( gamedataLifePath.Invalid ) );
+	}
+
+	private export function OnExperienceQueued( request : QueueCombatExperience )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.QueueCombatExperience( request.m_amount, request.m_experienceType, request.m_entity );
+	}
+
+	private export function OnProcessQueuedExperience( request : ProcessQueuedCombatExperience )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.ProcessQueuedCombatExperience( request.m_entity );
+	}
+
+	private export function OnExperienceAdded( request : AddExperience )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.AddExperience( request.m_amount, request.m_experienceType, ( ( request.m_debug ) ? ( telemetryLevelGainReason.IsDebug ) : ( telemetryLevelGainReason.Gameplay ) ) );
+	}
+
+	private function OnSetProficiencyLevel( request : SetProficiencyLevel )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.SetLevel( request.m_proficiencyType, request.m_newLevel, request.m_telemetryLevelGainReason );
+	}
+
+	private function OnPerkBought( request : BuyPerk )
+	{
+		var buyResult : Bool;
+		var perkBoughtEvent : PerkBoughtEvent;
+		var developmentData : PlayerDevelopmentData;
+		var playerStatsBB : IBlackboard;
+		developmentData = GetDevelopmentData( request.owner );
+		buyResult = developmentData.BuyPerk( request.m_perkType );
+		if( buyResult )
+		{
+			perkBoughtEvent = new PerkBoughtEvent;
+			perkBoughtEvent.perkType = request.m_perkType;
+			playerStatsBB = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_PlayerStats );
+			playerStatsBB.SetInt( GetAllBlackboardDefs().UI_PlayerStats.weightMax, ( ( Int32 )( GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( request.owner.GetEntityID(), gamedataStatType.CarryCapacity ) ) ), true );
+			GameInstance.GetUISystem( GetGameInstance() ).QueueEvent( perkBoughtEvent );
+			GameInstance.GetTelemetrySystem( GetGameInstance() ).LogPerkUpgraded( request.m_perkType, developmentData.GetPerkLevel( request.m_perkType ) );
+		}
+	}
+
+	private function OnTraitLevelIncreased( request : IncreaseTraitLevel )
+	{
+		var buyResult : Bool;
+		var traitBoughtEvent : TraitBoughtEvent;
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		buyResult = developmentData.IncreaseTraitLevel( request.m_trait );
+		if( buyResult )
+		{
+			traitBoughtEvent = new TraitBoughtEvent;
+			traitBoughtEvent.traitType = request.m_trait;
+			GameInstance.GetUISystem( GetGameInstance() ).QueueEvent( traitBoughtEvent );
+		}
+	}
+
+	private function OnPerkRemoved( request : RemovePerk )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.RemovePerk( request.m_perkType );
+	}
+
+	private function OnAllPerksRemoved( request : RemoveAllPerks )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.RemoveAllPerks( request.m_removeCost );
+		if( request.m_unequipPerkItems )
+		{
+			EquipmentSystem.UnequipPrereqItems( request.owner );
+		}
+	}
+
+	private function OnUnlockPerkArea( request : UnlockPerkArea )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.UnlockPerkArea( request.m_perkArea );
+	}
+
+	private function OnLockPerkArea( request : LockPerkArea )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.LockPerkArea( request.m_perkArea );
+	}
+
+	private function OnAttributeSet( request : SetAttribute )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.SetAttribute( request.m_attributeType, request.m_statLevel );
+	}
+
+	private function OnAttributeBuy( request : BuyAttribute )
+	{
+		var developmentData : PlayerDevelopmentData;
+		var result : Bool;
+		var attributeBoughtEvent : AttributeBoughtEvent;
+		developmentData = GetDevelopmentData( request.owner );
+		if( !( PlayerDevelopmentData.IsAttribute( request.m_attributeType ) ) )
+		{
+			return;
+		}
+		if( request.m_grantAttributePoint )
+		{
+			developmentData.AddDevelopmentPoints( 1, gamedataDevelopmentPointType.Attribute );
+		}
+		result = developmentData.BuyAttribute( request.m_attributeType );
+		if( result )
+		{
+			attributeBoughtEvent = new AttributeBoughtEvent;
+			attributeBoughtEvent.attributeType = request.m_attributeType;
+			GameInstance.GetUISystem( GetGameInstance() ).QueueEvent( attributeBoughtEvent );
+			GameInstance.GetTelemetrySystem( GetGameInstance() ).LogAttributeUpgraded( request.m_attributeType, RoundF( GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( request.owner.GetEntityID(), request.m_attributeType ) ) );
+		}
+	}
+
+	private export function OnDevelopmentPointsAdded( request : AddDevelopmentPoints )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.AddDevelopmentPoints( request.m_amountOfPoints, request.m_developmentPointType );
+	}
+
+	private function OnSkillCheckPrereqModified( request : ModifySkillCheckPrereq )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		if( request.m_register )
+		{
+			developmentData.RegisterSkillCheckPrereq( request.m_skillCheckState );
+		}
+		else
+		{
+			developmentData.UnregisterSkillCheckPrereq( request.m_skillCheckState );
+		}
+	}
+
+	private function OnStatCheckPrereqModified( request : ModifyStatCheckPrereq )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		if( request.m_register )
+		{
+			developmentData.RegisterStatCheckPrereq( request.m_statCheckState );
+		}
+		else
+		{
+			developmentData.UnregisterStatCheckPrereq( request.m_statCheckState );
+		}
+	}
+
+	private export function OnUpdatePlayerDevelopment( request : UpdatePlayerDevelopment )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		if( !( WasRestored() ) )
+		{
+			developmentData.RefreshDevelopmentSystemOnNewGameStarted();
+		}
+	}
+
+	private function OnSetProgressionBuild( request : SetProgressionBuild )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.SetProgressionBuild( request.m_buildType );
+	}
+
+	private export function OnSetProgressionBuild( request : questSetProgressionBuildRequest )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.SetProgressionBuild( request.buildID );
+	}
+
+	private function OnSetProgressionBuild( request : gameSetProgressionBuildRequest )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		if( !( WasRestored() ) )
+		{
+			developmentData.RefreshDevelopmentSystem();
+		}
+		developmentData.SetProgressionBuild( request.buildID );
+	}
+
+	private export function OnRefreshPerkAreas( request : RefreshPerkAreas )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.RefreshPerkAreas();
+	}
+
+	private export function OnSetLifePath( request : questSetLifePathRequest )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.SetLifePath( request.lifePathID );
+	}
+
+	private function OnBumpNetrunnerMinigameLevel( request : BumpNetrunnerMinigameLevel )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.BumpNetrunnerMinigameLevel( request.completedMinigameLevel );
+	}
+
+	private const function GetProficiencyRecord( type : gamedataProficiencyType ) : Proficiency_Record
+	{
+		return TweakDBInterface.GetProficiencyRecord( TDBID.Create( "Proficiencies." + EnumValueToString( "gamedataProficiencyType", ( ( Int32 )( type ) ) ) ) );
+	}
+
+	private export function OnRequestStatsBB( request : RequestStatsBB )
+	{
+		var developmentData : PlayerDevelopmentData;
+		developmentData = GetDevelopmentData( request.owner );
+		developmentData.UpdateUIBB();
+	}
+
+}
+
+struct SExperiencePoints
+{
+	persistent var amount : Float;
+	persistent var forType : gamedataProficiencyType;
+	persistent var entity : EntityID;
+}
+
+struct SProficiency
+{
+	persistent var type : gamedataProficiencyType;
+	persistent var currentLevel : Int32;
+	var maxLevel : Int32;
+	var isAtMaxLevel : Bool;
+	persistent var currentExp : Int32;
+	var expToLevel : Int32;
+	persistent var spentPerkPoints : Int32;
+}
+
+struct SDevelopmentPoints
+{
+	persistent var type : gamedataDevelopmentPointType;
+	persistent var spent : Int32;
+	persistent var unspent : Int32;
+}
+
+struct SPerkArea
+{
+	persistent var type : gamedataPerkArea;
+	persistent var unlocked : Bool;
+	persistent var boughtPerks : array< SPerk >;
+}
+
+struct SPerk
+{
+	persistent var type : gamedataPerkType;
+	persistent var currLevel : Int32;
+}
+
+struct SAttribute
+{
+	persistent var attributeName : gamedataStatType;
+	persistent var value : Int32;
+	persistent var id : TweakDBID;
+}
+
+struct STrait
+{
+	persistent var type : gamedataTraitType;
+	persistent var unlocked : Bool;
+	persistent var currLevel : Int32;
+}
+
+class ExperiencePointsEvent extends Event
+{
+	var amount : Int32;
+	var type : gamedataProficiencyType;
+	var isDebug : Bool;
+}
+
+class LevelUpdateEvent extends Event
+{
+	var lvl : Int32;
+	var type : gamedataProficiencyType;
+	var devPoints : array< SDevelopmentPoints >;
+}
+
+import class RequestStats extends Event
+{
+}
+
+class PerkBoughtEvent extends Event
+{
+	var perkType : gamedataPerkType;
+}
+
+class TraitBoughtEvent extends Event
+{
+	var traitType : gamedataTraitType;
+}
+
+class ActivePerkChangedEvent extends Event
+{
+	var perkArea : gamedataPerkArea;
+	var perkType : gamedataPerkType;
+}
+
+class AttributeBoughtEvent extends Event
+{
+	var attributeType : gamedataStatType;
+}
+
+class PerkResetEvent extends Event
+{
+}
+
+enum telemetryLevelGainReason
+{
+	Ignore = 0,
+	Gameplay = 1,
+	IsDebug = 2,
+}
+

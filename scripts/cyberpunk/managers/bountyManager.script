@@ -1,0 +1,277 @@
+struct Bounty
+{
+	var m_transgressions : array< TweakDBID >;
+	var m_bountySetter : TweakDBID;
+	var m_bountID : TweakDBID;
+	var m_moneyAmount : Int32;
+	var m_streetCredAmount : Int32;
+	var m_awarded : Bool;
+	var m_wantedStars : Int32;
+	var m_filteredOut : Bool;
+}
+
+class BountyManager
+{
+
+	public static function GenerateBounty( target : weak< NPCPuppet > ) : Bounty
+	{
+		var characterRecord : weak< Character_Record >;
+		var bountyDrawTable : weak< BountyDrawTable_Record >;
+		var bountyChoices : array< weak< Bounty_Record > >;
+		var bounty : weak< Bounty_Record >;
+		var randomDraw : Float;
+		var totalWeight : Float;
+		var weightSum : Float;
+		var visualTagFilter : CName;
+		var count : Int32;
+		var i, j : Int32;
+		var bountyData : Bounty;
+		var bountyID : TweakDBID;
+		bountyID = target.GetPuppetPS().GetBountyID();
+		if( !( TDBID.IsValid( bountyID ) ) )
+		{
+			characterRecord = TweakDBInterface.GetCharacterRecord( target.GetRecordID() );
+			bountyDrawTable = characterRecord.BountyDrawTable();
+			if( bountyDrawTable )
+			{
+				bountyDrawTable.BountyChoices( bountyChoices );
+				if( bountyChoices.Size() > 0 )
+				{
+					for( i = bountyChoices.Size() - 1; i >= 0; i -= 1 )
+					{
+						count = bountyChoices[ i ].GetVisualTagsFilterCount();
+						for( j = 0; j < count; j += 1 )
+						{
+							visualTagFilter = bountyChoices[ i ].GetVisualTagsFilterItem( j );
+							if( NPCManager.HasVisualTag( target, visualTagFilter ) )
+							{
+								bountyChoices.Remove( bountyChoices[ i ] );
+								break;
+							}
+						}
+					}
+					if( bountyChoices.Size() == 0 )
+					{
+						bountyData.m_filteredOut = true;
+						NPCPuppet.SetBountyObject( target, bountyData );
+						return bountyData;
+					}
+				}
+				for( i = 0; i < bountyChoices.Size(); i += 1 )
+				{
+					totalWeight += bountyChoices[ i ].DrawWeight();
+				}
+				randomDraw = RandRangeF( 0.0, totalWeight );
+				for( i = 0; i < bountyChoices.Size(); i += 1 )
+				{
+					weightSum += bountyChoices[ i ].DrawWeight();
+					if( randomDraw < weightSum )
+					{
+						bounty = bountyChoices[ i ];
+						bountyID = bounty.GetID();
+						break;
+					}
+				}
+			}
+		}
+		bountyData = SetBountyFromID( bountyID, target );
+		return bountyData;
+	}
+
+	public static function SetBountyFromID( bountyID : TweakDBID, target : weak< NPCPuppet > ) : Bounty
+	{
+		var bountyRecord : weak< Bounty_Record >;
+		var transgressionTable : array< weak< Transgression_Record > >;
+		var transgressionsIDs : array< TweakDBID >;
+		var totalWeight : Float;
+		var weightSum : Float;
+		var randomDraw : Float;
+		var bountySeverity : Float;
+		var totalSeverity : Float;
+		var i : Int32;
+		var bounty : Bounty;
+		var expArr : array< weak< XPPoints_Record > >;
+		var currencyArr : array< weak< CurrencyReward_Record > >;
+		var quantityMods : array< weak< StatModifier_Record > >;
+		var player : weak< PlayerPuppet >;
+		var wantedStarCount : Float;
+		var standardDeviation : Float;
+		var mean : Float;
+		var rarityString : String;
+		player = GetPlayer( target.GetGame() );
+		bounty.m_bountID = bountyID;
+		bountyRecord = TweakDBInterface.GetBountyRecord( bountyID );
+		if( bountyRecord )
+		{
+			if( bountyRecord.BountySetter() )
+			{
+				bounty.m_bountySetter = bountyRecord.BountySetter().GetID();
+			}
+			if( bountyRecord.Reward() )
+			{
+				bountyRecord.Reward().Experience( expArr );
+			}
+		}
+		if( expArr.Size() > 0 )
+		{
+			expArr[ 0 ].QuantityModifiers( quantityMods );
+		}
+		bounty.m_streetCredAmount = ( ( Int32 )( RPGManager.GetRarityMultiplier( target, 'power_level_to_bounty_cred_mult' ) * RPGManager.CalculateStatModifiers( quantityMods, player.GetGame(), player, target.GetEntityID() ) ) );
+		quantityMods.Clear();
+		if( bountyRecord && bountyRecord.Reward() )
+		{
+			bountyRecord.Reward().CurrencyPackage( currencyArr );
+		}
+		if( currencyArr.Size() > 0 )
+		{
+			currencyArr[ 0 ].QuantityModifiers( quantityMods );
+		}
+		bounty.m_moneyAmount = ( ( Int32 )( RPGManager.GetRarityMultiplier( target, 'power_level_to_bounty_money_mult' ) * RPGManager.CalculateStatModifiers( quantityMods, player.GetGame(), player, target.GetEntityID() ) ) );
+		transgressionsIDs = target.GetPuppetPS().GetTransgressions();
+		if( transgressionsIDs.Size() > 0 )
+		{
+			for( i = 0; i < transgressionsIDs.Size(); i += 1 )
+			{
+				bounty.m_transgressions.PushBack( transgressionsIDs[ i ] );
+			}
+		}
+		else
+		{
+			bountyRecord.Transgressions( transgressionTable );
+			for( i = 0; i < transgressionTable.Size(); i += 1 )
+			{
+				totalWeight += transgressionTable[ i ].DrawWeight();
+			}
+			totalSeverity = GameInstance.GetStatsDataSystem( target.GetGame() ).GetValueFromCurve( 'puppet_bounty_scaling', GameInstance.GetStatsSystem( target.GetGame() ).GetStatValue( target.GetEntityID(), gamedataStatType.PowerLevel ), 'power_level_to_severity' );
+			totalSeverity *= RPGManager.GetRarityMultiplier( target, 'power_level_to_bounty_severity_mult' );
+			while( ( bountySeverity <= totalSeverity ) && ( transgressionTable.Size() != 0 ) )
+			{
+				weightSum = 0.0;
+				randomDraw = RandRangeF( 0.0, totalWeight );
+				for( i = 0; i < transgressionTable.Size(); i += 1 )
+				{
+					weightSum += transgressionTable[ i ].DrawWeight();
+					if( randomDraw < weightSum )
+					{
+						bounty.m_transgressions.PushBack( transgressionTable[ i ].GetID() );
+						totalWeight -= transgressionTable[ i ].DrawWeight();
+						bountySeverity += transgressionTable[ i ].Severity();
+						transgressionTable.EraseFast( i );
+						break;
+					}
+				}
+			}
+		}
+		if( bountyRecord.WantedStars() == 0 )
+		{
+			rarityString = EnumValueToString( "gamedataNPCRarity", ( ( Int32 )( target.GetPuppetRarity().Type() ) ) );
+			mean = TweakDBInterface.GetFloat( TDBID.Create( "Constants.BountySystem.meanStars" + rarityString ), 3.0 );
+			standardDeviation = TweakDBInterface.GetFloat( TDBID.Create( "Constants.BountySystem.stdDevStars" + rarityString ), 1.0 );
+			wantedStarCount = MathHelper.RandFromNormalDist( mean, standardDeviation );
+			bounty.m_wantedStars = Clamp( RoundMath( wantedStarCount ), 1, 5 );
+		}
+		else
+		{
+			bounty.m_wantedStars = bountyRecord.WantedStars();
+		}
+		NPCPuppet.SetBountyObject( target, bounty );
+		return bounty;
+	}
+
+	private static function GetTransgressionRecords( transgressions : array< TweakDBID > ) : array< weak< Transgression_Record > >
+	{
+		var i : Int32;
+		var records : array< weak< Transgression_Record > >;
+		var record : weak< Transgression_Record >;
+		for( i = 0; i < transgressions.Size(); i += 1 )
+		{
+			record = TweakDBInterface.GetTransgressionRecord( transgressions[ i ] );
+			if( record )
+			{
+				records.PushBack( record );
+			}
+		}
+		return records;
+	}
+
+	public static function CompleteBounty( target : weak< NPCPuppet > )
+	{
+		var expEvt : ExperiencePointsEvent;
+		var player : weak< PlayerPuppet >;
+		var bounty : Bounty;
+		var bountyCompleteEvent : BountyCompletionEvent;
+		var powerDiff : EPowerDifferential;
+		var rewardID : TweakDBID;
+		player = GetPlayer( target.GetGame() );
+		bounty = target.GetBounty();
+		if( bounty.m_transgressions.Size() <= 0 )
+		{
+			bounty = GenerateBounty( target );
+		}
+		if( !( bounty.m_awarded ) )
+		{
+			if( GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.HasLinkToBountySystem ) > 0.0 )
+			{
+				expEvt = new ExperiencePointsEvent;
+				expEvt.amount = bounty.m_streetCredAmount;
+				expEvt.type = gamedataProficiencyType.StreetCred;
+				expEvt.isDebug = false;
+				player.QueueEvent( expEvt );
+				GameInstance.GetTransactionSystem( target.GetGame() ).GiveItem( player, MarketSystem.Money(), bounty.m_moneyAmount );
+				NPCPuppet.SetBountyObject( target, bounty );
+				bountyCompleteEvent = new BountyCompletionEvent;
+				bountyCompleteEvent.streetCredAwarded = bounty.m_streetCredAmount;
+				bountyCompleteEvent.moneyAwarded = bounty.m_moneyAmount;
+				GameInstance.GetUISystem( player.GetGame() ).QueueEvent( bountyCompleteEvent );
+			}
+			target.SetBountyAwarded( true );
+			if( target.AwardsExperience() )
+			{
+				powerDiff = RPGManager.CalculatePowerDifferential( target );
+				switch( powerDiff )
+				{
+					case EPowerDifferential.TRASH:
+						rewardID = T"RPGActionRewards.NeutralizeTrashEnemy";
+					break;
+					case EPowerDifferential.EASY:
+						rewardID = T"RPGActionRewards.NeutralizeEasyEnemy";
+					break;
+					case EPowerDifferential.NORMAL:
+						rewardID = T"RPGActionRewards.NeutralizeNormalEnemy";
+					break;
+					case EPowerDifferential.HARD:
+						rewardID = T"RPGActionRewards.NeutralizeHardEnemy";
+					break;
+					case EPowerDifferential.IMPOSSIBLE:
+						rewardID = T"RPGActionRewards.NeutralizeImpossibleEnemy";
+					break;
+				}
+				RPGManager.GiveReward( target.GetGame(), rewardID, target.GetEntityID() );
+			}
+		}
+	}
+
+}
+
+class SetBountyEvent extends Event
+{
+	[ customEditor = "TweakDBGroupInheritance;Bounty" ]
+	editable var bountyID : TweakDBID;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Set Bounty";
+	}
+
+}
+
+class SetBountyObjectEvent extends Event
+{
+	var bounty : Bounty;
+}
+
+class SetBountyAwardedEvent extends Event
+{
+	var awarded : Bool;
+}
+

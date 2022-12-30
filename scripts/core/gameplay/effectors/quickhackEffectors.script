@@ -1,0 +1,937 @@
+class ApplyObjectActionEffector extends Effector
+{
+	var m_actionID : TweakDBID;
+	var m_triggered : Bool;
+	var m_probability : Float;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_actionID = TDBID.Create( TweakDBInterface.GetString( record + T".actionID", "" ) );
+		m_probability = TweakDBInterface.GetFloat( record + T".probability", 1.0 );
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var action : PuppetAction;
+		var rand : Float;
+		if( !( m_triggered ) )
+		{
+			rand = RandRangeF( 0.0, 1.0 );
+			if( rand <= m_probability )
+			{
+				action = new PuppetAction;
+				action.RegisterAsRequester( owner.GetEntityID() );
+				action.SetExecutor( GetPlayer( owner.GetGame() ) );
+				action.SetObjectActionID( m_actionID );
+				action.SetUp( ( ( ScriptedPuppet )( owner ) ).GetPuppetPS() );
+				action.ProcessRPGAction( owner.GetGame() );
+				m_triggered = true;
+			}
+		}
+	}
+
+}
+
+class VoiceOverQuickHackFeedbackEvent extends Event
+{
+	var voName : CName;
+	var owner : weak< GameObject >;
+}
+
+class WeaponMalfunctionHudEffector extends Effector
+{
+	var m_bb : weak< IBlackboard >;
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		m_bb = GameInstance.GetBlackboardSystem( owner.GetGame() ).Get( GetAllBlackboardDefs().UI_Hacking );
+		m_bb.SetBool( GetAllBlackboardDefs().UI_Hacking.ammoIndicator, true );
+	}
+
+	protected override function ActionOff( owner : GameObject )
+	{
+		m_bb.SetBool( GetAllBlackboardDefs().UI_Hacking.ammoIndicator, false );
+	}
+
+	protected override function Uninitialize( game : GameInstance )
+	{
+		m_bb.SetBool( GetAllBlackboardDefs().UI_Hacking.ammoIndicator, false );
+	}
+
+}
+
+class MadnessDebuff extends Event
+{
+	var object : weak< GameObject >;
+}
+
+class MadnessEffector extends Effector
+{
+	var m_squadMembers : array< EntityID >;
+	var m_owner : weak< ScriptedPuppet >;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID ) {}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var evt : MadnessDebuff;
+		var link : PuppetDeviceLinkPS;
+		var secSys : SecuritySystemControllerPS;
+		m_owner = ( ( ScriptedPuppet )( owner ) );
+		if( !( m_owner ) )
+		{
+			return;
+		}
+		AISquadHelper.GetSquadmatesID( m_owner, m_squadMembers );
+		GameObject.PlayVoiceOver( m_owner, 'stlh_call', 'Scripts:OnVoiceOverQuickHackFeedbackEvent' );
+		AIActionHelper.TargetAllSquadMembers( m_owner );
+		link = m_owner.GetDeviceLink();
+		if( link )
+		{
+			secSys = link.GetSecuritySystem();
+			if( secSys )
+			{
+				evt = new MadnessDebuff;
+				evt.object = m_owner;
+				link.GetPersistencySystem().QueuePSEvent( secSys.GetID(), secSys.GetClassName(), evt );
+			}
+		}
+		NPCPuppet.SetTemporaryThreatCalculationType( m_owner, EAIThreatCalculationType.Madness );
+	}
+
+	protected override function ActionOff( owner : GameObject ) {}
+
+	protected override function Uninitialize( game : GameInstance )
+	{
+		if( !( m_owner ) || !( m_owner.IsAttached() ) )
+		{
+			return;
+		}
+		if( m_squadMembers.Size() == 0 )
+		{
+			return;
+		}
+		NPCPuppet.RemoveTemporaryThreatCalculationType( m_owner );
+	}
+
+}
+
+class PingSquadEffector extends Effector
+{
+	var m_squadMembers : array< EntityID >;
+	var m_owner : weak< GameObject >;
+	var m_oldSquadAttitude : AttitudeAgent;
+	var m_quickhackLevel : Float;
+	var m_data : FocusForcedHighlightData;
+	var m_squadName : CName;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_quickhackLevel = TweakDBInterface.GetFloat( record + T".level", 1.0 );
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		m_owner = owner;
+		if( !( owner ) )
+		{
+			return;
+		}
+		AISquadHelper.GetSquadmatesID( ( ( ScriptedPuppet )( owner ) ), m_squadMembers );
+		m_squadName = AISquadHelper.GetSquadName( ( ( ScriptedPuppet )( owner ) ) );
+		if( !( IsNameValid( m_squadName ) ) )
+		{
+			return;
+		}
+		MarkSquad( true, owner );
+	}
+
+	protected override function ActionOff( owner : GameObject )
+	{
+		MarkSquad( false, owner );
+	}
+
+	protected override function Uninitialize( game : GameInstance )
+	{
+		if( !( m_owner ) || !( m_owner.IsAttached() ) )
+		{
+			return;
+		}
+		MarkSquad( false, m_owner );
+	}
+
+	public function MarkSquad( mark : Bool, root : GameObject )
+	{
+		var target : weak< GameObject >;
+		var playerID : EntityID;
+		var i : Int32;
+		var statusEffectsystem : StatusEffectSystem;
+		var networkSystem : NetworkSystem;
+		var pingID : TweakDBID;
+		var game : GameInstance;
+		if( !( root ) )
+		{
+			return;
+		}
+		game = root.GetGame();
+		if( !( GameInstance.IsValid( game ) ) )
+		{
+			return;
+		}
+		networkSystem = ( ( NetworkSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'NetworkSystem' ) ) );
+		if( !( networkSystem ) )
+		{
+			return;
+		}
+		if( mark )
+		{
+			if( networkSystem.IsSquadMarkedWithPing( m_squadName ) )
+			{
+				return;
+			}
+			else
+			{
+				RegisterMarkedSquadInNetworkSystem( game );
+			}
+		}
+		else
+		{
+			if( !( networkSystem.IsSquadMarkedWithPing( m_squadName ) ) )
+			{
+				return;
+			}
+			else
+			{
+				UnregisterMarkedSquadInNetworkSystem( game );
+			}
+		}
+		statusEffectsystem = GameInstance.GetStatusEffectSystem( game );
+		if( !( statusEffectsystem ) )
+		{
+			return;
+		}
+		pingID = GetPingLevel( m_quickhackLevel );
+		playerID = GameInstance.GetPlayerSystem( game ).GetLocalPlayerMainGameObject().GetEntityID();
+		for( i = 0; i < m_squadMembers.Size(); i += 1 )
+		{
+			target = ( ( GameObject )( GameInstance.FindEntityByID( game, m_squadMembers[ i ] ) ) );
+			if( !( target ) || ( target == root ) )
+			{
+				continue;
+			}
+			if( mark )
+			{
+				if( !( statusEffectsystem.HasStatusEffect( m_squadMembers[ i ], pingID ) ) )
+				{
+					StatusEffectHelper.ApplyStatusEffect( target, pingID, playerID );
+				}
+			}
+			else
+			{
+				if( statusEffectsystem.HasStatusEffect( m_squadMembers[ i ], pingID ) )
+				{
+					StatusEffectHelper.RemoveStatusEffect( target, pingID );
+				}
+			}
+		}
+	}
+
+	private function RegisterMarkedSquadInNetworkSystem( game : GameInstance )
+	{
+		var request : AddPingedSquadRequest;
+		if( GameInstance.IsValid( game ) )
+		{
+			request = new AddPingedSquadRequest;
+			request.squadName = m_squadName;
+			GameInstance.QueueScriptableSystemRequest( game, 'NetworkSystem', request );
+		}
+	}
+
+	private function UnregisterMarkedSquadInNetworkSystem( game : GameInstance )
+	{
+		var request : RemovePingedSquadRequest;
+		if( GameInstance.IsValid( game ) )
+		{
+			request = new RemovePingedSquadRequest;
+			request.squadName = m_squadName;
+			GameInstance.QueueScriptableSystemRequest( game, 'NetworkSystem', request );
+		}
+	}
+
+	public function GetPingLevel( level : Float ) : TweakDBID
+	{
+		switch( level )
+		{
+			case 1.0:
+				return T"BaseStatusEffect.Ping";
+			break;
+			case 2.0:
+				return T"BaseStatusEffect.PingLevel2";
+			break;
+			case 3.0:
+				return T"BaseStatusEffect.PingLevel3";
+			break;
+			case 4.0:
+				return T"BaseStatusEffect.PingLevel4";
+			break;
+			default:
+				return T"BaseStatusEffect.Ping";
+		}
+		return T"BaseStatusEffect.Ping";
+	}
+
+}
+
+class RefreshPingEffector extends Effector
+{
+	var m_squadMembers : array< EntityID >;
+	var m_owner : weak< GameObject >;
+
+	protected export override function ActionOn( owner : GameObject )
+	{
+		var statValue : Float;
+		m_owner = owner;
+		statValue = GameInstance.GetStatsSystem( owner.GetGame() ).GetStatValue( GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject().GetEntityID(), gamedataStatType.RefreshesPingOnQuickhack );
+		AISquadHelper.GetSquadmatesID( ( ( ScriptedPuppet )( owner ) ), m_squadMembers );
+		m_squadMembers.PushBack( owner.GetEntityID() );
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( statValue == 1.0 )
+		{
+			RefreshSquad( owner );
+		}
+	}
+
+	public function RefreshSquad( root : GameObject )
+	{
+		var target : weak< GameObject >;
+		var i, j : Int32;
+		var appliedEffects : array< StatusEffect >;
+		var pingRecord : StatusEffect_Record;
+		var tags : array< CName >;
+		for( i = 0; i < m_squadMembers.Size(); i += 1 )
+		{
+			target = ( ( GameObject )( GameInstance.FindEntityByID( root.GetGame(), m_squadMembers[ i ] ) ) );
+			GameInstance.GetStatusEffectSystem( target.GetGame() ).GetAppliedEffects( target.GetEntityID(), appliedEffects );
+			if( !( target ) || ( appliedEffects.Size() == 0 ) )
+			{
+				continue;
+			}
+			for( j = 0; j < appliedEffects.Size(); j += 1 )
+			{
+				pingRecord = appliedEffects[ j ].GetRecord();
+				tags = pingRecord.GameplayTags();
+				if( tags.Contains( 'Ping' ) )
+				{
+					StatusEffectHelper.ApplyStatusEffect( target, pingRecord.GetID(), GameInstance.GetPlayerSystem( target.GetGame() ).GetLocalPlayerMainGameObject().GetEntityID() );
+				}
+			}
+		}
+	}
+
+}
+
+class SetFriendlyEffector extends Effector
+{
+	var m_target : weak< GameObject >;
+	var m_duration : Float;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_duration = TweakDBInterface.GetFloat( record + T".duration", 10.0 );
+	}
+
+	protected override function Uninitialize( game : GameInstance )
+	{
+		var puppet : ScriptedPuppet;
+		puppet = ( ( ScriptedPuppet )( m_target ) );
+		if( !( puppet ) || !( puppet.IsAttached() ) )
+		{
+			return;
+		}
+		if( puppet.GetNPCType() == gamedataNPCType.Drone )
+		{
+			StatusEffectHelper.ApplyStatusEffect( puppet, T"BaseStatusEffect.ForceKill" );
+		}
+		if( puppet.GetNPCType() == gamedataNPCType.Android )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectOfType( puppet, gamedataStatusEffectType.AndroidTurnOn ) )
+			{
+				GameInstance.GetStatusEffectSystem( puppet.GetGame() ).RemoveStatusEffect( m_target.GetEntityID(), T"BaseStatusEffect.AndroidTurnOn" );
+				StatusEffectHelper.ApplyStatusEffect( puppet, T"BaseStatusEffect.AndroidTurnOff" );
+			}
+		}
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var player : ScriptedPuppet;
+		var currentRole : AIRole;
+		var smi : SquadScriptInterface;
+		m_target = owner;
+		player = ( ( ScriptedPuppet )( GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject() ) );
+		ChangeAttitude( owner, player );
+		AIActionHelper.SetFriendlyTargetAllSquadMembers( owner );
+		if( AISquadHelper.GetSquadMemberInterface( player, smi ) )
+		{
+			smi.Join( owner );
+		}
+		currentRole = ( ( ScriptedPuppet )( owner ) ).GetAIControllerComponent().GetCurrentRole();
+		if( currentRole.GetRoleEnum() == EAIRole.Follower )
+		{
+			AIHumanComponent.SetCurrentRole( owner, new AINoRole );
+		}
+		if( ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Drone )
+		{
+			SetAnimFeature( ( ( ScriptedPuppet )( owner ) ) );
+		}
+		if( ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Android )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectOfType( owner, gamedataStatusEffectType.AndroidTurnOff ) )
+			{
+				StatusEffectHelper.ApplyStatusEffect( owner, T"BaseStatusEffect.AndroidTurnOn" );
+			}
+		}
+		if( RPGManager.GetStatValueFromObject( owner.GetGame(), GetPlayer( owner.GetGame() ), gamedataStatType.CanBuffMechanicalsOnTakeControl ) > 0.0 )
+		{
+			StatusEffectHelper.ApplyStatusEffect( owner, T"BaseStatusEffect.CombatHacking_Area_04_Perk_1_Buff_Level_1" );
+		}
+	}
+
+	protected override function ActionOff( owner : GameObject )
+	{
+		if( ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Drone )
+		{
+			StatusEffectHelper.ApplyStatusEffect( owner, T"BaseStatusEffect.ForceKill" );
+		}
+		if( ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Android )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectOfType( owner, gamedataStatusEffectType.AndroidTurnOn ) )
+			{
+				GameInstance.GetStatusEffectSystem( owner.GetGame() ).RemoveStatusEffect( owner.GetEntityID(), T"BaseStatusEffect.AndroidTurnOn" );
+				StatusEffectHelper.ApplyStatusEffect( owner, T"BaseStatusEffect.AndroidTurnOff" );
+			}
+		}
+	}
+
+	protected function ChangeAttitude( owner : weak< GameObject >, target : weak< GameObject > ) : Bool
+	{
+		var ownerAttitudeAgent : AttitudeAgent;
+		var targetAttitudeAgent : AttitudeAgent;
+		var targetSquadMembers : array< weak< Entity > >;
+		var currentTarget : weak< GameObject >;
+		var i : Int32;
+		if( !( owner ) || !( target ) )
+		{
+			return false;
+		}
+		ownerAttitudeAgent = owner.GetAttitudeAgent();
+		targetAttitudeAgent = target.GetAttitudeAgent();
+		if( !( ownerAttitudeAgent ) || !( targetAttitudeAgent ) )
+		{
+			return false;
+		}
+		if( AISquadHelper.GetSquadmates( ( ( ScriptedPuppet )( target ) ), targetSquadMembers ) )
+		{
+			for( i = 0; i < targetSquadMembers.Size(); i += 1 )
+			{
+				currentTarget = ( ( GameObject )( targetSquadMembers[ i ] ) );
+				if( !( currentTarget ) || ( currentTarget == owner ) )
+				{
+					continue;
+				}
+				ownerAttitudeAgent.SetAttitudeTowards( currentTarget.GetAttitudeAgent(), EAIAttitude.AIA_Friendly );
+			}
+		}
+		ownerAttitudeAgent.SetAttitudeGroup( targetAttitudeAgent.GetAttitudeGroup() );
+		ownerAttitudeAgent.SetAttitudeTowards( targetAttitudeAgent, EAIAttitude.AIA_Friendly );
+		return true;
+	}
+
+	protected function SetAnimFeature( owner : weak< ScriptedPuppet > )
+	{
+		var setFriendlyOverride : AnimFeature_StatusEffect;
+		setFriendlyOverride = new AnimFeature_StatusEffect;
+		setFriendlyOverride.state = 1;
+		setFriendlyOverride.duration = 8.0;
+		AnimationControllerComponent.ApplyFeatureToReplicate( owner, 'SetFriendlyOverride', setFriendlyOverride );
+	}
+
+}
+
+class AndroidTurnOnEffector extends Effector
+{
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		if( ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Android )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectOfType( owner, gamedataStatusEffectType.AndroidTurnOff ) )
+			{
+				GameInstance.GetStatusEffectSystem( owner.GetGame() ).RemoveStatusEffect( owner.GetEntityID(), T"BaseStatusEffect.AndroidTurnOff" );
+			}
+		}
+	}
+
+	protected override function ActionOff( owner : GameObject ) {}
+
+	protected override function Uninitialize( game : GameInstance ) {}
+}
+
+class AndroidTurnOffEffector extends Effector
+{
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		if( ( ( ScriptedPuppet )( owner ) ).GetNPCType() == gamedataNPCType.Android )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectOfType( owner, gamedataStatusEffectType.AndroidTurnOn ) )
+			{
+				GameInstance.GetStatusEffectSystem( owner.GetGame() ).RemoveStatusEffect( owner.GetEntityID(), T"BaseStatusEffect.AndroidTurnOn" );
+			}
+		}
+	}
+
+	protected override function ActionOff( owner : GameObject ) {}
+
+	protected override function Uninitialize( game : GameInstance ) {}
+}
+
+class SpreadInitEffector extends Effector
+{
+	var m_objectActionRecord : weak< ObjectAction_Record >;
+	var m_effectorRecord : SpreadInitEffector_Record;
+	var m_player : weak< PlayerPuppet >;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_effectorRecord = TweakDBInterface.GetSpreadInitEffectorRecord( record );
+		if( m_effectorRecord )
+		{
+			m_objectActionRecord = m_effectorRecord.ObjectAction();
+		}
+		m_player = GetPlayer( game );
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var spreadCount : Int32;
+		var range : Float;
+		var statsSystem : StatsSystem;
+		if( ( !( owner ) || !( m_objectActionRecord ) ) || !( m_effectorRecord ) )
+		{
+			return;
+		}
+		if( !( m_player ) )
+		{
+			return;
+		}
+		statsSystem = GameInstance.GetStatsSystem( m_player.GetGame() );
+		if( !( statsSystem ) )
+		{
+			return;
+		}
+		spreadCount = m_effectorRecord.SpreadCount();
+		if( spreadCount < 0 )
+		{
+			spreadCount = ( ( Int32 )( statsSystem.GetStatValue( m_player.GetEntityID(), gamedataStatType.QuickHackSpreadNumber ) ) );
+		}
+		range = ( ( Float )( m_effectorRecord.SpreadDistance() ) );
+		if( range < 0.0 )
+		{
+			range = statsSystem.GetStatValue( m_player.GetEntityID(), gamedataStatType.QuickHackSpreadDistance );
+		}
+		spreadCount += m_effectorRecord.BonusJumps();
+		if( ( spreadCount <= 0 ) || ( range <= 0.0 ) )
+		{
+			return;
+		}
+		HackingDataDef.AddItemToSpreadMap( m_player, m_objectActionRecord.ObjectActionUI(), spreadCount, range );
+	}
+
+}
+
+class SpreadEffector extends Effector
+{
+	var m_objectActionRecord : weak< ObjectAction_Record >;
+	var m_player : weak< PlayerPuppet >;
+	var m_effectorRecord : SpreadEffector_Record;
+	var m_spreadToAllTargetsInTheArea : Bool;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		var instigatorPrereqs : array< weak< IPrereq_Record > >;
+		m_effectorRecord = TweakDBInterface.GetSpreadEffectorRecord( record );
+		m_spreadToAllTargetsInTheArea = TweakDBInterface.GetBool( record + T".spreadToAllTargetsInTheArea", false );
+		if( m_effectorRecord )
+		{
+			m_objectActionRecord = m_effectorRecord.ObjectAction();
+		}
+		m_player = GetPlayer( game );
+		if( m_player )
+		{
+			m_objectActionRecord.InstigatorPrereqs( instigatorPrereqs );
+			if( !( RPGManager.CheckPrereqs( instigatorPrereqs, m_player ) ) )
+			{
+				m_objectActionRecord = NULL;
+				return;
+			}
+		}
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var effect : EffectInstance;
+		var range : Float;
+		var spreadCount : Int32;
+		if( !( owner ) || !( m_objectActionRecord ) )
+		{
+			return;
+		}
+		if( !( m_player ) )
+		{
+			return;
+		}
+		if( !( HackingDataDef.GetValuesFromSpreadMap( m_player, m_objectActionRecord.ObjectActionUI(), spreadCount, range ) ) )
+		{
+			return;
+		}
+		if( spreadCount <= 0 )
+		{
+			return;
+		}
+		effect = GameInstance.GetGameEffectSystem( owner.GetGame() ).CreateEffectStatic( 'forceVisionAppearanceOnNPC', m_effectorRecord.EffectTag(), m_player );
+		if( !( effect ) )
+		{
+			return;
+		}
+		EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, owner.GetWorldPosition() );
+		EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, range );
+		EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.maxPathLength, range * 2.0 );
+		EffectData.SetEntity( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.entity, owner );
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.statusEffect, m_objectActionRecord );
+		EffectData.SetInt( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attackNumber, spreadCount );
+		EffectData.SetBool( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.debugBool, m_spreadToAllTargetsInTheArea );
+		if( !( effect.Run() ) )
+		{
+			return;
+		}
+	}
+
+}
+
+class EffectExecutor_Spread extends EffectExecutor_Scripted
+{
+	var m_objectActionRecord : weak< ObjectAction_Record >;
+	var m_prevEntity : weak< Entity >;
+	var m_player : weak< PlayerPuppet >;
+	var m_spreadToAllTargetsInTheArea : Bool;
+
+	public function Init( ctx : EffectScriptContext ) : Bool
+	{
+		var variantValue : Variant;
+		m_player = GetPlayer( EffectScriptContext.GetGameInstance( ctx ) );
+		if( !( m_player ) )
+		{
+			return false;
+		}
+		if( !( EffectData.GetEntity( EffectScriptContext.GetSharedData( ctx ), GetAllBlackboardDefs().EffectSharedData.entity, m_prevEntity ) ) )
+		{
+			return false;
+		}
+		if( !( EffectData.GetVariant( EffectScriptContext.GetSharedData( ctx ), GetAllBlackboardDefs().EffectSharedData.statusEffect, variantValue ) ) )
+		{
+			return false;
+		}
+		if( !( EffectData.GetBool( EffectScriptContext.GetSharedData( ctx ), GetAllBlackboardDefs().EffectSharedData.debugBool, m_spreadToAllTargetsInTheArea ) ) )
+		{
+			return false;
+		}
+		m_objectActionRecord = ( ( weak< weak< ObjectAction_Record > > )variantValue );
+		if( !( m_objectActionRecord ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public function Process( ctx : EffectScriptContext, applierCtx : EffectExecutionScriptContext ) : Bool
+	{
+		var action : AIQuickHackAction;
+		var targetPrereqs : array< weak< ObjectActionPrereq_Record > >;
+		var targetActionRecords : array< weak< ObjectAction_Record > >;
+		var i : Int32;
+		var prereqsToCheck : array< weak< IPrereq_Record > >;
+		var result : Bool;
+		var target : weak< ScriptedPuppet >;
+		target = ( ( ScriptedPuppet )( EffectExecutionScriptContext.GetTarget( applierCtx ) ) );
+		if( !( target ) || !( ScriptedPuppet.IsActive( target ) ) )
+		{
+			return true;
+		}
+		if( target.IsPlayer() )
+		{
+			return true;
+		}
+		if( target == m_prevEntity )
+		{
+			return true;
+		}
+		if( GameObject.GetAttitudeTowards( target, m_player ) == EAIAttitude.AIA_Friendly )
+		{
+			return true;
+		}
+		if( !( target.IsAggressive() ) )
+		{
+			return true;
+		}
+		if( !( target.IsQuickHackAble() ) )
+		{
+			return true;
+		}
+		target.GetRecord().ObjectActions( targetActionRecords );
+		for( i = 0; i < targetActionRecords.Size(); i += 1 )
+		{
+			if( targetActionRecords[ i ].ObjectActionUI() == m_objectActionRecord.ObjectActionUI() )
+			{
+				result = true;
+				break;
+			}
+		}
+		if( result == false )
+		{
+			return true;
+		}
+		if( m_objectActionRecord.GetTargetActivePrereqsCount() > 0 )
+		{
+			m_objectActionRecord.TargetActivePrereqs( targetPrereqs );
+			for( i = 0; i < targetPrereqs.Size(); i += 1 )
+			{
+				if( targetPrereqs[ i ].GetFailureConditionPrereqCount() > 0 )
+				{
+					targetPrereqs[ i ].FailureConditionPrereq( prereqsToCheck );
+					if( !( RPGManager.CheckPrereqs( prereqsToCheck, target ) ) )
+					{
+						return true;
+					}
+				}
+			}
+		}
+		result = HackingDataDef.DecrementCountFromSpreadMap( m_player, m_objectActionRecord.ObjectActionUI() );
+		action = new AIQuickHackAction;
+		action.RegisterAsRequester( target.GetEntityID() );
+		action.SetExecutor( m_player );
+		action.SetObjectActionID( m_objectActionRecord.GetID() );
+		action.SetUp( target.GetPuppetPS() );
+		action.ProcessRPGAction( target.GetGame() );
+		if( m_spreadToAllTargetsInTheArea && result )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class SortOut_Contagion extends EffectObjectGroupFilter_Scripted
+{
+
+	[ profile = "" ]
+	public function Process( out ctx : EffectScriptContext, out filterCtx : EffectGroupFilterScriptContext ) : Bool
+	{
+		var numAgents : Int32;
+		var i, j : Int32;
+		var targets : array< ScriptedPuppet >;
+		var target : ScriptedPuppet;
+		var sortedTarget : ScriptedPuppet;
+		var dataObjectAction : Variant;
+		var sortedTargets : array< ScriptedPuppet >;
+		if( !( EffectData.GetVariant( EffectScriptContext.GetSharedData( ctx ), GetAllBlackboardDefs().EffectSharedData.statusEffect, dataObjectAction ) ) )
+		{
+			return false;
+		}
+		else
+		{
+			if( !( IsContagion( ( ( weak< weak< ObjectAction_Record > > )dataObjectAction ) ) ) )
+			{
+				return false;
+			}
+		}
+		numAgents = ( ( Int32 )( EffectGroupFilterScriptContext.GetNumAgents( filterCtx ) ) );
+		for( i = 0; i < numAgents; i = i + 1 )
+		{
+			target = ( ( ScriptedPuppet )( EffectGroupFilterScriptContext.GetEntity( filterCtx, i ) ) );
+			if( target )
+			{
+				targets.PushBack( target );
+			}
+		}
+		sortedTargets = SortTargetsByStatusEffect( targets );
+		filterCtx.resultIndices.Clear();
+		for( i = 0; i < sortedTargets.Size(); i += 1 )
+		{
+			sortedTarget = ( ( ScriptedPuppet )( sortedTargets[ i ] ) );
+			if( sortedTarget != NULL )
+			{
+				for( j = 0; j < numAgents; j = j + 1 )
+				{
+					target = ( ( ScriptedPuppet )( EffectGroupFilterScriptContext.GetEntity( filterCtx, j ) ) );
+					if( sortedTarget == target )
+					{
+						filterCtx.resultIndices.PushBack( j );
+						break;
+					}
+				}
+			}
+		}
+		return true;
+	}
+
+	private function IsContagion( objectAction : ObjectAction_Record ) : Bool
+	{
+		if( StrContains( objectAction.ObjectActionUI().Name(), "ContagionHack" ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	[ profile = "" ]
+	private function SortTargetsByStatusEffect( targets : array< ScriptedPuppet > ) : array< ScriptedPuppet >
+	{
+		var i : Int32;
+		var sortedTargetsWithStatus : array< ScriptedPuppet >;
+		var sortedTargetsWithoutStatus : array< ScriptedPuppet >;
+		var sortedTargets : array< ScriptedPuppet >;
+		for( i = targets.Size(); i > 0; i -= 1 )
+		{
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( targets[ i ] ) ), 'ContagionPoison' ) ) )
+			{
+				sortedTargetsWithoutStatus.Insert( 0, targets[ i ] );
+			}
+		}
+		for( i = 0; i < targets.Size(); i += 1 )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( targets[ i ] ) ), 'ContagionPoison' ) )
+			{
+				sortedTargetsWithStatus.PushBack( targets[ i ] );
+			}
+		}
+		sortedTargets = sortedTargetsWithoutStatus;
+		for( i = sortedTargetsWithoutStatus.Size(); i < ( sortedTargetsWithoutStatus.Size() + sortedTargetsWithStatus.Size() ); i += 1 )
+		{
+			sortedTargets.Insert( i, sortedTargetsWithStatus[ i - sortedTargetsWithoutStatus.Size() ] );
+		}
+		return sortedTargets;
+	}
+
+}
+
+class RevealPlayerPositionEffector extends Effector
+{
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID ) {}
+
+	protected override function ActionOn( owner : GameObject ) {}
+
+	protected override function ActionOff( owner : GameObject ) {}
+}
+
+class ForceMoveInCombatEffector extends Effector
+{
+	var m_target : weak< GameObject >;
+	var m_duration : Float;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_duration = TweakDBInterface.GetFloat( record + T".duration", 30.0 );
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var player : GameObject;
+		var AIcomponent : AIHumanComponent;
+		var moveCommand : AIMoveToCommand;
+		var targetPosition : Vector4;
+		var end : AIPositionSpec;
+		var endWorldPosition : WorldPosition;
+		m_target = owner;
+		AIcomponent = ( ( ScriptedPuppet )( owner ) ).GetAIControllerComponent();
+		player = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		if( ( ( ScriptedPuppet )( owner ) ).GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat )
+		{
+			targetPosition = player.GetWorldPosition();
+			WorldPosition.SetVector4( endWorldPosition, targetPosition );
+			AIPositionSpec.SetWorldPosition( end, endWorldPosition );
+			moveCommand = new AIMoveToCommand;
+			moveCommand.movementTarget = end;
+			moveCommand.facingTarget = end;
+			moveCommand.ignoreNavigation = false;
+			moveCommand.desiredDistanceFromTarget = 2.0;
+			moveCommand.movementType = moveMovementType.Run;
+			moveCommand.finishWhenDestinationReached = true;
+			AIcomponent.SendCommand( moveCommand );
+		}
+	}
+
+	protected override function ActionOff( owner : GameObject )
+	{
+		StatusEffectHelper.RemoveStatusEffect( owner, T"BaseStatusEffects.WhistleLvl3" );
+	}
+
+}
+
+class ForceMoveInCombatCallInEffector extends Effector
+{
+	var m_target : weak< GameObject >;
+	var m_duration : Float;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_duration = TweakDBInterface.GetFloat( record + T".duration", 30.0 );
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var player : GameObject;
+		var calledObject : GameObject;
+		var AIcomponent : AIHumanComponent;
+		var moveCommand : AIMoveToCommand;
+		var targetPosition : Vector4;
+		var end : AIPositionSpec;
+		var endWorldPosition : WorldPosition;
+		var squadMembers : array< EntityID >;
+		if( !( AISquadHelper.GetSquadmatesID( owner, squadMembers ) ) )
+		{
+			return;
+		}
+		m_target = owner;
+		calledObject = ( ( GameObject )( GameInstance.FindEntityByID( owner.GetGame(), squadMembers[ 0 ] ) ) );
+		AIcomponent = ( ( ScriptedPuppet )( calledObject ) ).GetAIControllerComponent();
+		player = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject();
+		if( ( ( ScriptedPuppet )( owner ) ).GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat )
+		{
+			targetPosition = owner.GetWorldPosition();
+			WorldPosition.SetVector4( endWorldPosition, targetPosition );
+			AIPositionSpec.SetEntity( end, EntityGameInterface.GetEntity( owner.GetEntity() ) );
+			moveCommand = new AIMoveToCommand;
+			AIPositionSpec.SetEntity( moveCommand.facingTarget, EntityGameInterface.GetEntity( player.GetEntity() ) );
+			moveCommand.movementTarget = end;
+			moveCommand.ignoreNavigation = false;
+			moveCommand.desiredDistanceFromTarget = 1.0;
+			moveCommand.movementType = moveMovementType.Run;
+			moveCommand.finishWhenDestinationReached = true;
+			AIcomponent.SendCommand( moveCommand );
+			GameObject.PlayVoiceOver( calledObject, 'stlh_call', 'Scripts:OnVoiceOverQuickHackFeedbackEvent' );
+		}
+	}
+
+	protected override function ActionOff( owner : GameObject )
+	{
+		StatusEffectHelper.RemoveStatusEffect( owner, T"BaseStatusEffects.CommsCallInLevel3" );
+	}
+
+}
+

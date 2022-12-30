@@ -1,0 +1,272 @@
+class PauseMenuListItemData extends ListItemData
+{
+	var eventName : CName;
+	var action : PauseMenuAction;
+}
+
+class PauseMenuBackgroundGameController extends inkGameController
+{
+
+	protected event OnInitialize()
+	{
+		var setMenuModeEvent : inkMenuLayer_SetMenuModeEvent;
+		setMenuModeEvent = new inkMenuLayer_SetMenuModeEvent;
+		setMenuModeEvent.Init( inkMenuMode.PauseMenu, inkMenuState.Enabled );
+		QueueBroadcastEvent( setMenuModeEvent );
+		GetSystemRequestsHandler().PauseGame();
+	}
+
+	protected event OnUninitialize()
+	{
+		var setMenuModeEvent : inkMenuLayer_SetMenuModeEvent;
+		setMenuModeEvent = new inkMenuLayer_SetMenuModeEvent;
+		setMenuModeEvent.Init( inkMenuMode.PauseMenu, inkMenuState.Disabled );
+		QueueBroadcastEvent( setMenuModeEvent );
+		GetSystemRequestsHandler().UnpauseGame();
+	}
+
+}
+
+class PauseMenuGameController extends gameuiMenuItemListGameController
+{
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	var m_gameInstance : GameInstance;
+	private var m_savesCount : Int32;
+	private var m_quickSaveInProgress : Bool;
+
+	protected event OnInitialize()
+	{
+		var owner : GameObject;
+		var handler : weak< inkISystemRequestsHandler >;
+		m_savesCount = GetSystemRequestsHandler().RequestSavesCountSync();
+		super.OnInitialize();
+		owner = ( ( GameObject )( GetPlayerControlledObject() ) );
+		m_gameInstance = ( ( GameInstance )( owner.GetGame() ) );
+		PlayLibraryAnimation( 'intro' );
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-UserActions-Select" ) );
+		m_buttonHintsController.AddButtonHint( 'pause_menu_quicksave', GetLocalizedText( "UI-ResourceExports-Quicksave" ) );
+		m_menuListController.GetRootWidget().RegisterToCallback( 'OnRelease', this, 'OnListRelease' );
+		m_menuListController.GetRootWidget().RegisterToCallback( 'OnRepeat', this, 'OnListRelease' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnGlobalRelease' );
+		handler = GetSystemRequestsHandler();
+		handler.RegisterToCallback( 'OnSavingComplete', this, 'OnSavingComplete' );
+		handler.RegisterToCallback( 'OnBoughtFullGame', this, 'OnRedrawRequested' );
+	}
+
+	protected event OnUninitialize()
+	{
+		var handler : weak< inkISystemRequestsHandler >;
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnGlobalRelease' );
+		m_menuListController.GetRootWidget().UnregisterFromCallback( 'OnRelease', this, 'OnListRelease' );
+		m_menuListController.GetRootWidget().UnregisterFromCallback( 'OnRepeat', this, 'OnListRelease' );
+		handler = GetSystemRequestsHandler();
+		handler.UnregisterFromCallback( 'OnSavingComplete', this, 'OnSavingComplete' );
+		handler.UnregisterFromCallback( 'OnBoughtFullGame', this, 'OnRedrawRequested' );
+		super.OnUninitialize();
+	}
+
+	private override function PopulateMenuItemList()
+	{
+		AddMenuItem( GetLocalizedText( "UI-Labels-Resume" ), 'OnClosePauseMenu' );
+		if( !( IsFinal() ) || UseProfiler() )
+		{
+			AddMenuItem( "OPEN DEBUG MENU", 'OnOpenDebugHubMenu' );
+		}
+		AddMenuItem( GetLocalizedText( "UI-ResourceExports-SaveGame" ), PauseMenuAction.Save );
+		if( m_savesCount > 0 )
+		{
+			AddMenuItem( GetLocalizedText( "UI-ScriptExports-LoadGame0" ), 'OnSwitchToLoadGame' );
+		}
+		AddMenuItem( GetLocalizedText( "UI-Labels-Settings" ), 'OnSwitchToSettings' );
+		AddMenuItem( GetLocalizedText( "UI-DLC-MenuTitle" ), 'OnSwitchToDlc' );
+		AddMenuItem( GetLocalizedText( "UI-Labels-Credits" ), 'OnSwitchToCredits' );
+		if( TrialHelper.IsInPS5TrialMode() )
+		{
+			AddMenuItem( GetLocalizedText( "UI-Notifications-Ps5TrialBuyMenuItem" ), 'OnBuyGame' );
+		}
+		AddMenuItem( GetLocalizedText( "UI-Labels-ExitToMenu" ), PauseMenuAction.ExitToMainMenu );
+		m_menuListController.Refresh();
+		SetCursorOverWidget( inkCompoundRef.GetWidgetByIndex( m_menuList, 0 ) );
+	}
+
+	protected event OnUnitialize()
+	{
+		m_menuListController.UnregisterFromCallback( 'OnItemActivated', this, 'OnMenuItemActivated' );
+	}
+
+	protected event OnRedrawRequested()
+	{
+		ShowActionsList();
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		m_menuEventDispatcher = menuEventDispatcher;
+	}
+
+	private function HandlePressToSaveGame( target : weak< inkWidget > )
+	{
+		var locks : array< gameSaveLock >;
+		if( GameInstance.IsSavingLocked( m_gameInstance, locks ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			PlayLibraryAnimationOnAutoSelectedTargets( 'pause_button_blocked', target );
+			ShowSavingLockedNotification( locks );
+			return;
+		}
+		PlaySound( 'Button', 'OnPress' );
+		m_menuEventDispatcher.SpawnEvent( 'OnSwitchToSaveGame' );
+	}
+
+	private function HandlePressToQuickSaveGame()
+	{
+		var locks : array< gameSaveLock >;
+		if( ( m_quickSaveInProgress || IsSaveFailedNotificationActive() ) || IsGameSavedNotificationActive() )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			return;
+		}
+		if( GameInstance.IsSavingLocked( m_gameInstance, locks ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			ShowSavingLockedNotification( locks );
+			return;
+		}
+		PlaySound( 'Button', 'OnPress' );
+		GetSystemRequestsHandler().QuickSave();
+		m_quickSaveInProgress = true;
+	}
+
+	protected event OnMenuItemActivated( index : Int32, target : ListItemController )
+	{
+		var data : PauseMenuListItemData;
+		var nextLoadingTypeEvt : inkSetNextLoadingScreenEvent;
+		nextLoadingTypeEvt = new inkSetNextLoadingScreenEvent;
+		nextLoadingTypeEvt.SetNextLoadingScreenType( inkLoadingScreenType.FastTravel );
+		data = ( ( PauseMenuListItemData )( target.GetData() ) );
+		switch( data.action )
+		{
+			case PauseMenuAction.OpenSubMenu:
+				PlaySound( 'Button', 'OnPress' );
+			m_menuEventDispatcher.SpawnEvent( data.eventName );
+			break;
+			case PauseMenuAction.Save:
+				HandlePressToSaveGame( target.GetRootWidget() );
+			break;
+			case PauseMenuAction.QuickSave:
+				HandlePressToQuickSaveGame();
+			break;
+			case PauseMenuAction.ExitGame:
+				PlaySound( 'Button', 'OnPress' );
+			ExitGame();
+			break;
+			case PauseMenuAction.ExitToMainMenu:
+				QueueBroadcastEvent( nextLoadingTypeEvt );
+			PlaySound( 'Button', 'OnPress' );
+			GotoMainMenu();
+			break;
+		}
+	}
+
+	protected event OnSavingComplete( success : Bool, locks : array< gameSaveLock > )
+	{
+		if( success )
+		{
+			RequestGameSavedNotification();
+		}
+		else
+		{
+			RequestSaveFailedNotification();
+			ShowSavingLockedNotification( locks );
+		}
+		m_quickSaveInProgress = false;
+	}
+
+	protected event OnListRelease( e : inkPointerEvent )
+	{
+		if( e.IsHandled() )
+		{
+			return false;
+		}
+		m_menuListController.HandleInput( e, this );
+	}
+
+	protected event OnGlobalRelease( e : inkPointerEvent )
+	{
+		if( e.IsHandled() )
+		{
+			return false;
+		}
+		if( e.IsAction( 'pause_menu_quicksave' ) )
+		{
+			HandlePressToQuickSaveGame();
+		}
+		else if( e.IsAction( 'navigate_up' ) || e.IsAction( 'navigate_left' ) )
+		{
+			SetCursorOverWidget( inkCompoundRef.GetWidgetByIndex( m_menuList, 0 ), true );
+		}
+		else if( e.IsAction( 'navigate_down' ) || e.IsAction( 'navigate_right' ) )
+		{
+			SetCursorOverWidget( inkCompoundRef.GetWidgetByIndex( m_menuList, inkCompoundRef.GetNumChildren( m_menuList ) - 1 ), true );
+		}
+	}
+
+}
+
+class PauseMenuButtonItem extends AnimatedListItemController
+{
+	private editable var m_Fluff : inkTextRef;
+	private var m_animLoop : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+		super.OnInitialize();
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+		UnregisterFromCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		UnregisterFromCallback( 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	protected event OnAddedToList( target : weak< ListItemController > )
+	{
+		inkTextRef.SetText( m_Fluff, "RES__ASYNC_" + GetIndex() );
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		var options : inkAnimOptions;
+		options.loopType = inkanimLoopType.Cycle;
+		options.loopInfinite = true;
+		PlayLibraryAnimation( 'pause_button_hover_over_anim' );
+		m_animLoop = PlayLibraryAnimation( 'pause_button_loop_anim', options );
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		if( m_animLoop.IsPlaying() )
+		{
+			m_animLoop.Stop();
+		}
+		PlayLibraryAnimation( 'pause_button_hover_out_anim' );
+	}
+
+}
+
+enum PauseMenuAction
+{
+	OpenSubMenu = 0,
+	QuickSave = 1,
+	Save = 2,
+	ExitGame = 3,
+	ExitToMainMenu = 4,
+	QuickLoad = 5,
+}
+

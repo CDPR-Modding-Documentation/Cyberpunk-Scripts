@@ -1,0 +1,823 @@
+class TakeOverControlSystem extends ScriptableSystem
+{
+	private var m_controlledObject : weak< GameObject >;
+	private var m_takeControlSourceID : EntityID;
+	private var m_isInputRegistered : Bool;
+	private var m_isInputLockedFromQuest : Bool;
+	private var m_isChainForcedFromQuest : Bool;
+	private var m_isActionButtonLocked : Bool;
+	private var m_isDeviceChainCreationLocked : Bool;
+	private var m_chainLockSources : array< CName >;
+	private var m_TCDUpdateDelayID : DelayID;
+	private var m_TCSupdateRate : Float;
+	default m_TCSupdateRate = 0.1f;
+	private var m_lastInputSimTime : Float;
+
+	public const function GetControlledObject() : GameObject
+	{
+		return m_controlledObject;
+	}
+
+	public const function IsInputLockedFromQuest() : Bool
+	{
+		return m_isInputLockedFromQuest;
+	}
+
+	public const function IsDeviceControlled() : Bool
+	{
+		if( GetControlledObject() )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private export override function IsSavingLocked() : Bool
+	{
+		return IsDeviceControlled();
+	}
+
+	private function CleanupControlledObject()
+	{
+		var cameraControlEvt : DeviceEndPlayerCameraControlEvent;
+		cameraControlEvt = new DeviceEndPlayerCameraControlEvent;
+		m_controlledObject.QueueEvent( cameraControlEvt );
+		m_controlledObject = NULL;
+		CleanupActiveEntityInChainBlackboard();
+	}
+
+	private function OnEnableFastTravelRequest( request : LockTakeControlAction )
+	{
+		m_isActionButtonLocked = request.isLocked;
+	}
+
+	private function OnLockDeviceChainCreationRequest( request : LockDeviceChainCreation )
+	{
+		m_isDeviceChainCreationLocked = request.isLocked;
+		if( request.isLocked )
+		{
+			m_chainLockSources.PushBack( request.source );
+		}
+		else
+		{
+			m_chainLockSources.Remove( request.source );
+		}
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl ).SetBool( GetAllBlackboardDefs().DeviceTakeControl.ChainLocked, m_isDeviceChainCreationLocked );
+	}
+
+	public const function IskDeviceChainCreationLocked() : Bool
+	{
+		return m_isDeviceChainCreationLocked;
+	}
+
+	private function LockInputFromQuestRequest( isLocked : Bool )
+	{
+		m_isInputLockedFromQuest = isLocked;
+	}
+
+	private function ForceChainFromQuestRequest( isChainForced : Bool )
+	{
+		m_isChainForcedFromQuest = isChainForced;
+	}
+
+	public static function RequestTakeControl( context : GameObject, originalevent : ToggleTakeOverControl )
+	{
+		var takeOverRequest : RequestTakeControl;
+		var takeOverControlSystem : TakeOverControlSystem;
+		var psmBlackboard : IBlackboard;
+		var tier : Int32;
+		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( context.GetGame() ).Get( 'TakeOverControlSystem' ) ) );
+		if( !( takeOverControlSystem ) )
+		{
+			return;
+		}
+		if( originalevent.IsQuickHack() )
+		{
+			psmBlackboard = GameInstance.GetBlackboardSystem( context.GetGame() ).GetLocalInstanced( GameInstance.GetPlayerSystem( context.GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+			if( psmBlackboard )
+			{
+				tier = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel );
+				if( ( tier > ( ( Int32 )( gamePSMHighLevel.SceneTier1 ) ) ) && ( tier <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) ) )
+				{
+					return;
+				}
+			}
+		}
+		takeOverRequest = new RequestTakeControl;
+		takeOverRequest.requestSource = context.GetEntityID();
+		takeOverRequest.originalEvent = originalevent;
+		takeOverControlSystem.QueueRequest( takeOverRequest );
+	}
+
+	private export function OnRequestTakeControl( request : RequestTakeControl )
+	{
+		RegisterAsCurrentObject( request.requestSource );
+		SendTSCActivateEventToEntity( request.originalEvent.IsQuickHack() );
+		if( !( request.originalEvent.IsQuickHack() ) )
+		{
+			m_takeControlSourceID = request.originalEvent.GetRequesterID();
+		}
+		if( m_isChainForcedFromQuest )
+		{
+			TryFillControlBlackboardByForce( request );
+			m_isChainForcedFromQuest = false;
+		}
+		else
+		{
+			TryFillControlBlackboard( request );
+		}
+		EnablePlayerTPPRepresenation( true );
+		HideAdvanceInteractionInputHints();
+	}
+
+	private export function OnRemoveFromChainRequest( request : RemoveFromChainRequest )
+	{
+		var chain : array< SWidgetPackage >;
+		var psID : PersistentID;
+		var i : Int32;
+		if( GetControlledObject().GetEntityID() == request.requestSource )
+		{
+			ToggleToNextControlledDevice();
+		}
+		chain = GetChain();
+		for( i = 0; i < chain.Size(); i += 1 )
+		{
+			psID = CreatePersistentID( request.requestSource, 'controller' );
+			if( chain[ i ].ownerID == psID )
+			{
+				chain.EraseFast( i );
+				break;
+			}
+		}
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl ).SetVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain, chain );
+	}
+
+	public static function ReleaseControlOnHit( player : weak< PlayerPuppet > ) : Bool
+	{
+		var takeOverControlSystem : TakeOverControlSystem;
+		var controlledObject : weak< GameObject >;
+		if( !( player ) )
+		{
+			return false;
+		}
+		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( player.GetGame() ).Get( 'TakeOverControlSystem' ) ) );
+		if( !( takeOverControlSystem ) )
+		{
+			return false;
+		}
+		controlledObject = takeOverControlSystem.GetControlledObject();
+		if( !( controlledObject ) )
+		{
+			return false;
+		}
+		if( VehicleComponent.IsMountedToVehicle( player.GetGame(), player ) )
+		{
+			return false;
+		}
+		if( ( ( SensorDevice )( controlledObject ) ) )
+		{
+			takeOverControlSystem.QueueRequest( new RequestReleaseControl );
+			return true;
+		}
+		return false;
+	}
+
+	public static function ReleaseControl( game : GameInstance ) : Bool
+	{
+		var takeOverControlSystem : TakeOverControlSystem;
+		if( !( GameInstance.IsValid( game ) ) )
+		{
+			return false;
+		}
+		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'TakeOverControlSystem' ) ) );
+		if( !( takeOverControlSystem ) )
+		{
+			return false;
+		}
+		if( !( takeOverControlSystem.IsDeviceControlled() ) )
+		{
+			return false;
+		}
+		takeOverControlSystem.QueueRequest( new RequestReleaseControl );
+		return true;
+	}
+
+	private export function OnRequestReleaseControl( request : RequestReleaseControl )
+	{
+		var invalidID : EntityID;
+		m_takeControlSourceID = invalidID;
+		ToggleToMainPlayerObject();
+	}
+
+	private export function OnRequestQuestTakeControlInputLock( request : RequestQuestTakeControlInputLock )
+	{
+		LockInputFromQuestRequest( request.isLocked );
+		ForceChainFromQuestRequest( request.isChainForced );
+	}
+
+	private function ReleaseCurrentObject()
+	{
+		var ReleaseEvt : TCSTakeOverControlDeactivate;
+		ReleaseEvt = new TCSTakeOverControlDeactivate;
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( CreatePersistentID( GetControlledObject().GetEntityID(), 'controller' ), ( ( Device )( GetControlledObject() ) ).GetDevicePS().GetClassName(), ReleaseEvt );
+		CleanupControlledObject();
+	}
+
+	private function RegisterAsCurrentObject( entityID : EntityID )
+	{
+		RegisterObjectHandle( entityID );
+		RegisterSystemOnInput( true );
+		PSMSetIsPlayerControllDevice( true );
+		GameObjectEffectHelper.StartEffectEvent( GetControlledObject(), 'camera_transition_effect_start' );
+	}
+
+	private function RegisterBBActiveObjectAsCurrentObject()
+	{
+		var chainBlackBoard : IBlackboard;
+		chainBlackBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl );
+		chainBlackBoard.SetEntityID( GetAllBlackboardDefs().DeviceTakeControl.ActiveDevice, GetControlledObject().GetEntityID(), true );
+	}
+
+	private function RegisterObjectHandle( EntID : EntityID )
+	{
+		var player : PlayerPuppet;
+		if( GetControlledObject() )
+		{
+			if( GetControlledObject().GetEntityID() == EntID )
+			{
+				return;
+			}
+			else
+			{
+				ReleaseCurrentObject();
+			}
+		}
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+		m_controlledObject = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), EntID ) ) );
+		GetCameraDataFromControlledObject( GetControlledObject(), player );
+		RegisterBBActiveObjectAsCurrentObject();
+	}
+
+	private function SendTSCActivateEventToEntity( isQuickhack : Bool )
+	{
+		var evtOwner : TCSTakeOverControlActivate;
+		evtOwner = new TCSTakeOverControlActivate;
+		evtOwner.IsQuickhack = isQuickhack;
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( CreatePersistentID( GetControlledObject().GetEntityID(), 'controller' ), ( ( Device )( GetControlledObject() ) ).GetDevicePS().GetClassName(), evtOwner );
+	}
+
+	private function GetCameraDataFromControlledObject( ent : GameObject, player : GameObject )
+	{
+		var sensorControlledObject : SensorDevice;
+		var cameraRotationData : CameraRotationData;
+		var cameraControlEvt : DeviceStartPlayerCameraControlEvent;
+		cameraControlEvt = new DeviceStartPlayerCameraControlEvent;
+		sensorControlledObject = ( ( SensorDevice )( ent ) );
+		if( sensorControlledObject )
+		{
+			cameraControlEvt.playerController = player;
+			if( sensorControlledObject.GetDevicePS().IsON() )
+			{
+				sensorControlledObject.SyncRotationWithAnimGraph();
+			}
+			else
+			{
+				sensorControlledObject.ResetRotation();
+			}
+			cameraRotationData = sensorControlledObject.GetRotationData();
+			cameraControlEvt.minYaw = cameraRotationData.m_minYaw;
+			cameraControlEvt.maxYaw = cameraRotationData.m_maxYaw;
+			cameraControlEvt.minPitch = cameraRotationData.m_minPitch;
+			cameraControlEvt.maxPitch = cameraRotationData.m_maxPitch;
+			cameraControlEvt.initialRotation.X = cameraRotationData.m_yaw;
+			cameraControlEvt.initialRotation.Y = cameraRotationData.m_pitch;
+			sensorControlledObject.QueueEvent( cameraControlEvt );
+		}
+	}
+
+	private function GetChain() : array< SWidgetPackage >
+	{
+		var chainBlackboard : IBlackboard;
+		var chain : array< SWidgetPackage >;
+		chainBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl );
+		chain = ( ( array< SWidgetPackage > )( chainBlackboard.GetVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain ) ) );
+		return chain;
+	}
+
+	private function TryFillControlBlackboard( evt : RequestTakeControl )
+	{
+		if( !( ( ( Device )( GetControlledObject() ) ).GetDevicePS().CanBeInDeviceChain() ) )
+		{
+			CleanupChainBlackboard();
+			return;
+		}
+		TryFillControlBlackboardByForce( evt );
+		ShowChainControls( true );
+	}
+
+	private function TryFillControlBlackboardByForce( evt : RequestTakeControl )
+	{
+		var masterEvt : FillTakeOverChainBBoardEvent;
+		var allMasters : array< DeviceComponentPS >;
+		var i : Int32;
+		GameInstance.GetDeviceSystem( GetGameInstance() ).GetParents( evt.requestSource, allMasters );
+		masterEvt = new FillTakeOverChainBBoardEvent;
+		masterEvt.requesterID = evt.originalEvent.GetRequesterID();
+		for( i = 0; i < allMasters.Size(); i += 1 )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( allMasters[ i ].GetID(), allMasters[ i ].GetClassName(), masterEvt );
+		}
+		ShowChainControls( true );
+	}
+
+	private function RegisterSystemOnInput( register : Bool )
+	{
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+		if( player )
+		{
+			if( register && !( m_isInputRegistered ) )
+			{
+				StatusEffectHelper.ApplyStatusEffect( player, T"GameplayRestriction.NoCameraControl" );
+				player.RegisterInputListener( this, 'CameraX' );
+				player.RegisterInputListener( this, 'CameraY' );
+				player.RegisterInputListener( this, 'CameraMouseX' );
+				player.RegisterInputListener( this, 'CameraMouseY' );
+				player.RegisterInputListener( this, 'DeviceAttack' );
+				player.RegisterInputListener( this, 'StopDeviceControl' );
+				player.RegisterInputListener( this, 'SwitchDevicePrevious' );
+				player.RegisterInputListener( this, 'SwitchDeviceNext' );
+				player.RegisterInputListener( this, 'OpenPauseMenu' );
+				m_isInputRegistered = true;
+				CreateTCSUpdate();
+			}
+			else if( !( register ) && m_isInputRegistered )
+			{
+				StatusEffectHelper.RemoveStatusEffect( player, T"GameplayRestriction.NoCameraControl" );
+				player.UnregisterInputListener( this );
+				m_isInputRegistered = false;
+				BreakTCSUpdate();
+			}
+		}
+	}
+
+	private function ShowChainControls( show : Bool )
+	{
+		if( show )
+		{
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetString( GetAllBlackboardDefs().UI_HudButtonHelp.button1_Text, "Press to next" );
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetName( GetAllBlackboardDefs().UI_HudButtonHelp.button1_Icon, 'dpad_right' );
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetString( GetAllBlackboardDefs().UI_HudButtonHelp.button2_Text, "Press to previous" );
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetName( GetAllBlackboardDefs().UI_HudButtonHelp.button2_Icon, 'dpad_left' );
+		}
+		else
+		{
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetString( GetAllBlackboardDefs().UI_HudButtonHelp.button1_Text, "" );
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetName( GetAllBlackboardDefs().UI_HudButtonHelp.button1_Icon, '' );
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetString( GetAllBlackboardDefs().UI_HudButtonHelp.button2_Text, "" );
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_HudButtonHelp ).SetName( GetAllBlackboardDefs().UI_HudButtonHelp.button2_Icon, '' );
+		}
+	}
+
+	private function PSMSetIsPlayerControllDevice( controllsDevice : Bool )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, controllsDevice );
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, controllsDevice );
+		if( controllsDevice )
+		{
+			playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsUIZoomDevice, false );
+			playerStateMachineBlackboard.FireCallbacks();
+		}
+		else
+		{
+			playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, false );
+			playerStateMachineBlackboard.FireCallbacks();
+		}
+	}
+
+	private function ToggleToNextControlledDevice()
+	{
+		var package : SWidgetPackage;
+		var isStructValid : Bool;
+		package = GetPackageFromChainNextToMe( true, isStructValid );
+		if( !( isStructValid ) )
+		{
+			return;
+		}
+		ToggleToOtherDeviceFromChain( package );
+	}
+
+	private function ToggleToPreviousControlledDevice()
+	{
+		var package : SWidgetPackage;
+		var isStructValid : Bool;
+		package = GetPackageFromChainNextToMe( false, isStructValid );
+		if( !( isStructValid ) )
+		{
+			return;
+		}
+		ToggleToOtherDeviceFromChain( package );
+	}
+
+	private function ToggleToOtherDeviceFromChain( otherPackage : SWidgetPackage )
+	{
+		RegisterAsCurrentObject( PersistentID.ExtractEntityID( otherPackage.ownerID ) );
+		SendTSCActivateEventToEntity( false );
+	}
+
+	private function ToggleToMainPlayerObject()
+	{
+		GameObjectEffectHelper.StartEffectEvent( GetControlledObject(), 'camera_transition_effect_stop' );
+		ReleaseCurrentObject();
+		RegisterSystemOnInput( false );
+		PSMSetIsPlayerControllDevice( false );
+		CleanupChainBlackboard();
+		EnablePlayerTPPRepresenation( false );
+	}
+
+	private function ReturnToDeviceScreen()
+	{
+		var invalidID : EntityID;
+		var evt : ReturnToDeviceScreenEvent;
+		if( EntityID.IsDefined( m_takeControlSourceID ) )
+		{
+			evt = new ReturnToDeviceScreenEvent;
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( m_takeControlSourceID, evt );
+			m_takeControlSourceID = invalidID;
+		}
+	}
+
+	private function GetPackageFromChainNextToMe( higher : Bool, out isValid : Bool ) : SWidgetPackage
+	{
+		var chainBlackBoard : IBlackboard;
+		var deviceChain : array< SWidgetPackage >;
+		var choosenPackage : SWidgetPackage;
+		var myIndex : Int32;
+		var nextIndex : Int32;
+		var overJumpsDone : Int32;
+		chainBlackBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl );
+		deviceChain = ( ( array< SWidgetPackage > )( chainBlackBoard.GetVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain ) ) );
+		if( deviceChain.Size() < 2 )
+		{
+			isValid = false;
+		}
+		else
+		{
+			isValid = true;
+		}
+		myIndex = GetCurrentActiveDeviceChainBlackboardIndex( deviceChain );
+		( ( higher == true ) ? ( nextIndex = myIndex + 1 ) : ( nextIndex = myIndex - 1 ) );
+		while( ( nextIndex != myIndex ) && ( overJumpsDone < deviceChain.Size() ) )
+		{
+			if( nextIndex == deviceChain.Size() )
+			{
+				choosenPackage = deviceChain[ 0 ];
+			}
+			else if( nextIndex < 0 )
+			{
+				choosenPackage = deviceChain[ deviceChain.Size() - 1 ];
+			}
+			else
+			{
+				choosenPackage = deviceChain[ nextIndex ];
+			}
+			if( GameInstance.FindEntityByID( GetGameInstance(), PersistentID.ExtractEntityID( choosenPackage.ownerID ) ) )
+			{
+				return choosenPackage;
+			}
+			( ( higher == true ) ? ( nextIndex = nextIndex + 1 ) : ( nextIndex = nextIndex - 1 ) );
+			overJumpsDone += 1;
+		}
+		return deviceChain[ myIndex ];
+	}
+
+	private function GetCurrentActiveDeviceChainBlackboardIndex( deviceChain : array< SWidgetPackage > ) : Int32
+	{
+		var i : Int32;
+		var myPersistenID : PersistentID;
+		if( !( EntityID.IsDefined( GetControlledObject().GetEntityID() ) ) )
+		{
+			return -1;
+		}
+		myPersistenID = CreatePersistentID( GetControlledObject().GetEntityID(), 'controller' );
+		for( i = 0; i < deviceChain.Size(); i += 1 )
+		{
+			if( deviceChain[ i ].ownerID == myPersistenID )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function EnablePlayerTPPRepresenation( enable : Bool )
+	{
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+		if( player )
+		{
+			if( enable )
+			{
+				player.QueueEvent( new ActivateTPPRepresentationEvent );
+				GameInstance.GetAudioSystem( GetGameInstance() ).SetBDCameraListenerOverride( true );
+				GameObjectEffectHelper.StartEffectEvent( player, 'camera_mask' );
+			}
+			else
+			{
+				player.QueueEvent( new DeactivateTPPRepresentationEvent );
+				GameInstance.GetAudioSystem( GetGameInstance() ).SetBDCameraListenerOverride( false );
+				GameObjectEffectHelper.StopEffectEvent( player, 'camera_mask' );
+			}
+		}
+	}
+
+	private function CleanupChainBlackboard()
+	{
+		var emptyPSArray : array< SWidgetPackage >;
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl ).SetVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain, emptyPSArray );
+		ShowChainControls( false );
+	}
+
+	private function CleanupActiveEntityInChainBlackboard()
+	{
+		var emptyEntityID : EntityID;
+		emptyEntityID = EntityID();
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl ).SetEntityID( GetAllBlackboardDefs().DeviceTakeControl.ActiveDevice, emptyEntityID, true );
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var currentInput : Float;
+		var inputModifier : Float;
+		var player : PlayerPuppet;
+		var psmBlackboard : IBlackboard;
+		var zoomLevel : Float;
+		var XAxisEvt : TCSInputXAxisEvent;
+		var YAxisEvt : TCSInputYAxisEvent;
+		var devceAttackEvt : TCSInputDeviceAttack;
+		inputModifier = 1.0;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+		if( player )
+		{
+			psmBlackboard = player.GetPlayerStateMachineBlackboard();
+			zoomLevel = psmBlackboard.GetFloat( GetAllBlackboardDefs().PlayerStateMachine.ZoomLevel );
+		}
+		if( ListenerAction.GetName( action ) == 'CameraMouseX' || ListenerAction.GetName( action ) == 'CameraX' )
+		{
+			currentInput = -( ListenerAction.GetValue( action ) );
+			if( currentInput != 0.0 )
+			{
+				if( ListenerAction.GetName( action ) == 'CameraMouseX' )
+				{
+					inputModifier = 0.1;
+				}
+				else
+				{
+					inputModifier = 3.5;
+				}
+				XAxisEvt = new TCSInputXAxisEvent;
+				XAxisEvt.value -= ( ( currentInput * inputModifier ) / AbsF( zoomLevel ) );
+				XAxisEvt.value = ClampF( XAxisEvt.value, -180.0, 180.0 );
+				GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( GetControlledObject().GetEntityID(), XAxisEvt );
+				m_lastInputSimTime = EngineTime.ToFloat( GameInstance.GetTimeSystem( GetGameInstance() ).GetSimTime() );
+			}
+		}
+		if( ListenerAction.GetName( action ) == 'CameraMouseY' || ListenerAction.GetName( action ) == 'CameraY' )
+		{
+			currentInput = ListenerAction.GetValue( action );
+			if( currentInput != 0.0 )
+			{
+				if( ListenerAction.GetName( action ) == 'CameraMouseY' )
+				{
+					inputModifier = 0.1;
+				}
+				else
+				{
+					inputModifier = 3.5;
+				}
+				YAxisEvt = new TCSInputYAxisEvent;
+				YAxisEvt.value = ( ( -1.0 * currentInput ) * inputModifier ) / AbsF( zoomLevel );
+				YAxisEvt.value = ClampF( YAxisEvt.value, -180.0, 180.0 );
+				GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( GetControlledObject().GetEntityID(), YAxisEvt );
+				m_lastInputSimTime = EngineTime.ToFloat( GameInstance.GetTimeSystem( GetGameInstance() ).GetSimTime() );
+			}
+		}
+		if( !( m_isActionButtonLocked ) && ListenerAction.GetName( action ) == 'DeviceAttack' )
+		{
+			devceAttackEvt = new TCSInputDeviceAttack;
+			if( ListenerAction.IsButtonJustPressed( action ) )
+			{
+				devceAttackEvt.value = true;
+			}
+			if( ListenerAction.IsButtonJustReleased( action ) )
+			{
+				devceAttackEvt.value = false;
+			}
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( GetControlledObject().GetEntityID(), devceAttackEvt );
+		}
+		if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_PRESSED )
+		{
+			if( ListenerAction.GetName( action ) == 'StopDeviceControl' || ListenerAction.GetName( action ) == 'OpenPauseMenu' )
+			{
+				if( !( m_isInputLockedFromQuest ) )
+				{
+					ListenerActionConsumer.DontSendReleaseEvent( consumer );
+					ToggleToMainPlayerObject();
+					PSMSetIsPlayerControllDevice( false );
+					ReturnToDeviceScreen();
+				}
+			}
+		}
+		if( !( IskDeviceChainCreationLocked() ) )
+		{
+			if( ListenerAction.GetName( action ) == 'SwitchDevicePrevious' )
+			{
+				if( ListenerAction.IsButtonJustPressed( action ) )
+				{
+					ToggleToPreviousControlledDevice();
+				}
+			}
+			if( ListenerAction.GetName( action ) == 'SwitchDeviceNext' )
+			{
+				if( ListenerAction.IsButtonJustPressed( action ) )
+				{
+					ToggleToNextControlledDevice();
+				}
+			}
+		}
+	}
+
+	public static function CreateInputHint( context : GameInstance, isVisible : Bool )
+	{
+		var data : InputHintData;
+		var takeOverControlSystem : TakeOverControlSystem;
+		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'TakeOverControlSystem' ) ) );
+		if( !( takeOverControlSystem.IsInputLockedFromQuest() ) )
+		{
+			data.action = 'StopDeviceControl';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#52037";
+			SendInputHintData( context, isVisible, data );
+		}
+		data.action = 'ZoomIn';
+		data.source = 'TakeOverControlSystem';
+		data.localizedLabel = "LocKey#52038";
+		SendInputHintData( context, isVisible, data );
+		data.action = 'ZoomOut';
+		data.source = 'TakeOverControlSystem';
+		data.localizedLabel = "LocKey#52039";
+		SendInputHintData( context, isVisible, data );
+		if( EquipmentSystem.IsCyberdeckEquipped( GameInstance.GetPlayerSystem( context ).GetLocalPlayerControlledGameObject() ) )
+		{
+			data.action = 'VisionHold';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#52040";
+			SendInputHintData( context, isVisible, data );
+		}
+	}
+
+	private virtual function HideAdvanceInteractionInputHints()
+	{
+		var evt : DeleteInputHintBySourceEvent;
+		evt = new DeleteInputHintBySourceEvent;
+		evt.source = 'AdvanceInteractionMode';
+		evt.targetHintContainer = 'GameplayInputHelper';
+		GameInstance.GetUISystem( GetGameInstance() ).QueueEvent( evt );
+	}
+
+	private function CreateTCSUpdate()
+	{
+		var updateEvt : TCSUpdate;
+		if( m_TCDUpdateDelayID == GetInvalidDelayID() )
+		{
+			updateEvt = new TCSUpdate;
+			m_TCDUpdateDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'TakeOverControlSystem', updateEvt, m_TCSupdateRate );
+		}
+	}
+
+	private function BreakTCSUpdate()
+	{
+		if( m_TCDUpdateDelayID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_TCDUpdateDelayID );
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_TCDUpdateDelayID );
+		}
+	}
+
+	private export function OnTCSUpdate( request : TCSUpdate )
+	{
+		var XYAxisEvt : TCSInputXYAxisEvent;
+		XYAxisEvt = new TCSInputXYAxisEvent;
+		XYAxisEvt.isAnyInput = ( EngineTime.ToFloat( GameInstance.GetTimeSystem( GetGameInstance() ).GetSimTime() ) - m_lastInputSimTime ) < 0.2;
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( GetControlledObject().GetEntityID(), XYAxisEvt );
+		m_TCDUpdateDelayID = GetInvalidDelayID();
+		CreateTCSUpdate();
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug( XYAxisEvt.isAnyInput );
+		}
+	}
+
+	private function RefreshDebug( lastXYValue : Bool )
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "TCS" );
+		SDOSink.PushFloat( sink, "Last input simTime", m_lastInputSimTime );
+		SDOSink.PushFloat( sink, "Last update simTime", EngineTime.ToFloat( GameInstance.GetTimeSystem( GetGameInstance() ).GetSimTime() ) );
+		SDOSink.PushBool( sink, "Last XY event value", lastXYValue );
+	}
+
+}
+
+class LockTakeControlAction extends ScriptableSystemRequest
+{
+	editable var isLocked : Bool;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Is action button locked when player controlls device (e.g. turret shoot)";
+	}
+
+}
+
+class LockDeviceChainCreation extends ScriptableSystemRequest
+{
+	editable var isLocked : Bool;
+	editable var source : CName;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Is device chain locked? e.g. camera connected to network of 4 cameras will not create possibility to jump between cameras";
+	}
+
+}
+
+class RequestTakeControl extends ScriptableSystemRequest
+{
+	var requestSource : EntityID;
+	var originalEvent : ToggleTakeOverControl;
+}
+
+class RequestReleaseControl extends ScriptableSystemRequest
+{
+}
+
+class RemoveFromChainRequest extends ScriptableSystemRequest
+{
+	var requestSource : EntityID;
+}
+
+class RequestQuestTakeControlInputLock extends ScriptableSystemRequest
+{
+	var isLocked : Bool;
+	var isChainForced : Bool;
+}
+
+class TCSUpdate extends ScriptableSystemRequest
+{
+}
+
+class TCSTakeOverControlActivate extends Event
+{
+	var IsQuickhack : Bool;
+}
+
+class TCSTakeOverControlDeactivate extends Event
+{
+}
+
+class ReturnToDeviceScreenEvent extends Event
+{
+}
+
+class TCSInputXAxisEvent extends Event
+{
+	var value : Float;
+}
+
+class TCSInputYAxisEvent extends Event
+{
+	var value : Float;
+}
+
+class TCSInputXYAxisEvent extends Event
+{
+	var isAnyInput : Bool;
+}
+
+class TCSInputDeviceAttack extends Event
+{
+	var value : Bool;
+}
+
+class TCSInputCameraZoom extends Event
+{
+}
+
+class QhackExecuted extends Event
+{
+}
+

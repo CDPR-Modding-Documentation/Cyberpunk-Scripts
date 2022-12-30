@@ -1,0 +1,369 @@
+class CodexGameController extends gameuiMenuGameController
+{
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_entryViewRef : inkCompoundRef;
+	private editable var m_characterEntryViewRef : inkCompoundRef;
+	private editable var m_noEntrySelectedWidget : inkWidgetRef;
+	private editable var m_virtualList : inkWidgetRef;
+	private editable var m_emptyPlaceholderRef : inkWidgetRef;
+	private editable var m_leftBlockControllerRef : inkWidgetRef;
+	private editable var m_filtersContainer : inkCompoundRef;
+	private var m_journalManager : weak< JournalManager >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_listController : weak< CodexListVirtualNestedListController >;
+	private var m_entryViewController : weak< CodexEntryViewController >;
+	private var m_characterEntryViewController : weak< CodexEntryViewController >;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_activeData : CodexListSyncData;
+	private var m_selectedData : CodexEntryData;
+	private var m_userDataEntry : Int32;
+	private var m_doubleInputPreventionFlag : Bool;
+	private var m_filtersControllers : array< weak< CodexFilterButtonController > >;
+
+	protected event OnInitialize()
+	{
+		var hintsWidget : inkWidget;
+		hintsWidget = SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' );
+		m_buttonHintsController = ( ( ButtonHints )( hintsWidget.GetController() ) );
+		RefreshButtonHints();
+		m_entryViewController = ( ( CodexEntryViewController )( inkCompoundRef.GetController( m_entryViewRef ) ) );
+		m_characterEntryViewController = ( ( CodexEntryViewController )( inkCompoundRef.GetController( m_characterEntryViewRef ) ) );
+		m_listController = ( ( CodexListVirtualNestedListController )( inkWidgetRef.GetController( m_virtualList ) ) );
+		m_activeData = new CodexListSyncData;
+		inkCompoundRef.SetVisible( m_entryViewRef, true );
+		inkCompoundRef.SetVisible( m_characterEntryViewRef, false );
+		SetupFilterButtons();
+		PlayLibraryAnimation( 'codex_intro' );
+	}
+
+	private function SetupFilterButtons()
+	{
+		var i : Int32;
+		var widget : weak< inkWidget >;
+		var controller : CodexFilterButtonController;
+		m_filtersControllers.Clear();
+		for( i = 1; i < ( ( Int32 )( CodexCategoryType.Count ) ); i += 1 )
+		{
+			widget = SpawnFromLocal( inkCompoundRef.Get( m_filtersContainer ), 'CodexFilterButton' );
+			controller = ( ( CodexFilterButtonController )( widget.GetController() ) );
+			controller.Setup( ( ( CodexCategoryType )( i ) ) );
+			m_filtersControllers.PushBack( controller );
+		}
+	}
+
+	private function RefreshButtonHints()
+	{
+		m_buttonHintsController.ClearButtonHints();
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_journalManager = GameInstance.GetJournalManager( playerPuppet.GetGame() );
+		m_journalManager.RegisterScriptCallback( this, 'OnEntryVisitedUpdate', gameJournalListenerType.Visited );
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		PopulateData();
+		SelectEntry();
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		m_journalManager.UnregisterScriptCallback( this, 'OnJournalUpdate' );
+	}
+
+	protected event OnSetUserData( userData : IScriptable )
+	{
+		m_userDataEntry = ( ( ShardForceSelectionEvent )( userData ) ).m_hash;
+		SelectEntry();
+	}
+
+	private function SelectEntry()
+	{
+		var itemIndex : Int32;
+		if( ( m_userDataEntry != 0 ) && ( m_listController.GetDataSize() != 0 ) )
+		{
+			itemIndex = FindItem( m_userDataEntry );
+			if( itemIndex >= 0 )
+			{
+				ForceSelectIndex( ( ( Uint32 )( itemIndex ) ) );
+			}
+		}
+	}
+
+	public virtual function FindItem( hash : Int32 ) : Int32
+	{
+		var entryData : CodexEntryData;
+		var i : Int32;
+		for( i = 0; i < m_listController.GetDataSize(); i += 1 )
+		{
+			entryData = ( ( CodexEntryData )( m_listController.GetItem( ( ( Uint32 )( i ) ) ) ) );
+			if( entryData.m_hash == hash )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	protected event OnUninitialize()
+	{
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		m_menuEventDispatcher = menuEventDispatcher;
+		m_menuEventDispatcher.RegisterToEvent( 'OnBack', this, 'OnBack' );
+		m_menuEventDispatcher.RegisterToEvent( 'OnAccept', this, 'OnAccept' );
+	}
+
+	protected event OnBack( userData : IScriptable )
+	{
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) )
+		{
+			m_menuEventDispatcher.SpawnEvent( 'OnCloseHubMenu' );
+		}
+	}
+
+	protected event OnEntryVisitedUpdate( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		var selectedEvent : CodexEntrySelectedEvent;
+		if( className == 'gameJournalCodexEntry' || className == 'gameJournalOnscreen' )
+		{
+			ForceSelectIndex( m_listController.GetSelectedIndex() );
+			selectedEvent = new CodexEntrySelectedEvent;
+			selectedEvent.m_hash = entryHash;
+			QueueEvent( selectedEvent );
+		}
+	}
+
+	protected event OnEntryActivated( evt : CodexSelectedEvent )
+	{
+		var syncEvent : CodexSyncBackEvent;
+		var selectedEntry : weak< JournalEntry >;
+		if( evt.m_group )
+		{
+			m_listController.ToggleLevel( evt.m_level );
+		}
+		else
+		{
+			if( evt.m_data.m_imageType != CodexImageType.Character )
+			{
+				inkCompoundRef.SetVisible( m_entryViewRef, true );
+				inkCompoundRef.SetVisible( m_characterEntryViewRef, false );
+				m_entryViewController.ShowEntry( evt.m_data );
+			}
+			else
+			{
+				inkCompoundRef.SetVisible( m_entryViewRef, false );
+				inkCompoundRef.SetVisible( m_characterEntryViewRef, true );
+				m_characterEntryViewController.ShowEntry( evt.m_data );
+			}
+			m_selectedData = evt.m_data;
+			RefreshButtonHints();
+		}
+		m_activeData.m_entryHash = evt.m_entryHash;
+		m_activeData.m_level = evt.m_level;
+		selectedEntry = m_journalManager.GetEntry( ( ( Uint32 )( m_activeData.m_entryHash ) ) );
+		if( !( m_journalManager.IsEntryVisited( selectedEntry ) ) )
+		{
+			m_journalManager.SetEntryVisited( selectedEntry, true );
+		}
+		syncEvent = new CodexSyncBackEvent;
+		QueueEvent( syncEvent );
+	}
+
+	protected event OnCodexForceSelectionEvent( evt : CodexForceSelectionEvent )
+	{
+		if( evt.m_selectionIndex != -1 )
+		{
+			m_listController.SelectItem( ( ( Uint32 )( evt.m_selectionIndex ) ) );
+			m_listController.ToggleItem( ( ( Uint32 )( evt.m_selectionIndex ) ) );
+		}
+	}
+
+	private function ForceSelectIndex( idx : Uint32 )
+	{
+		var initEvent : CodexForceSelectionEvent;
+		initEvent = new CodexForceSelectionEvent;
+		initEvent.m_selectionIndex = ( ( Int32 )( idx ) );
+		QueueEvent( initEvent );
+	}
+
+	private function PopulateData()
+	{
+		var data : array< VirutalNestedListData >;
+		data = CodexUtils.GetCodexDataArray( m_journalManager, m_activeData );
+		if( data.Size() <= 0 )
+		{
+			ShowNodataWarning();
+		}
+		else
+		{
+			HideNodataWarning();
+			m_listController.SetData( data );
+		}
+	}
+
+	private function ShowNodataWarning()
+	{
+		inkWidgetRef.SetVisible( m_emptyPlaceholderRef, true );
+		inkCompoundRef.SetVisible( m_entryViewRef, false );
+		inkCompoundRef.SetVisible( m_characterEntryViewRef, false );
+		inkWidgetRef.SetVisible( m_leftBlockControllerRef, false );
+	}
+
+	private function HideNodataWarning()
+	{
+		inkWidgetRef.SetVisible( m_emptyPlaceholderRef, false );
+		inkWidgetRef.SetVisible( m_leftBlockControllerRef, true );
+	}
+
+	protected event OnCodexFilterButtonClicked( e : CodexFilterButtonClicked )
+	{
+		var i : Int32;
+		var targetCategory : CodexCategoryType;
+		targetCategory = ( ( e.toggled ) ? ( e.category ) : ( CodexCategoryType.All ) );
+		m_listController.SetFilter( targetCategory );
+		for( i = 0; i < m_filtersControllers.Size(); i += 1 )
+		{
+			m_filtersControllers[ i ].UpdateSelectedCategory( targetCategory );
+		}
+	}
+
+}
+
+class CodexUserData extends IScriptable
+{
+	var DataSource : CodexDataSource;
+
+	public static function Make( dataSource : CodexDataSource ) : CodexUserData
+	{
+		var instance : CodexUserData;
+		instance = new CodexUserData;
+		instance.DataSource = dataSource;
+		return instance;
+	}
+
+}
+
+class JournalRepresentationData extends ListItemData
+{
+	var Data : weak< JournalEntry >;
+	var OnscreenData : weak< JournalOnscreensStructuredGroup >;
+	var Reference : weak< inkWidget >;
+	var IsNew : Bool;
+}
+
+class OnOpenCodexAtEntryEvent extends Event
+{
+	var entry : weak< JournalCodexEntry >;
+}
+
+class OnVisitedJournalEntryEvent extends Event
+{
+	var entry : weak< JournalEntry >;
+}
+
+class OnscreenDisplayManager extends inkLogicController
+{
+	protected editable var m_contentText : inkTextRef;
+
+	public virtual function ShowEntry( entry : weak< JournalOnscreen > )
+	{
+		inkTextRef.SetText( m_contentText, entry.GetDescription() );
+	}
+
+}
+
+class CodexFilterButtonController extends inkLogicController
+{
+	protected editable var m_root : inkWidgetRef;
+	protected editable var m_image : inkImageRef;
+	protected var m_category : CodexCategoryType;
+	protected var m_toggled : Bool;
+	protected var m_hovered : Bool;
+
+	protected event OnInitialize()
+	{
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnRelease', this, 'OnClicked' );
+	}
+
+	public function Setup( category : CodexCategoryType )
+	{
+		m_category = category;
+		InkImageUtils.RequestSetImage( this, m_image, CodexUtils.GetCodexFilterIcon( category ) );
+	}
+
+	public function UpdateSelectedCategory( selectedCategory : CodexCategoryType )
+	{
+		if( m_category != selectedCategory )
+		{
+			m_toggled = false;
+		}
+		UpdateState();
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		m_hovered = false;
+		UpdateState();
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		m_hovered = true;
+		UpdateState();
+	}
+
+	protected event OnClicked( e : inkPointerEvent )
+	{
+		var evt : CodexFilterButtonClicked;
+		if( e.IsAction( 'click' ) )
+		{
+			m_toggled = !( m_toggled );
+			evt = new CodexFilterButtonClicked;
+			evt.category = m_category;
+			evt.toggled = m_toggled;
+			QueueEvent( evt );
+			UpdateState();
+		}
+	}
+
+	protected function UpdateState()
+	{
+		if( m_hovered )
+		{
+			inkWidgetRef.SetState( m_root, 'Hover' );
+		}
+		else
+		{
+			if( m_toggled )
+			{
+				inkWidgetRef.SetState( m_root, 'Active' );
+			}
+			else
+			{
+				inkWidgetRef.SetState( m_root, 'Default' );
+			}
+		}
+	}
+
+}
+
+class CodexFilterButtonClicked extends Event
+{
+	var category : CodexCategoryType;
+	var toggled : Bool;
+}
+
+enum CodexDataSource
+{
+	Undefined = 0,
+	Codex = 1,
+	Onscreen = 2,
+}
+

@@ -1,0 +1,544 @@
+class AcquireDeviceLink extends Event
+{
+}
+
+class DeviceLinkRequest extends Event
+{
+	private var deviceLink : DeviceLink;
+
+	public static function Construct( id : PersistentID, _className : CName ) : DeviceLinkRequest
+	{
+		var request : DeviceLinkRequest;
+		request = new DeviceLinkRequest;
+		request.deviceLink = DeviceLink.Construct( id, _className );
+		return request;
+	}
+
+	public const function GetLink() : DeviceLink
+	{
+		return deviceLink;
+	}
+
+}
+
+class DestroyLink extends Event
+{
+}
+
+class DeviceLinkEstablished extends Event
+{
+	var deviceLinkPS : weak< DeviceLinkComponentPS >;
+}
+
+struct DeviceLink
+{
+	private persistent var PSID : PersistentID;
+	private persistent var className : CName;
+
+	public static function Construct( ps : PersistentState ) : DeviceLink
+	{
+		return Construct( ps.GetID(), ps.GetClassName() );
+	}
+
+	public static function Construct( id : PersistentID, _className : CName ) : DeviceLink
+	{
+		var psRef : DeviceLink;
+		if( PersistentID.IsDefined( id ) )
+		{
+			psRef.PSID = id;
+			psRef.className = _className;
+			return psRef;
+		}
+		return DeviceLink();
+	}
+
+	public static function Construct( persistentStates : array< PersistentState > ) : array< DeviceLink >
+	{
+		var i : Int32;
+		var links : array< DeviceLink >;
+		for( i = 0; i < persistentStates.Size(); i += 1 )
+		{
+			links.PushBack( DeviceLink.Construct( persistentStates[ i ] ) );
+		}
+		return links;
+	}
+
+	public static function GetLinkID( s : ref< DeviceLink > ) : PersistentID
+	{
+		return s.PSID;
+	}
+
+	public static function GetLinkClassName( s : ref< DeviceLink > ) : CName
+	{
+		return s.className;
+	}
+
+	public static function IsValid( s : ref< DeviceLink > ) : Bool
+	{
+		return PersistentID.IsDefined( s.PSID ) && IsNameValid( s.className );
+	}
+
+}
+
+class DeviceLinkComponentPS extends SharedGameplayPS
+{
+	private persistent var m_parentDevice : DeviceLink;
+	private persistent var m_isConnected : Bool;
+	protected persistent var m_ownerEntityID : EntityID;
+
+	public static function CreateAndAcquireDeviceLink( game : GameInstance, entityID : EntityID ) : DeviceLinkComponentPS
+	{
+		var link : DeviceLinkComponentPS;
+		var linkPSID : PersistentID;
+		linkPSID = DeviceLinkComponentPS.GenerateID( entityID );
+		link = ( ( DeviceLinkComponentPS )( GameInstance.GetPersistencySystem( game ).GetConstAccessToPSObject( linkPSID, 'DeviceLinkComponentPS' ) ) );
+		if( link )
+		{
+			return link;
+		}
+		return NULL;
+	}
+
+	public static function AcquireDeviceLink( game : GameInstance, entityID : EntityID ) : DeviceLinkComponentPS
+	{
+		var link : DeviceLinkComponentPS;
+		link = CreateAndAcquireDeviceLink( game, entityID );
+		if( link && link.IsConnected() )
+		{
+			return link;
+		}
+		return NULL;
+	}
+
+	protected const function GetParentDeviceLink() : DeviceLink
+	{
+		return m_parentDevice;
+	}
+
+	public const function GetParentDevice() : weak< SharedGameplayPS >
+	{
+		var deviceRef : weak< SharedGameplayPS >;
+		if( IsConnected() )
+		{
+			deviceRef = ( ( SharedGameplayPS )( GetPersistencySystem().GetConstAccessToPSObject( DeviceLink.GetLinkID( GetParentDeviceLink() ), DeviceLink.GetLinkClassName( GetParentDeviceLink() ) ) ) );
+			if( deviceRef )
+			{
+				return deviceRef;
+			}
+			return NULL;
+		}
+		return NULL;
+	}
+
+	public const function IsConnected() : Bool
+	{
+		return m_isConnected;
+	}
+
+	protected virtual function OnDeviceLinkRequest( evt : DeviceLinkRequest ) : EntityNotificationType
+	{
+		var deviceAttachment : DeviceLinkEstablished;
+		var agentSpawned : SecurityAgentSpawnedEvent;
+		var secSys : SecuritySystemControllerPS;
+		if( IsConnected() )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		if( DeviceLink.IsValid( evt.GetLink() ) )
+		{
+			m_parentDevice = evt.GetLink();
+			m_isConnected = true;
+			m_ownerEntityID = GetMyEntityID();
+			deviceAttachment = new DeviceLinkEstablished;
+			deviceAttachment.deviceLinkPS = this;
+			EstablishLink( true );
+			GetPersistencySystem().QueueEntityEvent( m_ownerEntityID, deviceAttachment );
+			secSys = GetSecuritySystem();
+			if( secSys )
+			{
+				agentSpawned = SecurityAgentSpawnedEvent.Construct( DeviceLink.Construct( this ), gameEntitySpawnerEventType.Spawn, GetSecurityAreas( true ) );
+				QueuePSEvent( secSys, agentSpawned );
+			}
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected export function OnDestroyLink( evt : DestroyLink ) : EntityNotificationType
+	{
+		var secSys : SecuritySystemControllerPS;
+		var notification : SecurityAgentSpawnedEvent;
+		if( !( IsConnected() ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		secSys = GetSecuritySystem();
+		if( secSys )
+		{
+			notification = new SecurityAgentSpawnedEvent;
+			notification.spawnedAgent = DeviceLink.Construct( this );
+			notification.eventType = gameEntitySpawnerEventType.Despawn;
+			QueuePSEvent( secSys, notification );
+		}
+		EstablishLink( false );
+		GetPersistencySystem().ForgetObject( GetID(), false );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const override function GetParents( out outDevices : array< DeviceComponentPS > )
+	{
+		if( IsConnected() )
+		{
+			GameInstance.GetDeviceSystem( GetGameInstance() ).GetParents( PersistentID.ExtractEntityID( DeviceLink.GetLinkID( GetParentDeviceLink() ) ), outDevices );
+		}
+	}
+
+	public const override function GetAncestors( out outDevices : array< DeviceComponentPS > )
+	{
+		if( IsConnected() )
+		{
+			GameInstance.GetDeviceSystem( GetGameInstance() ).GetAllAncestors( PersistentID.ExtractEntityID( DeviceLink.GetLinkID( GetParentDeviceLink() ) ), outDevices );
+		}
+	}
+
+	private const function EstablishLink( connect : Bool )
+	{
+		var ancestors : array< DeviceComponentPS >;
+		GetParentDevice().GetParents( ancestors );
+		if( connect )
+		{
+			Connect( ancestors );
+		}
+		else
+		{
+			Disconnect( ancestors );
+		}
+	}
+
+	private const function Disconnect( links : array< DeviceComponentPS > )
+	{
+		var i : Int32;
+		for( i = 0; i < links.Size(); i += 1 )
+		{
+			Disconnect( links[ i ] );
+		}
+	}
+
+	private const function Disconnect( link : DeviceComponentPS )
+	{
+		GameInstance.GetDeviceSystem( GetGameInstance() ).RemoveDynamicConnection( GetID(), link.GetID() );
+	}
+
+	private const function Connect( links : array< DeviceComponentPS > )
+	{
+		var i : Int32;
+		for( i = 0; i < links.Size(); i += 1 )
+		{
+			Connect( links[ i ] );
+		}
+	}
+
+	private const function Connect( link : DeviceComponentPS )
+	{
+		GameInstance.GetDeviceSystem( GetGameInstance() ).AddDynamicConnection( GetID(), GetClassName(), link.GetID(), link.GetClassName() );
+	}
+
+	public static function GenerateID( id : EntityID ) : PersistentID
+	{
+		return CreatePersistentID( id, 'deviceLink' );
+	}
+
+	public const override function HasNetworkBackdoor() : Bool
+	{
+		return GetParentDevice().HasNetworkBackdoor();
+	}
+
+	public const function ActionSecurityBreachNotification( lastKnownPosition : Vector4, whoBreached : GameObject, type : ESecurityNotificationType, optional stimType : gamedataStimType ) : SecuritySystemInput
+	{
+		var action : SecuritySystemInput;
+		var isOfficer : Bool;
+		var canPerformReprimand : Bool;
+		isOfficer = ( ( ScriptedPuppet )( GetOwnerEntityWeak() ) ).IsOfficer();
+		action = new SecuritySystemInput;
+		action.SetUp( this );
+		if( whoBreached )
+		{
+			canPerformReprimand = true;
+		}
+		else
+		{
+			canPerformReprimand = false;
+		}
+		action.SetProperties( lastKnownPosition, whoBreached, this, type, canPerformReprimand, isOfficer, stimType );
+		action.AddDeviceName( "DebugNPC" );
+		action.SetPuppetCharacterRecord( ( ( ScriptedPuppet )( GetOwnerEntityWeak() ) ).GetRecordID() );
+		return action;
+	}
+
+	public const virtual function TriggerSecuritySystemNotification( lastKnownPosition : Vector4, whoBreached : GameObject, type : ESecurityNotificationType, optional stimType : gamedataStimType )
+	{
+		var secSys : SecuritySystemControllerPS;
+		if( IsConnected() )
+		{
+			secSys = GetSecuritySystem();
+			if( !( secSys ) )
+			{
+				return;
+			}
+			secSys.ReportPotentialSituation( ActionSecurityBreachNotification( lastKnownPosition, whoBreached, type, stimType ) );
+			return;
+		}
+	}
+
+	protected constexpr function OnSecuritySystemEnabled( evt : SecuritySystemEnabled ) : EntityNotificationType
+	{
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected constexpr function OnSecuritySystemDisabled( evt : SecuritySystemDisabled ) : EntityNotificationType
+	{
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected virtual function OnSecuritySystemOutput( evt : SecuritySystemOutput ) : EntityNotificationType
+	{
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected constexpr export function OnSecurityAreaCrossingPerimeter( evt : SecurityAreaCrossingPerimeter ) : EntityNotificationType
+	{
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected constexpr export function OnTargetAssessmentRequest( evt : TargetAssessmentRequest ) : EntityNotificationType
+	{
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public const override function WasRevealedInNetworkPing() : Bool
+	{
+		return GetParentDevice().WasRevealedInNetworkPing();
+	}
+
+	public const override function SetRevealedInNetworkPing( wasRevealed : Bool )
+	{
+		return GetParentDevice().SetRevealedInNetworkPing( wasRevealed );
+	}
+
+	public const function GetDevice( deviceLink : DeviceLink ) : weak< DeviceComponentPS >
+	{
+		var device : DeviceComponentPS;
+		device = ( ( SharedGameplayPS )( GetPersistencySystem().GetConstAccessToPSObject( DeviceLink.GetLinkID( deviceLink ), DeviceLink.GetLinkClassName( deviceLink ) ) ) );
+		return device;
+	}
+
+	protected const function QueuePSEvent( deviceLink : DeviceLink, evt : Event )
+	{
+		GetPersistencySystem().QueuePSEvent( DeviceLink.GetLinkID( deviceLink ), DeviceLink.GetLinkClassName( deviceLink ), evt );
+	}
+
+	public const function PingDevicesNetwork()
+	{
+		var actionPing : PingDevice;
+		var i : Int32;
+		var aps : array< AccessPointControllerPS >;
+		if( IsConnected() )
+		{
+			aps = GetAccessPoints();
+			for( i = 0; i < aps.Size(); i += 1 )
+			{
+				actionPing = ActionDevicePing( aps[ i ] );
+				QueuePSEvent( aps[ i ], actionPing );
+			}
+		}
+	}
+
+	private const function ActionDevicePing( const ps : PersistentState ) : PingDevice
+	{
+		var action : PingDevice;
+		action = new PingDevice;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( ps );
+		action.SetProperties();
+		action.SetShouldForward( false );
+		action.SetObjectActionID( T"DeviceAction.PingDevice" );
+		return action;
+	}
+
+}
+
+class PuppetDeviceLinkPS extends DeviceLinkComponentPS
+{
+	default m_revealDevicesGrid = false;
+	private persistent var m_securitySystemData : SecuritySystemData;
+
+	public static function CreateAndAcquirePuppetDeviceLinkPS( game : GameInstance, id : EntityID ) : PuppetDeviceLinkPS
+	{
+		var link : PuppetDeviceLinkPS;
+		var linkPSID : PersistentID;
+		linkPSID = DeviceLinkComponentPS.GenerateID( id );
+		link = ( ( PuppetDeviceLinkPS )( GameInstance.GetPersistencySystem( game ).GetConstAccessToPSObject( linkPSID, 'PuppetDeviceLinkPS' ) ) );
+		if( link )
+		{
+			return link;
+		}
+		return NULL;
+	}
+
+	public static function AcquirePuppetDeviceLink( game : GameInstance, entityID : EntityID ) : PuppetDeviceLinkPS
+	{
+		var link : PuppetDeviceLinkPS;
+		link = CreateAndAcquirePuppetDeviceLinkPS( game, entityID );
+		if( link && link.IsConnected() )
+		{
+			return link;
+		}
+		return NULL;
+	}
+
+	protected export override function OnDeviceLinkRequest( evt : DeviceLinkRequest ) : EntityNotificationType
+	{
+		super.OnDeviceLinkRequest( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const function AreIncomingEventsSuppressed() : Bool
+	{
+		return SecuritySystemData.AreIncomingEventsSuppressed( m_securitySystemData );
+	}
+
+	public const function AreOutgoingEventsSuppressed() : Bool
+	{
+		return SecuritySystemData.AreOutgoingEventsSuppressed( m_securitySystemData );
+	}
+
+	public const override function TriggerSecuritySystemNotification( lastKnownPosition : Vector4, whoBreached : GameObject, type : ESecurityNotificationType, optional stimType : gamedataStimType )
+	{
+		if( AreOutgoingEventsSuppressed() )
+		{
+			return;
+		}
+		super.TriggerSecuritySystemNotification( lastKnownPosition, whoBreached, type, stimType );
+	}
+
+	protected export override function OnSecuritySystemOutput( evt : SecuritySystemOutput ) : EntityNotificationType
+	{
+		if( m_securitySystemData.suppressIncomingEvents )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function OnSuppressNPCInSecuritySystem( evt : SuppressNPCInSecuritySystem ) : EntityNotificationType
+	{
+		m_securitySystemData.suppressIncomingEvents = evt.suppressIncomingEvents;
+		m_securitySystemData.suppressOutgoingEvents = evt.suppressOutgoingEvents;
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected constexpr export function OnSecuritySystemSupport( evt : SecuritySystemSupport ) : EntityNotificationType
+	{
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public const function PerformNPCBreach( state : HackingMinigameState )
+	{
+		var npcBreachEvent : NPCBreachEvent;
+		if( IsConnected() )
+		{
+			npcBreachEvent = new NPCBreachEvent;
+			npcBreachEvent.state = state;
+			QueuePSEvent( GetParentDeviceLink(), npcBreachEvent );
+		}
+	}
+
+	public const function NotifyAboutSpottingPlayer( doSee : Bool )
+	{
+		var secSys : SecuritySystemControllerPS;
+		var playerSpotted : PlayerSpotted;
+		secSys = GetSecuritySystem();
+		if( !( secSys ) )
+		{
+			return;
+		}
+		playerSpotted = PlayerSpotted.Construct( true, GetID(), doSee, GetSecurityAreas() );
+		QueuePSEvent( secSys, playerSpotted );
+	}
+
+	public const function PingSquadNetwork()
+	{
+		var evt : ExecutePuppetActionEvent;
+		if( IsConnected() )
+		{
+			evt = new ExecutePuppetActionEvent;
+			evt.actionID = T"QuickHack.PingHack";
+			evt.action = ActionPingSquad();
+			QueueEntityEvent( GetMyEntityID(), evt );
+		}
+	}
+
+	private const function ActionPingSquad() : PingSquad
+	{
+		var action : PingSquad;
+		action = new PingSquad;
+		action.SetShouldForward( false );
+		return action;
+	}
+
+	public const override function IsPuppet() : Bool
+	{
+		return true;
+	}
+
+}
+
+class VehicleDeviceLinkPS extends DeviceLinkComponentPS
+{
+
+	public static function CreateAndAcquirVehicleDeviceLinkPS( game : GameInstance, entityID : EntityID ) : VehicleDeviceLinkPS
+	{
+		var link : VehicleDeviceLinkPS;
+		var linkPSID : PersistentID;
+		linkPSID = DeviceLinkComponentPS.GenerateID( entityID );
+		link = ( ( VehicleDeviceLinkPS )( GameInstance.GetPersistencySystem( game ).GetConstAccessToPSObject( linkPSID, 'VehicleDeviceLinkPS' ) ) );
+		if( link )
+		{
+			return link;
+		}
+		return NULL;
+	}
+
+	public static function AcquireVehicleDeviceLink( game : GameInstance, entityID : EntityID ) : VehicleDeviceLinkPS
+	{
+		var link : VehicleDeviceLinkPS;
+		link = CreateAndAcquirVehicleDeviceLinkPS( game, entityID );
+		if( link && link.IsConnected() )
+		{
+			return link;
+		}
+		return NULL;
+	}
+
+	protected export override function OnDeviceLinkRequest( evt : DeviceLinkRequest ) : EntityNotificationType
+	{
+		super.OnDeviceLinkRequest( evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+}
+
+operator==( l1 : DeviceLink, l2 : DeviceLink ) : Bool
+{
+	return DeviceLink.GetLinkID( l1 ) == DeviceLink.GetLinkID( l2 ) && DeviceLink.GetLinkClassName( l1 ) == DeviceLink.GetLinkClassName( l2 );
+}
+
+operator==( ps : PersistentState, link : DeviceLink ) : Bool
+{
+	return ps.GetID() == DeviceLink.GetLinkID( link ) && ps.GetClassName() == DeviceLink.GetLinkClassName( link );
+}
+
+operator==( link : DeviceLink, ps : PersistentState ) : Bool
+{
+	return ps == link;
+}
+

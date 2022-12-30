@@ -1,0 +1,670 @@
+class StandLowGravityDecisions extends LocomotionGroundDecisions
+{
+}
+
+class StandLowGravityEvents extends LocomotionGroundEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Default ) ) );
+		super.OnEnter( stateContext, scriptInterface );
+		stateContext.SetPermanentBoolParameter( 'transitionFromCrouch', false, true );
+	}
+
+}
+
+class PreCrouchLowGravityDecisions extends LocomotionGroundDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var superResult : Bool;
+		superResult = super.EnterCondition( stateContext, scriptInterface );
+		return CrouchEnterCondition( stateContext, scriptInterface, GameplaySettingsSystem.GetGameplaySettingsSystemInstance( scriptInterface.executionOwner ).GetIsFastForwardByLine() ) && superResult;
+	}
+
+	protected const virtual function ToStandLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return stateContext.GetBoolParameter( 'transitionFromCrouch', true ) && ( GetInStateTime() >= GetStaticFloatParameterDefault( "timeToEnterCrouch", 0.2 ) );
+	}
+
+	protected const virtual function ToCrouchLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return !( stateContext.GetBoolParameter( 'transitionFromCrouch', true ) ) && ( GetInStateTime() >= GetStaticFloatParameterDefault( "timeToEnterCrouch", 0.2 ) );
+	}
+
+	protected const virtual function ToDodgeLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( GetInStateTime() <= 0.065 )
+		{
+			return false;
+		}
+		else
+		{
+			return ( scriptInterface.IsActionJustPressed( 'Dodge' ) && ( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) >= 0.1 ) ) && !( stateContext.GetBoolParameter( 'transitionFromCrouch', true ) );
+		}
+	}
+
+	protected const virtual function ToDodgeCrouchLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( GetInStateTime() <= 0.065 )
+		{
+			return false;
+		}
+		else
+		{
+			return ( scriptInterface.IsActionJustPressed( 'Dodge' ) && ( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) >= 0.1 ) ) && stateContext.GetBoolParameter( 'transitionFromCrouch', true );
+		}
+	}
+
+}
+
+class PreCrouchLowGravityEvents extends LocomotionGroundEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+	}
+
+	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Default ) ) );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 0.0 );
+	}
+
+	public function OnExitToDodgeCrouchLowGravity( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Default ) ) );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 1.0 );
+	}
+
+	protected override function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnUpdate( timeDelta, stateContext, scriptInterface );
+		if( GetInStateTime() > 0.065 )
+		{
+			scriptInterface.SetAnimationParameterFloat( 'crouch', 0.60000002 );
+		}
+	}
+
+}
+
+class CrouchLowGravityDecisions extends LocomotionGroundDecisions
+{
+
+	protected const virtual function ToCrouchLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return true;
+	}
+
+	protected const virtual function ToPreCrouchLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return CrouchExitCondition( stateContext, scriptInterface, false );
+	}
+
+}
+
+class CrouchLowGravityEvents extends LocomotionGroundEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		stateContext.SetConditionBoolParameter( 'CrouchToggled', true, true );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Crouch ) ) );
+		stateContext.SetPermanentBoolParameter( 'transitionFromCrouch', true, true );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 1.0 );
+	}
+
+	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Default ) ) );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 0.0 );
+	}
+
+	public function OnExitToSnapToCover( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Crouch ) ) );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 1.0 );
+	}
+
+	public function OnExitToPreCrouchLowGravity( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Crouch ) ) );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 1.0 );
+	}
+
+}
+
+class DodgeLowGravityDecisions extends LocomotionGroundDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return scriptInterface.IsActionJustPressed( 'Dodge' ) && ( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) >= 0.5 );
+	}
+
+	protected const function ToStandLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var maxDuration : Float;
+		maxDuration = GetStaticFloatParameterDefault( "maxDuration", 0.0 );
+		return GetInStateTime() >= maxDuration;
+	}
+
+}
+
+class DodgeLowGravityEvents extends LocomotionGroundEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		scriptInterface.PushAnimationEvent( 'Dodge' );
+		stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );
+	}
+
+	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+	}
+
+}
+
+class DodgeCrouchLowGravityDecisions extends LocomotionGroundDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return scriptInterface.IsActionJustPressed( 'Dodge' ) && ( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) >= 0.5 );
+	}
+
+	protected const function ToCrouchLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var maxDuration : Float;
+		maxDuration = GetStaticFloatParameterDefault( "maxDuration", 0.0 );
+		return GetInStateTime() >= maxDuration;
+	}
+
+}
+
+class DodgeCrouchLowGravityEvents extends LocomotionGroundEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		scriptInterface.PushAnimationEvent( 'Dodge' );
+	}
+
+	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+	}
+
+	protected override function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( GetInStateTime() >= TDB.GetFloat( T"cyberware.kereznikovDodge.timeStampToEnter", 0.0 ) )
+		{
+			stateContext.SetTemporaryBoolParameter( 'extendKerenzikovDuration', true, true );
+		}
+	}
+
+}
+
+class SprintLowGravityDecisions extends LocomotionGroundDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var enterAngleThreshold : Float;
+		var superResult : Bool;
+		var isAiming : Bool;
+		var isReloading : Bool;
+		isAiming = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody ) == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) );
+		isReloading = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon ) == ( ( Int32 )( gamePSMRangedWeaponStates.Reload ) );
+		superResult = super.EnterCondition( stateContext, scriptInterface );
+		if( !( IsTouchingGround( scriptInterface ) ) )
+		{
+			return false;
+		}
+		if( isAiming )
+		{
+			return false;
+		}
+		if( ( isReloading && !( scriptInterface.IsActionJustPressed( 'ToggleSprint' ) ) ) && !( scriptInterface.IsActionJustPressed( 'Sprint' ) ) )
+		{
+			return false;
+		}
+		if( scriptInterface.GetActionValue( 'AttackA' ) > 0.0 )
+		{
+			return false;
+		}
+		if( scriptInterface.IsActionJustPressed( 'ToggleSprint' ) || stateContext.GetConditionBool( 'SprintToggled' ) )
+		{
+			stateContext.SetConditionBoolParameter( 'SprintToggled', true, true );
+			return superResult;
+		}
+		enterAngleThreshold = GetStaticFloatParameterDefault( "enterAngleThreshold", -180.0 );
+		if( !( scriptInterface.IsMoveInputConsiderable() ) || ( AbsF( scriptInterface.GetInputHeading() ) > enterAngleThreshold ) )
+		{
+			return false;
+		}
+		if( scriptInterface.GetActionValue( 'Sprint' ) > 0.0 )
+		{
+			return superResult;
+		}
+		return false;
+	}
+
+	protected const virtual function ToStandLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var enterAngleThreshold : Float;
+		if( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) <= 0.5 )
+		{
+			stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+			return true;
+		}
+		if( stateContext.GetBoolParameter( 'InterruptSprint' ) )
+		{
+			stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+			return true;
+		}
+		enterAngleThreshold = GetStaticFloatParameterDefault( "enterAngleThreshold", -180.0 );
+		if( !( scriptInterface.IsMoveInputConsiderable() ) || ( AbsF( scriptInterface.GetInputHeading() ) > enterAngleThreshold ) )
+		{
+			stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+			return true;
+		}
+		if( !( stateContext.GetConditionBool( 'SprintToggled' ) ) && ( scriptInterface.GetActionValue( 'Sprint' ) == 0.0 ) )
+		{
+			return true;
+		}
+		if( scriptInterface.IsActionJustReleased( 'Sprint' ) || scriptInterface.IsActionJustPressed( 'AttackA' ) )
+		{
+			stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+			return true;
+		}
+		return false;
+	}
+
+	protected const virtual function ToSprintJumpLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( GetInStateTime() >= GetStaticFloatParameterDefault( "timeBetweenJumps", 0.2 ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class SprintWindupLowGravityDecisions extends SprintLowGravityDecisions
+{
+
+	protected const virtual function ToSprintLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) >= GetStaticFloatParameterDefault( "speedToEnterSprint", 4.0 ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class SprintLowGravityEvents extends LocomotionGroundEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		if( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) > 2.5 )
+		{
+			SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Sprint ) ) );
+			stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );
+			scriptInterface.PushAnimationEvent( 'Jump' );
+			scriptInterface.SetAnimationParameterFloat( 'sprint', 0.1 );
+		}
+	}
+
+	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		stateContext.SetPermanentFloatParameter( 'SprintingStoppedTimeStamp', scriptInterface.GetNow(), true );
+	}
+
+}
+
+class SprintWindupLowGravityEvents extends SprintLowGravityEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );
+	}
+
+}
+
+class LocomotionAirLowGravityDecisions extends LocomotionAirDecisions
+{
+
+	protected const function ToRegularLandLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var landingType : Int32;
+		landingType = GetLandingType( stateContext );
+		if( !( IsTouchingGround( scriptInterface ) ) )
+		{
+			return false;
+		}
+		return landingType <= ( ( Int32 )( LandingType.Regular ) );
+	}
+
+}
+
+class SprintJumpLowGravityDecisions extends LocomotionAirLowGravityDecisions
+{
+
+	protected const virtual function ToSprintLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( GetInStateTime() >= 0.30000001 )
+		{
+			return scriptInterface.IsOnGround();
+		}
+		return false;
+	}
+
+	protected const virtual function ToJumpLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( GetInStateTime() <= GetStaticFloatParameterDefault( "maxTimeToEnterJump", 0.89999998 ) )
+		{
+			return scriptInterface.IsActionJustPressed( 'Jump' );
+		}
+		return false;
+	}
+
+}
+
+class LocomotionAirLowGravityEvents extends LocomotionAirEvents
+{
+}
+
+class SprintJumpLowGravityEvents extends LocomotionAirLowGravityEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		stateContext.SetTemporaryBoolParameter( 'TryInterruptReload', true, true );
+		stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );
+	}
+
+	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+	}
+
+}
+
+class SlideLowGravityDecisions extends CrouchLowGravityDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var superResult : Bool;
+		return false;
+		superResult = super.EnterCondition( stateContext, scriptInterface );
+		return superResult && ( scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) >= GetStaticFloatParameterDefault( "minSpeedToEnter", 4.5 ) );
+	}
+
+	protected const override function ToCrouchLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( stateContext.GetConditionBool( 'CrouchToggled' ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) )
+		{
+			return ShouldExit( stateContext, scriptInterface );
+		}
+		return false;
+	}
+
+	protected const virtual function ShouldExit( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return scriptInterface.GetOwnerStateVectorParameterFloat( physicsStateValue.LinearSpeed ) <= GetStaticFloatParameterDefault( "minSpeedToExit", 2.0 );
+	}
+
+}
+
+class SlideLowGravityEvents extends CrouchLowGravityEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+		if( GetStaticBoolParameterDefault( "pushAnimEventOnEnter", false ) )
+		{
+			scriptInterface.PushAnimationEvent( 'Slide' );
+		}
+	}
+
+	protected override function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( GetInStateTime() >= TDB.GetFloat( T"cyberware.kereznikovSlide.minThresholdToEnter", 0.0 ) )
+		{
+			stateContext.SetTemporaryBoolParameter( 'canEnterKerenzikovSlide', true, true );
+		}
+		if( GetInStateTime() >= 0.1 )
+		{
+			UpdateCrouch( stateContext, scriptInterface );
+			UpdateSprint( stateContext, scriptInterface );
+		}
+	}
+
+	private function UpdateSprint( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( scriptInterface.IsActionJustPressed( 'ToggleSprint' ) )
+		{
+			stateContext.SetConditionBoolParameter( 'SprintToggled', true, true );
+			stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );
+		}
+	}
+
+	private function UpdateCrouch( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var crouchToggled : Bool;
+		crouchToggled = stateContext.GetConditionBool( 'CrouchToggled' );
+		if( crouchToggled && scriptInterface.IsActionJustReleased( 'Crouch' ) )
+		{
+			stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );
+		}
+		else if( scriptInterface.IsActionJustPressed( 'ToggleCrouch' ) )
+		{
+			stateContext.SetConditionBoolParameter( 'CrouchToggled', !( crouchToggled ), true );
+			if( crouchToggled )
+			{
+				stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+			}
+		}
+	}
+
+	public function OnExitToCrouch( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Crouch ) ) );
+		scriptInterface.SetAnimationParameterFloat( 'crouch', 1.0 );
+		stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+	}
+
+}
+
+class JumpLowGravityDecisions extends LocomotionAirLowGravityDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return scriptInterface.IsActionJustPressed( 'Jump' );
+	}
+
+	protected const function ToFallLowGravity( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( scriptInterface.GetActionValue( 'Jump' ) < 0.1 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class JumpLowGravityEvents extends LocomotionAirLowGravityEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Jump ) ) );
+	}
+
+	protected override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnExit( stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Locomotion, ( ( Int32 )( gamePSMLocomotionStates.Default ) ) );
+	}
+
+}
+
+class FallLowGravityDecisions extends LocomotionAirLowGravityDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( GetInStateTime() <= 0.1 )
+		{
+			return false;
+		}
+		return ShouldFall( stateContext, scriptInterface );
+	}
+
+}
+
+class FallLowGravityEvents extends LocomotionAirLowGravityEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		PlaySound( 'Player_falling_wind_loop', scriptInterface );
+		scriptInterface.PushAnimationEvent( 'Fall' );
+	}
+
+}
+
+class RegularLandLowGravityDecisions extends AbstractLandDecisions
+{
+}
+
+class RegularLandLowGravityEvents extends AbstractLandEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+	}
+
+}
+
+class DodgeAirLowGravityDecisions extends LocomotionAirLowGravityDecisions
+{
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentNumberOfAirDodges : Int32;
+		if( GetStaticBoolParameterDefault( "disable", false ) )
+		{
+			return false;
+		}
+		currentNumberOfAirDodges = stateContext.GetIntParameter( 'currentNumberOfAirDodges', true );
+		if( currentNumberOfAirDodges >= GetStaticIntParameterDefault( "numberOfAirDodges", 1 ) )
+		{
+			return false;
+		}
+		return scriptInterface.IsActionJustPressed( 'Dodge' ) && scriptInterface.IsMoveInputConsiderable();
+	}
+
+}
+
+class DodgeAirLowGravityEvents extends LocomotionAirLowGravityEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var currentNumberOfAirDodges : Int32;
+		super.OnEnter( stateContext, scriptInterface );
+		currentNumberOfAirDodges = stateContext.GetIntParameter( 'currentNumberOfAirDodges', true );
+		currentNumberOfAirDodges += 1;
+		stateContext.SetPermanentIntParameter( 'currentNumberOfAirDodges', currentNumberOfAirDodges, true );
+		scriptInterface.PushAnimationEvent( 'Dodge' );
+	}
+
+}
+
+class ClimbLowGravityDecisions extends LocomotionGroundDecisions
+{
+
+	private const function OverlapFitTest( const scriptInterface : StateGameScriptInterface, climbInfo : PlayerClimbInfo ) : Bool
+	{
+		var rotation : EulerAngles;
+		var crouchOverlap : Bool;
+		var fitTestOvelap : TraceResult;
+		var playerCapsuleDimensions : Vector4;
+		var Z : Vector4;
+		var queryPosition : Vector4;
+		Z.Z = 1.0;
+		playerCapsuleDimensions.X = GetStaticFloatParameterDefault( "capsuleRadius", 0.40000001 );
+		playerCapsuleDimensions.Y = -1.0;
+		playerCapsuleDimensions.Z = -1.0;
+		queryPosition = climbInfo.descResult.topPoint + ( Z * playerCapsuleDimensions.X );
+		crouchOverlap = scriptInterface.OverlapWithASingleGroup( playerCapsuleDimensions, queryPosition, rotation, 'PlayerBlocker', fitTestOvelap );
+		return !( crouchOverlap );
+	}
+
+	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var climbInfo : PlayerClimbInfo;
+		var enterAngleThreshold : Float;
+		if( GetStaticBoolParameterDefault( "allowClimbOnlyWhenMovingDown", false ) && ( GetVerticalSpeed( scriptInterface ) > 0.0 ) )
+		{
+			return false;
+		}
+		enterAngleThreshold = GetStaticFloatParameterDefault( "enterAngleThreshold", -180.0 );
+		if( !( scriptInterface.IsMoveInputConsiderable() ) || !( ( AbsF( scriptInterface.GetInputHeading() ) <= enterAngleThreshold ) ) )
+		{
+			return false;
+		}
+		climbInfo = scriptInterface.GetSpatialQueriesSystem().GetPlayerObstacleSystem().GetCurrentClimbInfo( scriptInterface.owner );
+		return climbInfo.climbValid && OverlapFitTest( scriptInterface, climbInfo );
+	}
+
+}
+
+class ClimbLowGravityEvents extends LocomotionGroundEvents
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var climbInfo : PlayerClimbInfo;
+		var direction : Vector4;
+		super.OnEnter( stateContext, scriptInterface );
+		climbInfo = scriptInterface.GetSpatialQueriesSystem().GetPlayerObstacleSystem().GetCurrentClimbInfo( scriptInterface.owner );
+		direction = scriptInterface.GetOwnerForward();
+		direction = Vector4.RotByAngleXY( direction, -( scriptInterface.GetInputHeading() ) );
+		stateContext.SetTemporaryVectorParameter( 'obstacleVerticalDestination', climbInfo.descResult.topPoint - ( direction * GetStaticFloatParameterDefault( "capsuleRadius", 0.0 ) ), true );
+		stateContext.SetTemporaryVectorParameter( 'obstacleHorizontalDestination', climbInfo.descResult.topPoint, true );
+		stateContext.SetTemporaryVectorParameter( 'obstacleSurfaceNormal', climbInfo.descResult.topNormal, true );
+	}
+
+}
+

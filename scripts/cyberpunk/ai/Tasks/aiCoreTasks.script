@@ -1,0 +1,515 @@
+abstract class AICoreTasks extends AIbehaviortaskScript
+{
+}
+
+class InitialiseNPC extends AIbehaviortaskScript
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		StoreScriptExecutionContext( context );
+	}
+
+	protected function StoreScriptExecutionContext( scriptExecutionContext : ScriptExecutionContext )
+	{
+		var context : SetScriptExecutionContextEvent;
+		context = new SetScriptExecutionContextEvent;
+		context.scriptExecutionContext = scriptExecutionContext;
+		ScriptExecutionContext.GetOwner( scriptExecutionContext ).QueueEvent( context );
+	}
+
+}
+
+class SelectorRevalutionBreak extends AIbehaviortaskScript
+{
+	private const var m_reevaluationDuration : Float;
+	default m_reevaluationDuration = 0.1f;
+	private var m_activationTimeStamp : Float;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		m_activationTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		SetUpdateInterval( context, m_reevaluationDuration );
+	}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		if( EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) < ( m_activationTimeStamp + m_reevaluationDuration ) )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		return AIbehaviorUpdateOutcome.SUCCESS;
+	}
+
+}
+
+class SetTopThreatToCombatTarget extends AIbehaviortaskScript
+{
+	var m_refreshTimer : Float;
+	default m_refreshTimer = 0.5;
+	private var m_previousChecktime : Float;
+	private var m_targetTrackerComponent : TargetTrackingExtension;
+	private var m_movePoliciesComponent : MovePoliciesComponent;
+	private var m_targetChangeTime : Float;
+	default m_targetChangeTime = 0.0;
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		m_targetTrackerComponent = ( ( TargetTrackingExtension )( GetPuppet( context ).GetTargetTrackerComponent() ) );
+		m_movePoliciesComponent = GetPuppet( context ).GetMovePolicesComponent();
+	}
+
+	protected export override function Deactivate( context : ScriptExecutionContext )
+	{
+		if( GetPuppet( context ).GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Combat )
+		{
+			SetCombatTarget( context, NULL );
+		}
+		m_targetTrackerComponent = NULL;
+		m_movePoliciesComponent = NULL;
+	}
+
+	protected export override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var topThreat : TrackedLocation;
+		var cssi : CombatSquadScriptInterface;
+		var newTargetObject : weak< GameObject >;
+		var puppet : ScriptedPuppet;
+		var time : Float;
+		var targetTrackerComp : TargetTrackerComponent;
+		var currentUpperBodyState : gamedataNPCUpperBodyState;
+		puppet = GetPuppet( context );
+		currentUpperBodyState = GetPuppet( context ).GetStatesComponent().GetCurrentUpperBodyState();
+		if( !( IsCurrentTargetValid( context, currentUpperBodyState ) ) || CanSwitchTarget( context, currentUpperBodyState ) )
+		{
+			time = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+			m_previousChecktime = time;
+			if( !( GetCommandCombatTarget( context, newTargetObject ) ) )
+			{
+				if( AIActionHelper.GetActiveTopHostilePuppetThreat( puppet, topThreat ) )
+				{
+					newTargetObject = ( ( ScriptedPuppet )( topThreat.entity ) );
+				}
+				else
+				{
+					if( ( ( SurveillanceCamera )( topThreat.entity ) ) == NULL )
+					{
+						newTargetObject = ( ( GameObject )( topThreat.entity ) );
+					}
+				}
+				if( newTargetObject && !( IsTargetValid( context, newTargetObject ) ) )
+				{
+					targetTrackerComp = puppet.GetTargetTrackerComponent();
+					targetTrackerComp.SetThreatBaseMul( newTargetObject, 0.0 );
+					targetTrackerComp.RemoveThreat( targetTrackerComp.MapThreat( newTargetObject ) );
+					newTargetObject = NULL;
+					ScriptExecutionContext.DebugLog( context, 'CombatTargetSelection', "NULL Target; NPC tried to choose autonomously non hostile or non active target" );
+				}
+			}
+			SetCombatTarget( context, newTargetObject );
+			AISquadHelper.GetCombatSquadInterface( puppet, cssi );
+			if( cssi )
+			{
+				if( newTargetObject )
+				{
+					cssi.SetAsEnemyAttacker( puppet, newTargetObject );
+				}
+				else
+				{
+					cssi.SetAsEnemyAttacker( puppet, NULL );
+				}
+			}
+			AIActionTarget.UpdateThreatsValue( GetNPCPuppet( context ), newTargetObject, time - m_targetChangeTime );
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	private final function CanSwitchTarget( context : ScriptExecutionContext, currentUpperBodyState : gamedataNPCUpperBodyState ) : Bool
+	{
+		if( EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) < ( m_previousChecktime + m_refreshTimer ) )
+		{
+			return false;
+		}
+		if( currentUpperBodyState == gamedataNPCUpperBodyState.Shoot && !( GetPuppet( context ).IsBoss() ) )
+		{
+			return true;
+		}
+		if( ( ( currentUpperBodyState == gamedataNPCUpperBodyState.Normal || currentUpperBodyState == gamedataNPCUpperBodyState.Reload ) || currentUpperBodyState == gamedataNPCUpperBodyState.Equip ) || currentUpperBodyState == gamedataNPCUpperBodyState.Aim )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private final function GetCommandCombatTarget( context : ScriptExecutionContext, out target : weak< GameObject > ) : Bool
+	{
+		target = ScriptExecutionContext.GetArgumentObject( context, 'CommandCombatTarget' );
+		if( target && target.IsPuppet() )
+		{
+			if( !( ScriptedPuppet.IsActive( target ) ) )
+			{
+				GetPuppet( context ).GetTargetTrackerComponent().SetThreatBaseMul( target, 0.0 );
+				target = NULL;
+				ScriptExecutionContext.DebugLog( context, 'CombatTargetSelection', "NULL Target; CommandCombatTarget is Non-Active Target" );
+			}
+			else if( GameObject.GetAttitudeBetween( ScriptExecutionContext.GetOwner( context ), target ) == EAIAttitude.AIA_Friendly )
+			{
+				GetPuppet( context ).GetTargetTrackerComponent().SetThreatBaseMul( target, 0.0 );
+				target = NULL;
+				ScriptExecutionContext.DebugLog( context, 'CombatTargetSelection', "NULL Target; CommandCombatTarget is Friendly" );
+			}
+		}
+		return target != NULL;
+	}
+
+	private final function SetCombatTarget( context : ScriptExecutionContext, target : GameObject )
+	{
+		if( !( AICombatTargetHelper.SetNewCombatTarget( context, target ) ) )
+		{
+			return;
+		}
+		if( target )
+		{
+			GameObject.ChangeAttitudeToHostile( ScriptExecutionContext.GetOwner( context ), target );
+			m_targetChangeTime = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		}
+	}
+
+	private final function IsCurrentTargetValid( context : ScriptExecutionContext, upperBodyState : gamedataNPCUpperBodyState ) : Bool
+	{
+		var target : weak< GameObject >;
+		target = ScriptExecutionContext.GetArgumentObject( context, 'CombatTarget' );
+		if( target && IsSwitchingTargetsBlocked( upperBodyState ) )
+		{
+			return true;
+		}
+		return IsTargetValid( context, target );
+	}
+
+	private final function IsSwitchingTargetsBlocked( upperBodyState : gamedataNPCUpperBodyState ) : Bool
+	{
+		if( upperBodyState == gamedataNPCUpperBodyState.Attack )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private final function IsTargetValid( context : ScriptExecutionContext, target : weak< GameObject > ) : Bool
+	{
+		var threat : TrackedLocation;
+		var owner : gamePuppet;
+		var puppetOwner : ScriptedPuppet;
+		var isTargetPlayer : Bool;
+		owner = ScriptExecutionContext.GetOwner( context );
+		if( !( target ) || !( target.IsAttached() ) )
+		{
+			return false;
+		}
+		isTargetPlayer = target.IsPlayer();
+		if( !( isTargetPlayer ) && !( ScriptedPuppet.IsActive( target ) ) )
+		{
+			return false;
+		}
+		if( !( m_targetTrackerComponent.ThreatFromEntity( target, threat ) ) )
+		{
+			return false;
+		}
+		if( !( IsTargetHostile( owner, target ) ) )
+		{
+			m_targetTrackerComponent.RemoveThreat( m_targetTrackerComponent.MapThreat( target ) );
+			return false;
+		}
+		puppetOwner = GetPuppet( context );
+		if( ( puppetOwner.IsPrevention() && isTargetPlayer ) && !( PreventionSystem.ShouldReactionBeAgressive( owner.GetGame() ) ) )
+		{
+			AISquadHelper.RemoveThreatFromSquad( puppetOwner, threat );
+			GameObject.ChangeAttitudeToNeutral( owner, target );
+			return false;
+		}
+		return true;
+	}
+
+	private final function IsTargetHostile( owner : weak< GameObject >, target : weak< GameObject > ) : Bool
+	{
+		var attitudeOwner : AttitudeAgent;
+		var attitudeTarget : AttitudeAgent;
+		if( !( owner ) || !( target ) )
+		{
+			return false;
+		}
+		attitudeOwner = owner.GetAttitudeAgent();
+		attitudeTarget = target.GetAttitudeAgent();
+		if( !( attitudeOwner ) || !( attitudeTarget ) )
+		{
+			return false;
+		}
+		if( attitudeOwner.GetAttitudeTowards( attitudeTarget ) != EAIAttitude.AIA_Hostile )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private final function IsTargetLost( context : ScriptExecutionContext, trackedLocation : TrackedLocation ) : Bool
+	{
+		var vecToTarget : Vector4;
+		var distanceSquared : Float;
+		if( ScriptedPuppet.IsPlayerCompanion( GetPuppet( context ) ) )
+		{
+			return false;
+		}
+		if( ( trackedLocation.visible || ( trackedLocation.sharedAccuracy >= 0.33000001 ) ) || !( trackedLocation.invalidExpectation ) )
+		{
+			return false;
+		}
+		if( m_movePoliciesComponent )
+		{
+			if( !( m_movePoliciesComponent.IsTopPolicyEvaluated() ) )
+			{
+				return false;
+			}
+			if( m_movePoliciesComponent.IsPathfindingFailed() )
+			{
+				ScriptExecutionContext.DebugLog( context, 'CombatTargetSelection', "TARGET LOST, reason: invalidExpectation + path finding failed" );
+				return true;
+			}
+			if( m_movePoliciesComponent.IsConstrainedByRestrictedArea() )
+			{
+				ScriptExecutionContext.DebugLog( context, 'CombatTargetSelection', "TARGET LOST, reason: invalidExpectation + movement constrained by restricted area" );
+				return true;
+			}
+		}
+		vecToTarget = trackedLocation.sharedLocation.position - ScriptExecutionContext.GetOwner( context ).GetWorldPosition();
+		distanceSquared = Vector4.LengthSquared( vecToTarget );
+		if( distanceSquared <= 4.0 )
+		{
+			ScriptExecutionContext.DebugLog( context, 'CombatTargetSelection', "TARGET LOST, reason: distance to sharedBelief position is less than < 2 meters" );
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class ClearCombatTarget extends AIbehaviortaskScript
+{
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		AICombatTargetHelper.SetNewCombatTarget( context, NULL );
+	}
+
+}
+
+class StackClearCombatTarget extends AIbehaviortaskStackScript
+{
+
+	protected export function OnActivate( context : ScriptExecutionContext )
+	{
+		AICombatTargetHelper.SetNewCombatTarget( context, NULL );
+	}
+
+}
+
+class TempClearForcedCombatTarget extends AIbehaviortaskScript
+{
+
+	protected override function Deactivate( context : ScriptExecutionContext )
+	{
+		var threatPersistenceSource : AIThreatPersistenceSource_Record;
+		threatPersistenceSource = TweakDBInterface.GetAIThreatPersistenceSourceRecord( T"AIThreatPersistenceSource.SetNewCombatTarget" );
+		AICombatTargetHelper.SetNewCombatTarget( context, NULL );
+		AIActionHelper.ClearCommandCombatTarget( context, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+	}
+
+}
+
+abstract class AICombatTargetHelper extends IScriptable
+{
+
+	public static function SetNewCombatTarget( context : ScriptExecutionContext, target : GameObject ) : Bool
+	{
+		var evt : OnBeingTarget;
+		var prevTarget : GameObject;
+		var owner : ScriptedPuppet;
+		var tte : TargetTrackingExtension;
+		var threatPersistenceSource : AIThreatPersistenceSource_Record;
+		owner = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( ( target == owner ) || ( ( SurveillanceCamera )( target ) ) )
+		{
+			return false;
+		}
+		prevTarget = ScriptExecutionContext.GetArgumentObject( context, 'CombatTarget' );
+		if( target == prevTarget )
+		{
+			return false;
+		}
+		threatPersistenceSource = TweakDBInterface.GetAIThreatPersistenceSourceRecord( T"AIThreatPersistenceSource.SetNewCombatTarget" );
+		if( target && ( target.IsPlayer() || ScriptedPuppet.IsPlayerCompanion( target ) ) )
+		{
+			TargetTrackingExtension.InjectThreat( ( ( ScriptedPuppet )( target ) ), owner, 1.0 );
+			TargetTrackingExtension.SetThreatPersistence( ( ( ScriptedPuppet )( target ) ), owner, true, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+		}
+		if( prevTarget )
+		{
+			if( prevTarget.IsPlayer() || ScriptedPuppet.IsPlayerCompanion( prevTarget ) )
+			{
+				tte = ( ( TargetTrackingExtension )( ( ( ScriptedPuppet )( prevTarget ) ).GetTargetTrackerComponent() ) );
+				if( tte )
+				{
+					if( !( tte.WasThreatPersistent( prevTarget ) ) )
+					{
+						TargetTrackingExtension.SetThreatPersistence( ( ( ScriptedPuppet )( prevTarget ) ), owner, false, ( ( Uint32 )( threatPersistenceSource.EnumValue() ) ) );
+					}
+					else
+					{
+						LogAI( "Threat Persistency of player/companion attacker not disabled from SetNewCombatTarget because it was previously set from quest" );
+					}
+				}
+			}
+			if( owner )
+			{
+				owner.GetSensesComponent().SetDetectionMultiplier( prevTarget.GetEntityID(), 1.0 );
+			}
+			if( prevTarget.IsPlayer() )
+			{
+				evt = new OnBeingTarget;
+				evt.objectThatTargets = ScriptExecutionContext.GetOwner( context );
+				evt.noLongerTarget = true;
+				prevTarget.QueueEvent( evt );
+			}
+		}
+		ScriptExecutionContext.SetArgumentObject( context, 'CombatTarget', target );
+		if( target )
+		{
+			if( target.IsPlayer() )
+			{
+				evt = new OnBeingTarget;
+				evt.objectThatTargets = owner;
+				target.QueueEvent( evt );
+				if( PreventionSystem.ShouldPreventionSystemReactToCombat( owner ) )
+				{
+					PreventionSystem.CombatStartedRequestToPreventionSystem( owner.GetGame(), owner );
+				}
+			}
+		}
+		if( owner )
+		{
+			owner.SetMainTrackedObject( target );
+		}
+		AIActionHelper.CombatQueriesInit( owner );
+		SetCombatTargetChangeSignal( context );
+		return true;
+	}
+
+	public static function SetCombatTargetChangeSignal( context : ScriptExecutionContext )
+	{
+		var puppet : weak< ScriptedPuppet >;
+		puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( !( puppet ) )
+		{
+			return;
+		}
+		ScriptedPuppet.SendActionSignal( puppet, 'CombatTargetChanged', 0.5 );
+	}
+
+}
+
+class SetDroppedThreatLastKnowPosition extends AIbehaviortaskScript
+{
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		var threatData : DroppedThreatData;
+		var tte : TargetTrackingExtension;
+		tte = ( ( TargetTrackingExtension )( GetPuppet( context ).GetTargetTrackerComponent() ) );
+		if( tte && tte.GetDroppedThreat( ScriptExecutionContext.GetOwner( context ).GetGame(), threatData ) )
+		{
+			ScriptExecutionContext.SetArgumentVector( context, 'StimSource', threatData.position );
+		}
+	}
+
+	protected export override function Deactivate( context : ScriptExecutionContext )
+	{
+		ScriptExecutionContext.SetArgumentVector( context, 'StimSource', Vector4( 0.0, 0.0, 0.0, 0.0 ) );
+	}
+
+}
+
+class StopCallReinforcements extends AIbehaviortaskScript
+{
+	protected var m_puppet : weak< ScriptedPuppet >;
+	protected var m_pauseResumePhoneCallEvent : PauseResumePhoneCallEvent;
+	protected var m_statPoolType : gamedataStatPoolType;
+	default m_statPoolType = gamedataStatPoolType.CallReinforcementProgress;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		m_puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		m_pauseResumePhoneCallEvent = new PauseResumePhoneCallEvent;
+		m_pauseResumePhoneCallEvent.pauseCall = true;
+		m_pauseResumePhoneCallEvent.statPoolType = m_statPoolType;
+		m_puppet.QueueEvent( m_pauseResumePhoneCallEvent );
+	}
+
+}
+
+class UpdateDyingStimSource extends AIbehaviortaskScript
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var investigateData : stimInvestigateData;
+		investigateData = GetPuppet( context ).GetStimReactionComponent().GetDesiredReactionData().stimInvestigateData;
+		if( investigateData.attackInstigator )
+		{
+			ScriptExecutionContext.SetArgumentVector( context, 'StimSource', investigateData.attackInstigatorPosition );
+		}
+	}
+
+}
+
+class AddWeapon extends AIbehaviortaskScript
+{
+	editable var m_weapon : EquipmentPriority;
+	default m_weapon = EquipmentPriority.All;
+
+	public export static function ExecuteForAllWeapons( puppet : ScriptedPuppet )
+	{
+		Execute( puppet, EquipmentPriority.All );
+	}
+
+	private static function Execute( puppet : ScriptedPuppet, weapon : EquipmentPriority )
+	{
+		var statSys : StatsSystem;
+		var powerLevel : Int32;
+		statSys = GameInstance.GetStatsSystem( puppet.GetGame() );
+		powerLevel = ( ( Int32 )( statSys.GetStatValue( puppet.GetEntityID(), gamedataStatType.PowerLevel ) ) );
+		if( !( puppet.HasEquipment( weapon ) ) )
+		{
+			puppet.AddRecordEquipment( weapon, powerLevel );
+		}
+	}
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		Execute( GetPuppet( context ), m_weapon );
+	}
+
+}
+
+class IncrementArgumentInt extends AIbehaviortaskScript
+{
+	editable var argumentIntName : CName;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var argumentIntValue : Int32;
+		argumentIntValue = ScriptExecutionContext.GetArgumentInt( context, argumentIntName );
+		argumentIntValue += 1;
+		ScriptExecutionContext.SetArgumentInt( context, argumentIntName, argumentIntValue );
+	}
+
+}
+

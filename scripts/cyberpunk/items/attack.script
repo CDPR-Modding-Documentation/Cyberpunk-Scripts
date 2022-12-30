@@ -1,0 +1,275 @@
+import struct AttackInitContext
+{
+	import var record : Attack_Record;
+	import var instigator : weak< GameObject >;
+	import var source : weak< GameObject >;
+	import var weapon : weak< WeaponObject >;
+}
+
+import struct AttackDebugData
+{
+	import var pointOfViewTransform : WorldTransform;
+	import var projectileHitplaneSpread : Vector4;
+	import var bulletStartPosition : Vector4;
+}
+
+import class gameAttackComputed extends IScriptable
+{
+	public import function GetTotalAttackValue( statPoolType : gamedataStatPoolType ) : Float;
+	public import function GetAttackValue( damageType : gamedataDamageType ) : Float;
+	public import function SetAttackValue( value : Float, optional damageType : gamedataDamageType );
+	public import function AddAttackValue( value : Float, optional damageType : gamedataDamageType );
+	public import function MultAttackValue( value : Float, optional damageType : gamedataDamageType );
+	public import function GetAttackValues() : array< Float >;
+	public import function SetAttackValues( attackValues : array< Float > );
+	public import function GetOriginalAttackValues() : array< Float >;
+
+	public function GetDominatingDamageType() : gamedataDamageType
+	{
+		var i : Int32;
+		var dmgIndex : Int32;
+		var highestValue : Float;
+		var currentValue : Float;
+		highestValue = 0.0;
+		for( i = 0; i < ( ( Int32 )( gamedataDamageType.Count ) ); i += 1 )
+		{
+			currentValue = GetAttackValue( ( ( gamedataDamageType )( i ) ) );
+			if( currentValue > highestValue )
+			{
+				highestValue = currentValue;
+				dmgIndex = i;
+			}
+		}
+		return ( ( gamedataDamageType )( dmgIndex ) );
+	}
+
+}
+
+import abstract class IAttack extends IScriptable
+{
+	public import static function Create( context : AttackInitContext ) : IAttack;
+	public import static function GetExplosiveHitAttack( attackRecord : Attack_Record ) : Attack_GameEffect_Record;
+	public import function GetParameterBool( parameterName : CName, optional defaultValue : Bool ) : Bool;
+	public import function GetParameterFloat( parameterName : CName, optional defaultValue : Float ) : Float;
+	public import function GetParameterInt( parameterName : CName, optional defaultValue : Int32 ) : Int32;
+	public import function GetParameterName( parameterName : CName, optional defaultValue : CName ) : CName;
+	public import function GetRecord() : weak< Attack_Record >;
+	public import function GetStatModList( statModList : array< gameStatModifierData > );
+	public import function StartAttack() : Bool;
+	public import function SetPreviewActive( previewActive : Bool );
+	public import function SetDamageProjectionActive( active : Bool );
+	public import function GetDebugData() : AttackDebugData;
+}
+
+import class Attack_GameEffect extends IAttack
+{
+	public import function PrepareAttack( instigator : weak< GameObject > ) : EffectInstance;
+	public import function StartAttackContinous();
+	public import function StopAttack() : Bool;
+	public import function SetAttackPosition( pos : Vector4 );
+	public import function OverrideTimeDilationDriver( timeDilatable : weak< TimeDilatable > ) : Bool;
+	public import function ResetTimeDilationDriver() : Bool;
+	public import static function SpawnExplosionAttack( attackIniattackRecord : Attack_Record, weapon : weak< WeaponObject >, instigator : weak< GameObject >, source : weak< GameObject >, position : Vector4, optional duration : Float ) : Attack_GameEffect_Record;
+}
+
+import class Attack_Projectile extends IAttack
+{
+	public import function PrepareAttack( instigator : weak< GameObject > ) : gameprojectileSpawnerLaunchEvent;
+}
+
+import class Attack_Continuous extends Attack_GameEffect
+{
+	public import function GetRunningContinuousEffect() : EffectInstance;
+
+	public virtual function OnTick( weapon : WeaponObject ) {}
+
+	public virtual function OnStop( weapon : WeaponObject ) {}
+}
+
+class Attack_Beam extends Attack_Continuous
+{
+
+	public override function OnTick( weapon : WeaponObject )
+	{
+		var beamEffect : EffectInstance;
+		if( weapon )
+		{
+			beamEffect = GetRunningContinuousEffect();
+			if( beamEffect )
+			{
+				EffectData.SetVector( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, weapon.GetWorldPosition() );
+				EffectData.SetVector( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.forward, weapon.GetWorldForward() );
+				EffectData.SetFloat( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.minRayAngleDiff, 2.0 );
+			}
+		}
+	}
+
+}
+
+class LaserSight extends Attack_Beam
+{
+	private var previousTarget : weak< Entity >;
+
+	public override function OnTick( weapon : WeaponObject )
+	{
+		var beamEffect : EffectInstance;
+		var targetComponent : weak< IComponent >;
+		var targetComponentVariant : Variant;
+		var target : weak< Entity >;
+		super.OnTick( weapon );
+		if( weapon )
+		{
+			beamEffect = GetRunningContinuousEffect();
+			if( beamEffect )
+			{
+				EffectData.GetVariant( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.targetComponent, targetComponentVariant );
+				if( targetComponentVariant.IsValid() )
+				{
+					targetComponent = ( ( weak< weak< IComponent > > )( ( ( weak< weak< IPlacedComponent > > )targetComponentVariant ) ) );
+				}
+				if( targetComponent )
+				{
+					target = targetComponent.GetEntity();
+				}
+				HandleTargetEvents( weapon, target );
+			}
+		}
+	}
+
+	public override function OnStop( weapon : WeaponObject )
+	{
+		HandleTargetEvents( weapon, NULL );
+	}
+
+	private function HandleTargetEvents( weapon : WeaponObject, target : weak< Entity > )
+	{
+		var evt : BeingTargetByLaserSightUpdateEvent;
+		if( previousTarget && ( previousTarget != target ) )
+		{
+			evt = new BeingTargetByLaserSightUpdateEvent;
+			evt.weapon = weapon;
+			evt.state = LaserTargettingState.End;
+			LogAI( "Queue end" );
+			previousTarget.QueueEvent( evt );
+		}
+		if( target )
+		{
+			evt = new BeingTargetByLaserSightUpdateEvent;
+			evt.weapon = weapon;
+			if( previousTarget != target )
+			{
+				LogAI( "Queue start" );
+				evt.state = LaserTargettingState.Start;
+			}
+			else
+			{
+				LogAI( "Queue update" );
+				evt.state = LaserTargettingState.Update;
+			}
+			target.QueueEvent( evt );
+		}
+		previousTarget = target;
+	}
+
+}
+
+class RoyceLaserSight extends Attack_Beam
+{
+	private var previousTarget : weak< Entity >;
+
+	public override function OnTick( weapon : WeaponObject )
+	{
+		var beamEffect : EffectInstance;
+		var targetComponent : weak< IComponent >;
+		var targetComponentVariant : Variant;
+		var target : weak< Entity >;
+		super.OnTick( weapon );
+		if( weapon )
+		{
+			beamEffect = GetRunningContinuousEffect();
+			if( beamEffect )
+			{
+				EffectData.GetVariant( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.targetComponent, targetComponentVariant );
+				targetComponent = ( ( weak< weak< IComponent > > )targetComponentVariant );
+				if( targetComponent )
+				{
+					target = targetComponent.GetEntity();
+				}
+				HandleTargetEvents( weapon, target );
+			}
+		}
+	}
+
+	public override function OnStop( weapon : WeaponObject )
+	{
+		HandleTargetEvents( weapon, NULL );
+	}
+
+	private function HandleTargetEvents( weapon : WeaponObject, target : weak< Entity > )
+	{
+		var evt : BeingTargetByLaserSightUpdateEvent;
+		if( previousTarget && ( previousTarget != target ) )
+		{
+			evt = new BeingTargetByLaserSightUpdateEvent;
+			evt.weapon = weapon;
+			evt.state = LaserTargettingState.End;
+			LogAI( "Queue end" );
+			previousTarget.QueueEvent( evt );
+		}
+		if( target )
+		{
+			evt = new BeingTargetByLaserSightUpdateEvent;
+			evt.weapon = weapon;
+			if( previousTarget != target )
+			{
+				LogAI( "Queue start" );
+				evt.state = LaserTargettingState.Start;
+			}
+			else
+			{
+				LogAI( "Queue update" );
+				evt.state = LaserTargettingState.Update;
+			}
+			target.QueueEvent( evt );
+		}
+		previousTarget = target;
+	}
+
+}
+
+class Bombus_Flame_Beam extends Attack_Continuous
+{
+
+	public override function OnTick( weapon : WeaponObject )
+	{
+		var beamEffect : EffectInstance;
+		if( weapon )
+		{
+			beamEffect = GetRunningContinuousEffect();
+			if( beamEffect )
+			{
+				EffectData.SetVector( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, weapon.GetWorldPosition() );
+				EffectData.SetVector( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.forward, weapon.GetWorldForward() );
+				EffectData.SetFloat( beamEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.minRayAngleDiff, 1.0 );
+			}
+		}
+	}
+
+}
+
+function PreloadGameEffectAttackResources( attackRecord : Attack_GameEffect_Record, effectSystem : EffectSystem )
+{
+	if( attackRecord )
+	{
+		effectSystem.PreloadStaticEffectResources( attackRecord.EffectName(), attackRecord.EffectTag() );
+	}
+}
+
+function ReleaseGameEffectAttackResources( attackRecord : Attack_GameEffect_Record, effectSystem : EffectSystem )
+{
+	if( attackRecord )
+	{
+		effectSystem.ReleaseStaticEffectResources( attackRecord.EffectName(), attackRecord.EffectTag() );
+	}
+}
+

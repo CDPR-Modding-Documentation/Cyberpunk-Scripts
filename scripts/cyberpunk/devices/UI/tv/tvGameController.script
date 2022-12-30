@@ -1,0 +1,595 @@
+class TvChannelSpawnData
+{
+	var m_channelName : CName;
+	var m_localizedName : String;
+	var m_order : Int32;
+
+	public function Initialize( channelName : CName, localizedName : String, order : Int32 )
+	{
+		m_channelName = channelName;
+		m_localizedName = localizedName;
+		m_order = order;
+	}
+
+}
+
+class TvInkGameController extends DeviceInkGameControllerBase
+{
+	private var m_defaultUI : weak< inkCanvas >;
+	private var m_securedUI : weak< inkCanvas >;
+	private var m_channellTextWidget : weak< inkText >;
+	private var m_securedTextWidget : weak< inkText >;
+	protected var m_mainDisplayWidget : weak< inkVideo >;
+	private var m_actionsList : weak< inkWidget >;
+	private var m_activeChannelIDX : Int32;
+	default m_activeChannelIDX = -1;
+	private var m_activeSequence : array< SequenceVideo >;
+	private var m_activeSequenceVideo : Int32;
+	default m_activeSequenceVideo = 0;
+	private var m_globalTVChannels : array< weak< inkWidget > >;
+	protected var m_messegeWidget : weak< inkText >;
+	protected var m_backgroundWidget : weak< inkLeafWidget >;
+	private var m_previousGlobalTVChannelID : Int32;
+	default m_previousGlobalTVChannelID = -1;
+	private var m_globalTVchanellsCount : Int32;
+	default m_globalTVchanellsCount = -1;
+	private var m_globalTVchanellsSpawned : Int32;
+	private var m_globalTVslot : weak< inkWidget >;
+	private var m_activeAudio : CName;
+	private var m_activeMessage : weak< ScreenMessageData_Record >;
+	private var m_onChangeChannelListener : CallbackHandle;
+	private var m_onGlitchingStateChangedListener : CallbackHandle;
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+		if( m_mainDisplayWidget )
+		{
+			m_mainDisplayWidget.Stop();
+		}
+	}
+
+	protected override function SetupWidgets()
+	{
+		if( !( m_isInitialized ) )
+		{
+			m_rootWidget.SetVisible( false );
+			m_defaultUI = ( ( inkCanvas )( GetWidget( 'default_ui' ) ) );
+			m_securedUI = ( ( inkCanvas )( GetWidget( 'secured_ui' ) ) );
+			m_channellTextWidget = ( ( inkText )( GetWidget( 'default_ui/channel_text' ) ) );
+			m_securedTextWidget = ( ( inkText )( GetWidget( 'secured_ui/secured_text' ) ) );
+			m_mainDisplayWidget = ( ( inkVideo )( GetWidget( 'main_display' ) ) );
+			m_actionsList = ( ( inkWidget )( GetWidget( 'default_ui/actions_list_slot' ) ) );
+			m_messegeWidget = ( ( inkText )( GetWidget( 'messege_text' ) ) );
+			m_backgroundWidget = ( ( inkLeafWidget )( GetWidget( 'background' ) ) );
+			m_globalTVslot = ( ( inkWidget )( GetWidget( 'global_tv_slot' ) ) );
+			if( !( ( ( TV )( GetOwner() ) ).IsInteractive() ) )
+			{
+				m_rootWidget.SetInteractive( false );
+				m_defaultUI.SetInteractive( false );
+				if( m_actionsList )
+				{
+					m_actionsList.SetVisible( false );
+				}
+			}
+		}
+	}
+
+	public override function Refresh( state : EDeviceStatus )
+	{
+		SetupWidgets();
+		if( !( IsGlobalTVInitialized() ) )
+		{
+			if( !( WasGlobalTVinitalizationTrigered() ) )
+			{
+				InitializeGlobalTV();
+			}
+			return;
+		}
+		switch( state )
+		{
+			case EDeviceStatus.ON:
+				TurnOn();
+			break;
+			case EDeviceStatus.OFF:
+				TurnOff();
+			break;
+			case EDeviceStatus.UNPOWERED:
+				TurnOff();
+			break;
+			case EDeviceStatus.DISABLED:
+				TurnOff();
+			break;
+			default:
+				break;
+		}
+		super.Refresh( state );
+	}
+
+	protected override function RegisterBlackboardCallbacks( blackboard : IBlackboard )
+	{
+		super.RegisterBlackboardCallbacks( blackboard );
+		if( blackboard )
+		{
+			m_onChangeChannelListener = blackboard.RegisterListenerInt( GetOwner().GetBlackboardDef().CurrentChannel, this, 'OnChangeChannel' );
+			m_onGlitchingStateChangedListener = blackboard.RegisterListenerVariant( GetOwner().GetBlackboardDef().GlitchData, this, 'OnGlitchingStateChanged' );
+		}
+	}
+
+	protected override function UnRegisterBlackboardCallbacks( blackboard : IBlackboard )
+	{
+		super.UnRegisterBlackboardCallbacks( blackboard );
+		if( blackboard )
+		{
+			blackboard.UnregisterListenerVariant( GetOwner().GetBlackboardDef().GlitchData, m_onGlitchingStateChangedListener );
+			blackboard.UnregisterListenerInt( GetOwner().GetBlackboardDef().CurrentChannel, m_onChangeChannelListener );
+		}
+	}
+
+	protected override function GetOwner() : TV
+	{
+		return ( ( TV )( GetOwnerEntity() ) );
+	}
+
+	protected event OnChangeChannel( value : Int32 )
+	{
+		if( m_cashedState != EDeviceStatus.ON )
+		{
+			Refresh( GetOwner().GetDeviceState() );
+		}
+		else
+		{
+			SelectChannel( value );
+		}
+	}
+
+	private override function StartGlitchingScreen( glitchData : GlitchData )
+	{
+		var glitchVideoPath : ResRef;
+		StopVideo();
+		HideAllGlobalTVChannels();
+		if( glitchData.state == EGlitchState.DEFAULT )
+		{
+			glitchVideoPath = GetOwner().GetDefaultGlitchVideoPath();
+		}
+		else
+		{
+			glitchVideoPath = GetOwner().GetBroadcastGlitchVideoPath();
+		}
+		if( ResRef.IsValid( glitchVideoPath ) )
+		{
+			PlayVideo( glitchVideoPath, true, '' );
+		}
+	}
+
+	private override function StopGlitchingScreen()
+	{
+		StopVideo();
+		SelectChannel( m_activeChannelIDX, true );
+	}
+
+	private function SelectChannel( value : Int32, optional force : Bool )
+	{
+		var channel : STvChannel;
+		if( !( m_isInitialized ) )
+		{
+			return;
+		}
+		if( ( value == m_activeChannelIDX ) && !( force ) )
+		{
+			return;
+		}
+		channel = GetOwner().GetChannelData( value );
+		m_activeSequence = channel.m_sequence;
+		ResolveMessegeRecord( GetMessageRecord( channel.m_messageRecordID ) );
+		if( ( value != m_activeChannelIDX ) && ( m_activeChannelIDX != -1 ) )
+		{
+			StopVideo();
+			HideAllGlobalTVChannels();
+			m_activeSequenceVideo = 0;
+		}
+		if( IsGlobalTVChannel( channel ) )
+		{
+			if( ShowGlobalTVChannel( channel.channelTweakID ) )
+			{
+				m_activeChannelIDX = value;
+				SetChannellText( "" );
+			}
+		}
+		else
+		{
+			m_activeChannelIDX = value;
+			SetChannellText( channel.channelName );
+			PlayVideo( channel.videoPath, channel.looped, channel.audioEvent );
+		}
+	}
+
+	public function PlayVideo( videoPath : ResRef, looped : Bool, audioEvent : CName )
+	{
+		RegisterTvChannel( -1 );
+		if( m_mainDisplayWidget == NULL )
+		{
+			return;
+		}
+		m_mainDisplayWidget.SetVideoPath( videoPath );
+		m_mainDisplayWidget.SetLoop( looped );
+		if( IsNameValid( audioEvent ) )
+		{
+			m_mainDisplayWidget.SetAudioEvent( audioEvent );
+		}
+		if( ResRef.IsValid( videoPath ) )
+		{
+			m_mainDisplayWidget.Play();
+		}
+	}
+
+	public function StopVideo()
+	{
+		if( m_mainDisplayWidget == NULL )
+		{
+			return;
+		}
+		GameObject.StopSound( GetOwner(), m_activeAudio );
+		m_activeAudio = '';
+		m_mainDisplayWidget.Stop();
+	}
+
+	public function SetChannellText( channelName : String )
+	{
+		if( m_channellTextWidget != NULL )
+		{
+			m_channellTextWidget.SetLocalizedTextScript( channelName );
+		}
+	}
+
+	public function SetSecuredText( text : String )
+	{
+		if( m_securedTextWidget != NULL )
+		{
+			m_securedTextWidget.SetText( text );
+		}
+	}
+
+	public function TurnOff()
+	{
+		m_rootWidget.SetVisible( false );
+		if( ( m_mainDisplayWidget != NULL ) && m_cashedState == EDeviceStatus.ON )
+		{
+			m_mainDisplayWidget.UnregisterFromCallback( 'OnVideoFinished', this, 'OnVideoFinished' );
+		}
+		StopVideo();
+		RegisterTvChannel( -1 );
+		m_activeSequenceVideo = 0;
+		m_activeChannelIDX = -1;
+		if( IsNameValid( m_activeAudio ) )
+		{
+			GameObject.StopSound( GetOwner(), m_activeAudio );
+		}
+	}
+
+	public virtual function TurnOn()
+	{
+		m_rootWidget.SetVisible( true );
+		m_defaultUI.SetVisible( true );
+		if( !( GetOwner().IsDeviceSecured() ) )
+		{
+			SelectChannel( GetOwner().GetDevicePS().GetActiveStationIndex() );
+		}
+		if( ( m_mainDisplayWidget != NULL ) && m_cashedState != EDeviceStatus.ON )
+		{
+			m_mainDisplayWidget.RegisterToCallback( 'OnVideoFinished', this, 'OnVideoFinished' );
+		}
+	}
+
+	protected event OnVideoFinished( target : weak< inkVideo > )
+	{
+		var index : Int32;
+		if( ( m_activeSequence.Size() > 0 ) && ( m_activeSequenceVideo < m_activeSequence.Size() ) )
+		{
+			index = m_activeSequenceVideo;
+			PlayVideo( m_activeSequence[ index ].videoPath, m_activeSequence[ index ].looped, m_activeSequence[ index ].audioEvent );
+			m_activeSequenceVideo += 1;
+		}
+	}
+
+	private function RegisterTvChannel( id : Int32 )
+	{
+		if( id == m_previousGlobalTVChannelID )
+		{
+			m_previousGlobalTVChannelID = -1;
+		}
+		GameInstance.GetGlobalTVSystem( GetOwner().GetGame() ).RegisterTVChannelOnController( this, m_previousGlobalTVChannelID, id );
+		m_previousGlobalTVChannelID = id;
+	}
+
+	private function IsGlobalTVInitialized() : Bool
+	{
+		return m_globalTVchanellsCount == m_globalTVchanellsSpawned;
+	}
+
+	private function WasGlobalTVinitalizationTrigered() : Bool
+	{
+		return m_globalTVchanellsCount > -1;
+	}
+
+	private function InitializeGlobalTV()
+	{
+		var i : Int32;
+		var channels : array< weak< ChannelData_Record > >;
+		var tvWidgetData : TvChannelSpawnData;
+		var spawnData : AsyncSpawnData;
+		if( m_globalTVchanellsCount > -1 )
+		{
+			return;
+		}
+		channels = GetOwner().GetGlobalTVChannels();
+		m_globalTVchanellsCount = channels.Size();
+		for( i = 0; i < channels.Size(); i += 1 )
+		{
+			tvWidgetData = new TvChannelSpawnData;
+			tvWidgetData.Initialize( channels[ i ].ChannelWidget(), channels[ i ].LocalizedName(), channels[ i ].OrderID() );
+			spawnData = new AsyncSpawnData;
+			spawnData.Initialize( this, 'OnGLobalChannelSpawned', tvWidgetData, this );
+			if( !( CreateWidgetAsync( GetGlobalTVSlot(), channels[ i ].ChannelWidget(), , spawnData ) ) )
+			{
+				m_globalTVchanellsSpawned += 1;
+			}
+		}
+		if( IsGlobalTVInitialized() )
+		{
+			Refresh( GetOwner().GetDeviceState() );
+		}
+	}
+
+	private function GetGlobalTVSlot() : weak< inkWidget >
+	{
+		if( m_globalTVslot != NULL )
+		{
+			return m_globalTVslot;
+		}
+		else
+		{
+			return GetRootWidget();
+		}
+	}
+
+	protected event OnGLobalChannelSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var spawnData : AsyncSpawnData;
+		var tvWidgetData : TvChannelSpawnData;
+		spawnData = ( ( AsyncSpawnData )( userData ) );
+		if( spawnData )
+		{
+			tvWidgetData = ( ( TvChannelSpawnData )spawnData.m_widgetData );
+		}
+		if( widget )
+		{
+			m_globalTVchanellsSpawned += 1;
+			widget.SetAnchor( inkEAnchor.Fill );
+			widget.SetVisible( false );
+			if( tvWidgetData )
+			{
+				widget.SetName( tvWidgetData.m_channelName );
+			}
+			m_globalTVChannels.PushBack( widget );
+		}
+		if( IsGlobalTVInitialized() )
+		{
+			Refresh( GetOwner().GetDeviceState() );
+		}
+	}
+
+	private function HideAllGlobalTVChannels()
+	{
+		var i : Int32;
+		for( i = 0; i < m_globalTVChannels.Size(); i += 1 )
+		{
+			m_globalTVChannels[ i ].SetVisible( false );
+		}
+		if( IsNameValid( m_activeAudio ) )
+		{
+			GameObject.StopSound( GetOwner(), m_activeAudio );
+		}
+	}
+
+	private function ShowGlobalTVChannel( channelID : TweakDBID ) : Bool
+	{
+		var i : Int32;
+		var channelRecord : weak< ChannelData_Record >;
+		var audioEvent : CName;
+		var realChannelID : Int32;
+		channelRecord = TweakDBInterface.GetChannelDataRecord( channelID );
+		if( channelRecord )
+		{
+			realChannelID = channelRecord.OrderID();
+			for( i = 0; i < m_globalTVChannels.Size(); i += 1 )
+			{
+				if( m_globalTVChannels[ i ].GetName() == channelRecord.ChannelWidget() )
+				{
+					audioEvent = channelRecord.AudioEvent();
+					m_globalTVChannels[ i ].SetVisible( true );
+					RegisterTvChannel( realChannelID );
+					GameObject.PlaySound( GetOwner(), audioEvent );
+					m_activeAudio = audioEvent;
+					SetChannellText( "" );
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private function HideGlobalTVChannel( channelID : TweakDBID )
+	{
+		var i : Int32;
+		var channelRecord : weak< ChannelData_Record >;
+		var audioEvent : CName;
+		channelRecord = TweakDBInterface.GetChannelDataRecord( channelID );
+		if( channelRecord )
+		{
+			for( i = 0; i < m_globalTVChannels.Size(); i += 1 )
+			{
+				if( m_globalTVChannels[ i ].GetName() == channelRecord.ChannelWidget() )
+				{
+					audioEvent = channelRecord.AudioEvent();
+					GameObject.StopSound( GetOwner(), audioEvent );
+					m_activeAudio = '';
+					m_globalTVChannels[ i ].SetVisible( false );
+					SetChannellText( "" );
+				}
+			}
+		}
+	}
+
+	private function IsGlobalTVChannel( channel : STvChannel ) : Bool
+	{
+		return TDBID.IsValid( channel.channelTweakID );
+	}
+
+	protected virtual function ResolveMessegeRecord( record : weak< ScreenMessageData_Record > )
+	{
+		var fontPath : String;
+		var fontstyle : CName;
+		var verticalAlignment : CName;
+		var horizontalAlignment : CName;
+		if( record != NULL )
+		{
+			fontPath = record.FontPath();
+			fontstyle = record.FontStyle();
+			verticalAlignment = record.TextVerticalAlignment();
+			horizontalAlignment = record.TextHorizontalAlignment();
+			if( IsStringValid( fontPath ) )
+			{
+				m_messegeWidget.SetFontFamily( fontPath, fontstyle );
+			}
+			else if( IsNameValid( fontstyle ) )
+			{
+				m_messegeWidget.SetFontStyle( fontstyle );
+			}
+			if( IsNameValid( verticalAlignment ) )
+			{
+				m_messegeWidget.SetVerticalAlignment( m_messegeWidget.GetVerticalAlignmentEnumValue( verticalAlignment ) );
+			}
+			if( IsNameValid( horizontalAlignment ) )
+			{
+				m_messegeWidget.SetHorizontalAlignment( m_messegeWidget.GetHorizontalAlignmentEnumValue( horizontalAlignment ) );
+			}
+			m_messegeWidget.UpdateMargin( record.LeftMargin(), record.TopMargin(), record.RightMargin(), record.BottomMargin() );
+			m_messegeWidget.EnableAutoScroll( record.AutoScroll() );
+			m_messegeWidget.SetFontSize( record.FontSize() );
+			m_messegeWidget.SetLocalizedTextScript( record.LocalizedDescription() );
+			m_messegeWidget.SetTintColor( GetColorFromArray( record.TextColor() ) );
+			m_messegeWidget.SetScrollTextSpeed( record.ScrollSpeed() );
+			m_backgroundWidget.SetTintColor( GetColorFromArray( record.BackgroundColor() ) );
+			m_backgroundWidget.SetOpacity( record.BackgroundOpacity() );
+			SetBackgroundTexture( ( ( inkImage )( m_backgroundWidget ) ), record.BackgroundTextureID() );
+			m_activeMessage = record;
+		}
+		else
+		{
+			m_activeMessage = NULL;
+			m_messegeWidget.SetText( "" );
+			m_backgroundWidget.SetOpacity( 0.0 );
+		}
+	}
+
+	private function GetColorFromArray( colorArray : array< Int32 > ) : Color
+	{
+		var i : Int32;
+		var color : Color;
+		for( i = 0; i < colorArray.Size(); i += 1 )
+		{
+			if( i == 0 )
+			{
+				color.Red = ( ( Uint8 )( colorArray[ i ] ) );
+			}
+			else if( i == 1 )
+			{
+				color.Green = ( ( Uint8 )( colorArray[ i ] ) );
+			}
+			else if( i == 2 )
+			{
+				color.Blue = ( ( Uint8 )( colorArray[ i ] ) );
+			}
+			else if( i == 3 )
+			{
+				color.Alpha = ( ( Uint8 )( colorArray[ i ] ) );
+			}
+		}
+		return color;
+	}
+
+	private const function GetMessageRecord( messageID : TweakDBID ) : ScreenMessageData_Record
+	{
+		var messageRecord : weak< ScreenMessageData_Record >;
+		var groupRecord : weak< ScreenMessagesList_Record >;
+		var count : Int32;
+		var rand : Int32;
+		if( !( TDBID.IsValid( messageID ) ) )
+		{
+			return NULL;
+		}
+		messageRecord = TweakDBInterface.GetScreenMessageDataRecord( messageID );
+		if( messageRecord != NULL )
+		{
+			groupRecord = messageRecord.MessageGroup();
+			if( groupRecord != NULL )
+			{
+				count = groupRecord.GetMessagesCount();
+				if( count > 0 )
+				{
+					rand = RandRange( 0, count );
+					messageRecord = groupRecord.GetMessagesItem( rand );
+				}
+			}
+		}
+		return messageRecord;
+	}
+
+	private function SetBackgroundTexture( imageWidget : weak< inkImage >, textureID : TweakDBID )
+	{
+		if( ( imageWidget != NULL ) && TDBID.IsValid( textureID ) )
+		{
+			InkImageUtils.RequestSetImage( this, imageWidget, textureID );
+		}
+	}
+
+	private function SetBackgroundTexture( imageWidget : weak< inkImage >, textureRecord : weak< UIIcon_Record > )
+	{
+		if( ( imageWidget != NULL ) && ( textureRecord != NULL ) )
+		{
+			imageWidget.SetAtlasResource( textureRecord.AtlasResourcePath() );
+			imageWidget.SetTexturePart( textureRecord.AtlasPartName() );
+		}
+	}
+
+	private function SetBackgroundTexture( imageWidgetRef : inkImageRef, textureRecord : weak< UIIcon_Record > )
+	{
+		if( inkImageRef.IsValid( imageWidgetRef ) && ( textureRecord != NULL ) )
+		{
+			inkImageRef.SetAtlasResource( imageWidgetRef, textureRecord.AtlasResourcePath() );
+			inkImageRef.SetTexturePart( imageWidgetRef, textureRecord.AtlasPartName() );
+		}
+	}
+
+	protected event OnMessageTextureCallback( e : iconAtlasCallbackData )
+	{
+		switch( e.loadResult )
+		{
+			case inkIconResult.Success:
+				Log( "TEST SUCCESS" );
+			break;
+			case inkIconResult.AtlasResourceNotFound:
+				Log( "TEST FAIL" );
+			break;
+			case inkIconResult.UnknownIconTweak:
+				Log( "TEST FAIL" );
+			break;
+			case inkIconResult.PartNotFoundInAtlas:
+				Log( "TEST FAIL" );
+			break;
+		}
+	}
+
+}
+

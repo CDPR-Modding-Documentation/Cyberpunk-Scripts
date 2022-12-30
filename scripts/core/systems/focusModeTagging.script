@@ -1,0 +1,415 @@
+class TagObjectEvent extends Event
+{
+	editable var isTagged : Bool;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Tag Object";
+	}
+
+}
+
+class RegisterInputListenerRequest extends ScriptableSystemRequest
+{
+	var object : weak< GameObject >;
+}
+
+class UnRegisterInputListenerRequest extends ScriptableSystemRequest
+{
+	var object : weak< GameObject >;
+}
+
+importonly class TagObjectRequest extends ScriptableSystemRequest
+{
+	import var object : weak< GameObject >;
+}
+
+importonly class UnTagObjectRequest extends ScriptableSystemRequest
+{
+	import var object : weak< GameObject >;
+}
+
+class UnTagAllObjectRequest extends ScriptableSystemRequest
+{
+}
+
+class FocusModeTaggingSystem extends ScriptableSystem
+{
+	private var m_playerAttachedCallbackID : Uint32;
+	private var m_playerDetachedCallbackID : Uint32;
+
+	private export override function OnAttach()
+	{
+		RegisterPlayerAttachedCallback();
+		RegisterPlayerDetachedCallback();
+	}
+
+	private export override function OnDetach()
+	{
+		UnregisterPlayerAttachedCallback();
+		UnregisterPlayerDetachedCallback();
+	}
+
+	protected function RegisterPlayerAttachedCallback()
+	{
+		if( m_playerAttachedCallbackID == ( ( Uint32 )( 0 ) ) )
+		{
+			m_playerAttachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetAttachedCallback( this, 'OnPlayerAttachedCallback' );
+		}
+	}
+
+	protected function UnregisterPlayerAttachedCallback()
+	{
+		if( m_playerAttachedCallbackID > ( ( Uint32 )( 0 ) ) )
+		{
+			GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetAttachedCallback( m_playerAttachedCallbackID );
+			m_playerAttachedCallbackID = ( ( Uint32 )( 0 ) );
+		}
+	}
+
+	protected function RegisterPlayerDetachedCallback()
+	{
+		if( m_playerDetachedCallbackID == ( ( Uint32 )( 0 ) ) )
+		{
+			m_playerDetachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetDetachedCallback( this, 'OnPlayerDetachedCallback' );
+		}
+	}
+
+	protected function UnregisterPlayerDetachedCallback()
+	{
+		if( m_playerDetachedCallbackID > ( ( Uint32 )( 0 ) ) )
+		{
+			GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetDetachedCallback( m_playerDetachedCallbackID );
+			m_playerDetachedCallbackID = ( ( Uint32 )( 0 ) );
+		}
+	}
+
+	private export function OnPlayerAttachedCallback( playerPuppet : GameObject )
+	{
+		Register( playerPuppet );
+	}
+
+	private export function OnPlayerDetachedCallback( playerPuppet : GameObject )
+	{
+		Unregister( playerPuppet );
+	}
+
+	protected function GetPlayerStateMachineBlackboard( playerPuppet : weak< GameObject > ) : IBlackboard
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return blackboard;
+	}
+
+	private function GetScannerTargetID() : EntityID
+	{
+		var blackBoard : IBlackboard;
+		var entityID : EntityID;
+		if( GameInstance.GetRuntimeInfo( GetGameInstance() ).IsMultiplayer() )
+		{
+			return entityID;
+		}
+		blackBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		entityID = blackBoard.GetEntityID( GetAllBlackboardDefs().UI_Scanner.ScannedObject );
+		return entityID;
+	}
+
+	private const function GetNetworkSystem() : NetworkSystem
+	{
+		return ( ( NetworkSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'NetworkSystem' ) ) );
+	}
+
+	private const function GetHudManager() : HUDManager
+	{
+		return ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'HUDManager' ) ) );
+	}
+
+	public const function RequestUntagAll()
+	{
+		var request : UnTagAllObjectRequest;
+		request = new UnTagAllObjectRequest;
+		QueueRequest( request );
+	}
+
+	private function Register( source : GameObject )
+	{
+		source.RegisterInputListenerWithOwner( this, 'TagButton' );
+	}
+
+	private function Unregister( source : GameObject )
+	{
+		source.UnregisterInputListener( this );
+	}
+
+	private function TagObject( target : GameObject )
+	{
+		if( !( CanTag() ) || !( target.CanBeTagged() ) )
+		{
+			return;
+		}
+		GameInstance.GetVisionModeSystem( GetGameInstance() ).GetScanningController().TagObject( target );
+		SendForceRevealObjectEvent( true, target );
+		RefreshUI( target );
+		NotifyHudManager( true, target );
+		RegisterObjectToBlackboard( target );
+	}
+
+	private function UntagObject( target : GameObject )
+	{
+		GameInstance.GetVisionModeSystem( GetGameInstance() ).GetScanningController().UntagObject( target );
+		SendForceRevealObjectEvent( false, target );
+		RefreshUI( target );
+		NotifyNetworkSystem();
+		NotifyHudManager( false, target );
+		UnRegisterObjectToBlackboard( target );
+	}
+
+	private function UntagAll()
+	{
+		var i : Int32;
+		var listOfObjects : array< weak< GameObject > >;
+		var object : weak< GameObject >;
+		listOfObjects = GetTaggedObjectsList();
+		GameInstance.GetVisionModeSystem( GetGameInstance() ).GetScanningController().UntagAll();
+		UnRegisterAllObjectToBlackboard();
+		for( i = 0; i < listOfObjects.Size(); i += 1 )
+		{
+			object = listOfObjects[ i ];
+			if( !( object ) )
+			{
+				continue;
+			}
+			SendForceRevealObjectEvent( false, object );
+			RefreshUI( object );
+			NotifyNetworkSystem();
+			NotifyHudManager( false, object );
+		}
+	}
+
+	private function ResolveFocusClues( tag : Bool, target : GameObject )
+	{
+		var clueIndex : Int32;
+		var linkedClueData : LinkedFocusClueData;
+		var clueRequest : TagLinkedCluekRequest;
+		clueIndex = target.GetAvailableClueIndex();
+		if( clueIndex >= 0 )
+		{
+			linkedClueData = target.GetLinkedClueData( clueIndex );
+			if( IsNameValid( linkedClueData.clueGroupID ) )
+			{
+				clueRequest = new TagLinkedCluekRequest;
+				clueRequest.tag = tag;
+				clueRequest.linkedCluekData = linkedClueData;
+				target.GetFocusClueSystem().QueueRequest( clueRequest );
+			}
+		}
+	}
+
+	private function SendForceRevealObjectEvent( reveal : Bool, target : GameObject )
+	{
+		var evt : RevealObjectEvent;
+		evt = new RevealObjectEvent;
+		evt.reveal = reveal;
+		evt.reason.reason = 'tag';
+		target.QueueEvent( evt );
+	}
+
+	private function SendForceVisionApperaceEvent( enable : Bool, target : GameObject, highlightType : EFocusForcedHighlightType )
+	{
+		var evt : ForceVisionApperanceEvent;
+		var highlight : FocusForcedHighlightData;
+		evt = new ForceVisionApperanceEvent;
+		highlight = new FocusForcedHighlightData;
+		highlight.sourceID = target.GetEntityID();
+		highlight.sourceName = GetClassName();
+		highlight.highlightType = highlightType;
+		highlight.priority = EPriority.Absolute;
+		evt.forcedHighlight = highlight;
+		evt.apply = enable;
+		target.QueueEvent( evt );
+	}
+
+	private const function IsTagged( target : GameObject ) : Bool
+	{
+		if( target != NULL )
+		{
+			return GameInstance.GetVisionModeSystem( GetGameInstance() ).GetScanningController().IsTagged( target );
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function IsPlayerAiming( playerPuppet : weak< GameObject > ) : Bool
+	{
+		return GetPlayerStateMachineBlackboard( playerPuppet ).GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody ) == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) );
+	}
+
+	private function IsPlayerInFocusMode( playerPuppet : weak< GameObject > ) : Bool
+	{
+		return GetPlayerStateMachineBlackboard( playerPuppet ).GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vision ) == ( ( Int32 )( gamePSMVision.Focus ) );
+	}
+
+	public const function CanTag() : Bool
+	{
+		var statValue : Float;
+		var canScan : Bool;
+		var player : GameObject;
+		player = GetPlayer( GetGameInstance() );
+		statValue = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( player.GetEntityID(), gamedataStatType.HasCybereye );
+		canScan = !( StatusEffectSystem.ObjectHasStatusEffect( player, T"GameplayRestriction.NoScanning" ) );
+		return ( statValue > 0.0 ) && canScan;
+	}
+
+	protected event OnActionWithOwner( action : ListenerAction, consumer : ListenerActionConsumer, owner : weak< GameObject > )
+	{
+		var target : GameObject;
+		var isTaggable : Bool;
+		if( owner && IsPlayerInFocusMode( owner ) )
+		{
+			if( ListenerAction.GetName( action ) == 'TagButton' && ListenerAction.IsButtonJustPressed( action ) )
+			{
+				if( GameInstance.GetRuntimeInfo( owner.GetGame() ).IsMultiplayer() && GameInstance.GetRuntimeInfo( owner.GetGame() ).IsClient() )
+				{
+					return false;
+				}
+				isTaggable = true;
+				target = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), GetScannerTargetID() ) ) );
+				if( !( target ) )
+				{
+					target = GameInstance.GetTargetingSystem( GetGameInstance() ).GetLookAtObject( owner, true, true );
+				}
+				if( !( target ) )
+				{
+					target = GameInstance.GetTargetingSystem( GetGameInstance() ).GetLookAtObject( owner, false );
+					isTaggable = ( ( target ) ? ( target.IsObjectRevealed() ) : ( false ) );
+				}
+				if( target )
+				{
+					if( !( IsTagged( target ) ) )
+					{
+						if( isTaggable )
+						{
+							TagObject( target );
+							ResolveFocusClues( true, target );
+						}
+					}
+					else
+					{
+						UntagObject( target );
+						ResolveFocusClues( false, target );
+					}
+				}
+			}
+		}
+	}
+
+	private function OnTagObjectRequest( request : TagObjectRequest )
+	{
+		TagObject( request.object );
+	}
+
+	private export function OnUnTagObjectRequest( request : UnTagObjectRequest )
+	{
+		UntagObject( request.object );
+	}
+
+	private function OnUnTagAllObjectRequest( request : UnTagAllObjectRequest )
+	{
+		UntagAll();
+	}
+
+	private function OnRegisterInputListenerRequest( request : RegisterInputListenerRequest )
+	{
+		Register( request.object );
+	}
+
+	private function OnUnRegisterInputListenerRequest( request : UnRegisterInputListenerRequest )
+	{
+		Unregister( request.object );
+	}
+
+	private function NotifyNetworkSystem()
+	{
+		var updateNetworkRequest : UpdateNetworkVisualisationRequest;
+		var playerPuppet : GameObject;
+		playerPuppet = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( IsPlayerInFocusMode( playerPuppet ) )
+		{
+			updateNetworkRequest = new UpdateNetworkVisualisationRequest;
+			GetNetworkSystem().QueueRequest( updateNetworkRequest );
+		}
+	}
+
+	private function NotifyHudManager( isTagged : Bool, target : GameObject )
+	{
+		var request : TagStatusNotification;
+		request = new TagStatusNotification;
+		request.isTagged = isTagged;
+		request.ownerID = target.GetEntityID();
+		GetHudManager().QueueRequest( request );
+	}
+
+	private function RefreshUI( target : GameObject )
+	{
+		var uiBlackboard : IBlackboard;
+		uiBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_Scanner.LastTaggedTarget, ( ( weak< weak< GameObject > > )( target ) ), true );
+	}
+
+	private function RegisterObjectToBlackboard( target : GameObject )
+	{
+		var BBoard : IBlackboard;
+		var listOfObjects : array< weak< GameObject > >;
+		BBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().TaggedObjectsList );
+		listOfObjects = ( ( array< weak< GameObject > > )( BBoard.GetVariant( GetAllBlackboardDefs().TaggedObjectsList.taggedObjectsList ) ) );
+		CleanupTaggedObjects( listOfObjects );
+		listOfObjects.Insert( 0, target );
+		BBoard.SetVariant( GetAllBlackboardDefs().TaggedObjectsList.taggedObjectsList, listOfObjects );
+	}
+
+	private function UnRegisterObjectToBlackboard( target : GameObject )
+	{
+		var listOfObjects : array< weak< GameObject > >;
+		listOfObjects = GetTaggedObjectsList();
+		listOfObjects.Remove( target );
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().TaggedObjectsList ).SetVariant( GetAllBlackboardDefs().TaggedObjectsList.taggedObjectsList, listOfObjects );
+	}
+
+	private function UnRegisterAllObjectToBlackboard()
+	{
+		var listOfObjects : array< weak< GameObject > >;
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().TaggedObjectsList ).SetVariant( GetAllBlackboardDefs().TaggedObjectsList.taggedObjectsList, listOfObjects );
+	}
+
+	private function GetTaggedObjectsList() : array< weak< GameObject > >
+	{
+		var BBoard : IBlackboard;
+		var listOfObjects : array< weak< GameObject > >;
+		var listOfObjectsVariant : Variant;
+		BBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().TaggedObjectsList );
+		listOfObjectsVariant = BBoard.GetVariant( GetAllBlackboardDefs().TaggedObjectsList.taggedObjectsList );
+		if( listOfObjectsVariant.IsValid() )
+		{
+			listOfObjects = ( ( array< weak< GameObject > > )listOfObjectsVariant );
+		}
+		CleanupTaggedObjects( listOfObjects );
+		return listOfObjects;
+	}
+
+	private const function CleanupTaggedObjects( out listToClean : array< weak< GameObject > > )
+	{
+		var i : Int32;
+		i = listToClean.Size() - 1;
+		for( i; i >= 0; i -= 1 )
+		{
+			if( listToClean[ i ] == NULL )
+			{
+				listToClean.Erase( i );
+			}
+		}
+	}
+
+}
+

@@ -1,0 +1,1840 @@
+abstract class TweakAIActionAbstract extends AIbehaviortaskScript
+{
+	private var m_actionRecord : weak< AIAction_Record >;
+	private var m_actionDebugName : String;
+	private var m_actionActivationTimeStamp : Float;
+	private var m_startActionTimeStamp : Float;
+	protected var m_hasGracefulInterruptionConditions : Bool;
+	protected var m_gracefulInterruptionCheckRandomizedInterval : Float;
+	protected var m_gracefullyInterrupted : Bool;
+	private var m_actionPhase : EAIActionPhase;
+	private var m_phaseRecord : weak< AIActionPhase_Record >;
+	private var m_nextPhaseConditionCount : Int32;
+	private var m_repeatPhaseConditionCount : Int32;
+	private var m_phaseActivationTimeStamp : Float;
+	private var m_phaseConditionSuccessfulCheckTimeStamp : Float;
+	private var m_phaseConditionCheckTimeStamp : Float;
+	private var m_phaseConditionCheckRandomizedInterval : Float;
+	private var m_phaseIteration : Uint32;
+	private var m_phaseDuration : Float;
+	private var m_phaseAnimationDuration : Float;
+	private var m_lookatEvents : array< LookAtAddEvent >;
+	private var m_movePolicy : MovePolicies;
+	private var m_generalSubActionsResults : AIbehaviorUpdateOutcome[ 8 ];
+	private var m_phaseSubActionsResults : AIbehaviorUpdateOutcome[ 8 ];
+	private var m_phaseSubActionsCount : Int32;
+	private var m_generalSubActionsCount : Int32;
+	private var m_repeatPhaseConditionsCount : Int32;
+	private var m_tickForActionDurationOnly : Bool;
+	private var m_tickForActionDurationActivePhase : EAIActionPhase;
+	private var m_hasTicketDeactivationConditions : Bool;
+	private var m_isActionImmediate : Bool;
+	private var m_lookatActivated : Bool;
+	private var m_ticketsCommited : Bool;
+	private var m_ticketsAcknowledged : Bool;
+	private var m_failureStatus : Bool;
+	private var m_animationLoaded : Bool;
+	private var m_initializedAfterActivation : Bool;
+	protected var m_shouldCallGetActionRecordAgain : Bool;
+
+	private final function Initialize( const context : ScriptExecutionContext )
+	{
+		m_actionPhase = EAIActionPhase.Inactive;
+		m_shouldCallGetActionRecordAgain = false;
+		SetUpdateInterval( context, 0.0 );
+		if( !( GetActionRecord( context, m_actionDebugName, m_actionRecord, m_shouldCallGetActionRecordAgain ) ) )
+		{
+			if( !( m_shouldCallGetActionRecordAgain ) )
+			{
+				m_actionRecord = NULL;
+			}
+		}
+		else
+		{
+			ActionUpdateIntervalCheck( context );
+		}
+	}
+
+	private final function ActionUpdateIntervalCheck( const context : ScriptExecutionContext )
+	{
+		var animData : weak< AIActionAnimData_Record >;
+		var phase : AIActionPhase_Record;
+		var endConditions : Bool;
+		m_generalSubActionsCount = 0;
+		m_repeatPhaseConditionsCount = 0;
+		m_tickForActionDurationOnly = false;
+		m_hasTicketDeactivationConditions = false;
+		m_isActionImmediate = false;
+		m_tickForActionDurationActivePhase = EAIActionPhase.Inactive;
+		if( IsActionImmediate() )
+		{
+			m_isActionImmediate = true;
+			return;
+		}
+		if( HasTicketDeactivationCondition( context ) )
+		{
+			m_hasTicketDeactivationConditions = true;
+		}
+		m_generalSubActionsCount = m_actionRecord.GetSubActionsCount();
+		if( m_generalSubActionsCount > 0 )
+		{
+			return;
+		}
+		if( m_actionRecord.GetStartupSubActionsCount() > 0 )
+		{
+			return;
+		}
+		if( m_actionRecord.GetLoopSubActionsCount() > 0 )
+		{
+			return;
+		}
+		if( m_actionRecord.GetRecoverySubActionsCount() > 0 )
+		{
+			return;
+		}
+		phase = m_actionRecord.Startup();
+		if( phase )
+		{
+			if( phase.GetToNextPhaseConditionCount() > 0 )
+			{
+				endConditions = true;
+			}
+			if( phase.GetNotRepeatPhaseConditionCount() > 0 )
+			{
+				m_repeatPhaseConditionsCount += 1;
+			}
+		}
+		phase = m_actionRecord.Loop();
+		if( phase )
+		{
+			if( phase.GetToNextPhaseConditionCount() > 0 )
+			{
+				endConditions = true;
+			}
+			if( phase.GetNotRepeatPhaseConditionCount() > 0 )
+			{
+				m_repeatPhaseConditionsCount += 1;
+			}
+		}
+		phase = m_actionRecord.Recovery();
+		if( phase )
+		{
+			if( phase.GetToNextPhaseConditionCount() > 0 )
+			{
+				endConditions = true;
+			}
+			if( phase.GetNotRepeatPhaseConditionCount() > 0 )
+			{
+				m_repeatPhaseConditionsCount += 1;
+			}
+		}
+		if( endConditions )
+		{
+			return;
+		}
+		if( m_hasTicketDeactivationConditions )
+		{
+			return;
+		}
+		if( m_hasGracefulInterruptionConditions )
+		{
+			return;
+		}
+		if( GetTotalActionDuration() > 0.0 )
+		{
+			m_tickForActionDurationOnly = true;
+			return;
+		}
+		animData = m_actionRecord.AnimData();
+		if( animData && IsNameValid( animData.AnimFeature() ) )
+		{
+			m_tickForActionDurationOnly = true;
+		}
+	}
+
+	protected final function VerifyActionRecord() : Bool
+	{
+		if( ( m_actionRecord != NULL ) || m_shouldCallGetActionRecordAgain )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	[ profile = "" ]
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		Initialize( context );
+		m_initializedAfterActivation = false;
+		m_ticketsAcknowledged = false;
+		m_animationLoaded = false;
+		m_ticketsCommited = false;
+		m_failureStatus = false;
+		m_lookatActivated = false;
+		if( m_actionRecord )
+		{
+			ActivateAnimationWrapperOverrides( context );
+		}
+	}
+
+	protected function RetryGetActionRecord( context : ScriptExecutionContext ) : Bool
+	{
+		if( m_shouldCallGetActionRecordAgain )
+		{
+			m_shouldCallGetActionRecordAgain = false;
+			if( GetActionRecord( context, m_actionDebugName, m_actionRecord, m_shouldCallGetActionRecordAgain ) )
+			{
+				ActionUpdateIntervalCheck( context );
+				if( m_shouldCallGetActionRecordAgain )
+				{
+					Log( "Not desired code path. GetActionRecord returned true, but it wants to be called again. There is something wrong." );
+					m_shouldCallGetActionRecordAgain = false;
+					return true;
+				}
+				else
+				{
+					return true;
+				}
+			}
+			else
+			{
+				if( m_shouldCallGetActionRecordAgain )
+				{
+					GetAIComponent( context ).ForceTickNextFrame();
+					return false;
+				}
+				else
+				{
+					m_actionRecord = NULL;
+					return false;
+				}
+			}
+		}
+		else
+		{
+			return true;
+		}
+	}
+
+	private function WaitForAnimToLoad( const context : ScriptExecutionContext ) : Bool
+	{
+		var animData : AIActionAnimData_Record;
+		var variationSubAction : AISubAction_Record;
+		var animFeatureName : CName;
+		var animVariation : Int32;
+		var phaseToCheck : Int32;
+		animData = m_actionRecord.AnimData();
+		if( !( animData ) )
+		{
+			return false;
+		}
+		if( !( animData.AnimSlot() ) )
+		{
+			return false;
+		}
+		animFeatureName = animData.AnimFeature();
+		if( !( IsNameValid( animFeatureName ) ) )
+		{
+			return false;
+		}
+		phaseToCheck = 0;
+		if( m_actionRecord.Startup() )
+		{
+			phaseToCheck = 1;
+		}
+		else if( m_actionRecord.Loop() )
+		{
+			phaseToCheck = 2;
+		}
+		else if( m_actionRecord.Recovery() )
+		{
+			phaseToCheck = 3;
+		}
+		if( animData.AnimSlot().UsePoseMatching() )
+		{
+			animVariation = -1;
+		}
+		else
+		{
+			variationSubAction = animData.AnimVariationSubAction();
+			if( variationSubAction )
+			{
+				animVariation = AIScriptUtils.CallGetAnimVariation( context, variationSubAction );
+			}
+			else
+			{
+				animVariation = animData.AnimVariation();
+			}
+		}
+		if( AIScriptUtils.CheckAnimation( context, animFeatureName, animVariation, phaseToCheck, true ) )
+		{
+			m_animationLoaded = true;
+			return false;
+		}
+		return true;
+	}
+
+	[ profile = "" ]
+	protected export override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var subActionsOutcome : AIbehaviorUpdateOutcome;
+		var squadInterface : PuppetSquadInterface;
+		var phaseChanged : Bool;
+		if( !( RetryGetActionRecord( context ) ) )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		if( !( m_actionRecord ) )
+		{
+			m_actionDebugName = "No Action Record Selected";
+			m_actionRecord = NULL;
+			LogAIError( "No Action found with ID: " + m_actionDebugName );
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( !( m_lookatActivated ) )
+		{
+			DeactivateLookat( context );
+			if( m_actionRecord.GetLookatsCount() > 0 )
+			{
+				ActivateLookat( context );
+			}
+			m_lookatActivated = true;
+		}
+		if( ( !( m_animationLoaded ) && m_actionRecord.WaitForAnimationToLoad() ) && WaitForAnimToLoad( context ) )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		if( AISquadHelper.GetSquadBaseInterface( ScriptExecutionContext.GetOwner( context ), squadInterface ) )
+		{
+			if( !( m_ticketsCommited ) )
+			{
+				m_actionActivationTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+				m_startActionTimeStamp = 0.0;
+				AIScriptSquad.CommitToTickets( context, m_actionRecord );
+				m_ticketsCommited = true;
+			}
+			if( !( m_ticketsAcknowledged ) )
+			{
+				if( AIScriptSquad.WaitForTicketsAcknowledgement( context, m_actionRecord ) )
+				{
+					if( ( m_actionRecord.TicketAcknowledgeTimeout() > 0.0 ) && ( GetActionDuration( context ) > m_actionRecord.TicketAcknowledgeTimeout() ) )
+					{
+						m_failureStatus = true;
+						return AIbehaviorUpdateOutcome.FAILURE;
+					}
+					return AIbehaviorUpdateOutcome.IN_PROGRESS;
+				}
+				m_ticketsAcknowledged = true;
+			}
+		}
+		if( !( m_initializedAfterActivation ) )
+		{
+			m_actionActivationTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+			m_startActionTimeStamp = 0.0;
+			ActivateGeneralSubActions( context );
+			ChangeToNextPhase( context );
+			TrackCommands( context, false );
+			if( m_actionRecord.AnimData() )
+			{
+				ActivateAnimData( context );
+			}
+			m_initializedAfterActivation = true;
+		}
+		StartActionTimeStamp( context );
+		if( UpdateActivePhase( context, subActionsOutcome, phaseChanged ) )
+		{
+			switch( subActionsOutcome )
+			{
+				case AIbehaviorUpdateOutcome.FAILURE:
+					m_failureStatus = true;
+				return AIbehaviorUpdateOutcome.FAILURE;
+				case AIbehaviorUpdateOutcome.SUCCESS:
+					if( !( phaseChanged ) )
+					{
+						ReactOnAllPhaseSubActionsCompleted( context );
+					}
+				return AIbehaviorUpdateOutcome.IN_PROGRESS;
+				default:
+					return AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+		}
+		if( m_failureStatus )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( m_actionRecord.CompleteWithFailure() )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		return AIbehaviorUpdateOutcome.SUCCESS;
+	}
+
+	protected export override function Deactivate( context : ScriptExecutionContext )
+	{
+		if( !( ChangePhaseTo( context, EAIActionPhase.Inactive ) ) )
+		{
+			SetUpdateInterval( context, 0.0 );
+		}
+		DeactivateGeneralSubActions( context, GetActionDuration( context ) );
+		DeactivateLookat( context );
+		TrackCommands( context, true );
+		if( m_actionRecord )
+		{
+			DeactivateAnimationWrapperOverrides( context );
+			if( m_actionRecord.AnimData() )
+			{
+				DeactivateAnimData( context );
+			}
+			StartCooldowns( context );
+			if( m_actionRecord.AnimData() && m_actionRecord.AnimData().AnimVariationSubAction() )
+			{
+				TweakAISubAction.Deactivate( context, m_actionRecord.AnimData().AnimVariationSubAction(), GetActionDuration( context ), false );
+			}
+			AIScriptSquad.CompleteTickets( context, m_actionRecord, !( m_failureStatus ) );
+			AIScriptSquad.CloseTickets( context, m_actionRecord );
+			if( !( IsFinal() ) )
+			{
+				ScriptExecutionContext.GetTweakActionSystem( context ).Debug_OnActionEnded( context, m_actionRecord.GetID() );
+			}
+		}
+		m_initializedAfterActivation = false;
+	}
+
+	protected export override function ChildCompleted( context : ScriptExecutionContext, status : AIbehaviorCompletionStatus )
+	{
+		if( status == AIbehaviorCompletionStatus.FAILURE )
+		{
+			m_failureStatus = true;
+		}
+	}
+
+	private final function GetActionDuration( const context : ScriptExecutionContext ) : Float
+	{
+		if( m_startActionTimeStamp == 0.0 )
+		{
+			return EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) - m_actionActivationTimeStamp;
+		}
+		return EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) - m_startActionTimeStamp;
+	}
+
+	private final function GetTotalActionDuration() : Float
+	{
+		var startup : Float;
+		var loop : Float;
+		var recovery : Float;
+		startup = m_actionRecord.Startup().Duration();
+		loop = m_actionRecord.Loop().Duration();
+		recovery = m_actionRecord.Recovery().Duration();
+		if( startup < 0.0 )
+		{
+			startup = 0.0;
+		}
+		if( loop < 0.0 )
+		{
+			loop = 0.0;
+		}
+		if( recovery < 0.0 )
+		{
+			recovery = 0.0;
+		}
+		return ( startup + loop ) + recovery;
+	}
+
+	private final function IsActionImmediate() : Bool
+	{
+		var startup : Float;
+		var loop : Float;
+		var recovery : Float;
+		startup = m_actionRecord.Startup().Duration();
+		loop = m_actionRecord.Loop().Duration();
+		recovery = m_actionRecord.Recovery().Duration();
+		if( startup < 0.0 )
+		{
+			return false;
+		}
+		if( loop < 0.0 )
+		{
+			return false;
+		}
+		if( recovery < 0.0 )
+		{
+			return false;
+		}
+		return ( ( startup + loop ) + recovery ) <= 0.1;
+	}
+
+	private final function StartActionTimeStamp( const context : ScriptExecutionContext )
+	{
+		if( m_startActionTimeStamp == 0.0 )
+		{
+			m_startActionTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		}
+	}
+
+	private final function HasTicketDeactivationCondition( const context : ScriptExecutionContext ) : Bool
+	{
+		var i : Int32;
+		var count : Int32;
+		var baseSquadRecord : weak< AISquadParams_Record >;
+		var squadRecord : AISquadParams_Record;
+		var ticketType : weak< AITicketType_Record >;
+		var ticket : AITicket_Record;
+		count = m_actionRecord.GetTicketsCount();
+		if( count > 0 )
+		{
+			AIScriptSquad.GetBaseSquadRecord( baseSquadRecord );
+			for( i = 0; i < count; i += 1 )
+			{
+				ticketType = m_actionRecord.GetTicketsItem( i );
+				if( AIScriptUtils.GetTicketType( ticketType.EnumName(), GetPuppet( context ), baseSquadRecord, ticket, squadRecord ) )
+				{
+					if( ticket.GetDeactivationConditionCount() > 0 )
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	private final function SetPhaseUpdateInterval( const context : ScriptExecutionContext, subActionsOutcome : AIbehaviorUpdateOutcome, generalSubActionsOutcome : AIbehaviorUpdateOutcome )
+	{
+		var phaseDuration : Float;
+		if( m_actionPhase == EAIActionPhase.Inactive )
+		{
+			return;
+		}
+		if( m_isActionImmediate )
+		{
+			return;
+		}
+		if( m_phaseDuration < 0.0 )
+		{
+			phaseDuration = 999999.0;
+		}
+		else
+		{
+			phaseDuration = m_phaseDuration;
+		}
+		if( m_tickForActionDurationOnly )
+		{
+			SetUpdateInterval( context, phaseDuration );
+			m_tickForActionDurationActivePhase = m_actionPhase;
+			return;
+		}
+		if( ( m_phaseSubActionsCount > 0 ) && subActionsOutcome == AIbehaviorUpdateOutcome.IN_PROGRESS )
+		{
+			return;
+		}
+		if( ( ( m_phaseSubActionsCount == 0 ) && ( m_generalSubActionsCount > 0 ) ) && generalSubActionsOutcome == AIbehaviorUpdateOutcome.IN_PROGRESS )
+		{
+			return;
+		}
+		if( ( ( ( m_nextPhaseConditionCount > 0 ) || m_hasGracefulInterruptionConditions ) || m_hasTicketDeactivationConditions ) && ( m_phaseDuration > 0.0 ) )
+		{
+			return;
+		}
+		if( m_hasGracefulInterruptionConditions && ( m_nextPhaseConditionCount > 0 ) )
+		{
+			if( m_gracefulInterruptionCheckRandomizedInterval < m_phaseConditionCheckRandomizedInterval )
+			{
+				SetUpdateInterval( context, m_gracefulInterruptionCheckRandomizedInterval );
+				return;
+			}
+			else
+			{
+				SetUpdateInterval( context, m_phaseConditionCheckRandomizedInterval );
+				return;
+			}
+		}
+		if( m_nextPhaseConditionCount > 0 )
+		{
+			SetUpdateInterval( context, m_phaseConditionCheckRandomizedInterval );
+			return;
+		}
+		if( m_hasGracefulInterruptionConditions )
+		{
+			SetUpdateInterval( context, m_gracefulInterruptionCheckRandomizedInterval );
+			return;
+		}
+		if( m_hasTicketDeactivationConditions )
+		{
+			SetUpdateInterval( context, RandomizeOffsetForUpdateInterval( 0.40000001 ) );
+			return;
+		}
+		if( ( GetTotalActionDuration() > 0.0 ) && ( GetTotalActionDuration() > GetActionDuration( context ) ) )
+		{
+			SetUpdateInterval( context, phaseDuration - GetPhaseDuration( context ) );
+			return;
+		}
+		SetUpdateInterval( context, phaseDuration );
+	}
+
+	private final function UpdateActivePhase( const context : ScriptExecutionContext, out subActionsOutcome : AIbehaviorUpdateOutcome, out phaseChanged : Bool ) : Bool
+	{
+		var generalSubActionsOutcome : AIbehaviorUpdateOutcome;
+		if( m_actionPhase == EAIActionPhase.Inactive )
+		{
+			return false;
+		}
+		if( !( m_phaseRecord ) )
+		{
+			phaseChanged = ChangeToNextPhase( context );
+			return ( ( m_actionPhase == EAIActionPhase.Inactive ) ? ( false ) : ( true ) );
+		}
+		subActionsOutcome = UpdateSubActions( context, generalSubActionsOutcome );
+		if( m_nextPhaseConditionCount > 0 )
+		{
+			if( ( m_phaseConditionCheckRandomizedInterval <= 0.0 ) || ( ( m_phaseConditionCheckRandomizedInterval > 0.0 ) && ( EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) >= ( m_phaseConditionCheckTimeStamp + m_phaseConditionCheckRandomizedInterval ) ) ) )
+			{
+				if( AICondition.NextPhaseCheck( context, ( ( Uint32 )( m_actionPhase ) ), m_actionRecord ) )
+				{
+					if( ( m_phaseRecord.ConditionSuccessDuration() > 0.0 ) && ( m_phaseConditionSuccessfulCheckTimeStamp < 0.0 ) )
+					{
+						m_phaseConditionSuccessfulCheckTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+					}
+					if( m_phaseRecord && m_phaseRecord.CompleteActionWithFailureOnCondition() )
+					{
+						m_failureStatus = true;
+					}
+					if( ( m_phaseRecord.ConditionSuccessDuration() <= 0.0 ) || ( ( m_phaseRecord.ConditionSuccessDuration() > 0.0 ) && ( EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) >= ( m_phaseConditionSuccessfulCheckTimeStamp + m_phaseRecord.ConditionSuccessDuration() ) ) ) )
+					{
+						phaseChanged = ChangeToNextPhase( context );
+					}
+				}
+				else
+				{
+					m_phaseConditionSuccessfulCheckTimeStamp = -1.0;
+				}
+				m_phaseConditionCheckTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+			}
+		}
+		if( ( m_tickForActionDurationOnly && m_tickForActionDurationActivePhase == m_actionPhase ) || ( ( m_phaseDuration == 0.0 ) || ( ( m_phaseDuration > 0.0 ) && ( GetPhaseDuration( context ) >= m_phaseDuration ) ) ) )
+		{
+			if( !( RepeatPhase( context ) ) )
+			{
+				if( subActionsOutcome == AIbehaviorUpdateOutcome.SUCCESS )
+				{
+					subActionsOutcome = AIbehaviorUpdateOutcome.IN_PROGRESS;
+				}
+				phaseChanged = ChangeToNextPhase( context );
+			}
+		}
+		SetPhaseUpdateInterval( context, subActionsOutcome, generalSubActionsOutcome );
+		return ( ( m_actionPhase == EAIActionPhase.Inactive ) ? ( false ) : ( true ) );
+	}
+
+	private final function UpdateSubActions( const context : ScriptExecutionContext, out generalResult : AIbehaviorUpdateOutcome ) : AIbehaviorUpdateOutcome
+	{
+		var phaseResult : AIbehaviorUpdateOutcome;
+		generalResult = UpdateGeneralSubActions( context, GetActionDuration( context ) );
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				phaseResult = UpdateStartupSubActions( context, GetPhaseDuration( context ), m_phaseSubActionsCount );
+			break;
+			case EAIActionPhase.Loop:
+				phaseResult = UpdateLoopSubActions( context, GetPhaseDuration( context ), m_phaseSubActionsCount );
+			break;
+			case EAIActionPhase.Recovery:
+				phaseResult = UpdateRecoverySubActions( context, GetPhaseDuration( context ), m_phaseSubActionsCount );
+			break;
+			default:
+				break;
+		}
+		if( generalResult == AIbehaviorUpdateOutcome.FAILURE )
+		{
+			return generalResult;
+		}
+		if( ( m_actionRecord.SubActionsCanCompleteAction() && ( m_phaseSubActionsCount == 0 ) ) && generalResult == AIbehaviorUpdateOutcome.SUCCESS )
+		{
+			return generalResult;
+		}
+		return phaseResult;
+	}
+
+	private final function UpdateGeneralSubActions( const context : ScriptExecutionContext, const duration : Float ) : AIbehaviorUpdateOutcome
+	{
+		var i : Int32;
+		var countSuccess : Int32;
+		var countFailure : Int32;
+		var subActionCount : Int32;
+		var subAction : AISubAction_Record;
+		subActionCount = m_actionRecord.GetSubActionsCount();
+		if( subActionCount == 0 )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		for( i = 0; i < subActionCount; i += 1 )
+		{
+			if( m_generalSubActionsResults[ i ] == AIbehaviorUpdateOutcome.IN_PROGRESS )
+			{
+				subAction = m_actionRecord.GetSubActionsItem( i );
+				m_generalSubActionsResults[ i ] = TweakAISubAction.Update( context, subAction, duration );
+			}
+			if( m_generalSubActionsResults[ i ] == AIbehaviorUpdateOutcome.FAILURE )
+			{
+				countFailure += 1;
+			}
+			else if( m_generalSubActionsResults[ i ] == AIbehaviorUpdateOutcome.SUCCESS )
+			{
+				countSuccess += 1;
+			}
+		}
+		if( countFailure > 0 )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		else if( countSuccess >= subActionCount )
+		{
+			return AIbehaviorUpdateOutcome.SUCCESS;
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	private final function UpdateStartupSubActions( const context : ScriptExecutionContext, const duration : Float, subActionCount : Int32 ) : AIbehaviorUpdateOutcome
+	{
+		var i : Int32;
+		var countSuccess : Int32;
+		var countFailure : Int32;
+		var subAction : AISubAction_Record;
+		subActionCount = m_actionRecord.GetStartupSubActionsCount();
+		if( subActionCount == 0 )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		for( i = 0; i < subActionCount; i += 1 )
+		{
+			if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.IN_PROGRESS )
+			{
+				subAction = m_actionRecord.GetStartupSubActionsItem( i );
+				m_phaseSubActionsResults[ i ] = TweakAISubAction.Update( context, subAction, duration );
+			}
+			if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.FAILURE )
+			{
+				countFailure += 1;
+			}
+			else if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.SUCCESS )
+			{
+				countSuccess += 1;
+			}
+		}
+		if( countFailure > 0 )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		else if( countSuccess >= subActionCount )
+		{
+			return AIbehaviorUpdateOutcome.SUCCESS;
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	private final function UpdateLoopSubActions( const context : ScriptExecutionContext, const duration : Float, subActionCount : Int32 ) : AIbehaviorUpdateOutcome
+	{
+		var i : Int32;
+		var countSuccess : Int32;
+		var countFailure : Int32;
+		var subAction : AISubAction_Record;
+		subActionCount = m_actionRecord.GetLoopSubActionsCount();
+		if( subActionCount == 0 )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		for( i = 0; i < subActionCount; i += 1 )
+		{
+			if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.IN_PROGRESS )
+			{
+				subAction = m_actionRecord.GetLoopSubActionsItem( i );
+				m_phaseSubActionsResults[ i ] = TweakAISubAction.Update( context, subAction, duration );
+			}
+			if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.FAILURE )
+			{
+				countFailure += 1;
+			}
+			else if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.SUCCESS )
+			{
+				countSuccess += 1;
+			}
+		}
+		if( countFailure > 0 )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		else if( countSuccess >= subActionCount )
+		{
+			return AIbehaviorUpdateOutcome.SUCCESS;
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	private final function UpdateRecoverySubActions( const context : ScriptExecutionContext, const duration : Float, subActionCount : Int32 ) : AIbehaviorUpdateOutcome
+	{
+		var i : Int32;
+		var countSuccess : Int32;
+		var countFailure : Int32;
+		var subAction : AISubAction_Record;
+		subActionCount = m_actionRecord.GetRecoverySubActionsCount();
+		if( subActionCount == 0 )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		for( i = 0; i < subActionCount; i += 1 )
+		{
+			if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.IN_PROGRESS )
+			{
+				subAction = m_actionRecord.GetRecoverySubActionsItem( i );
+				m_phaseSubActionsResults[ i ] = TweakAISubAction.Update( context, subAction, duration );
+			}
+			if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.FAILURE )
+			{
+				countFailure += 1;
+			}
+			else if( m_phaseSubActionsResults[ i ] == AIbehaviorUpdateOutcome.SUCCESS )
+			{
+				countSuccess += 1;
+			}
+		}
+		if( countFailure > 0 )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		else if( countSuccess >= subActionCount )
+		{
+			return AIbehaviorUpdateOutcome.SUCCESS;
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	protected final function RequestGracefulInterruption( const context : ScriptExecutionContext ) : Bool
+	{
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				if( m_phaseRecord.Duration() < 0.0 )
+				{
+					if( ChangePhaseTo( context, EAIActionPhase.Recovery ) )
+					{
+						if( m_phaseRecord.Duration() < 0.0 )
+						{
+							ChangePhaseTo( context, EAIActionPhase.Inactive );
+						}
+						break;
+					}
+				}
+			return false;
+			case EAIActionPhase.Loop:
+				if( ChangePhaseTo( context, EAIActionPhase.Recovery ) )
+				{
+					if( m_phaseRecord.Duration() < 0.0 )
+					{
+						ChangePhaseTo( context, EAIActionPhase.Inactive );
+					}
+					break;
+				}
+				else
+				{
+					ChangePhaseTo( context, EAIActionPhase.Inactive );
+					break;
+				}
+			case EAIActionPhase.Recovery:
+				if( m_phaseRecord.Duration() < 0.0 )
+				{
+					ChangePhaseTo( context, EAIActionPhase.Inactive );
+				}
+			break;
+			case EAIActionPhase.Inactive:
+				break;
+		}
+		return true;
+	}
+
+	private final function ReactOnAllPhaseSubActionsCompleted( const context : ScriptExecutionContext )
+	{
+		if( m_phaseRecord.Duration() <= 0.0 )
+		{
+			if( !( RepeatPhase( context ) ) )
+			{
+				ChangeToNextPhase( context );
+			}
+		}
+	}
+
+	private final function GetPhaseDuration( const context : ScriptExecutionContext ) : Float
+	{
+		return EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) - m_phaseActivationTimeStamp;
+	}
+
+	private final function CalculatePhaseDuration( const context : ScriptExecutionContext, optional phaseDurationFromAnimSlot : Float )
+	{
+		var animData : AIActionAnimData_Record;
+		var scaledDuration : Float;
+		var allowBlend : Float;
+		var ratio : Float;
+		if( phaseDurationFromAnimSlot > 0.0 )
+		{
+			m_phaseDuration = phaseDurationFromAnimSlot;
+			m_phaseAnimationDuration = phaseDurationFromAnimSlot;
+		}
+		else if( m_phaseRecord )
+		{
+			if( m_phaseRecord.MaxDuration() > m_phaseRecord.Duration() )
+			{
+				m_phaseDuration = MaxF( 0.0, RandRangeF( m_phaseRecord.Duration(), m_phaseRecord.MaxDuration() ) );
+			}
+			else
+			{
+				m_phaseDuration = m_phaseRecord.Duration();
+			}
+			if( m_phaseRecord.AnimationDuration() >= 0.0 )
+			{
+				m_phaseAnimationDuration = m_phaseRecord.AnimationDuration();
+			}
+			else
+			{
+				m_phaseAnimationDuration = m_phaseDuration;
+			}
+		}
+		if( m_phaseDuration <= 0.1 )
+		{
+			return;
+		}
+		animData = m_actionRecord.AnimData();
+		if( !( animData ) || !( IsNameValid( animData.AnimFeature() ) ) )
+		{
+			return;
+		}
+		if( ( m_phaseRecord && m_phaseRecord.DynamicDuration() ) && TweakAISubAction.GetPhaseDuration( context, m_phaseRecord.DynamicDuration(), m_actionPhase, m_phaseDuration, scaledDuration ) )
+		{
+			ratio = scaledDuration / m_phaseDuration;
+			m_phaseDuration = scaledDuration;
+			if( ratio > 0.0 )
+			{
+				m_phaseAnimationDuration *= ratio;
+			}
+		}
+		allowBlend = 0.0;
+		if( m_actionRecord )
+		{
+			allowBlend = GetAllowBlendDuration();
+			if( m_actionRecord.AllowBlendPercCap() >= 0.0 )
+			{
+				allowBlend = MinF( allowBlend, m_actionRecord.AllowBlendPercCap() * m_phaseDuration );
+			}
+		}
+		m_phaseDuration = MaxF( m_phaseDuration - allowBlend, 0.001 );
+	}
+
+	private final function GetAllowBlendDuration() : Float
+	{
+		if( m_actionRecord.AllowBlendDuration() <= 0.0 )
+		{
+			return 0.0;
+		}
+		if( m_actionRecord.Recovery() && ( m_actionRecord.Recovery().Duration() != 0.0 ) )
+		{
+			if( m_actionPhase != EAIActionPhase.Recovery )
+			{
+				return 0.0;
+			}
+		}
+		else if( m_actionRecord.Loop() && ( m_actionRecord.Loop().Duration() != 0.0 ) )
+		{
+			if( m_actionPhase != EAIActionPhase.Loop )
+			{
+				return 0.0;
+			}
+		}
+		else if( m_actionRecord.Startup() && ( m_actionRecord.Startup().Duration() != 0.0 ) )
+		{
+			if( m_actionPhase != EAIActionPhase.Startup )
+			{
+				return 0.0;
+			}
+		}
+		else
+		{
+			return 0.0;
+		}
+		return m_actionRecord.AllowBlendDuration();
+	}
+
+	private final function RepeatPhase( const context : ScriptExecutionContext ) : Bool
+	{
+		m_phaseIteration += ( ( Uint32 )( 1 ) );
+		if( ( m_phaseRecord.Repeat() < 0 ) || ( m_phaseIteration == ( ( Uint32 )( m_phaseRecord.Repeat() ) ) ) )
+		{
+			return false;
+		}
+		if( ( m_repeatPhaseConditionCount > 0 ) && AICondition.RepeatPhaseCheck( context, ( ( Uint32 )( m_actionPhase ) ), m_actionRecord ) )
+		{
+			if( m_phaseRecord.CompleteActionWithFailureOnCondition() )
+			{
+				m_failureStatus = true;
+			}
+			return false;
+		}
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				DeactivateStartupSubActions( context, GetPhaseDuration( context ) );
+			ActivateStartupSubActions( context );
+			break;
+			case EAIActionPhase.Loop:
+				DeactivateLoopSubActions( context, GetPhaseDuration( context ) );
+			ActivateLoopSubActions( context );
+			break;
+			case EAIActionPhase.Recovery:
+				DeactivateRecoverySubActions( context, GetPhaseDuration( context ) );
+			ActivateRecoverySubActions( context );
+			break;
+			case EAIActionPhase.Inactive:
+				break;
+		}
+		CalculatePhaseDuration( context );
+		if( m_actionRecord.AnimData() )
+		{
+			SendAnimData( context );
+		}
+		if( m_phaseRecord.MovePolicy() )
+		{
+			AIActionMovePolicy.Pop( context, m_movePolicy );
+			AIActionMovePolicy.Add( context, m_phaseRecord.MovePolicy(), m_movePolicy );
+		}
+		m_phaseActivationTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		m_phaseConditionSuccessfulCheckTimeStamp = -1.0;
+		return true;
+	}
+
+	private final function ChangeToNextPhase( const context : ScriptExecutionContext ) : Bool
+	{
+		if( m_actionPhase == EAIActionPhase.Inactive )
+		{
+			if( ChangePhaseTo( context, EAIActionPhase.Startup ) )
+			{
+				return true;
+			}
+		}
+		if( m_actionPhase == EAIActionPhase.Startup )
+		{
+			if( ChangePhaseTo( context, EAIActionPhase.Loop ) )
+			{
+				return true;
+			}
+		}
+		if( m_actionPhase == EAIActionPhase.Loop )
+		{
+			if( ChangePhaseTo( context, EAIActionPhase.Recovery ) )
+			{
+				return true;
+			}
+		}
+		if( ChangePhaseTo( context, EAIActionPhase.Inactive ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private final function ChangePhaseTo( const context : ScriptExecutionContext, const newPhase : EAIActionPhase ) : Bool
+	{
+		if( newPhase == m_actionPhase )
+		{
+			return false;
+		}
+		if( !( IsFinal() ) )
+		{
+			if( newPhase == EAIActionPhase.Startup )
+			{
+				ScriptExecutionContext.GetTweakActionSystem( context ).Debug_OnActionStarted( context, m_actionRecord.GetID(), Debug_GetBaseActionId(), Debug_GetCompositeId() );
+			}
+		}
+		if( m_phaseRecord )
+		{
+			OnPhaseEnded( context, GetPhaseDuration( context ) );
+		}
+		m_actionPhase = newPhase;
+		m_phaseActivationTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		m_phaseConditionSuccessfulCheckTimeStamp = -1.0;
+		m_phaseIteration = 0;
+		m_phaseSubActionsCount = 0;
+		m_nextPhaseConditionCount = 0;
+		m_repeatPhaseConditionCount = 0;
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				m_phaseRecord = m_actionRecord.Startup();
+			m_phaseSubActionsCount = m_actionRecord.GetStartupSubActionsCount();
+			if( m_phaseRecord )
+			{
+				m_nextPhaseConditionCount = m_phaseRecord.GetToNextPhaseConditionCount();
+				m_repeatPhaseConditionCount = m_phaseRecord.GetNotRepeatPhaseConditionCount();
+			}
+			break;
+			case EAIActionPhase.Loop:
+				m_phaseRecord = m_actionRecord.Loop();
+			m_phaseSubActionsCount = m_actionRecord.GetLoopSubActionsCount();
+			if( m_phaseRecord )
+			{
+				m_nextPhaseConditionCount = m_phaseRecord.GetToNextPhaseConditionCount();
+				m_repeatPhaseConditionCount = m_phaseRecord.GetNotRepeatPhaseConditionCount();
+			}
+			break;
+			case EAIActionPhase.Recovery:
+				m_phaseRecord = m_actionRecord.Recovery();
+			m_phaseSubActionsCount = m_actionRecord.GetRecoverySubActionsCount();
+			if( m_phaseRecord )
+			{
+				m_nextPhaseConditionCount = m_phaseRecord.GetToNextPhaseConditionCount();
+				m_repeatPhaseConditionCount = m_phaseRecord.GetNotRepeatPhaseConditionCount();
+			}
+			break;
+			default:
+				m_phaseRecord = NULL;
+			break;
+		}
+		m_phaseConditionCheckRandomizedInterval = 0.0;
+		if( ( m_nextPhaseConditionCount > 0 ) && ( m_phaseRecord.ToNextPhaseConditionCheckInterval() > 0.0 ) )
+		{
+			m_phaseConditionCheckRandomizedInterval = RandomizeOffsetForUpdateInterval( m_phaseRecord.ToNextPhaseConditionCheckInterval() );
+		}
+		OnPhaseStarted( context );
+		return m_phaseRecord != NULL;
+	}
+
+	private final function OnPhaseStarted( const context : ScriptExecutionContext )
+	{
+		if( m_phaseRecord )
+		{
+			if( !( IsFinal() ) )
+			{
+				ScriptExecutionContext.GetTweakActionSystem( context ).Debug_OnActionPhaseStarted( context, m_actionRecord.GetID(), ( ( Uint32 )( m_actionPhase ) ) );
+			}
+			switch( m_actionPhase )
+			{
+				case EAIActionPhase.Startup:
+					ActivateStartupSubActions( context );
+				break;
+				case EAIActionPhase.Loop:
+					ActivateLoopSubActions( context );
+				break;
+				case EAIActionPhase.Recovery:
+					ActivateRecoverySubActions( context );
+				break;
+				default:
+					break;
+			}
+		}
+		CalculatePhaseDuration( context );
+		SetUpdateInterval( context, 0.0 );
+		if( m_actionRecord.AnimData() && ( m_phaseRecord || m_actionPhase == EAIActionPhase.Inactive ) )
+		{
+			SendAnimData( context );
+		}
+		if( !( m_phaseRecord ) )
+		{
+			return;
+		}
+		if( m_phaseRecord.ChangeNPCState() )
+		{
+			ChangeNPCState( context );
+		}
+		if( m_phaseRecord.MovePolicy() )
+		{
+			AIActionMovePolicy.Add( context, m_phaseRecord.MovePolicy(), m_movePolicy );
+		}
+	}
+
+	private final function OnPhaseEnded( const context : ScriptExecutionContext, const duration : Float )
+	{
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				DeactivateStartupSubActions( context, duration );
+			if( m_repeatPhaseConditionCount > 0 )
+			{
+				m_repeatPhaseConditionsCount -= 1;
+			}
+			break;
+			case EAIActionPhase.Loop:
+				DeactivateLoopSubActions( context, duration );
+			if( m_repeatPhaseConditionCount > 0 )
+			{
+				m_repeatPhaseConditionsCount -= 1;
+			}
+			break;
+			case EAIActionPhase.Recovery:
+				DeactivateRecoverySubActions( context, duration );
+			if( m_repeatPhaseConditionCount > 0 )
+			{
+				m_repeatPhaseConditionsCount -= 1;
+			}
+			break;
+			default:
+				break;
+		}
+		if( m_phaseRecord.ChangeNPCState() )
+		{
+			ResetNPCState( context );
+		}
+		if( m_movePolicy )
+		{
+			AIActionMovePolicy.Pop( context, m_movePolicy );
+		}
+	}
+
+	private final function ActivateGeneralSubActions( const context : ScriptExecutionContext )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = m_actionRecord.GetSubActionsCount();
+		if( count > m_generalSubActionsResults.Size() )
+		{
+			LogAIError( ( m_actionDebugName + "GeneralSubActions exceeded max size of " ) + m_generalSubActionsResults.Size() );
+			return;
+		}
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetSubActionsItem( i );
+			if( TweakAISubAction.Activate( context, subAction ) )
+			{
+				m_generalSubActionsResults[ i ] = AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+			else
+			{
+				m_generalSubActionsResults[ i ] = AIbehaviorUpdateOutcome.FAILURE;
+				LogAIError( m_actionDebugName + ":::GeneralSubActions:::Trying to activate NULL subaction!!!" );
+			}
+		}
+	}
+
+	private final function ActivateStartupSubActions( const context : ScriptExecutionContext )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = m_actionRecord.GetStartupSubActionsCount();
+		if( count > m_phaseSubActionsResults.Size() )
+		{
+			LogAIError( ( m_actionDebugName + "StartupSubActions exceeded max size of " ) + m_generalSubActionsResults.Size() );
+			return;
+		}
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetStartupSubActionsItem( i );
+			if( TweakAISubAction.Activate( context, subAction ) )
+			{
+				m_phaseSubActionsResults[ i ] = AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+			else
+			{
+				m_phaseSubActionsResults[ i ] = AIbehaviorUpdateOutcome.FAILURE;
+				LogAIError( m_actionDebugName + ":::StartupSubActions:::Trying to activate NULL subaction!!!" );
+			}
+		}
+	}
+
+	private final function ActivateLoopSubActions( const context : ScriptExecutionContext )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = m_actionRecord.GetLoopSubActionsCount();
+		if( count > m_phaseSubActionsResults.Size() )
+		{
+			LogAIError( ( m_actionDebugName + "LoopSubActions exceeded max size of " ) + m_generalSubActionsResults.Size() );
+			return;
+		}
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetLoopSubActionsItem( i );
+			if( TweakAISubAction.Activate( context, subAction ) )
+			{
+				m_phaseSubActionsResults[ i ] = AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+			else
+			{
+				m_phaseSubActionsResults[ i ] = AIbehaviorUpdateOutcome.FAILURE;
+				LogAIError( m_actionDebugName + ":::LoopSubActions:::Trying to activate NULL subaction!!!" );
+			}
+		}
+	}
+
+	private final function ActivateRecoverySubActions( const context : ScriptExecutionContext )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = ( ( m_actionRecord ) ? ( m_actionRecord.GetRecoverySubActionsCount() ) : ( 0 ) );
+		if( count > m_phaseSubActionsResults.Size() )
+		{
+			LogAIError( ( m_actionDebugName + "RecoverySubActions exceeded max size of " ) + m_generalSubActionsResults.Size() );
+			return;
+		}
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetRecoverySubActionsItem( i );
+			if( TweakAISubAction.Activate( context, subAction ) )
+			{
+				m_phaseSubActionsResults[ i ] = AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+			else
+			{
+				m_phaseSubActionsResults[ i ] = AIbehaviorUpdateOutcome.FAILURE;
+				LogAIError( m_actionDebugName + ":::RecoverySubActions:::Trying to activate NULL subaction!!!" );
+			}
+		}
+	}
+
+	private final function DeactivateGeneralSubActions( const context : ScriptExecutionContext, const duration : Float )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = ( ( m_actionRecord ) ? ( m_actionRecord.GetSubActionsCount() ) : ( 0 ) );
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetSubActionsItem( i );
+			TweakAISubAction.Deactivate( context, subAction, duration, m_gracefullyInterrupted );
+		}
+	}
+
+	private final function DeactivateStartupSubActions( const context : ScriptExecutionContext, const duration : Float )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = ( ( m_actionRecord ) ? ( m_actionRecord.GetStartupSubActionsCount() ) : ( 0 ) );
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetStartupSubActionsItem( i );
+			TweakAISubAction.Deactivate( context, subAction, duration, m_gracefullyInterrupted );
+		}
+	}
+
+	private final function DeactivateLoopSubActions( const context : ScriptExecutionContext, const duration : Float )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = ( ( m_actionRecord ) ? ( m_actionRecord.GetLoopSubActionsCount() ) : ( 0 ) );
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetLoopSubActionsItem( i );
+			TweakAISubAction.Deactivate( context, subAction, duration, m_gracefullyInterrupted );
+		}
+	}
+
+	private final function DeactivateRecoverySubActions( const context : ScriptExecutionContext, const duration : Float )
+	{
+		var i : Int32;
+		var count : Int32;
+		var subAction : AISubAction_Record;
+		count = ( ( m_actionRecord ) ? ( m_actionRecord.GetRecoverySubActionsCount() ) : ( 0 ) );
+		for( i = 0; i < count; i += 1 )
+		{
+			subAction = m_actionRecord.GetRecoverySubActionsItem( i );
+			TweakAISubAction.Deactivate( context, subAction, duration, m_gracefullyInterrupted );
+		}
+	}
+
+	private final function ActivateAnimationWrapperOverrides( const context : ScriptExecutionContext )
+	{
+		if( m_actionRecord.GetAnimationWrapperOverridesCount() <= 0 )
+		{
+			return;
+		}
+		SetAnimationWrapperOverrides( context, 1.0 );
+	}
+
+	private final function DeactivateAnimationWrapperOverrides( const context : ScriptExecutionContext )
+	{
+		if( m_actionRecord.GetAnimationWrapperOverridesCount() <= 0 )
+		{
+			return;
+		}
+		SetAnimationWrapperOverrides( context, 0.0 );
+	}
+
+	private final function SetAnimationWrapperOverrides( const context : ScriptExecutionContext, value : Float )
+	{
+		var i : Int32;
+		var wrappers : array< CName >;
+		wrappers = m_actionRecord.AnimationWrapperOverrides();
+		for( i = 0; i < wrappers.Size(); i += 1 )
+		{
+			AnimationControllerComponent.SetAnimWrapperWeight( ScriptExecutionContext.GetOwner( context ), wrappers[ i ], value );
+		}
+	}
+
+	private final function ActivateAnimData( const context : ScriptExecutionContext )
+	{
+		if( m_actionRecord.AnimData().RagdollOnDeath() )
+		{
+			NPCPuppet.ChangeForceRagdollOnDeath( ScriptExecutionContext.GetOwner( context ), true );
+		}
+		if( m_actionRecord.AnimData().WeaponOverride() > 0 )
+		{
+			WeaponOverride( context, m_actionRecord.AnimData().WeaponOverride() );
+		}
+	}
+
+	private final function DeactivateAnimData( const context : ScriptExecutionContext )
+	{
+		if( m_actionRecord.AnimData().RagdollOnDeath() )
+		{
+			NPCPuppet.ChangeForceRagdollOnDeath( ScriptExecutionContext.GetOwner( context ), false );
+		}
+		if( m_actionRecord.AnimData().WeaponOverride() > 0 )
+		{
+			WeaponOverride( context, 0 );
+		}
+		if( m_actionRecord.AnimData().AnimSlot() )
+		{
+			GetPuppet( context ).GetPuppetStateBlackboard().SetBool( GetAllBlackboardDefs().PuppetState.SlotAnimationInProgress, false );
+		}
+	}
+
+	private final function SendAnimData( const context : ScriptExecutionContext )
+	{
+		var items : array< weak< ItemObject > >;
+		var animFeature : AnimFeature_AIAction;
+		var animData : AIActionAnimData_Record;
+		var animFeatureName : CName;
+		var i : Int32;
+		animData = m_actionRecord.AnimData();
+		animFeatureName = animData.AnimFeature();
+		if( !( IsNameValid( animFeatureName ) ) )
+		{
+			return;
+		}
+		animFeature = GetAnimFeature( context );
+		if( animData.AnimSlot() )
+		{
+			PlayAnimationOnSlot( context, animFeature );
+		}
+		else
+		{
+			AnimationControllerComponent.ApplyFeatureToReplicate( ScriptExecutionContext.GetOwner( context ), animFeatureName, animFeature );
+		}
+		if( AIActionHelper.GetItemsFromWeaponSlots( ScriptExecutionContext.GetOwner( context ), items ) )
+		{
+			for( i = 0; i < items.Size(); i += 1 )
+			{
+				AnimationControllerComponent.ApplyFeatureToReplicate( items[ i ], animFeatureName, animFeature );
+			}
+		}
+	}
+
+	private final function GetAnimFeature( const context : ScriptExecutionContext ) : AnimFeature_AIAction
+	{
+		var animFeature : AnimFeature_AIAction;
+		var animVariation : Int32;
+		var blackBoard : IBlackboard;
+		var actionName : CName;
+		animFeature = new AnimFeature_AIAction;
+		animFeature.state = ( ( Int32 )( m_actionPhase ) );
+		animFeature.stateDuration = m_phaseAnimationDuration;
+		if( m_actionRecord.AnimData().Direction() )
+		{
+			animFeature.direction = GetAnimDirection( context, m_actionRecord.AnimData().Direction() );
+		}
+		if( m_actionRecord.AnimData().AnimVariationSubAction() )
+		{
+			if( ( ( AISubActionRandomize_Record )( m_actionRecord.AnimData().AnimVariationSubAction() ) ) )
+			{
+				actionName = StringToName( m_actionDebugName );
+				blackBoard = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetAIControllerComponent().GetActionBlackboard();
+				if( blackBoard.GetName( GetAllBlackboardDefs().AIAction.ownerLastAnimVariationAction ) != actionName )
+				{
+					blackBoard.SetBool( GetAllBlackboardDefs().AIAction.ownerCurrentAnimVariationSet, false );
+				}
+				blackBoard.SetName( GetAllBlackboardDefs().AIAction.ownerLastAnimVariationAction, actionName );
+				if( TweakAISubAction.GetAnimVariation( context, ( ( AISubActionRandomize_Record )( m_actionRecord.AnimData().AnimVariationSubAction() ) ), animVariation ) )
+				{
+					animFeature.animVariation = animVariation;
+				}
+				else
+				{
+					animFeature.animVariation = m_actionRecord.AnimData().AnimVariation();
+				}
+			}
+			else if( TweakAISubAction.GetAnimVariation( context, m_actionRecord.AnimData().AnimVariationSubAction(), animVariation ) )
+			{
+				animFeature.animVariation = animVariation;
+			}
+			else
+			{
+				animFeature.animVariation = m_actionRecord.AnimData().AnimVariation();
+			}
+		}
+		else
+		{
+			animFeature.animVariation = m_actionRecord.AnimData().AnimVariation();
+		}
+		return animFeature;
+	}
+
+	private final function GetAnimDirection( const context : ScriptExecutionContext, animDirection : weak< AIActionAnimDirection_Record > ) : Float
+	{
+		var vecToTarget : Vector4;
+		var targetPos : Vector4;
+		if( AIActionTarget.GetPosition( context, animDirection.Target(), targetPos, false ) )
+		{
+			vecToTarget = targetPos - ScriptExecutionContext.GetOwner( context ).GetWorldPosition();
+			return AngleNormalize180( Vector4.GetAngleDegAroundAxis( ScriptExecutionContext.GetOwner( context ).GetWorldForward(), vecToTarget, ScriptExecutionContext.GetOwner( context ).GetWorldUp() ) + animDirection.DirectionAngle() );
+		}
+		return AngleNormalize180( animDirection.DirectionAngle() );
+	}
+
+	private final function PlayAnimationOnSlot( const context : ScriptExecutionContext, animFeature : weak< AnimFeature_AIAction > )
+	{
+		var actionAnimationScriptProxy : ActionAnimationScriptProxy;
+		var slideParams : ActionAnimationSlideParams;
+		var slideTarget : weak< GameObject >;
+		var slideTargetTrackingMode : gamedataTrackingMode;
+		var slideTargetPositionProvider : IPositionProvider;
+		var phaseDurationFromAnimSlot : Float;
+		actionAnimationScriptProxy = GetPuppet( context ).GetAIControllerComponent().GetActionAnimationScriptProxy();
+		if( actionAnimationScriptProxy )
+		{
+			GetPuppet( context ).GetPuppetStateBlackboard().SetBool( GetAllBlackboardDefs().PuppetState.SlotAnimationInProgress, true );
+			if( m_actionPhase == EAIActionPhase.Inactive )
+			{
+				actionAnimationScriptProxy.Stop();
+				actionAnimationScriptProxy.Setup( m_actionRecord.AnimData().AnimFeature(), new AnimFeature_AIAction, false, false, false, false, m_actionRecord.AnimData().UpdateMovePolicy(), slideParams, slideTarget, m_actionRecord.AnimData().MarginToPlayer() );
+				actionAnimationScriptProxy.Launch();
+			}
+			else
+			{
+				if( GetSlideTarget( context, slideTarget, slideTargetTrackingMode ) )
+				{
+					slideParams = GetSlideParams( context, slideTarget );
+				}
+				if( slideTargetTrackingMode != gamedataTrackingMode.RealPosition )
+				{
+					slideTargetPositionProvider = AIActionMovePolicy.GetTargetPositionProvider( ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ), slideTarget, slideTargetTrackingMode );
+				}
+				actionAnimationScriptProxy.Stop();
+				if( ( m_phaseRecord && m_phaseRecord.UseDurationFromAnimSlot() ) && ( m_phaseRecord.Duration() > 0.0 ) )
+				{
+					phaseDurationFromAnimSlot = actionAnimationScriptProxy.GetPhaseDuration( m_actionRecord.AnimData().AnimFeature(), animFeature );
+					CalculatePhaseDuration( context, phaseDurationFromAnimSlot );
+					if( AbsF( m_phaseAnimationDuration - phaseDurationFromAnimSlot ) >= 0.01 )
+					{
+						animFeature.stateDuration = m_phaseAnimationDuration;
+					}
+					else if( animFeature.stateDuration > 0.0 )
+					{
+						animFeature.stateDuration = 0.0;
+					}
+				}
+				actionAnimationScriptProxy.Setup( m_actionRecord.AnimData().AnimFeature(), animFeature, m_actionRecord.AnimData().AnimSlot().UseRootMotion(), m_actionRecord.AnimData().AnimSlot().UsePoseMatching(), m_actionRecord.AnimData().AnimSlot().ResetRagdollOnStart(), m_actionRecord.AnimData().AnimSlot().UseDynamicObjectsCheck(), m_actionRecord.AnimData().UpdateMovePolicy(), slideParams, slideTarget, m_actionRecord.AnimData().MarginToPlayer(), slideTargetPositionProvider );
+				actionAnimationScriptProxy.Launch();
+			}
+		}
+	}
+
+	private final function GetSlideParams( context : ScriptExecutionContext, slideTarget : weak< GameObject > ) : ActionAnimationSlideParams
+	{
+		var slideParams : ActionAnimationSlideParams;
+		var slideActionParams : AIActionSlideData_Record;
+		var weaponData : gameItemData;
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				if( !( m_actionRecord.AnimData().AnimSlot().StartupSlide() ) )
+				{
+					break;
+				}
+			slideParams = GetActionAnimationSlideParams( m_actionRecord.AnimData().AnimSlot().StartupSlide() );
+			slideActionParams = m_actionRecord.AnimData().AnimSlot().StartupSlide();
+			break;
+			case EAIActionPhase.Loop:
+				if( !( m_actionRecord.AnimData().AnimSlot().LoopSlide() ) )
+				{
+					break;
+				}
+			slideParams = GetActionAnimationSlideParams( m_actionRecord.AnimData().AnimSlot().LoopSlide() );
+			slideActionParams = m_actionRecord.AnimData().AnimSlot().LoopSlide();
+			break;
+			case EAIActionPhase.Recovery:
+				if( !( m_actionRecord.AnimData().AnimSlot().RecoverySlide() ) )
+				{
+					break;
+				}
+			slideParams = GetActionAnimationSlideParams( m_actionRecord.AnimData().AnimSlot().RecoverySlide() );
+			slideActionParams = m_actionRecord.AnimData().AnimSlot().RecoverySlide();
+			break;
+			default:
+				break;
+		}
+		if( slideTarget.IsPlayer() )
+		{
+			if( slideActionParams.OverrideOffsetToTargetFromWeapon() )
+			{
+				weaponData = GameInstance.GetTransactionSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetItemData( ScriptExecutionContext.GetOwner( context ), ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetActiveWeapon( ScriptExecutionContext.GetOwner( context ) ).GetItemID() );
+				slideParams.offsetToTarget = weaponData.GetStatValueByType( gamedataStatType.Range );
+			}
+			return slideParams;
+		}
+		else
+		{
+			if( slideActionParams.DisablePositionSlideAgainstNpc() )
+			{
+				slideParams.usePositionSlide = false;
+			}
+			slideParams.offsetToTarget = 1.0;
+			return slideParams;
+		}
+	}
+
+	private final function GetSlideTarget( const context : ScriptExecutionContext, out slideTarget : weak< GameObject >, out slideTargetTrackingMode : gamedataTrackingMode ) : Bool
+	{
+		slideTargetTrackingMode = gamedataTrackingMode.RealPosition;
+		switch( m_actionPhase )
+		{
+			case EAIActionPhase.Startup:
+				if( !( m_actionRecord.AnimData().AnimSlot().StartupSlide() ) || !( m_actionRecord.AnimData().AnimSlot().StartupSlide().Target() ) )
+				{
+					break;
+				}
+			slideTargetTrackingMode = m_actionRecord.AnimData().AnimSlot().StartupSlide().Target().TrackingMode().Type();
+			return AIActionTarget.GetObject( context, m_actionRecord.AnimData().AnimSlot().StartupSlide().Target(), slideTarget );
+			case EAIActionPhase.Loop:
+				if( !( m_actionRecord.AnimData().AnimSlot().LoopSlide() ) || !( m_actionRecord.AnimData().AnimSlot().LoopSlide().Target() ) )
+				{
+					break;
+				}
+			slideTargetTrackingMode = m_actionRecord.AnimData().AnimSlot().LoopSlide().Target().TrackingMode().Type();
+			return AIActionTarget.GetObject( context, m_actionRecord.AnimData().AnimSlot().LoopSlide().Target(), slideTarget );
+			case EAIActionPhase.Recovery:
+				if( !( m_actionRecord.AnimData().AnimSlot().RecoverySlide() ) || !( m_actionRecord.AnimData().AnimSlot().RecoverySlide().Target() ) )
+				{
+					break;
+				}
+			slideTargetTrackingMode = m_actionRecord.AnimData().AnimSlot().RecoverySlide().Target().TrackingMode().Type();
+			return AIActionTarget.GetObject( context, m_actionRecord.AnimData().AnimSlot().RecoverySlide().Target(), slideTarget );
+		}
+		return false;
+	}
+
+	private final function ActivateLookat( const context : ScriptExecutionContext )
+	{
+		var i : Int32;
+		var count : Int32;
+		var record : AIActionLookAtData_Record;
+		var lookAtEvent : LookAtAddEvent;
+		var debugActionName : String;
+		count = m_actionRecord.GetLookatsCount();
+		for( i = 0; i < count; i += 1 )
+		{
+			record = m_actionRecord.GetLookatsItem( i );
+			if( !( IsFinal() ) )
+			{
+				debugActionName = TDBID.ToStringDEBUG( record.Preset().GetID() );
+				if( AIActionHelper.ActionDebugHelper( "", ScriptExecutionContext.GetOwner( context ), debugActionName ) )
+				{
+					LogAI( "ActivateLookat Debug Breakpoint" );
+				}
+			}
+			if( record.ActivationCondition() && !( AICondition.CheckActionCondition( context, record.ActivationCondition() ) ) )
+			{
+				continue;
+			}
+			AIActionLookat.Activate( context, record, lookAtEvent );
+			if( lookAtEvent )
+			{
+				if( lookAtEvent.bodyPart == 'RightHand' )
+				{
+					GetPuppet( context ).GetAIControllerComponent().GetShootingBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.rightArmLookAtLimitReached, 1 );
+				}
+				m_lookatEvents.PushBack( lookAtEvent );
+			}
+		}
+	}
+
+	private final function DeactivateLookat( const context : ScriptExecutionContext )
+	{
+		if( m_lookatEvents.Size() == 0 )
+		{
+			return;
+		}
+		AIActionLookat.Deactivate( ScriptExecutionContext.GetOwner( context ), m_lookatEvents );
+	}
+
+	private final function TrackCommands( const context : ScriptExecutionContext, stop : Bool )
+	{
+		var commandNames : array< CName >;
+		var signalTable : gameBoolSignalTable;
+		var signal : CommandSignal;
+		var signalId : Uint16;
+		if( m_actionRecord )
+		{
+			commandNames = m_actionRecord.Commands();
+		}
+		if( commandNames.Size() == 0 )
+		{
+			return;
+		}
+		signalTable = GetPuppet( context ).GetAIControllerComponent().GetSignals();
+		if( !( signalTable ) )
+		{
+			return;
+		}
+		signal = new CommandSignal;
+		signal.track = !( stop );
+		signal.commandClassNames = commandNames;
+		signalId = signalTable.GetOrCreateSignal( 'CommandSignal' );
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+	}
+
+	private final function WeaponOverride( const context : ScriptExecutionContext, const value : Int32 )
+	{
+		var weaponOverride : AnimFeature_WeaponOverride;
+		weaponOverride = new AnimFeature_WeaponOverride;
+		weaponOverride.state = value;
+		AnimationControllerComponent.ApplyFeatureToReplicate( ScriptExecutionContext.GetOwner( context ), 'weaponOverride', weaponOverride );
+	}
+
+	private final function ChangeNPCState( context : ScriptExecutionContext )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		signalTable = GetPuppet( context ).GetAIControllerComponent().GetSignals();
+		if( !( signalTable ) )
+		{
+			return;
+		}
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		if( m_phaseRecord.ChangeNPCState().HighLevelState() != '' )
+		{
+			signal.m_highLevelState = ( ( gamedataNPCHighLevelState )( ( ( Int32 )( EnumValueFromName( 'gamedataNPCHighLevelState', m_phaseRecord.ChangeNPCState().HighLevelState() ) ) ) ) );
+			signal.m_highLevelStateValid = true;
+		}
+		else if( ( ( m_phaseDuration > 0.0 ) && ( m_phaseDuration <= 0.1 ) ) && !( m_actionRecord.AnimData() ) )
+		{
+			return;
+		}
+		if( m_phaseRecord.ChangeNPCState().UpperBodyState() != '' )
+		{
+			signal.m_upperBodyState = ( ( gamedataNPCUpperBodyState )( ( ( Int32 )( EnumValueFromName( 'gamedataNPCUpperBodyState', m_phaseRecord.ChangeNPCState().UpperBodyState() ) ) ) ) );
+			signal.m_upperBodyStateValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().StanceState() != '' )
+		{
+			signal.m_stanceState = ( ( gamedataNPCStanceState )( ( ( Int32 )( EnumValueFromName( 'gamedataNPCStanceState', m_phaseRecord.ChangeNPCState().StanceState() ) ) ) ) );
+			signal.m_stanceStateValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().HitReactionMode() != '' )
+		{
+			signal.m_hitReactionModeState = ( ( EHitReactionMode )( ( ( Int32 )( EnumValueFromName( 'EHitReactionMode', m_phaseRecord.ChangeNPCState().HitReactionMode() ) ) ) ) );
+			signal.m_hitReactionModeStateValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().DefenseMode() != '' )
+		{
+			signal.m_defenseMode = ( ( gamedataDefenseMode )( ( ( Int32 )( EnumValueFromName( 'gamedataDefenseMode', m_phaseRecord.ChangeNPCState().DefenseMode() ) ) ) ) );
+			signal.m_defenseModeValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().LocomotionMode() != '' )
+		{
+			signal.m_locomotionMode = ( ( gamedataLocomotionMode )( ( ( Int32 )( EnumValueFromName( 'gamedataLocomotionMode', m_phaseRecord.ChangeNPCState().LocomotionMode() ) ) ) ) );
+			signal.m_locomotionModeValid = true;
+		}
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+	}
+
+	private final function ResetNPCState( context : ScriptExecutionContext )
+	{
+		var signalTable : gameBoolSignalTable;
+		var signal : NPCStateChangeSignal;
+		var signalId : Uint16;
+		if( ( ( m_phaseDuration > 0.0 ) && ( m_phaseDuration <= 0.1 ) ) && !( m_actionRecord.AnimData() ) )
+		{
+			return;
+		}
+		signalTable = GetPuppet( context ).GetAIControllerComponent().GetSignals();
+		if( !( signalTable ) )
+		{
+			return;
+		}
+		signal = new NPCStateChangeSignal;
+		signalId = signalTable.GetOrCreateSignal( 'NPCStateChangeSignal' );
+		if( m_phaseRecord.ChangeNPCState().UpperBodyState() != '' )
+		{
+			signal.m_upperBodyState = gamedataNPCUpperBodyState.Normal;
+			signal.m_upperBodyStateValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().StanceState() != '' )
+		{
+			signal.m_stanceState = gamedataNPCStanceState.Stand;
+			signal.m_stanceStateValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().HitReactionMode() != '' )
+		{
+			signal.m_hitReactionModeState = EHitReactionMode.Regular;
+			signal.m_hitReactionModeStateValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().DefenseMode() != '' )
+		{
+			signal.m_defenseMode = gamedataDefenseMode.NoDefend;
+			signal.m_defenseModeValid = true;
+		}
+		if( m_phaseRecord.ChangeNPCState().LocomotionMode() != '' )
+		{
+			signal.m_locomotionMode = gamedataLocomotionMode.Moving;
+			signal.m_locomotionModeValid = true;
+		}
+		signalTable.Set( signalId, false );
+		signalTable.SetWithData( signalId, signal );
+	}
+
+	private final function StartCooldowns( const context : ScriptExecutionContext )
+	{
+		var i : Int32;
+		var count : Int32;
+		var record : AIActionCooldown_Record;
+		count = m_actionRecord.GetCooldownsCount();
+		for( i = 0; i < count; i += 1 )
+		{
+			record = m_actionRecord.GetCooldownsItem( i );
+			AIActionHelper.StartCooldown( ScriptExecutionContext.GetOwner( context ), record );
+		}
+	}
+
+	public override function GetDescription( context : ScriptExecutionContext ) : String
+	{
+		return m_actionDebugName;
+	}
+
+	private virtual function GetActionRecord( const context : ScriptExecutionContext, out actionDebugName : String, out actionRecord : weak< AIAction_Record >, out shouldCallAgain : Bool ) : Bool
+	{
+		return false;
+	}
+
+	private virtual function Debug_GetBaseActionId() : TweakDBID
+	{
+		return T"";
+	}
+
+	private virtual function Debug_GetCompositeId() : TweakDBID
+	{
+		return T"";
+	}
+
+}
+
+enum EAIActionPhase
+{
+	Inactive = 0,
+	Startup = 1,
+	Loop = 2,
+	Recovery = 3,
+}
+

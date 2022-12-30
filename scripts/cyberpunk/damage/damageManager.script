@@ -1,0 +1,260 @@
+class DamageManager
+{
+
+	public static function ModifyHitData( hitEvent : gameHitEvent )
+	{
+		var attackData : AttackData;
+		var statusEffectsSystem : StatusEffectSystem;
+		var statPoolSystem : StatPoolsSystem;
+		var ownerStatsSystem : StatsSystem;
+		var attackType : gamedataAttackType;
+		var chargeVal : Float;
+		attackData = hitEvent.attackData;
+		statusEffectsSystem = GameInstance.GetStatusEffectSystem( hitEvent.target.GetGame() );
+		statPoolSystem = GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() );
+		ownerStatsSystem = GameInstance.GetStatsSystem( attackData.GetInstigator().GetGame() );
+		attackType = attackData.GetAttackType();
+		if( !( GetScriptedPuppetTarget( hitEvent ) ) )
+		{
+			LogAI( "No scripted puppet has been found /!\" );
+			return;
+		}
+		if( ( hitEvent.hitRepresentationResult.hitShapes.Size() > 0 ) && DamageSystemHelper.IsProtectionLayer( DamageSystemHelper.GetHitShape( hitEvent ) ) )
+		{
+			attackData.AddFlag( hitFlag.DamageNullified, 'ProtectionLayer' );
+		}
+		if( attackData.GetWeapon() && ( GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( attackData.GetWeapon().GetEntityID(), gamedataStatType.CanSilentKill ) > 0.0 ) )
+		{
+			attackData.AddFlag( hitFlag.SilentKillModifier, 'CanSilentKill' );
+		}
+		if( attackData.GetInstigator().IsPlayer() )
+		{
+			if( !( AttackData.IsPlayerInCombat( attackData ) ) )
+			{
+				attackData.AddFlag( hitFlag.StealthHit, 'Player attacked from out of combat' );
+			}
+		}
+		if( ( AttackData.IsBullet( attackType ) || AttackData.IsMelee( attackType ) ) || AttackData.IsStrongMelee( attackType ) )
+		{
+			if( ownerStatsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CanForceDismbember ) > 0.0 )
+			{
+				attackData.AddFlag( hitFlag.ForceDismember, 'CanForceDismbember ability' );
+			}
+			if( !( hitEvent.target.IsPlayer() ) && ( ownerStatsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CanInstaKillNPCs ) > 0.0 ) )
+			{
+				attackData.AddFlag( hitFlag.Kill, 'CanInstaKillNPCs ability' );
+			}
+		}
+		if( statusEffectsSystem.HasStatusEffect( hitEvent.target.GetEntityID(), T"BaseStatusEffect.Defeated" ) )
+		{
+			attackData.AddFlag( hitFlag.Defeated, 'Defeated' );
+		}
+		if( statPoolSystem.HasActiveStatPool( attackData.GetWeapon().GetEntityID(), gamedataStatPoolType.WeaponCharge ) )
+		{
+			chargeVal = statPoolSystem.GetStatPoolValue( attackData.GetWeapon().GetEntityID(), gamedataStatPoolType.WeaponCharge, false );
+			if( RPGManager.GetWeaponEvolution( attackData.GetWeapon().GetItemID() ) == gamedataWeaponEvolution.Tech && ( chargeVal >= 50.0 ) )
+			{
+				attackData.AddFlag( hitFlag.WeaponFullyCharged, 'Charge Weapon' );
+			}
+			else if( chargeVal >= 100.0 )
+			{
+				attackData.AddFlag( hitFlag.WeaponFullyCharged, 'Charge Weapon' );
+			}
+		}
+		if( !( AttackData.IsBullet( attackType ) ) && !( AttackData.IsExplosion( attackType ) ) )
+		{
+			ProcessDefensiveState( hitEvent );
+		}
+		return;
+	}
+
+	public static function IsValidDirectionToDefendMeleeAttack( attackerForward : Vector4, defenderForward : Vector4 ) : Bool
+	{
+		var finalHitDirection : Float;
+		finalHitDirection = Vector4.GetAngleBetween( attackerForward, defenderForward );
+		return finalHitDirection < 180.0;
+	}
+
+	private static function ProcessDefensiveState( hitEvent : gameHitEvent )
+	{
+		var attackData : AttackData;
+		var targetID : StatsObjectID;
+		var targetPuppet : weak< ScriptedPuppet >;
+		var aiComponent : AIHumanComponent;
+		var statSystem : StatsSystem;
+		var hitAIEvent : AIEvent;
+		var attackType : gamedataAttackType;
+		var attackSource : weak< GameObject >;
+		attackData = hitEvent.attackData;
+		targetID = hitEvent.target.GetEntityID();
+		targetPuppet = ( ( weak< weak< ScriptedPuppet > > )( hitEvent.target ) );
+		aiComponent = targetPuppet.GetAIControllerComponent();
+		attackSource = attackData.GetSource();
+		hitAIEvent = new AIEvent;
+		statSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
+		if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) )
+		{
+			if( IsValidDirectionToDefendMeleeAttack( attackSource.GetWorldForward(), hitEvent.target.GetWorldForward() ) )
+			{
+				attackType = attackData.GetAttackType();
+				if( ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) && attackType != gamedataAttackType.QuickMelee ) && ( targetPuppet.IsPlayer() || aiComponent.GetActionBlackboard().GetBool( GetAllBlackboardDefs().AIAction.attackParried ) ) )
+				{
+					attackData.AddFlag( hitFlag.WasDeflected, 'Parry' );
+					attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Parry' );
+					AnimationControllerComponent.PushEvent( attackSource, 'myAttackParried' );
+					hitAIEvent.name = 'MyAttackParried';
+					attackSource.QueueEvent( hitAIEvent );
+					if( hitEvent.target.IsPlayer() )
+					{
+						SendNameEventToPSM( 'successfulDeflect', hitEvent );
+					}
+				}
+				else if( aiComponent.GetActionBlackboard().GetBool( GetAllBlackboardDefs().AIAction.attackBlocked ) || ( targetPuppet.IsPlayer() && ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsBlocking ) == 1.0 ) || ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) && attackType == gamedataAttackType.QuickMelee ) ) ) )
+				{
+					attackData.AddFlag( hitFlag.WasBlocked, 'Block' );
+					attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Block' );
+					AnimationControllerComponent.PushEvent( attackSource, 'myAttackBlocked' );
+					ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( attackSource ) ), 'BlockSignal', 0.30000001 );
+					hitAIEvent.name = 'MyAttackBlocked';
+					attackSource.QueueEvent( hitAIEvent );
+					DealStaminaDamage( hitEvent, targetID, statSystem );
+				}
+				else
+				{
+					ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( attackSource ) ), 'HitSignal', 0.30000001 );
+					hitAIEvent.name = 'MyAttackHit';
+					attackSource.QueueEvent( hitAIEvent );
+				}
+			}
+		}
+		else
+		{
+			ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( attackSource ) ), 'HitSignal', 0.30000001 );
+			hitAIEvent.name = 'MyAttackHit';
+			attackSource.QueueEvent( hitAIEvent );
+		}
+	}
+
+	protected static function SendNameEventToPSM( eventName : CName, hitEvent : gameHitEvent )
+	{
+		var psmEvent : PSMPostponedParameterBool;
+		var player : PlayerPuppet;
+		var playerWeapon : ItemObject;
+		var es : EquipmentSystem;
+		player = ( ( PlayerPuppet )( hitEvent.target ) );
+		es = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( player.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		playerWeapon = es.GetActiveWeaponObject( player, gamedataEquipmentArea.Weapon );
+		psmEvent = new PSMPostponedParameterBool;
+		psmEvent.id = eventName;
+		psmEvent.value = true;
+		player.QueueEvent( psmEvent );
+		player.QueueEventForEntityID( playerWeapon.GetEntityID(), psmEvent );
+	}
+
+	public static function PostProcess( hitEvent : gameHitEvent ) {}
+
+	public static function CalculateSourceModifiers( hitEvent : gameHitEvent )
+	{
+		var targetPuppet : ScriptedPuppet;
+		var tempStat : Float;
+		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
+		if( ScriptedPuppet.IsMechanical( targetPuppet ) || hitEvent.target.IsTurret() )
+		{
+			tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstMechanicals );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 + tempStat );
+			}
+		}
+		if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Boss )
+		{
+			tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstBosses );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
+			}
+		}
+		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		{
+			if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Elite )
+			{
+				tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstElites );
+				if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
+				}
+			}
+			else if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Rare )
+			{
+				tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstRares );
+				if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
+				}
+			}
+			if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) && StatusEffectSystem.ObjectHasStatusEffect( hitEvent.attackData.GetInstigator(), T"BaseStatusEffect.BerserkPlayerBuff" ) )
+			{
+				tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BerserkMeleeDamageBonus );
+				if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
+				}
+			}
+		}
+	}
+
+	public static function CalculateTargetModifiers( hitEvent : gameHitEvent )
+	{
+		var tempStat : Float;
+		if( AttackData.IsExplosion( hitEvent.attackData.GetAttackType() ) )
+		{
+			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionExplosion );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - tempStat );
+			}
+		}
+		if( AttackData.IsDoT( hitEvent.attackData.GetAttackType() ) )
+		{
+			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionDamageOverTime );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - tempStat );
+			}
+		}
+		if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) )
+		{
+			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionMelee );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - ( tempStat / 100.0 ) );
+			}
+		}
+		if( AttackData.IsHack( hitEvent.attackData.GetAttackType() ) )
+		{
+			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionQuickhacks );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - ( tempStat / 100.0 ) );
+			}
+		}
+	}
+
+	public static function CalculateGlobalModifiers( hitEvent : gameHitEvent ) {}
+
+	private static function GetScriptedPuppetTarget( hitEvent : gameHitEvent ) : ScriptedPuppet
+	{
+		return ( ( ScriptedPuppet )( hitEvent.target ) );
+	}
+
+	protected static function DealStaminaDamage( hitEvent : gameHitEvent, targetID : StatsObjectID, statSystem : StatsSystem )
+	{
+		var weapon : WeaponObject;
+		var staminaDamageValue : Float;
+		weapon = hitEvent.attackData.GetWeapon();
+		staminaDamageValue = statSystem.GetStatValue( weapon.GetEntityID(), gamedataStatType.StaminaDamage );
+		GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() ).RequestChangingStatPoolValue( targetID, gamedataStatPoolType.Stamina, -( staminaDamageValue ), hitEvent.attackData.GetInstigator(), false, false );
+	}
+
+}
+

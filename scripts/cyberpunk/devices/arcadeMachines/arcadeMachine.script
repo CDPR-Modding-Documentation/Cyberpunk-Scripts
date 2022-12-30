@@ -1,0 +1,307 @@
+class ArcadeMachine extends InteractiveDevice
+{
+	default m_controllerTypeName = 'ArcadeMachineController';
+	private var m_isShortGlitchActive : Bool;
+	private var m_shortGlitchDelayID : DelayID;
+	private var m_currentGame : ResRef;
+	protected var m_currentGameAudio : CName;
+	protected var m_currentGameAudioStop : CName;
+	private var m_meshAppearanceOn : CName;
+	private var m_meshAppearanceOff : CName;
+	private var m_arcadeMinigameComponent : WorkspotResourceComponent;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ui', 'worlduiWidgetComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'arcadeMinigamePlayerWorkspot', 'workWorkspotResourceComponent', false );
+		super.OnRequestComponents( ri );
+	}
+
+	protected event OnPersitentStateInitialized( evt : GameAttachedEvent )
+	{
+		super.OnPersitentStateInitialized( evt );
+		SetupMinigame();
+	}
+
+	public override function ResavePersistentData( ps : PersistentState ) : Bool
+	{
+		return false;
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_uiComponent = ( ( worlduiWidgetComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ui' ) ) );
+		m_arcadeMinigameComponent = ( ( WorkspotResourceComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'arcadeMinigamePlayerWorkspot' ) ) );
+		super.OnTakeControl( ri );
+		m_controller = ( ( ArcadeMachineController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		super.ResolveGameplayState();
+		if( IsUIdirty() && m_isInsideLogicArea )
+		{
+			RefreshUI();
+		}
+	}
+
+	protected override function CreateBlackboard()
+	{
+		m_blackboard = IBlackboard.Create( GetAllBlackboardDefs().ArcadeMachineBlackBoard );
+	}
+
+	public const override function GetBlackboardDef() : ArcadeMachineBlackboardDef
+	{
+		return GetDevicePS().GetBlackboardDef();
+	}
+
+	protected const override function GetController() : ArcadeMachineController
+	{
+		return ( ( ArcadeMachineController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : ArcadeMachineControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	protected override function StartGlitching( glitchState : EGlitchState, optional intensity : Float )
+	{
+		var glitchData : GlitchData;
+		var evt : AdvertGlitchEvent;
+		glitchData.state = glitchState;
+		glitchData.intensity = intensity;
+		if( intensity == 0.0 )
+		{
+			intensity = 1.0;
+		}
+		evt = new AdvertGlitchEvent;
+		evt.SetShouldGlitch( intensity );
+		QueueEvent( evt );
+		GetBlackboard().SetVariant( GetBlackboardDef().GlitchData, glitchData, true );
+		GetBlackboard().FireCallbacks();
+		GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.Start, 'hack_fx' );
+	}
+
+	protected override function StopGlitching()
+	{
+		var glitchData : GlitchData;
+		var evt : AdvertGlitchEvent;
+		evt = new AdvertGlitchEvent;
+		evt.SetShouldGlitch( 0.0 );
+		QueueEvent( evt );
+		glitchData.state = EGlitchState.NONE;
+		GetBlackboard().SetVariant( GetBlackboardDef().GlitchData, glitchData );
+		GetBlackboard().FireCallbacks();
+		GameObjectEffectHelper.ActivateEffectAction( this, gamedataFxActionType.BreakLoop, 'hack_fx' );
+	}
+
+	protected event OnHitEvent( hit : gameHitEvent )
+	{
+		super.OnHitEvent( hit );
+		StartShortGlitch();
+	}
+
+	private function StartShortGlitch()
+	{
+		var evt : StopShortGlitchEvent;
+		if( GetDevicePS().IsGlitching() || GetDevicePS().IsDistracting() )
+		{
+			return;
+		}
+		if( !( m_isShortGlitchActive ) )
+		{
+			evt = new StopShortGlitchEvent;
+			StartGlitching( EGlitchState.DEFAULT, 1.0 );
+			m_shortGlitchDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 0.25 );
+			m_isShortGlitchActive = true;
+		}
+	}
+
+	protected event OnStopShortGlitch( evt : StopShortGlitchEvent )
+	{
+		m_isShortGlitchActive = false;
+		if( !( GetDevicePS().IsGlitching() ) && !( GetDevicePS().IsDistracting() ) )
+		{
+			StopGlitching();
+		}
+	}
+
+	protected override function TurnOnDevice()
+	{
+		super.TurnOnDevice();
+		TurnOnScreen();
+	}
+
+	protected override function TurnOffDevice()
+	{
+		super.TurnOffDevice();
+		TurnOffScreen();
+	}
+
+	protected override function CutPower()
+	{
+		super.CutPower();
+		TurnOffScreen();
+	}
+
+	protected virtual function TurnOffScreen()
+	{
+		m_uiComponent.Toggle( false );
+		PlaySound( this, m_currentGameAudioStop );
+		SetMeshAppearance( m_meshAppearanceOff );
+	}
+
+	protected virtual function TurnOnScreen()
+	{
+		m_uiComponent.Toggle( true );
+		PlaySound( this, m_currentGameAudio );
+		SetMeshAppearance( m_meshAppearanceOn );
+	}
+
+	protected event OnBeginArcadeMinigameUI( evt : BeginArcadeMinigameUI )
+	{
+		var workspotSystem : WorkspotGameSystem;
+		var playerStateMachineBlackboard : IBlackboard;
+		var puppet : GameObject;
+		puppet = ( ( GameObject )( evt.GetExecutor() ) );
+		if( puppet.IsPlayer() )
+		{
+			workspotSystem = GameInstance.GetWorkspotSystem( GetGame() );
+			if( workspotSystem )
+			{
+				playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( puppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+				playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, true );
+				workspotSystem.PlayInDevice( this, puppet, 'lockedCamera', 'arcadeMinigamePlayerWorkspot' );
+			}
+		}
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.Distract;
+	}
+
+	protected override function ApplyActiveStatusEffect( target : EntityID, statusEffect : TweakDBID )
+	{
+		if( IsActiveStatusEffectValid() && GetDevicePS().IsGlitching() )
+		{
+			GameInstance.GetStatusEffectSystem( GetGame() ).ApplyStatusEffect( target, statusEffect );
+		}
+	}
+
+	protected override function UploadActiveProgramOnNPC( targetID : EntityID )
+	{
+		var evt : ExecutePuppetActionEvent;
+		if( IsActiveProgramToUploadOnNPCValid() && GetDevicePS().IsGlitching() )
+		{
+			evt = new ExecutePuppetActionEvent;
+			evt.actionID = GetActiveProgramToUploadOnNPC();
+			QueueEventForEntityID( targetID, evt );
+		}
+	}
+
+	private function SetupMinigame()
+	{
+		var randValue : Int32;
+		var panzerMovie : ResRef;
+		var quadracerMovie : ResRef;
+		var retrosMovie : ResRef;
+		var roachraceMovie1 : ResRef;
+		var roachraceMovie2 : ResRef;
+		var minigame : ArcadeMinigame;
+		randValue = -1;
+		panzerMovie = R"base\movies\misc\arcade\hishousai_panzer.bk2";
+		quadracerMovie = R"base\movies\misc\arcade\quadracer.bk2";
+		retrosMovie = R"base\movies\misc\arcade\retros.bk2";
+		roachraceMovie1 = R"base\movies\misc\arcade\roach_race.bk2";
+		roachraceMovie2 = R"base\movies\misc\arcade\roachrace.bk2";
+		minigame = ArcadeMinigame.INVALID;
+		m_currentGame = GetDevicePS().GetGameVideoPath();
+		if( !( ResRef.IsValid( m_currentGame ) ) )
+		{
+			randValue = RandRange( 0, 6 );
+			if( randValue == 0 )
+			{
+				m_currentGame = panzerMovie;
+			}
+			else if( randValue == 1 )
+			{
+				m_currentGame = quadracerMovie;
+			}
+			else if( randValue == 2 )
+			{
+				m_currentGame = retrosMovie;
+			}
+			else
+			{
+				m_currentGame = roachraceMovie1;
+			}
+		}
+		if( m_currentGame == panzerMovie )
+		{
+			minigame = ArcadeMinigame.Panzer;
+			m_currentGameAudio = 'mus_cp_arcade_panzer_START_menu';
+			m_currentGameAudioStop = 'mus_cp_arcade_panzer_STOP';
+			m_meshAppearanceOn = 'ap4';
+			m_meshAppearanceOff = 'ap4_off';
+		}
+		else if( m_currentGame == quadracerMovie )
+		{
+			minigame = ArcadeMinigame.Quadracer;
+			m_currentGameAudio = 'mus_cp_arcade_quadra_START_menu';
+			m_currentGameAudioStop = 'mus_cp_arcade_quadra_STOP';
+			m_meshAppearanceOn = 'ap1';
+			m_meshAppearanceOff = 'ap1_off';
+		}
+		else if( m_currentGame == retrosMovie )
+		{
+			minigame = ArcadeMinigame.Retros;
+			m_currentGameAudio = 'mus_cp_arcade_shooter_START_menu';
+			m_currentGameAudioStop = 'mus_cp_arcade_shooter_STOP';
+			m_meshAppearanceOn = 'ap3';
+			m_meshAppearanceOff = 'ap3_off';
+		}
+		else if( m_currentGame == roachraceMovie1 || m_currentGame == roachraceMovie2 )
+		{
+			minigame = ArcadeMinigame.RoachRace;
+			m_currentGameAudio = 'mus_cp_arcade_roach_START_menu';
+			m_currentGameAudioStop = 'mus_cp_arcade_roach_STOP';
+			m_meshAppearanceOn = 'ap2';
+			m_meshAppearanceOff = 'ap2_off';
+		}
+		else
+		{
+			minigame = ArcadeMinigame.INVALID;
+			m_meshAppearanceOn = 'default';
+			m_meshAppearanceOff = 'default';
+		}
+		GetDevicePS().SetArcadeMinigame( minigame );
+	}
+
+	public const function GetArcadeGame() : ResRef
+	{
+		return m_currentGame;
+	}
+
+	public const function GetArcadeGameAudio() : CName
+	{
+		return m_currentGameAudio;
+	}
+
+	public const function GetArcadeGameAudioStop() : CName
+	{
+		return m_currentGameAudioStop;
+	}
+
+}
+
+enum ArcadeMinigame
+{
+	INVALID = 0,
+	RoachRace = 1,
+	Panzer = 2,
+	Retros = 3,
+	Quadracer = 4,
+}
+

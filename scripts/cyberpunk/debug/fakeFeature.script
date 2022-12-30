@@ -1,0 +1,337 @@
+struct SComponentOperationData
+{
+	instanceeditable var componentName : CName;
+	instanceeditable var operationType : EComponentOperation;
+}
+
+struct SFactOperationData
+{
+	instanceeditable var factName : CName;
+	instanceeditable var factValue : Int32;
+	instanceeditable var operationType : EMathOperationType;
+}
+
+struct SFakeFeatureChoice
+{
+	instanceeditable var choiceID : String;
+	instanceeditable var isEnabled : Bool;
+	instanceeditable var disableOnUse : Bool;
+	instanceeditable var factToEnableName : CName;
+	instanceeditable var factOnUse : SFactOperationData;
+	const instanceeditable var factsOnUse : array< SFactOperationData >;
+	const instanceeditable var affectedComponents : array< SComponentOperationData >;
+	var callbackID : Uint32;
+}
+
+class FakeFeature extends GameObject
+{
+	private const instanceeditable var m_choices : array< SFakeFeatureChoice >;
+	protected var m_interaction : InteractionComponent;
+	private var m_components : array< IPlacedComponent >;
+	private var m_scaningComponent : ScanningComponent;
+	private var was_used : Bool;
+	default was_used = false;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		var i : Int32;
+		var k : Int32;
+		EntityRequestComponentsInterface.RequestComponent( ri, 'interaction', 'gameinteractionsComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'scanning', 'gameScanningComponent', false );
+		for( i = 0; i < m_choices.Size(); i += 1 )
+		{
+			for( k = 0; k < m_choices[ i ].affectedComponents.Size(); k += 1 )
+			{
+				EntityRequestComponentsInterface.RequestComponent( ri, m_choices[ i ].affectedComponents[ k ].componentName, 'IPlacedComponent', false );
+			}
+		}
+		super.OnRequestComponents( ri );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		var i : Int32;
+		var k : Int32;
+		m_interaction = ( ( InteractionComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'interaction' ) ) );
+		m_scaningComponent = ( ( ScanningComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'scanning' ) ) );
+		for( i = 0; i < m_choices.Size(); i += 1 )
+		{
+			for( k = 0; k < m_choices[ i ].affectedComponents.Size(); k += 1 )
+			{
+				m_components.PushBack( ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, m_choices[ i ].affectedComponents[ k ].componentName ) ) ) );
+			}
+		}
+		super.OnTakeControl( ri );
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		InitializeChoices();
+		RefreshChoices();
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		UnInitializeChoices();
+	}
+
+	protected event OnInteractionChoice( choiceEvent : InteractionChoiceEvent )
+	{
+		var choiceID : Int32;
+		choiceID = ( ( Int32 )( choiceEvent.choice.data[ 0 ] ) );
+		ResolveChoice( choiceID );
+		RefreshChoices();
+	}
+
+	protected event OnEnabledFactChangeTrigerred( evt : FactChangedEvent )
+	{
+		var factName : CName;
+		var isEnabled : Bool;
+		var i : Int32;
+		factName = evt.GetFactName();
+		for( i = 0; i < m_choices.Size(); i += 1 )
+		{
+			if( factName == m_choices[ i ].factToEnableName )
+			{
+				isEnabled = GameInstance.GetQuestsSystem( GetGame() ).GetFact( m_choices[ i ].factToEnableName ) > 0;
+				m_choices[ i ].isEnabled = isEnabled;
+			}
+		}
+		RefreshChoices();
+	}
+
+	private function RefreshChoices()
+	{
+		var i : Int32;
+		var choices : array< InteractionChoice >;
+		m_interaction.ResetChoices();
+		for( i = 0; i < m_choices.Size(); i += 1 )
+		{
+			if( m_choices[ i ].isEnabled )
+			{
+				choices.PushBack( CreateChoice( m_choices[ i ].choiceID, i ) );
+			}
+		}
+		m_interaction.SetChoices( choices );
+	}
+
+	private function InitializeChoices()
+	{
+		var i : Int32;
+		for( i = 0; i < m_choices.Size(); i += 1 )
+		{
+			if( IsNameValid( m_choices[ i ].factToEnableName ) )
+			{
+				m_choices[ i ].callbackID = GameInstance.GetQuestsSystem( GetGame() ).RegisterEntity( m_choices[ i ].factToEnableName, GetEntityID() );
+			}
+		}
+	}
+
+	private function UnInitializeChoices()
+	{
+		var i : Int32;
+		for( i = 0; i < m_choices.Size(); i += 1 )
+		{
+			if( IsNameValid( m_choices[ i ].factToEnableName ) )
+			{
+				GameInstance.GetQuestsSystem( GetGame() ).UnregisterEntity( m_choices[ i ].factToEnableName, m_choices[ i ].callbackID );
+			}
+		}
+	}
+
+	private function CreateChoice( choiceID : String, data : Int32 ) : InteractionChoice
+	{
+		var choice : InteractionChoice;
+		choice.choiceMetaData.tweakDBName = choiceID;
+		choice.data.PushBack( data );
+		return choice;
+	}
+
+	private function ResolveChoice( choiceID : Int32 )
+	{
+		var i : Int32;
+		if( m_choices[ choiceID ].disableOnUse )
+		{
+			if( IsNameValid( m_choices[ choiceID ].factToEnableName ) )
+			{
+				SetFactValue( GetGame(), m_choices[ choiceID ].factToEnableName, 0 );
+			}
+			m_choices[ choiceID ].isEnabled = false;
+		}
+		ResolveFact( m_choices[ choiceID ].factOnUse );
+		for( i = 0; i < m_choices[ choiceID ].factsOnUse.Size(); i += 1 )
+		{
+			ResolveFact( m_choices[ choiceID ].factsOnUse[ i ] );
+		}
+		ResolveComponents( choiceID );
+	}
+
+	private function ResolveFact( factData : SFactOperationData )
+	{
+		var uiBlackboard : IBlackboard;
+		was_used = true;
+		uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+		uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, false );
+		if( IsNameValid( factData.factName ) )
+		{
+			if( factData.operationType == EMathOperationType.Add )
+			{
+				AddFact( GetGame(), factData.factName, factData.factValue );
+			}
+			else
+			{
+				SetFactValue( GetGame(), factData.factName, factData.factValue );
+			}
+		}
+	}
+
+	private function ResolveComponents( choiceID : Int32 )
+	{
+		var i : Int32;
+		var k : Int32;
+		for( i = 0; i < m_choices[ choiceID ].affectedComponents.Size(); i += 1 )
+		{
+			for( k = 0; k < m_components.Size(); k += 1 )
+			{
+				if( m_choices[ choiceID ].affectedComponents[ i ].componentName == m_components[ k ].GetName() )
+				{
+					if( m_choices[ choiceID ].affectedComponents[ i ].operationType == EComponentOperation.Enable )
+					{
+						m_components[ k ].Toggle( true );
+					}
+					else
+					{
+						m_components[ k ].Toggle( false );
+					}
+				}
+			}
+		}
+	}
+
+	protected event OnItemTooltip( evt : InteractionActivationEvent )
+	{
+		var uiBlackboard : IBlackboard;
+		var show : Bool;
+		if( evt.activator.IsPlayer() && !( evt.hotspot.IsNPC() ) )
+		{
+			if( evt.hotspot.GetDisplayName() == "q001_take_gun" && evt.layerData.tag == 'default' )
+			{
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate && !( was_used ) )
+				{
+					show = true;
+				}
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+				{
+					show = false;
+				}
+				uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+				if( uiBlackboard )
+				{
+					uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_HudTooltip.ItemId, T"Items.w_power_corp_handgun_11101_a" );
+					uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, show );
+				}
+			}
+			if( evt.hotspot.GetDisplayName() == "q001_take_katana" && evt.layerData.tag == 'default' )
+			{
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate && !( was_used ) )
+				{
+					show = true;
+				}
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+				{
+					show = false;
+				}
+				uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+				if( uiBlackboard )
+				{
+					uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_HudTooltip.ItemId, T"Items.w_melee_001__katana_a" );
+					uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, show );
+				}
+			}
+			if( evt.hotspot.GetDisplayName() == "q003_smartrifle_container" && evt.layerData.tag == 'default' )
+			{
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate && !( was_used ) )
+				{
+					show = true;
+				}
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+				{
+					show = false;
+				}
+				uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+				if( uiBlackboard )
+				{
+					uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_HudTooltip.ItemId, T"Items.w_smart_corp_rifle_21301_a" );
+					uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, show );
+				}
+			}
+			if( evt.hotspot.GetDisplayName() == "q001_get_dressed" && evt.layerData.tag == 'default' )
+			{
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate && !( was_used ) )
+				{
+					show = true;
+				}
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+				{
+					show = false;
+				}
+				uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+				if( uiBlackboard )
+				{
+					uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_HudTooltip.ItemId, T"Items.q003_jacket" );
+					uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, show );
+				}
+			}
+			if( evt.hotspot.GetDisplayName() == "q003_shotgun_container" && evt.layerData.tag == 'default' )
+			{
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate && !( was_used ) )
+				{
+					show = true;
+				}
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+				{
+					show = false;
+				}
+				uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+				if( uiBlackboard )
+				{
+					uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_HudTooltip.ItemId, T"Items.w_smart_corp_shotgun_21201_a" );
+					uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, show );
+				}
+			}
+			if( evt.hotspot.GetDisplayName() == "q003_techrifle_container" && evt.layerData.tag == 'default' )
+			{
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_activate && !( was_used ) )
+				{
+					show = true;
+				}
+				if( evt.eventType == gameinteractionsEInteractionEventType.EIET_deactivate )
+				{
+					show = false;
+				}
+				uiBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_HudTooltip );
+				if( uiBlackboard )
+				{
+					uiBlackboard.SetVariant( GetAllBlackboardDefs().UI_HudTooltip.ItemId, T"Items.w_tech_corp_rifle_31301_a" );
+					uiBlackboard.SetBool( GetAllBlackboardDefs().UI_HudTooltip.ShowTooltip, show );
+				}
+			}
+		}
+	}
+
+}
+
+enum EComponentOperation
+{
+	Enable = 0,
+	Disable = 1,
+}
+
+enum EMathOperationType
+{
+	Add = 0,
+	Set = 1,
+}
+

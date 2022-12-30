@@ -1,0 +1,3316 @@
+import class DistrictEnteredEvent extends ScriptableSystemRequest
+{
+	import editable var entered : Bool;
+	import editable var sendNewLocationNotification : Bool;
+	[ customEditor = "TweakDBGroupInheritance;District" ]
+	import editable var district : TweakDBID;
+}
+
+class RefreshDistrictRequest extends ScriptableSystemRequest
+{
+	var preventionPreset : weak< DistrictPreventionData_Record >;
+}
+
+class UnlockPreventionInputRequest extends ScriptableSystemRequest
+{
+}
+
+class District extends IScriptable
+{
+	private var m_districtID : TweakDBID;
+	private var m_presetID : TweakDBID;
+
+	public const function GetDistrictID() : TweakDBID
+	{
+		return m_districtID;
+	}
+
+	public const function CreateDistrictRecord() : weak< District_Record >
+	{
+		return TweakDBInterface.GetDistrictRecord( m_districtID );
+	}
+
+	public const function GetPresetID() : TweakDBID
+	{
+		return m_presetID;
+	}
+
+	public const function GetGunshotStimRange() : Float
+	{
+		return CreateDistrictRecord().GunShotStimRange();
+	}
+
+	public const function GetExplosiveDeviceStimRange() : Float
+	{
+		return CreateDistrictRecord().ExplosiveDeviceStimRangeMultiplier();
+	}
+
+	public function Initialize( district : TweakDBID )
+	{
+		var createdDistrictRecord : weak< District_Record >;
+		m_districtID = district;
+		createdDistrictRecord = CreateDistrictRecord();
+		if( !( createdDistrictRecord ) )
+		{
+			m_presetID = T"PreventionData.NCPD";
+			return;
+		}
+		if( TDBID.IsValid( createdDistrictRecord.PreventionPreset().GetID() ) )
+		{
+			m_presetID = createdDistrictRecord.PreventionPreset().GetID();
+		}
+		else if( TDBID.IsValid( createdDistrictRecord.ParentDistrict().PreventionPreset().GetID() ) )
+		{
+			m_presetID = createdDistrictRecord.ParentDistrict().PreventionPreset().GetID();
+		}
+		else
+		{
+			m_presetID = T"PreventionData.NCPD";
+		}
+	}
+
+}
+
+class DistrictManager extends IScriptable
+{
+	private var m_system : weak< PreventionSystem >;
+	private var m_stack : array< District >;
+	private persistent var m_visitedDistricts : array< TweakDBID >;
+
+	public function Initialize( system : PreventionSystem )
+	{
+		m_system = system;
+	}
+
+	public function Update( evt : DistrictEnteredEvent )
+	{
+		ManageDistrictStack( evt );
+	}
+
+	private function ManageDistrictStack( request : DistrictEnteredEvent )
+	{
+		if( request.entered )
+		{
+			PushDistrict( request );
+		}
+		else
+		{
+			PopDistrict( request );
+		}
+		Refresh();
+		NotifySystem();
+	}
+
+	private function PushDistrict( request : DistrictEnteredEvent )
+	{
+		var i : Int32;
+		var d : District;
+		var playerNotification : PlayerEnteredNewDistrictEvent;
+		if( !( TDBID.IsValid( request.district ) ) )
+		{
+			return;
+		}
+		for( i = 0; i < m_stack.Size(); i += 1 )
+		{
+			if( m_stack[ i ].GetDistrictID() == request.district )
+			{
+				m_stack.Erase( i );
+				break;
+			}
+		}
+		d = new District;
+		d.Initialize( request.district );
+		m_stack.PushBack( d );
+		playerNotification = new PlayerEnteredNewDistrictEvent;
+		playerNotification.gunshotRange = d.GetGunshotStimRange();
+		playerNotification.explosionRange = d.GetExplosiveDeviceStimRange();
+		GameInstance.GetPlayerSystem( m_system.GetGame() ).GetLocalPlayerMainGameObject().QueueEvent( playerNotification );
+	}
+
+	private function PopDistrict( request : DistrictEnteredEvent )
+	{
+		var i : Int32;
+		for( i = m_stack.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_stack[ i ].GetDistrictID() == request.district )
+			{
+				m_stack.Erase( i );
+				return;
+			}
+		}
+	}
+
+	private function Refresh()
+	{
+		var d : weak< District >;
+		var isNew : Bool;
+		var blackboard : IBlackboard;
+		var districtRecord : weak< District_Record >;
+		d = GetCurrentDistrict();
+		if( !( d ) )
+		{
+			return;
+		}
+		if( !( m_visitedDistricts.Contains( d.GetDistrictID() ) ) )
+		{
+			m_visitedDistricts.PushBack( d.GetDistrictID() );
+			isNew = true;
+		}
+		districtRecord = d.CreateDistrictRecord();
+		blackboard = GameInstance.GetBlackboardSystem( m_system.GetGame() ).Get( GetAllBlackboardDefs().UI_Map );
+		if( blackboard )
+		{
+			blackboard.SetString( GetAllBlackboardDefs().UI_Map.currentLocationEnumName, districtRecord.EnumName(), true );
+			blackboard.SetString( GetAllBlackboardDefs().UI_Map.currentLocation, districtRecord.LocalizedName(), true );
+			blackboard.SetBool( GetAllBlackboardDefs().UI_Map.newLocationDiscovered, isNew, true );
+		}
+		GameInstance.GetTelemetrySystem( m_system.GetGame() ).LogDistrictChanged( districtRecord.EnumName(), isNew );
+	}
+
+	private function NotifySystem()
+	{
+		var request : RefreshDistrictRequest;
+		request = new RefreshDistrictRequest;
+		request.preventionPreset = TweakDBInterface.GetDistrictPreventionDataRecord( GetCurrentDistrict().GetPresetID() );
+		m_system.QueueRequest( request );
+	}
+
+	public const function GetCurrentDistrict() : weak< District >
+	{
+		var size : Int32;
+		size = m_stack.Size();
+		if( size == 0 )
+		{
+			return NULL;
+		}
+		return m_stack[ size - 1 ];
+	}
+
+}
+
+struct SpawnOriginData
+{
+	var position : Vector4;
+	var direction : Vector4;
+	var playerPosition : Vector4;
+}
+
+class PreventionSystem extends ScriptableSystem
+{
+	private persistent var m_districtManager : DistrictManager;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_preventionPreset : weak< DistrictPreventionData_Record >;
+	private var m_hiddenReaction : Bool;
+	private var m_systemDisabled : Bool;
+	private var m_systemLockSources : array< CName >;
+	private var m_deescalationZeroLockExecution : Bool;
+	private var m_heatStage : EPreventionHeatStage;
+	private var m_tempForcedheatStage : EPreventionHeatStage;
+	default m_tempForcedheatStage = EPreventionHeatStage.Invalid;
+	private var m_playerIsInSecurityArea : array< PersistentID >;
+	private var m_policeSecuritySystems : array< PersistentID >;
+	private var m_policeman100SpawnHits : Int32;
+	private var m_agentGroupsList : array< PreventionAgents >;
+	private var m_agentsWhoSeePlayer : array< EntityID >;
+	private var m_hitNPC : array< SHitNPC >;
+	private var m_spawnedAgents : array< weak< ScriptedPuppet > >;
+	private var m_lastCrimePoint : Vector4;
+	private var m_lastBodyPosition : Vector4;
+	private var m_DEBUG_lastCrimeDistance : Float;
+	private var m_policemanRandPercent : Int32;
+	private var m_policemabProbabilityPercent : Int32;
+	private var m_generalPercent : Float;
+	private var m_partGeneralPercent : Float;
+	private var m_newDamageValue : Float;
+	private var m_gameTimeStampPrevious : Float;
+	private var m_gameTimeStampLastPoliceRise : Float;
+	private var m_gameTimeStampDeescalationZero : Float;
+	private var m_deescalationZeroDelayID : DelayID;
+	private var m_blinkingStatusDelayID : DelayID;
+	private var m_deescalationZeroCheck : Bool;
+	private var m_blinkingStatusDeescalationCheck : Bool;
+	private var m_vehicleSpawnDelayID : DelayID;
+	private var m_policemenSpawnDelayID : DelayID;
+	private var m_preventionTickDelayID : DelayID;
+	private var m_preventionTickCheck : Bool;
+	private var m_securityAreaResetDelayID : DelayID;
+	private var m_securityAreaResetCheck : Bool;
+	private var m_hadOngoingSpawnRequest : Bool;
+	private var Debug_PorcessReason : EPreventionDebugProcessReason;
+	private var Debug_PsychoLogicType : EPreventionPsychoLogicType;
+	private var m_currentPreventionPreset : TweakDBID;
+	private var m_failsafePoliceRecordT1 : TweakDBID;
+	private var m_failsafePoliceRecordT2 : TweakDBID;
+	private var m_failsafePoliceRecordT3 : TweakDBID;
+	private var m_blinkReasonsStack : array< CName >;
+	private var m_wantedBarBlackboard : weak< IBlackboard >;
+	private var m_onPlayerChoiceCallID : CallbackHandle;
+	private var m_playerAttachedCallbackID : Uint32;
+	private var m_playerDetachedCallbackID : Uint32;
+	private var m_playerHLSID : CallbackHandle;
+	private var m_playerVehicleStateID : CallbackHandle;
+	private var m_playerHLS : gamePSMHighLevel;
+	private var m_playerVehicleState : gamePSMVehicle;
+	private var m_currentStageFallbackUnitSpawned : Bool;
+	private var m_unhandledInputsReceived : Int32;
+	private var m_inputlockDelayID : DelayID;
+	private var m_preventionUnitKilledDuringLock : Bool;
+	private var m_reconDeployed : Bool;
+	private var m_reconDestroyed : Bool;
+	private var m_isHidingFromPolice : Bool;
+	private var m_vehicles : array< weak< VehicleObject > >;
+	private var m_viewers : array< weak< GameObject > >;
+	private var m_hasViewers : Bool;
+
+	public const function IsSystemDissabled() : Bool
+	{
+		return m_systemDisabled;
+	}
+
+	public const function GetHeatStage() : EPreventionHeatStage
+	{
+		return m_heatStage;
+	}
+
+	public const function GetGeneralPercent() : Float
+	{
+		return m_generalPercent;
+	}
+
+	public const function GetPartGeneralPercent() : Float
+	{
+		return m_partGeneralPercent;
+	}
+
+	public const function GetNewDamageValue() : Float
+	{
+		return m_newDamageValue;
+	}
+
+	public const function IsChasingPlayer() : Bool
+	{
+		return m_heatStage != EPreventionHeatStage.Heat_0;
+	}
+
+	public const function AreTurretsActive() : Bool
+	{
+		return m_heatStage == EPreventionHeatStage.Heat_4;
+	}
+
+	private function GetGameTimeStamp() : Float
+	{
+		return EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+	}
+
+	public const function GetGame() : GameInstance
+	{
+		return GetGameInstance();
+	}
+
+	public const function GetSafeDistance() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.SafeDistance();
+		}
+		return 400.0;
+	}
+
+	public const function GetBlinkThreshold() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.BlinkThreshold();
+		}
+		return 270.0;
+	}
+
+	public const function GetInteriorSpawnDelay() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.InteriorSpawnDelay();
+		}
+		return 7.0;
+	}
+
+	public const function GetExteriorSpawnDelay() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.ExteriorSpawnDelay();
+		}
+		return 4.0;
+	}
+
+	public const function GetDamagePercentThreshold() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.DamagePercentThreshold();
+		}
+		return 1.0;
+	}
+
+	public const function GetDeescalationTime() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.DeescalationZeroTime();
+		}
+		return 60.0;
+	}
+
+	public const function GetBlinkingStarsDurationTime() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.BlinkingStarsDurationTime();
+		}
+		return 20.0;
+	}
+
+	public const function GetNonAggressiveReactionMultipler() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.NonAggressiveReactionMultipler();
+		}
+		return 5.0;
+	}
+
+	public const function GetPreventionInputLockTime() : Float
+	{
+		return 0.0;
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.InputLockTime();
+		}
+		return 3.0;
+	}
+
+	public const function GetInputLockOverrideThreshold() : Int32
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.InputLockOverrideThreshold();
+		}
+		return 4;
+	}
+
+	public const function GetSpawnOriginMaxDistance() : Float
+	{
+		if( m_preventionPreset )
+		{
+			return m_preventionPreset.SpawnOriginMaxDistance();
+		}
+		return 30.0;
+	}
+
+	private function IsPreventionInputLocked() : Bool
+	{
+		return m_inputlockDelayID != GetInvalidDelayID();
+	}
+
+	private function RemovePreventionInputLock()
+	{
+		if( IsPreventionInputLocked() )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_inputlockDelayID );
+			m_inputlockDelayID = GetInvalidDelayID();
+			m_unhandledInputsReceived = 0;
+			m_preventionUnitKilledDuringLock = false;
+		}
+	}
+
+	private function ActivatePreventionInputLock()
+	{
+		var request : UnlockPreventionInputRequest;
+		var inputLockTime : Float;
+		if( IsPreventionInputLocked() )
+		{
+			RemovePreventionInputLock();
+		}
+		inputLockTime = GetPreventionInputLockTime();
+		if( inputLockTime > 0.0 )
+		{
+			request = new UnlockPreventionInputRequest;
+			m_inputlockDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'PreventionSystem', request, inputLockTime );
+		}
+	}
+
+	private function OnUnlockPreventionInputRequest( request : UnlockPreventionInputRequest )
+	{
+		if( m_preventionUnitKilledDuringLock )
+		{
+			SendInternalSystem( 1.0 );
+		}
+		RemovePreventionInputLock();
+	}
+
+	protected function SetPartGeneralPercent( value : Float )
+	{
+		m_partGeneralPercent = value;
+	}
+
+	protected function SetNewDamageValue( value : Float )
+	{
+		m_newDamageValue = value;
+	}
+
+	protected function SetHeatStage( value : EPreventionHeatStage ) : Bool
+	{
+		if( m_heatStage == value )
+		{
+			m_tempForcedheatStage = EPreventionHeatStage.Invalid;
+			if( m_reconDeployed && !( m_reconDestroyed ) )
+			{
+				m_reconDestroyed = true;
+				return true;
+			}
+			return false;
+		}
+		m_heatStage = value;
+		if( m_wantedBarBlackboard )
+		{
+			m_wantedBarBlackboard.SetInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, ( ( Int32 )( m_heatStage ) ), true );
+			SetWantedLevelFact( ( ( Int32 )( m_heatStage ) ) );
+		}
+		m_tempForcedheatStage = EPreventionHeatStage.Invalid;
+		return true;
+	}
+
+	protected function SetNewLastCrimePoint( value : Vector4 )
+	{
+		ResetDeescalationZero();
+		if( CheckifNewPointIsCloserThanPrevious( m_lastCrimePoint, value ) )
+		{
+			m_lastCrimePoint = value;
+		}
+	}
+
+	protected function SetNewLastBodyPosition( value : Vector4 )
+	{
+		if( CheckifNewPointIsCloserThanPrevious( m_lastBodyPosition, value ) )
+		{
+			m_lastBodyPosition = value;
+		}
+	}
+
+	protected function AddGeneralPercent( value : Float )
+	{
+		var heatStageValue : Int32;
+		if( m_unhandledInputsReceived >= GetInputLockOverrideThreshold() )
+		{
+			RemovePreventionInputLock();
+		}
+		if( IsPreventionInputLocked() )
+		{
+			m_unhandledInputsReceived += 1;
+			return;
+		}
+		if( m_tempForcedheatStage != EPreventionHeatStage.Invalid )
+		{
+			heatStageValue = ( ( Int32 )( m_tempForcedheatStage ) );
+			m_generalPercent = ( ( Float )( heatStageValue ) );
+		}
+		else if( ( m_heatStage == EPreventionHeatStage.Heat_1 && m_reconDeployed ) && !( m_reconDestroyed ) )
+		{
+		}
+		else
+		{
+			m_generalPercent += value;
+		}
+		if( m_generalPercent < 0.0 )
+		{
+			m_generalPercent = 0.0;
+		}
+		if( ( m_generalPercent < 1.0 ) && ( m_generalPercent > 0.30000001 ) )
+		{
+			m_generalPercent = 1.0;
+		}
+		ActivatePreventionInputLock();
+	}
+
+	public const function CanPreventionReactToInput() : Bool
+	{
+		if( !( m_player ) )
+		{
+			return false;
+		}
+		if( IsSystemDissabled() || IsMultiplayer() )
+		{
+			return false;
+		}
+		if( ( ( ( Int32 )( m_playerHLS ) ) > ( ( Int32 )( gamePSMHighLevel.SceneTier1 ) ) ) && ( ( ( Int32 )( m_playerHLS ) ) <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) ) )
+		{
+			return false;
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_player, 'VehicleCombat' ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( m_player, 'VehicleScene' ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private function GetFallbackUnitSpawnData( heatStage : EPreventionHeatStage, out characterRecord : TweakDBID, out minSpawnRange : Float, out unitsCount : Int32 ) : Bool
+	{
+		var heatData : weak< PreventionHeatData_Record >;
+		var fallbackUnitData : weak< PreventionFallbackUnitData_Record >;
+		if( m_preventionPreset )
+		{
+			switch( heatStage )
+			{
+				case EPreventionHeatStage.Heat_0:
+					return false;
+				case EPreventionHeatStage.Heat_1:
+					heatData = m_preventionPreset.Heat1();
+				break;
+				case EPreventionHeatStage.Heat_2:
+					heatData = m_preventionPreset.Heat2();
+				break;
+				case EPreventionHeatStage.Heat_3:
+					heatData = m_preventionPreset.Heat3();
+				break;
+				case EPreventionHeatStage.Heat_4:
+					heatData = m_preventionPreset.Heat4();
+				break;
+				default:
+					return false;
+			}
+			if( heatData )
+			{
+				fallbackUnitData = heatData.FallbackUnitData();
+				if( fallbackUnitData )
+				{
+					characterRecord = fallbackUnitData.CharacterRecord().GetID();
+					minSpawnRange = fallbackUnitData.MinSpawnRange();
+					unitsCount = fallbackUnitData.UnitsCount();
+					return true;
+				}
+				else
+				{
+					return false;
+				}
+			}
+			else
+			{
+				return false;
+			}
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function GetSpawnDataFromHeatStage( heatStage : EPreventionHeatStage, out characterRecords : array< TweakDBID >, out spawnRange : Vector2, out unitsCount : Uint32, out spawnInterval : Float, out hasRecon : Bool ) : Bool
+	{
+		var heatData : weak< PreventionHeatData_Record >;
+		var characterRecordPool : array< weak< PreventionUnitPoolData_Record > >;
+		var characterRecord : TweakDBID;
+		var i : Int32;
+		characterRecords.Clear();
+		if( m_preventionPreset )
+		{
+			if( !( m_reconDeployed ) && heatStage == EPreventionHeatStage.Heat_1 )
+			{
+				heatData = m_preventionPreset.Recon();
+			}
+			if( !( heatData ) )
+			{
+				switch( heatStage )
+				{
+					case EPreventionHeatStage.Heat_0:
+						return false;
+					case EPreventionHeatStage.Heat_1:
+						heatData = m_preventionPreset.Heat1();
+					break;
+					case EPreventionHeatStage.Heat_2:
+						heatData = m_preventionPreset.Heat2();
+					break;
+					case EPreventionHeatStage.Heat_3:
+						heatData = m_preventionPreset.Heat3();
+					break;
+					case EPreventionHeatStage.Heat_4:
+						heatData = m_preventionPreset.Heat4();
+					break;
+					default:
+						return false;
+				}
+			}
+			else
+			{
+				hasRecon = true;
+			}
+			if( heatData && ( heatData.GetUnitRecordsPoolCount() > 0 ) )
+			{
+				heatData.UnitRecordsPool( characterRecordPool );
+				unitsCount = ( ( Uint32 )( heatData.UnitsCount() ) );
+				spawnRange = heatData.SpawnRange();
+				spawnInterval = MaxF( heatData.SpawnInterval(), 0.0 );
+				for( i = 0; i < ( ( Int32 )( unitsCount ) ); i += 1 )
+				{
+					if( GetCharacterRecordFromPool( characterRecordPool, characterRecord ) )
+					{
+						characterRecords.PushBack( characterRecord );
+					}
+					else
+					{
+						break;
+					}
+				}
+				if( characterRecords.Size() > 0 )
+				{
+					return true;
+				}
+			}
+		}
+		switch( heatStage )
+		{
+			case EPreventionHeatStage.Heat_0:
+				return false;
+			case EPreventionHeatStage.Heat_1:
+			{
+				characterRecords.PushBack( m_failsafePoliceRecordT1 );
+				unitsCount = ( ( Uint32 )( 2 ) );
+				spawnRange.Y = 45.0;
+				spawnRange.Y = 65.0;
+				break;
+			}
+			case EPreventionHeatStage.Heat_2:
+			{
+				characterRecords.PushBack( m_failsafePoliceRecordT2 );
+				unitsCount = ( ( Uint32 )( 2 ) );
+				spawnRange.Y = 45.0;
+				spawnRange.Y = 65.0;
+				break;
+			}
+			case EPreventionHeatStage.Heat_3:
+			case EPreventionHeatStage.Heat_4:
+			{
+				characterRecords.PushBack( m_failsafePoliceRecordT3 );
+				unitsCount = ( ( Uint32 )( 2 ) );
+				spawnRange.Y = 45.0;
+				spawnRange.Y = 65.0;
+				break;
+			}
+			;
+			default:
+				break;
+		}
+		if( characterRecords.Size() > 0 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function GetCharacterRecordFromPool( pool : array< weak< PreventionUnitPoolData_Record > >, out recordID : TweakDBID ) : Bool
+	{
+		var i : Int32;
+		var weightSum, accumulator, randomVal : Float;
+		var characterRecord : weak< Character_Record >;
+		randomVal = 0.0;
+		for( i = 0; i < pool.Size(); i += 1 )
+		{
+			weightSum += pool[ i ].Weight();
+		}
+		randomVal = RandRangeF( 0.0, weightSum );
+		for( i = 0; i < pool.Size(); i += 1 )
+		{
+			pool[ i ].Weight();
+			accumulator += pool[ i ].Weight();
+			if( randomVal < accumulator )
+			{
+				characterRecord = pool[ i ].CharacterRecord();
+				if( characterRecord )
+				{
+					recordID = characterRecord.GetID();
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private export override function IsSavingLocked() : Bool
+	{
+		return IsChasingPlayer();
+	}
+
+	private export override function OnAttach()
+	{
+		m_districtManager = new DistrictManager;
+		m_districtManager.Initialize( this );
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+		RestoreDefaultConfig();
+		m_failsafePoliceRecordT1 = T"Character.prevention_unit_tier1";
+		m_failsafePoliceRecordT2 = T"Character.prevention_unit_tier2";
+		m_failsafePoliceRecordT3 = T"Character.prevention_unit_tier3";
+		m_wantedBarBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_WantedBar );
+		RegisterToBBCalls();
+		ChangeAgentsAttitude( EAIAttitude.AIA_Neutral );
+	}
+
+	private export override function OnDetach()
+	{
+		UnregisterBBCalls();
+	}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		m_districtManager.Initialize( this );
+		if( !( IsChasingPlayer() ) )
+		{
+			FastTravelSystem.RemoveFastTravelLock( 'PreventionSystem', GetGameInstance() );
+			ChangeAgentsAttitude( EAIAttitude.AIA_Neutral );
+		}
+	}
+
+	private function RegisterToBBCalls()
+	{
+		if( !( m_onPlayerChoiceCallID ) )
+		{
+			m_onPlayerChoiceCallID = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UIInteractions ).RegisterListenerVariant( GetAllBlackboardDefs().UIInteractions.LastAttemptedChoice, this, 'OnPlayerChoice' );
+		}
+		m_playerAttachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetAttachedCallback( this, 'PlayerAttachedCallback' );
+		m_playerDetachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetDetachedCallback( this, 'PlayerDetachedCallback' );
+	}
+
+	private function UnregisterBBCalls()
+	{
+		if( m_onPlayerChoiceCallID )
+		{
+			GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UIInteractions ).UnregisterListenerVariant( GetAllBlackboardDefs().UIInteractions.LastAttemptedChoice, m_onPlayerChoiceCallID );
+		}
+		GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetAttachedCallback( m_playerAttachedCallbackID );
+		GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetDetachedCallback( m_playerDetachedCallbackID );
+	}
+
+	private export function PlayerAttachedCallback( playerPuppet : GameObject )
+	{
+		var psmBlackboard : IBlackboard;
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		if( !( m_player ) )
+		{
+			return;
+		}
+		psmBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( psmBlackboard )
+		{
+			m_playerHLSID = psmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel, this, 'OnPlayerHLSChange', true );
+			m_playerVehicleStateID = psmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, this, 'OnPlayerVehicleStateChange', true );
+		}
+		else
+		{
+			m_playerHLSID = NULL;
+			m_playerVehicleStateID = NULL;
+		}
+	}
+
+	private export function PlayerDetachedCallback( playerPuppet : GameObject )
+	{
+		var psmBlackboard : IBlackboard;
+		m_player = NULL;
+		psmBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( psmBlackboard )
+		{
+			if( m_playerHLSID )
+			{
+				psmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel, m_playerHLSID );
+			}
+			if( m_playerVehicleStateID )
+			{
+				psmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, m_playerVehicleStateID );
+			}
+		}
+	}
+
+	protected event OnPlayerHLSChange( value : Int32 )
+	{
+		m_playerHLS = ( ( gamePSMHighLevel )( value ) );
+		ReevaluateSecurityAreaReset();
+	}
+
+	protected event OnPlayerVehicleStateChange( value : Int32 )
+	{
+		m_playerVehicleState = ( ( gamePSMVehicle )( value ) );
+	}
+
+	protected function AddUniqueHitNPC( entityID : EntityID ) : Bool
+	{
+		var i : Int32;
+		var newData : SHitNPC;
+		if( !( EntityID.IsDefined( entityID ) ) )
+		{
+			return false;
+		}
+		for( i = m_hitNPC.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_hitNPC[ i ].entityID == entityID )
+			{
+				return false;
+			}
+		}
+		newData.entityID = entityID;
+		newData.calls = 0;
+		m_hitNPC.PushBack( newData );
+		return true;
+	}
+
+	protected function WhipeHitNPC()
+	{
+		m_hitNPC.Clear();
+	}
+
+	protected function OnDamageInput( request : PreventionDamageRequest )
+	{
+		if( !( CanPreventionReactToInput() ) )
+		{
+			Debug_PorcessReason = EPreventionDebugProcessReason.Abort_SystemLockedBySceneTier;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugProcessInfo();
+			}
+			return;
+		}
+		if( request.requestedHeat != EPreventionHeatStage.Invalid )
+		{
+			m_tempForcedheatStage = request.requestedHeat;
+		}
+		if( !( request.isInternal ) )
+		{
+			if( request.requestedHeat == EPreventionHeatStage.Invalid || request.requestedHeat != EPreventionHeatStage.Heat_0 )
+			{
+				ResetDeescalationZero();
+				CreateCrowdNullArea( request.targetPosition );
+			}
+		}
+		if( IsPreventionInputLocked() )
+		{
+			if( !( request.isTargetPrevention ) && !( request.isTargetAlive ) )
+			{
+				m_preventionUnitKilledDuringLock = true;
+			}
+		}
+		Debug_PorcessReason = EPreventionDebugProcessReason.Process_NewDamage;
+		if( request.damagePercentValue < 0.0 )
+		{
+			Debug_PorcessReason = EPreventionDebugProcessReason.Abort_DamageZero;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugProcessInfo();
+			}
+			return;
+		}
+		if( !( AddUniqueHitNPC( request.targetID ) ) && !( request.isInternal ) )
+		{
+			Debug_PorcessReason = EPreventionDebugProcessReason.Abort_EntitySame;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugProcessInfo();
+			}
+			return;
+		}
+		if( request.requestedHeat == EPreventionHeatStage.Heat_0 )
+		{
+			execInstructionSafe();
+			return;
+		}
+		else
+		{
+			if( request.damagePercentValue > 1.0 )
+			{
+				SetNewDamageValue( 1.0 );
+			}
+			else
+			{
+				SetNewDamageValue( request.damagePercentValue );
+			}
+		}
+		SetNewLastCrimePoint( request.targetPosition );
+		SetNewLastBodyPosition( request.targetPosition );
+		StartPipeline();
+	}
+
+	private function ShouldSkipSpawning( optional requester : weak< ScriptedPuppet > ) : Bool
+	{
+		if( !( requester ) )
+		{
+			return false;
+		}
+		if( NPCManager.HasTag( requester.GetRecordID(), 'DoNotTriggerSpawningPolice' ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function HeatPipeline( optional skipSpawningUnits : Bool )
+	{
+		var flooredGenPercent : Int32;
+		var heatStageToSet : EPreventionHeatStage;
+		flooredGenPercent = FloorF( GetGeneralPercent() );
+		heatStageToSet = IntToEPreventionHeatStage( flooredGenPercent );
+		if( SetHeatStage( heatStageToSet ) || ( m_heatStage == EPreventionHeatStage.Heat_4 && ( flooredGenPercent >= 5 ) ) )
+		{
+			OnHeatChanged( skipSpawningUnits );
+		}
+		else
+		{
+			GameInstance.GetAudioSystem( GetGame() ).Play( 'gmp_ui_prevention_player_commit_crime' );
+		}
+	}
+
+	private function OnHeatChanged( optional skipSpawningUnits : Bool )
+	{
+		var elevator : weak< GameObject >;
+		var i : Int32;
+		var lockDropPointSystem : ToggleDropPointSystemRequest;
+		if( IsChasingPlayer() )
+		{
+			StartPreventionTickRequest();
+			GameInstance.GetAudioSystem( GetGame() ).Play( 'gmp_ui_prevention_player_marked_psycho' );
+			ChangeAgentsAttitude( EAIAttitude.AIA_Hostile );
+			TutorialAddPoliceSystemFact();
+			FastTravelSystem.AddFastTravelLock( 'PreventionSystem', GetGameInstance() );
+			lockDropPointSystem = new ToggleDropPointSystemRequest;
+			lockDropPointSystem.isEnabled = false;
+			lockDropPointSystem.reason = 'PreventionSystem';
+			GameInstance.QueueScriptableSystemRequest( GetGameInstance(), 'DropPointSystem', lockDropPointSystem );
+			StartDeescalationZero();
+			if( !( skipSpawningUnits ) )
+			{
+				if( m_playerIsInSecurityArea.Size() > 0 )
+				{
+					ReevaluateSecurityAreaReset();
+				}
+				else
+				{
+					SpawnPipeline( m_heatStage );
+				}
+			}
+			for( i = m_vehicles.Size() - 1; i >= 0; i -= 1 )
+			{
+				if( IsVehicleValid( m_vehicles[ i ] ) )
+				{
+					GameInstance.GetPreventionSpawnSystem( GetGame() ).ReinitVehicle( m_vehicles[ i ] );
+				}
+			}
+		}
+		if( LiftDevice.GetCurrentElevator( GetGame(), elevator ) )
+		{
+			elevator.QueueEvent( new RefreshPlayerAuthorizationEvent );
+		}
+		switch( m_heatStage )
+		{
+			case EPreventionHeatStage.Heat_0:
+				GameInstance.GetAudioSystem( GetGame() ).Play( 'gmp_ui_prevention_player_reset' );
+			GameInstance.GetAudioSystem( GetGame() ).RegisterPreventionHeatStage( 0 );
+			FastTravelSystem.RemoveFastTravelLock( 'PreventionSystem', GetGameInstance() );
+			lockDropPointSystem = new ToggleDropPointSystemRequest;
+			lockDropPointSystem.isEnabled = true;
+			lockDropPointSystem.reason = 'PreventionSystem';
+			GameInstance.QueueScriptableSystemRequest( GetGameInstance(), 'DropPointSystem', lockDropPointSystem );
+			RemovePreventionInputLock();
+			m_reconDeployed = false;
+			m_reconDestroyed = false;
+			m_generalPercent = 0.0;
+			break;
+			case EPreventionHeatStage.Heat_1:
+				GameInstance.GetAudioSystem( GetGame() ).RegisterPreventionHeatStage( 1 );
+			m_generalPercent = 1.0;
+			break;
+			case EPreventionHeatStage.Heat_2:
+				GameInstance.GetAudioSystem( GetGame() ).RegisterPreventionHeatStage( 2 );
+			m_generalPercent = 2.0;
+			break;
+			case EPreventionHeatStage.Heat_3:
+				GameInstance.GetAudioSystem( GetGame() ).RegisterPreventionHeatStage( 3 );
+			m_generalPercent = 3.0;
+			break;
+			case EPreventionHeatStage.Heat_4:
+				GameInstance.GetAudioSystem( GetGame() ).RegisterPreventionHeatStage( 4 );
+			m_generalPercent = 4.0;
+			WakeUpAllAgents( true );
+			break;
+		}
+		m_currentStageFallbackUnitSpawned = false;
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+	}
+
+	private function TutorialAddPoliceSystemFact()
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( GetGameInstance() );
+		if( ( questSystem.GetFact( 'police_system_tutorial' ) == 0 ) && ( questSystem.GetFact( 'disable_tutorials' ) == 0 ) )
+		{
+			questSystem.SetFact( 'police_system_tutorial', 1 );
+		}
+	}
+
+	private function SetWantedLevelFact( level : Int32 )
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( GetGameInstance() );
+		if( questSystem )
+		{
+			questSystem.SetFact( 'wanted_level', level );
+		}
+	}
+
+	private function StartPipeline()
+	{
+		m_hiddenReaction = false;
+		PreDamageChange();
+		DamageChange();
+		PostDamageChange();
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+		m_gameTimeStampPrevious = GetGameTimeStamp();
+	}
+
+	private function PreDamageChange()
+	{
+		switch( m_heatStage )
+		{
+			case EPreventionHeatStage.Heat_1:
+				if( m_reconDeployed && !( m_reconDestroyed ) )
+				{
+					SetPartGeneralPercent( 0.0 );
+				}
+				else
+				{
+					SetPartGeneralPercent( 0.5 );
+				}
+			break;
+			case EPreventionHeatStage.Heat_2:
+				SetPartGeneralPercent( 0.34 );
+			break;
+			case EPreventionHeatStage.Heat_3:
+				SetPartGeneralPercent( 0.34 );
+			break;
+			case EPreventionHeatStage.Heat_4:
+				SetPartGeneralPercent( 0.25999999 );
+			break;
+			default:
+				SetPartGeneralPercent( 1.0 );
+			break;
+		}
+	}
+
+	private function DamageChange()
+	{
+		AddGeneralPercent( GetPartGeneralPercent() );
+	}
+
+	private function PostDamageChange()
+	{
+		HeatPipeline();
+	}
+
+	private function RisePoliceProbability()
+	{
+		m_policeman100SpawnHits += 1;
+		m_gameTimeStampLastPoliceRise = GetGameTimeStamp();
+	}
+
+	private function StartDeescalationZero()
+	{
+		var delayedDeescalationZero : PreventionDelayedZeroRequest;
+		if( !( m_deescalationZeroCheck ) )
+		{
+			delayedDeescalationZero = new PreventionDelayedZeroRequest;
+			m_deescalationZeroDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'PreventionSystem', delayedDeescalationZero, GetDeescalationTime() );
+			m_deescalationZeroCheck = true;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugEvents();
+			}
+		}
+	}
+
+	private function StopDeescalationZero()
+	{
+		if( m_deescalationZeroCheck )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_deescalationZeroDelayID );
+			m_deescalationZeroCheck = false;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugEvents();
+			}
+		}
+	}
+
+	private function ResetDeescalationZero()
+	{
+		if( !( m_deescalationZeroCheck ) )
+		{
+			return;
+		}
+		StopDeescalationZero();
+		m_deescalationZeroLockExecution = false;
+		StartDeescalationZero();
+	}
+
+	private function StartBlinkingStatusDeescalation()
+	{
+		var delayedBlinkingStatus : PreventionBlinkingStatusRequest;
+		if( !( m_blinkingStatusDeescalationCheck ) )
+		{
+			delayedBlinkingStatus = new PreventionBlinkingStatusRequest;
+			m_blinkingStatusDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'PreventionSystem', delayedBlinkingStatus, GetBlinkingStarsDurationTime() );
+			m_blinkingStatusDeescalationCheck = true;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugEvents();
+			}
+		}
+	}
+
+	private function StopBlinkingStatusDeescalation()
+	{
+		if( m_blinkingStatusDeescalationCheck )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_blinkingStatusDelayID );
+			m_blinkingStatusDeescalationCheck = false;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugEvents();
+			}
+		}
+	}
+
+	private function OnDeescalationZero( evt : PreventionDelayedZeroRequest )
+	{
+		if( m_viewers.Size() > 0 )
+		{
+			ResetDeescalationZero();
+			return;
+		}
+		execInstructionSafe();
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugEvents();
+		}
+	}
+
+	private function OnDelayedSpawnRequest( evt : PreventionDelayedSpawnRequest )
+	{
+		m_policemenSpawnDelayID = GetInvalidDelayID();
+		SpawnPolice( evt.heatStage );
+	}
+
+	private function OnDelayedSpawnRequest( evt : PreventionDelayedVehicleSpawnRequest )
+	{
+		m_vehicleSpawnDelayID = GetInvalidDelayID();
+		SpawnPoliceVehicle( evt.heatStage );
+	}
+
+	private function SpawnPipeline( heatStage : EPreventionHeatStage, optional delay : Float )
+	{
+		if( !( CanPreventionReactToInput() ) )
+		{
+			return;
+		}
+		if( heatStage == EPreventionHeatStage.Heat_0 )
+		{
+			return;
+		}
+		CancelSpawnDelay();
+		UpdateVehicles();
+		if( delay > 0.0 )
+		{
+			SpawnPoliceWithDelay( heatStage, delay );
+		}
+		else if( IsEntityInInteriorArea( m_player ) )
+		{
+			SpawnPoliceWithDelay( heatStage, GetInteriorSpawnDelay() );
+		}
+		else
+		{
+			if( ShouldSpawnVehicle() )
+			{
+				SpawnPoliceVehicle( heatStage );
+			}
+			else
+			{
+				SpawnPoliceWithDelay( heatStage, GetExteriorSpawnDelay() );
+			}
+		}
+	}
+
+	private function CancelSpawnDelay() : Bool
+	{
+		if( m_policemenSpawnDelayID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_policemenSpawnDelayID );
+			m_policemenSpawnDelayID = GetInvalidDelayID();
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function CancelVehicleSpawnDelay() : Bool
+	{
+		if( m_vehicleSpawnDelayID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_vehicleSpawnDelayID );
+			m_vehicleSpawnDelayID = GetInvalidDelayID();
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function SpawnPoliceWithDelay( heatStage : EPreventionHeatStage, delay : Float )
+	{
+		var evt : PreventionDelayedSpawnRequest;
+		CancelSpawnDelay();
+		evt = new PreventionDelayedSpawnRequest;
+		evt.heatStage = heatStage;
+		m_policemenSpawnDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayScriptableSystemRequest( 'PreventionSystem', evt, delay );
+	}
+
+	private function SpawnPoliceVehicleWithDelay( heatStage : EPreventionHeatStage, delay : Float )
+	{
+		var evt : PreventionDelayedVehicleSpawnRequest;
+		CancelVehicleSpawnDelay();
+		evt = new PreventionDelayedVehicleSpawnRequest;
+		evt.heatStage = heatStage;
+		m_vehicleSpawnDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayScriptableSystemRequest( 'PreventionSystem', evt, delay );
+	}
+
+	private function SpawnPolice( heatStage : EPreventionHeatStage )
+	{
+		var unitsCount : Uint32;
+		var spawnRange : Vector2;
+		var spawnPoints : array< Vector4 >;
+		var fallbackSpawnPoints : array< Vector4 >;
+		var backupSpawnPoints : array< Vector4 >;
+		var i : Int32;
+		var spawnInterval : Float;
+		var characterRecordIDs : array< TweakDBID >;
+		var fallbackUnitRecordID : TweakDBID;
+		var fallbackUnitMinSpawnRange : Float;
+		var fallbackUnitsCount : Int32;
+		var hasRecon : Bool;
+		var spawnOriginsData : array< SpawnOriginData >;
+		var isFallbackValid : Bool;
+		if( !( m_player ) )
+		{
+			return;
+		}
+		if( GetSpawnDataFromHeatStage( heatStage, characterRecordIDs, spawnRange, unitsCount, spawnInterval, hasRecon ) )
+		{
+			GetFindSpawnPointsOriginsData( spawnOriginsData );
+			for( i = 0; i < spawnOriginsData.Size(); i += 1 )
+			{
+				if( GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).FindPursuitPointsRange( spawnOriginsData[ i ].playerPosition, spawnOriginsData[ i ].position, spawnOriginsData[ i ].direction, spawnRange.X, spawnRange.Y, characterRecordIDs.Size(), false, NavGenAgentSize.Human, spawnPoints, fallbackSpawnPoints ) )
+				{
+					if( SpawnUnits( spawnPoints, characterRecordIDs, ( ( Uint32 )( heatStage ) ), spawnInterval ) )
+					{
+						if( hasRecon && !( m_reconDeployed ) )
+						{
+							m_reconDeployed = true;
+						}
+						return;
+					}
+				}
+			}
+			if( !( m_currentStageFallbackUnitSpawned ) && GetFallbackUnitSpawnData( heatStage, fallbackUnitRecordID, fallbackUnitMinSpawnRange, fallbackUnitsCount ) )
+			{
+				isFallbackValid = true;
+				fallbackSpawnPoints.Clear();
+				characterRecordIDs.Clear();
+				characterRecordIDs.PushBack( fallbackUnitRecordID );
+				for( i = 0; i < spawnOriginsData.Size(); i += 1 )
+				{
+					if( GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).FindPursuitPointsRange( spawnOriginsData[ i ].playerPosition, spawnOriginsData[ i ].position, spawnOriginsData[ i ].direction, fallbackUnitMinSpawnRange, spawnRange.X, fallbackUnitsCount, false, NavGenAgentSize.Human, spawnPoints, fallbackSpawnPoints ) )
+					{
+						if( backupSpawnPoints.Size() == 0 )
+						{
+							backupSpawnPoints = fallbackSpawnPoints;
+						}
+						if( SpawnUnits( spawnPoints, characterRecordIDs, ( ( Uint32 )( heatStage ) ), spawnInterval ) )
+						{
+							m_currentStageFallbackUnitSpawned = true;
+							if( hasRecon && !( m_reconDeployed ) )
+							{
+								m_reconDeployed = true;
+							}
+							else
+							{
+								SpawnPoliceWithDelay( heatStage, 1.0 );
+							}
+							return;
+						}
+					}
+				}
+			}
+			if( !( m_currentStageFallbackUnitSpawned ) && isFallbackValid )
+			{
+				if( SpawnUnits( backupSpawnPoints, characterRecordIDs, ( ( Uint32 )( heatStage ) ), spawnInterval ) )
+				{
+					m_currentStageFallbackUnitSpawned = true;
+					if( hasRecon && !( m_reconDeployed ) )
+					{
+						m_reconDeployed = true;
+					}
+					else
+					{
+						SpawnPoliceWithDelay( heatStage, 1.0 );
+					}
+				}
+				else
+				{
+					SpawnPoliceWithDelay( heatStage, 1.0 );
+				}
+			}
+		}
+	}
+
+	private function SpawnUnits( spawnPoints : array< Vector4 >, characterRecords : array< TweakDBID >, heatStage : Uint32, spawnInterval : Float ) : Bool
+	{
+		var i : Int32;
+		var spawnTransform : WorldTransform;
+		var currentRecordIdx : Int32;
+		var lastRecordIdx : Int32;
+		if( spawnPoints.Size() > 0 )
+		{
+			lastRecordIdx = characterRecords.Size() - 1;
+			for( i = 0; i < spawnPoints.Size(); i += 1 )
+			{
+				WorldTransform.SetPosition( spawnTransform, spawnPoints[ i ] );
+				WorldTransform.SetOrientationFromDir( spawnTransform, Vector4.Normalize2D( m_player.GetWorldPosition() - spawnPoints[ i ] ) );
+				PreventionSystem.DelayedSpawnUnitRequest( GetGame(), characterRecords[ currentRecordIdx ], heatStage, spawnTransform, ( ( Float )( ( i + 1 ) ) ) * spawnInterval );
+				if( currentRecordIdx < lastRecordIdx )
+				{
+					currentRecordIdx += 1;
+				}
+			}
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private function GetVehicleIDFromHeatStage( heatStage : EPreventionHeatStage, out vehicleID : TweakDBID ) : Bool
+	{
+		var heatData : weak< PreventionHeatData_Record >;
+		if( m_preventionPreset )
+		{
+			switch( heatStage )
+			{
+				case EPreventionHeatStage.Heat_0:
+					return false;
+				case EPreventionHeatStage.Heat_1:
+					heatData = m_preventionPreset.Heat1();
+				break;
+				case EPreventionHeatStage.Heat_2:
+					heatData = m_preventionPreset.Heat2();
+				break;
+				case EPreventionHeatStage.Heat_3:
+					heatData = m_preventionPreset.Heat3();
+				break;
+				case EPreventionHeatStage.Heat_4:
+					heatData = m_preventionPreset.Heat4();
+				break;
+				default:
+					return false;
+			}
+			if( heatData && heatData.VehicleRecord() )
+			{
+				vehicleID = heatData.VehicleRecord().GetID();
+			}
+		}
+		return TDBID.IsValid( vehicleID );
+	}
+
+	private function ShouldSpawnVehicle() : Bool
+	{
+		if( !( GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).IsPreventionVehiclePrototypeEnabled() ) )
+		{
+			return false;
+		}
+		if( m_preventionPreset.Recon() && !( m_reconDeployed ) )
+		{
+			return false;
+		}
+		if( ( m_vehicles.Size() > 0 ) || ( m_vehicleSpawnDelayID != GetInvalidDelayID() ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private function SpawnPoliceVehicle( heatStage : EPreventionHeatStage )
+	{
+		var vehicleID : TweakDBID;
+		if( !( GetVehicleIDFromHeatStage( heatStage, vehicleID ) ) )
+		{
+			return;
+		}
+		GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).RequestVehicleSpawn( vehicleID, m_preventionPreset.GetID(), ( ( Uint32 )( heatStage ) ) );
+	}
+
+	private function OnSpawnUnitDelayRequest( request : PreventionDelayedSpawnUnitRequest )
+	{
+		if( ( ( Int32 )( m_heatStage ) ) >= ( ( Int32 )( request.preventionLevel ) ) )
+		{
+			GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).RequestSpawn( request.recordID, request.preventionLevel, request.spawnTransform );
+		}
+	}
+
+	private function GetFindSpawnPointsOrigin( out pos : Vector4, out dir : Vector4 )
+	{
+		var vehicle : weak< VehicleObject >;
+		var vehSpeed : Float;
+		var offsetDist : Float;
+		dir = m_player.GetWorldForward();
+		if( VehicleComponent.GetVehicle( m_player.GetGame(), m_player, vehicle ) )
+		{
+			vehSpeed = vehicle.GetBlackboard().GetFloat( GetAllBlackboardDefs().Vehicle.SpeedValue );
+			if( vehSpeed > 0.5 )
+			{
+				offsetDist = LerpF( vehSpeed / 30.0, 20.0, 60.0, true );
+				pos = pos + ( offsetDist * vehicle.GetWorldForward() );
+				dir *= -1.0;
+			}
+		}
+		else
+		{
+			pos = m_lastCrimePoint;
+		}
+	}
+
+	private function GetFindSpawnPointsOriginsData( out spawnOriginsData : array< SpawnOriginData > )
+	{
+		var vehicle : weak< VehicleObject >;
+		var vehSpeed : Float;
+		var offsetDist : Float;
+		var playerForward : Vector4;
+		var playrPos : Vector4;
+		var viewerPos : Vector4;
+		var currentOriginData : SpawnOriginData;
+		var distanceToCheck : Float;
+		var sortedResults : array< HandleWithValue >;
+		var singleSortedResult : HandleWithValue;
+		var pointData : PointData;
+		var i : Int32;
+		playerForward = m_player.GetWorldForward();
+		playrPos = m_player.GetWorldPosition();
+		if( VehicleComponent.GetVehicle( m_player.GetGame(), m_player, vehicle ) )
+		{
+			vehSpeed = vehicle.GetBlackboard().GetFloat( GetAllBlackboardDefs().Vehicle.SpeedValue );
+			if( vehSpeed > 0.5 )
+			{
+				offsetDist = LerpF( vehSpeed / 30.0, 20.0, 60.0, true );
+				currentOriginData.position = playrPos + ( offsetDist * vehicle.GetWorldForward() );
+				currentOriginData.direction = playerForward * -1.0;
+				currentOriginData.playerPosition = playrPos;
+			}
+			else
+			{
+				currentOriginData.position = playrPos;
+				currentOriginData.direction = playerForward;
+				currentOriginData.playerPosition = playrPos;
+			}
+			spawnOriginsData.PushBack( currentOriginData );
+		}
+		else
+		{
+			currentOriginData.position = playrPos;
+			currentOriginData.direction = playerForward;
+			currentOriginData.playerPosition = playrPos;
+			spawnOriginsData.PushBack( currentOriginData );
+			for( i = 0; i < m_viewers.Size(); i += 1 )
+			{
+				viewerPos = m_viewers[ i ].GetWorldPosition();
+				distanceToCheck = Vector4.Distance( playrPos, viewerPos );
+				if( distanceToCheck <= GetSpawnOriginMaxDistance() )
+				{
+					pointData = new PointData;
+					pointData.position = viewerPos;
+					pointData.direction = playerForward;
+					singleSortedResult.value = distanceToCheck;
+					singleSortedResult.handle = pointData;
+					sortedResults.PushBack( singleSortedResult );
+				}
+			}
+			if( !( Vector4.IsZero( m_lastCrimePoint ) ) && m_lastCrimePoint != playrPos )
+			{
+				distanceToCheck = Vector4.Distance( playrPos, m_lastCrimePoint );
+				if( distanceToCheck <= GetSpawnOriginMaxDistance() )
+				{
+					pointData = new PointData;
+					pointData.position = m_lastCrimePoint;
+					pointData.direction = playerForward;
+					singleSortedResult.value = distanceToCheck;
+					singleSortedResult.handle = pointData;
+					sortedResults.PushBack( singleSortedResult );
+				}
+			}
+			if( !( Vector4.IsZero( m_lastBodyPosition ) ) && m_lastBodyPosition != m_lastCrimePoint )
+			{
+				distanceToCheck = Vector4.Distance( playrPos, m_lastBodyPosition );
+				if( distanceToCheck <= GetSpawnOriginMaxDistance() )
+				{
+					pointData = new PointData;
+					pointData.position = m_lastBodyPosition;
+					pointData.direction = playerForward;
+					singleSortedResult.value = distanceToCheck;
+					singleSortedResult.handle = pointData;
+					sortedResults.PushBack( singleSortedResult );
+				}
+			}
+			if( sortedResults.Size() > 0 )
+			{
+				SortHandleWithValueArray( sortedResults );
+				for( i = 0; i < sortedResults.Size(); i += 1 )
+				{
+					pointData = ( ( PointData )( sortedResults[ i ].handle ) );
+					if( pointData )
+					{
+						currentOriginData.position = pointData.position;
+						currentOriginData.direction = pointData.direction;
+						currentOriginData.playerPosition = playrPos;
+						spawnOriginsData.PushBack( currentOriginData );
+					}
+				}
+			}
+		}
+	}
+
+	private function DespawnAllPolice()
+	{
+		var i : Int32;
+		for( i = 0; i <= ( ( Int32 )( EPreventionHeatStage.Size ) ); i += 1 )
+		{
+			GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).RequestDespawnPreventionLevel( ( ( Uint32 )( i ) ) );
+		}
+	}
+
+	public static function IsChasingPlayer( game : GameInstance ) : Bool
+	{
+		var self : PreventionSystem;
+		if( !( GameInstance.IsValid( game ) ) )
+		{
+			return false;
+		}
+		self = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'PreventionSystem' ) ) );
+		if( !( self ) )
+		{
+			return false;
+		}
+		if( self.IsChasingPlayer() )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function InjectPlayerAsPoliceTarget( police : ScriptedPuppet )
+	{
+		var player : weak< GameObject >;
+		var m_command : AIInjectCombatThreatCommand;
+		var nullArrayOfNames : array< CName >;
+		if( !( police ) )
+		{
+			return;
+		}
+		if( !( PreventionSystem.IsChasingPlayer( police.GetGame() ) ) )
+		{
+			return;
+		}
+		player = GameInstance.GetPlayerSystem( police.GetGame() ).GetLocalPlayerMainGameObject();
+		if( !( player ) )
+		{
+			return;
+		}
+		m_command = new AIInjectCombatThreatCommand;
+		m_command.targetPuppetRef = CreateEntityReference( "#player", nullArrayOfNames );
+		m_command.duration = 60.0;
+		AIComponent.SendCommand( police, m_command );
+	}
+
+	private function CheckDamageThreshold() : Bool
+	{
+		if( ( GetGeneralPercent() >= 1.0 ) || IsChasingPlayer() )
+		{
+			return true;
+		}
+		else if( ( GetGeneralPercent() > 0.5 ) && !( IsChasingPlayer() ) )
+		{
+			return false;
+		}
+		return false;
+	}
+
+	private function CalculateDeescaletion()
+	{
+		if( !( IsChasingPlayer() ) )
+		{
+			AddGeneralPercent( -( CalculateDeescalationPercent() ) );
+		}
+	}
+
+	private function CalculateDeescalationPercent() : Float
+	{
+		var timeBetween : Float;
+		timeBetween = GetTimeBetweenStamp( m_gameTimeStampPrevious );
+		if( ( timeBetween - 45.0 ) < 0.0 )
+		{
+			return 0.0;
+		}
+		timeBetween = GetTimeBetweenStamp( m_gameTimeStampPrevious ) / 100.0;
+		timeBetween /= 2.5;
+		return timeBetween;
+	}
+
+	private function GetTimeBetweenStamp( previousStamp : Float ) : Float
+	{
+		var timeBetween : Float;
+		timeBetween = GetGameTimeStamp() - previousStamp;
+		return timeBetween;
+	}
+
+	public static function ShowMessage( gameInstance : GameInstance, message : String, time : Float )
+	{
+		var warningMsg : SimpleScreenMessage;
+		warningMsg.isShown = true;
+		warningMsg.duration = time;
+		warningMsg.message = message;
+		GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, warningMsg, true );
+	}
+
+	private export function OnRefreshDistrict( request : RefreshDistrictRequest )
+	{
+		if( !( request.preventionPreset ) )
+		{
+			RestoreDefaultPreset();
+		}
+		else
+		{
+			m_preventionPreset = request.preventionPreset;
+		}
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugDistrictInfo();
+		}
+	}
+
+	private function RestoreDefaultConfig()
+	{
+		RestoreDefaultPreset();
+	}
+
+	private function IsVehicleValid( vehicle : weak< VehicleObject > ) : Bool
+	{
+		return ( vehicle && !( vehicle.IsDestroyed() ) ) && VehicleComponent.HasAnyActivePassengers( vehicle.GetGame(), vehicle.GetEntityID() );
+	}
+
+	private function UpdateVehicles()
+	{
+		var i : Int32;
+		for( i = m_vehicles.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( !( IsVehicleValid( m_vehicles[ i ] ) ) )
+			{
+				m_vehicles.Erase( i );
+			}
+		}
+	}
+
+	private function OnRegisterVehicle( request : RegisterVehicleRequest )
+	{
+		if( !( m_vehicles.Contains( request.vehicle ) ) )
+		{
+			m_vehicles.PushBack( request.vehicle );
+		}
+	}
+
+	protected export function OnViewerRequest( request : PreventionVisibilityRequest )
+	{
+		if( !( m_player ) )
+		{
+			return;
+		}
+		if( request.seePlayer )
+		{
+			ViewerRegister( request.requester );
+			SetNewLastCrimePoint( m_player.GetWorldPosition() );
+		}
+		else
+		{
+			ViewerUnRegister( request.requester );
+		}
+	}
+
+	protected function OnVehicleStolenRequest( request : PreventionVehicleStolenRequest )
+	{
+		if( !( CanPreventionReactToInput() ) )
+		{
+			return;
+		}
+		if( request.vehicleAffiliation != gamedataAffiliation.NCPD )
+		{
+			return;
+		}
+		if( !( IsChasingPlayer() ) )
+		{
+			AddGeneralPercent( 1.0 );
+			HeatPipeline();
+		}
+		else
+		{
+			ResetDeescalationZero();
+		}
+	}
+
+	protected export function OnCombatStartedRequest( request : PreventionCombatStartedRequest )
+	{
+		if( !( CanPreventionReactToInput() ) )
+		{
+			return;
+		}
+		if( !( IsChasingPlayer() ) )
+		{
+			AddGeneralPercent( 1.0 );
+			HeatPipeline( ShouldSkipSpawning( ( ( ScriptedPuppet )( request.requester ) ) ) );
+			CreateCrowdNullArea( request.requesterPosition );
+		}
+		else
+		{
+			ResetDeescalationZero();
+		}
+		SetNewLastCrimePoint( request.requesterPosition );
+	}
+
+	protected function OnCrimeWitnessRequest( request : PreventionCrimeWitnessRequest )
+	{
+		if( !( CanPreventionReactToInput() ) )
+		{
+			return;
+		}
+		if( !( IsChasingPlayer() ) )
+		{
+			AddGeneralPercent( 1.0 );
+			HeatPipeline();
+		}
+		else
+		{
+			ResetDeescalationZero();
+		}
+		SetNewLastCrimePoint( request.criminalPosition );
+	}
+
+	private function UpdateViewers() : Bool
+	{
+		var i : Int32;
+		if( m_viewers.Size() <= 0 )
+		{
+			HasViewersChanged( false );
+			return false;
+		}
+		for( i = m_viewers.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( !( m_viewers[ i ] ) || !( m_viewers[ i ].IsActive() ) )
+			{
+				m_viewers.Erase( i );
+			}
+		}
+		if( m_viewers.Size() <= 0 )
+		{
+			HasViewersChanged( false );
+			return false;
+		}
+		HasViewersChanged( true );
+		return true;
+	}
+
+	private function HasViewersChanged( currentViewerState : Bool )
+	{
+		if( currentViewerState != m_hasViewers )
+		{
+			m_hasViewers = currentViewerState;
+			OnViewersStateChanged();
+		}
+	}
+
+	private function OnViewersStateChanged()
+	{
+		if( AreTurretsActive() )
+		{
+			SetAgentsSupport( m_hasViewers );
+		}
+	}
+
+	private function ViewerRegister( viewer : weak< GameObject > )
+	{
+		if( !( viewer ) )
+		{
+			return;
+		}
+		SetNewLastCrimePoint( m_player.GetWorldPosition() );
+		if( !( m_viewers.Contains( viewer ) ) )
+		{
+			m_viewers.PushBack( viewer );
+		}
+	}
+
+	private function ViewerUnRegister( viewer : weak< GameObject > )
+	{
+		m_viewers.Remove( viewer );
+	}
+
+	protected export function OnRegisterRequest( request : PreventionRegisterRequest )
+	{
+		if( request.register )
+		{
+			Register( request.attitudeGroup, request.requester );
+		}
+		else
+		{
+			UnRegister( request.attitudeGroup, request.requester );
+		}
+	}
+
+	private function Register( attitudeGroup : CName, ps : weak< PersistentState > )
+	{
+		var i : Int32;
+		var newGroup : PreventionAgents;
+		for( i = 0; i < m_agentGroupsList.Size(); i += 1 )
+		{
+			if( m_agentGroupsList[ i ].GetGroupName() == attitudeGroup )
+			{
+				if( !( m_agentGroupsList[ i ].IsAgentalreadyAdded( ps ) ) )
+				{
+					m_agentGroupsList[ i ].AddAgent( ps );
+				}
+				if( AreTurretsActive() )
+				{
+					WakeUpAgent( ps, true );
+				}
+				else
+				{
+					WakeUpAgent( ps, false );
+				}
+				return;
+			}
+		}
+		if( IsNameValid( attitudeGroup ) )
+		{
+			newGroup = new PreventionAgents;
+			newGroup.CreateGroup( attitudeGroup, ps );
+			m_agentGroupsList.PushBack( newGroup );
+		}
+	}
+
+	private function UnRegister( attitudeGroup : CName, ps : weak< PersistentState > )
+	{
+		var i : Int32;
+		for( i = 0; i < m_agentGroupsList.Size(); i += 1 )
+		{
+			if( m_agentGroupsList[ i ].GetGroupName() == attitudeGroup )
+			{
+				m_agentGroupsList[ i ].RemoveAgent( ps );
+				if( !( m_agentGroupsList[ i ].HasAgents() ) )
+				{
+					m_agentGroupsList.Remove( m_agentGroupsList[ i ] );
+					break;
+				}
+			}
+		}
+	}
+
+	protected export function OnPreventionSecurityAreaRequest( request : PreventionSecurityAreaRequest )
+	{
+		if( request.playerIsIn )
+		{
+			if( !( m_playerIsInSecurityArea.Contains( request.areaID ) ) )
+			{
+				m_playerIsInSecurityArea.PushBack( request.areaID );
+			}
+		}
+		else
+		{
+			if( m_playerIsInSecurityArea.Contains( request.areaID ) )
+			{
+				m_playerIsInSecurityArea.Remove( request.areaID );
+			}
+		}
+		ReevaluateSecurityAreaReset();
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugSecAreaInfo();
+		}
+	}
+
+	protected export function OnPreventionPoliceSecuritySystemRequest( request : PreventionPoliceSecuritySystemRequest )
+	{
+		var removeFromBlacklist : RemoveFromBlacklistEvent;
+		if( !( m_policeSecuritySystems.Contains( request.securitySystemID ) ) )
+		{
+			m_policeSecuritySystems.PushBack( request.securitySystemID );
+			if( m_player && !( IsChasingPlayer() ) )
+			{
+				removeFromBlacklist = new RemoveFromBlacklistEvent;
+				removeFromBlacklist.entityIDToRemove = m_player.GetEntityID();
+				GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( request.securitySystemID, 'SecuritySystemControllerPS', removeFromBlacklist );
+			}
+		}
+	}
+
+	public const function ShouldReactionBeAggressive() : Bool
+	{
+		if( IsChasingPlayer() )
+		{
+			return true;
+		}
+		if( m_playerIsInSecurityArea.Size() > 0 )
+		{
+			return false;
+		}
+		if( !( CanPreventionReactToInput() ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function ShouldReactionBeAgressive( game : GameInstance ) : Bool
+	{
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			return preventionSystem.ShouldReactionBeAggressive();
+		}
+		return true;
+	}
+
+	public static function CanPreventionReact( game : GameInstance ) : Bool
+	{
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			return preventionSystem.CanPreventionReactToInput();
+		}
+		return true;
+	}
+
+	public static function ShouldPreventionSystemReactToKill( puppet : weak< ScriptedPuppet > ) : Bool
+	{
+		if( !( puppet ) )
+		{
+			return false;
+		}
+		if( puppet.IsIncapacitated() )
+		{
+			return false;
+		}
+		if( NPCManager.HasTag( puppet.GetRecordID(), 'DoNotTriggerPrevention' ) )
+		{
+			return false;
+		}
+		if( puppet.IsCrowd() )
+		{
+			if( puppet.IsAggressive() )
+			{
+				return false;
+			}
+		}
+		if( ( ( ( puppet.IsCrowd() || puppet.IsVendor() ) || puppet.IsCharacterCivilian() ) || puppet.IsPrevention() ) || NPCManager.HasTag( puppet.GetRecordID(), 'TriggerPrevention' ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function ShouldPreventionSystemReactToDamageDealt( puppet : weak< ScriptedPuppet > ) : Bool
+	{
+		if( !( puppet ) || !( puppet.IsActive() ) )
+		{
+			return false;
+		}
+		if( puppet.IsPrevention() || NPCManager.HasTag( puppet.GetRecordID(), 'TriggerPrevention' ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function ShouldPreventionSystemReactToCombat( puppet : weak< ScriptedPuppet > ) : Bool
+	{
+		if( !( puppet ) || puppet.IsIncapacitated() )
+		{
+			return false;
+		}
+		if( puppet.IsPrevention() || NPCManager.HasTag( puppet.GetRecordID(), 'TriggerPrevention' ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function OnBountyResetRequest( request : BountyResetRequest )
+	{
+		execInstructionSafe();
+	}
+
+	protected event OnPlayerChoice( value : Variant )
+	{
+		var attemptedChoice : InteractionAttemptedChoice;
+		attemptedChoice = ( ( InteractionAttemptedChoice )value );
+		if( attemptedChoice.isSuccess && attemptedChoice.visualizerType == EVisualizerType.Dialog )
+		{
+			execInstructionSafe();
+		}
+	}
+
+	private export function OnDistrictAreaEntered( request : DistrictEnteredEvent )
+	{
+		if( m_districtManager )
+		{
+			m_districtManager.Update( request );
+		}
+	}
+
+	private function RestoreDefaultPreset()
+	{
+		m_preventionPreset = TweakDBInterface.GetDistrictPreventionDataRecord( T"PreventionData.NCPD" );
+	}
+
+	private function ChangeAgentsAttitude( desiredAffiliation : EAIAttitude )
+	{
+		var i : Int32;
+		var player : GameObject;
+		var playerAttitude : CName;
+		var spawnedEntities : array< weak< Entity > >;
+		var groupName : CName;
+		player = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( !( player ) )
+		{
+			return;
+		}
+		playerAttitude = player.GetAttitudeAgent().GetAttitudeGroup();
+		GameInstance.GetAttitudeSystem( GetGameInstance() ).SetAttitudeGroupRelationPersistent( 'police', playerAttitude, desiredAffiliation );
+		for( i = 0; i < m_agentGroupsList.Size(); i += 1 )
+		{
+			groupName = m_agentGroupsList[ i ].GetGroupName();
+			if( !( CanChangeAttitudeRelationFor( groupName ) ) )
+			{
+				continue;
+			}
+			GameInstance.GetAttitudeSystem( GetGameInstance() ).SetAttitudeGroupRelationPersistent( groupName, playerAttitude, desiredAffiliation );
+		}
+		GameInstance.GetCompanionSystem( GetGameInstance() ).GetSpawnedEntities( spawnedEntities );
+		for( i = 0; i < spawnedEntities.Size(); i += 1 )
+		{
+			ChangeAttitude( ( ( GameObject )( spawnedEntities[ i ] ) ), player, desiredAffiliation );
+		}
+	}
+
+	private final function ChangeAttitude( owner : weak< GameObject >, target : weak< GameObject >, desiredAttitude : EAIAttitude )
+	{
+		var attitudeOwner : AttitudeAgent;
+		var attitudeTarget : AttitudeAgent;
+		if( !( owner ) || !( target ) )
+		{
+			return;
+		}
+		attitudeOwner = owner.GetAttitudeAgent();
+		attitudeTarget = target.GetAttitudeAgent();
+		if( !( attitudeOwner ) || !( attitudeTarget ) )
+		{
+			return;
+		}
+		attitudeOwner.SetAttitudeTowards( attitudeTarget, desiredAttitude );
+	}
+
+	private function WakeUpAllAgents( wakeUp : Bool )
+	{
+		var i : Int32;
+		var i1 : Int32;
+		for( i = 0; i < m_agentGroupsList.Size(); i += 1 )
+		{
+			for( i1 = 0; i1 < m_agentGroupsList[ i ].GetAgentsNumber(); i1 += 1 )
+			{
+				WakeUpAgent( m_agentGroupsList[ i ].GetAgetntByIndex( i1 ), wakeUp );
+			}
+		}
+	}
+
+	private function WakeUpAgent( ps : weak< PersistentState >, wakeUp : Bool )
+	{
+		var evt : ReactoToPreventionSystem;
+		evt = new ReactoToPreventionSystem;
+		evt.wakeUp = wakeUp;
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( ps.GetID(), ps.GetClassName(), evt );
+		if( wakeUp )
+		{
+			SetSingleAgentSupport( ps, m_hasViewers );
+		}
+		else
+		{
+			SetSingleAgentSupport( ps, false );
+		}
+	}
+
+	private function SetAgentsSupport( hasSupport : Bool )
+	{
+		var i : Int32;
+		var i1 : Int32;
+		for( i = 0; i < m_agentGroupsList.Size(); i += 1 )
+		{
+			for( i1 = 0; i1 < m_agentGroupsList[ i ].GetAgentsNumber(); i1 += 1 )
+			{
+				SetSingleAgentSupport( m_agentGroupsList[ i ].GetAgetntByIndex( i1 ), hasSupport );
+			}
+		}
+	}
+
+	private function SetSingleAgentSupport( ps : weak< PersistentState >, hasSupport : Bool )
+	{
+		var evt : SecuritySystemSupport;
+		if( !( PersistentID.IsDefined( ps.GetID() ) ) )
+		{
+			return;
+		}
+		evt = new SecuritySystemSupport;
+		evt.supportGranted = hasSupport;
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( ps.GetID(), ps.GetClassName(), evt );
+	}
+
+	private function StartPreventionTickRequest()
+	{
+		var request : PreventionTickRequest;
+		if( !( m_preventionTickCheck ) && IsChasingPlayer() )
+		{
+			request = new PreventionTickRequest;
+			m_preventionTickDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'PreventionSystem', request, 0.30000001 );
+			m_preventionTickCheck = true;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugEvents();
+			}
+		}
+	}
+
+	private function CancelPreventionTickRequest()
+	{
+		if( m_preventionTickCheck )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_preventionTickDelayID );
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_preventionTickDelayID );
+			m_preventionTickCheck = false;
+			if( !( IsFinal() ) )
+			{
+				RefreshDebugEvents();
+			}
+		}
+	}
+
+	private export function OnPreventionTickRequest( request : PreventionTickRequest )
+	{
+		if( IsChasingPlayer() )
+		{
+			if( UpdateViewers() )
+			{
+				SetNewLastCrimePoint( m_player.GetWorldPosition() );
+			}
+			CheckLastCrimeDistanceToPlayer();
+			StimBroadcasterComponent.BroadcastStim( m_player, gamedataStimType.CrimeWitness );
+		}
+		WhipeHitNPC();
+		m_preventionTickCheck = false;
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugEvents();
+		}
+		StartPreventionTickRequest();
+	}
+
+	private function ReevaluateSecurityAreaReset()
+	{
+		if( ( ( ( Int32 )( m_playerHLS ) ) > ( ( Int32 )( gamePSMHighLevel.SceneTier1 ) ) ) && ( ( ( Int32 )( m_playerHLS ) ) <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) ) )
+		{
+			StartSecurityAreaResetRequest( 2.0 );
+		}
+		else if( m_playerIsInSecurityArea.Size() > 0 )
+		{
+			StartSecurityAreaResetRequest( 4.0 );
+		}
+		else
+		{
+			CancelSecurityAreaResetRequest();
+		}
+	}
+
+	private function StartSecurityAreaResetRequest( optional resetDelay : Float )
+	{
+		var request : SecurityAreaResetRequest;
+		if( !( IsChasingPlayer() ) )
+		{
+			return;
+		}
+		if( m_securityAreaResetCheck )
+		{
+			return;
+		}
+		request = new SecurityAreaResetRequest;
+		if( resetDelay <= 0.0 )
+		{
+			resetDelay = 5.0;
+		}
+		m_securityAreaResetDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'PreventionSystem', request, resetDelay );
+		ResolveBlinkingStack( 'securityArea', true );
+		m_securityAreaResetCheck = true;
+		if( CancelSpawnDelay() )
+		{
+			m_hadOngoingSpawnRequest = true;
+		}
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugEvents();
+		}
+	}
+
+	private function CancelSecurityAreaResetRequest()
+	{
+		if( !( m_securityAreaResetCheck ) )
+		{
+			return;
+		}
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_securityAreaResetDelayID );
+		ResolveBlinkingStack( 'securityArea', false );
+		m_securityAreaResetCheck = false;
+		if( m_hadOngoingSpawnRequest )
+		{
+			m_hadOngoingSpawnRequest = false;
+			SpawnPipeline( m_heatStage, 5.0 );
+		}
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugEvents();
+		}
+	}
+
+	private function OnSecurityAreaResetRequest( request : SecurityAreaResetRequest )
+	{
+		m_securityAreaResetCheck = false;
+		execInstructionSafe();
+	}
+
+	private function CheckLastCrimeDistanceToPlayer()
+	{
+		var currentDistance : Float;
+		var blinkDistance : Float;
+		var safeDistance : Float;
+		if( Vector4.IsZero( m_lastCrimePoint ) )
+		{
+			return;
+		}
+		currentDistance = Vector4.Distance( m_player.GetWorldPosition(), m_lastCrimePoint );
+		m_DEBUG_lastCrimeDistance = currentDistance;
+		safeDistance = GetSafeDistance();
+		blinkDistance = safeDistance - GetBlinkThreshold();
+		if( blinkDistance < currentDistance )
+		{
+			if( !( m_isHidingFromPolice ) )
+			{
+				m_isHidingFromPolice = true;
+				ResolveBlinkingStack( 'distanceCheck', true );
+				StartBlinkingStatusDeescalation();
+			}
+		}
+		else
+		{
+			ResolveBlinkingStack( 'distanceCheck', false );
+			if( m_isHidingFromPolice )
+			{
+				StopBlinkingStatusDeescalation();
+				m_isHidingFromPolice = false;
+			}
+		}
+		if( safeDistance < currentDistance )
+		{
+			execInstructionSafe();
+		}
+		if( !( IsFinal() ) )
+		{
+			RefreshDebugDistanceInfo();
+		}
+	}
+
+	private function CheckifNewPointIsCloserThanPrevious( oldValue : Vector4, newValue : Vector4 ) : Bool
+	{
+		if( Vector4.IsZero( oldValue ) )
+		{
+			return true;
+		}
+		if( Vector4.Distance( m_player.GetWorldPosition(), newValue ) < Vector4.Distance( m_player.GetWorldPosition(), oldValue ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private function CreateCrowdNullArea( targetPos : Vector4 )
+	{
+		var box : Box;
+		var minMaxPoint : Vector4;
+		var position : WorldTransform;
+		var distance : Float;
+		return;
+		minMaxPoint.X = 25.0;
+		minMaxPoint.Y = 25.0;
+		minMaxPoint.Z = 25.0;
+		position = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetWorldTransform();
+		distance = Vector4.Distance( Transform.GetPosition( WorldTransform._ToXForm( position ) ), targetPos );
+		minMaxPoint.X += distance;
+		minMaxPoint.Y += distance;
+		box.Max = minMaxPoint;
+		box.Min = -( minMaxPoint );
+		GameInstance.GetCommunitySystem( GetGame() ).EnableDynamicCrowdNullArea( box, position, true, 30.0 );
+	}
+
+	private function CancelAllDelayedEvents()
+	{
+		CancelSpawnDelay();
+		CancelPreventionTickRequest();
+		CancelSecurityAreaResetRequest();
+		StopDeescalationZero();
+	}
+
+	private function ResolveBlinkingStack( reasonName : CName, active : Bool )
+	{
+		if( !( IsChasingPlayer() ) )
+		{
+			WhipeBlinkData();
+			return;
+		}
+		if( active )
+		{
+			if( !( m_blinkReasonsStack.Contains( reasonName ) ) )
+			{
+				if( m_blinkReasonsStack.Size() == 0 )
+				{
+					WantedBarGameController.FlashWantedBar( GetGameInstance() );
+				}
+				m_blinkReasonsStack.PushBack( reasonName );
+			}
+		}
+		else
+		{
+			if( !( m_blinkReasonsStack.Contains( reasonName ) ) )
+			{
+				return;
+			}
+			m_blinkReasonsStack.Remove( reasonName );
+			if( m_blinkReasonsStack.Size() == 0 )
+			{
+				WantedBarGameController.FlashAndShowWantedBar( GetGameInstance() );
+			}
+		}
+	}
+
+	private function WhipeBlinkData()
+	{
+		m_blinkReasonsStack.Clear();
+		WantedBarGameController.EndFlashWantedBar( GetGameInstance() );
+		return;
+	}
+
+	private function OnTogglePreventionSystem( evt : TogglePreventionSystem )
+	{
+		if( !( IsNameValid( evt.sourceName ) ) )
+		{
+			return;
+		}
+		RefreshDebugRemoveAllLockSources();
+		if( evt.isActive )
+		{
+			if( m_systemLockSources.Contains( evt.sourceName ) )
+			{
+				m_systemLockSources.Remove( evt.sourceName );
+				if( m_systemLockSources.Size() <= 0 )
+				{
+					execInstructionOn();
+				}
+			}
+		}
+		else
+		{
+			if( !( m_systemLockSources.Contains( evt.sourceName ) ) )
+			{
+				m_systemLockSources.PushBack( evt.sourceName );
+				if( m_systemLockSources.Size() > 0 )
+				{
+					execInstructionOff();
+				}
+			}
+		}
+		RefreshDebugLockSources();
+	}
+
+	private function OnSetWantedLevel( evt : SetWantedLevel )
+	{
+		var playerPos : Vector4;
+		if( evt.m_wantedLevel != EPreventionHeatStage.Invalid )
+		{
+			m_tempForcedheatStage = evt.m_wantedLevel;
+			m_systemDisabled = false;
+			if( m_tempForcedheatStage == EPreventionHeatStage.Heat_0 )
+			{
+				execInstructionSafe();
+				return;
+			}
+			playerPos = GetPlayer( GetGameInstance() ).GetWorldPosition();
+			if( evt.m_forcePlayerPositionAsLastCrimePoint )
+			{
+				SetNewLastCrimePoint( playerPos );
+			}
+			else if( Vector4.IsZero( m_lastCrimePoint ) )
+			{
+				SetNewLastCrimePoint( playerPos );
+			}
+			ResetDeescalationZero();
+			CreateCrowdNullArea( m_lastCrimePoint );
+			StartPipeline();
+		}
+	}
+
+	public static function DelayedSpawnUnitRequest( context : GameInstance, recordID : TweakDBID, preventionLevel : Uint32, spawnTransform : WorldTransform, delay : Float )
+	{
+		var request : PreventionDelayedSpawnUnitRequest;
+		if( delay <= 0.0 )
+		{
+			GameInstance.GetPreventionSpawnSystem( context ).RequestSpawn( recordID, preventionLevel, spawnTransform );
+			return;
+		}
+		request = new PreventionDelayedSpawnUnitRequest;
+		request.recordID = recordID;
+		request.preventionLevel = preventionLevel;
+		request.spawnTransform = spawnTransform;
+		PreventionSystem.QueueRequest( context, request, delay );
+	}
+
+	public static function QueueRequest( context : GameInstance, request : ScriptableSystemRequest, optional delay : Float ) : Bool
+	{
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			if( delay <= 0.0 )
+			{
+				preventionSystem.QueueRequest( request );
+			}
+			else
+			{
+				GameInstance.GetDelaySystem( context ).DelayScriptableSystemRequest( 'PreventionSystem', request, delay );
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public static function CreateNewDamageRequest( context : GameInstance, target : GameObject, damage : Float )
+	{
+		var preventionSystemRequest : PreventionDamageRequest;
+		preventionSystemRequest = new PreventionDamageRequest;
+		if( target )
+		{
+			preventionSystemRequest.targetID = target.GetEntityID();
+			preventionSystemRequest.targetPosition = target.GetWorldPosition();
+			preventionSystemRequest.isTargetPrevention = target.IsPrevention();
+			preventionSystemRequest.isTargetAlive = target.IsActive();
+		}
+		preventionSystemRequest.damagePercentValue = damage;
+		GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ).QueueRequest( preventionSystemRequest );
+	}
+
+	public static function RegisterToPreventionSystem( context : GameInstance, requester : Device )
+	{
+		var request : PreventionRegisterRequest;
+		request = new PreventionRegisterRequest;
+		request.requester = requester.GetDevicePS();
+		request.attitudeGroup = requester.GetAttitudeAgent().GetAttitudeGroup();
+		request.register = true;
+		GameInstance.QueueScriptableSystemRequest( context, 'PreventionSystem', request );
+	}
+
+	public static function UnRegisterToPreventionSystem( context : GameInstance, requester : Device )
+	{
+		var request : PreventionRegisterRequest;
+		request = new PreventionRegisterRequest;
+		request.requester = requester.GetDevicePS();
+		request.attitudeGroup = requester.GetAttitudeAgent().GetAttitudeGroup();
+		request.register = false;
+		GameInstance.QueueScriptableSystemRequest( context, 'PreventionSystem', request );
+	}
+
+	public static function RegisterAsViewerToPreventionSystem( context : GameInstance, requester : GameObject )
+	{
+		var request : PreventionVisibilityRequest;
+		var self : PreventionSystem;
+		self = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( ( ( Int32 )( self.GetHeatStage() ) ) == 0 )
+		{
+			return;
+		}
+		request = new PreventionVisibilityRequest;
+		request.requester = requester;
+		request.seePlayer = true;
+		GameInstance.QueueScriptableSystemRequest( context, 'PreventionSystem', request );
+	}
+
+	public static function UnRegisterAsViewerToPreventionSystem( context : GameInstance, requester : GameObject )
+	{
+		var request : PreventionVisibilityRequest;
+		var self : PreventionSystem;
+		self = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( ( ( Int32 )( self.GetHeatStage() ) ) == 0 )
+		{
+			return;
+		}
+		request = new PreventionVisibilityRequest;
+		request.requester = requester;
+		request.seePlayer = false;
+		self.QueueRequest( request );
+	}
+
+	public static function CombatStartedRequestToPreventionSystem( context : GameInstance, requester : weak< GameObject > )
+	{
+		var request : PreventionCombatStartedRequest;
+		var self : PreventionSystem;
+		self = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( self )
+		{
+			request = new PreventionCombatStartedRequest;
+			request.requesterPosition = requester.GetWorldPosition();
+			request.requester = requester;
+			self.QueueRequest( request );
+		}
+	}
+
+	public static function VehicleStolenRequestToPreventionSystem( vehicle : weak< VehicleObject >, optional thief : weak< GameObject > )
+	{
+		var request : PreventionVehicleStolenRequest;
+		var self : PreventionSystem;
+		var vehicleRecord : Vehicle_Record;
+		if( !( vehicle ) )
+		{
+			return;
+		}
+		self = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( vehicle.GetGame() ).Get( 'PreventionSystem' ) ) );
+		if( !( self ) )
+		{
+			return;
+		}
+		if( !( VehicleComponent.GetVehicleRecord( vehicle, vehicleRecord ) ) )
+		{
+			return;
+		}
+		request = new PreventionVehicleStolenRequest;
+		request.requesterPosition = vehicle.GetWorldPosition();
+		if( vehicleRecord.Affiliation() )
+		{
+			request.vehicleAffiliation = vehicleRecord.Affiliation().Type();
+		}
+		self.QueueRequest( request );
+	}
+
+	public static function CrimeWitnessRequestToPreventionSystem( context : GameInstance, criminalPosition : Vector4 )
+	{
+		var request : PreventionCrimeWitnessRequest;
+		var self : PreventionSystem;
+		self = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		request = new PreventionCrimeWitnessRequest;
+		request.criminalPosition = criminalPosition;
+		self.QueueRequest( request );
+	}
+
+	public static function PreventionSecurityAreaEnterRequest( context : GameInstance, playerIsIn : Bool, areaID : PersistentID )
+	{
+		var request : PreventionSecurityAreaRequest;
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			request = new PreventionSecurityAreaRequest;
+			request.playerIsIn = playerIsIn;
+			request.areaID = areaID;
+			preventionSystem.QueueRequest( request );
+		}
+	}
+
+	public static function PreventionPoliceSecuritySystemRequest( context : GameInstance, securitySystemID : PersistentID )
+	{
+		var request : PreventionPoliceSecuritySystemRequest;
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			request = new PreventionPoliceSecuritySystemRequest;
+			request.securitySystemID = securitySystemID;
+			preventionSystem.QueueRequest( request );
+		}
+	}
+
+	public static function PreventionBountyResetRequest( context : GameInstance )
+	{
+		var request : BountyResetRequest;
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem && preventionSystem.IsChasingPlayer() )
+		{
+			request = new BountyResetRequest;
+			preventionSystem.QueueRequest( request );
+		}
+	}
+
+	public static function RegisterPoliceUnit( context : GameInstance, unit : weak< ScriptedPuppet > )
+	{
+		if( unit )
+		{
+			PreventionSystem.InjectPlayerAsPoliceTarget( unit );
+		}
+	}
+
+	private static function VehicleRegistered( vehicle : weak< VehicleObject > ) : Bool
+	{
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		return vehicle.GetPreventionSystem().m_vehicles.Contains( vehicle );
+	}
+
+	private static function ChasePlayer( vehicle : weak< VehicleObject > )
+	{
+		var command : AIVehicleChaseCommand;
+		var evt : AICommandEvent;
+		command = new AIVehicleChaseCommand;
+		command.target = GameInstance.GetPlayerSystem( vehicle.GetGame() ).GetLocalPlayerMainGameObject();
+		command.distanceMin = 3.0;
+		command.distanceMax = 10.0;
+		command.forcedStartSpeed = ( ( VehicleRegistered( vehicle ) ) ? ( -1.0 ) : ( 15.0 ) );
+		evt = new AICommandEvent;
+		evt.command = command;
+		vehicle.QueueEvent( evt );
+	}
+
+	public static function RegisterPoliceVehicle( context : GameInstance, vehicle : weak< VehicleObject > )
+	{
+		var request : RegisterVehicleRequest;
+		if( vehicle )
+		{
+			ChasePlayer( vehicle );
+			request = new RegisterVehicleRequest;
+			request.vehicle = vehicle;
+			PreventionSystem.QueueRequest( vehicle.GetGame(), request );
+		}
+	}
+
+	protected export function OnPreventionConsoleInstructionRequest( request : PreventionConsoleInstructionRequest )
+	{
+		switch( request.instruction )
+		{
+			case EPreventionSystemInstruction.Safe:
+			{
+				execInstructionSafe();
+				break;
+			}
+			case EPreventionSystemInstruction.Active:
+			{
+				execInstructionActive( request.heatStage );
+				break;
+			}
+			case EPreventionSystemInstruction.On:
+			{
+				execInstructionOn();
+				break;
+			}
+			case EPreventionSystemInstruction.Off:
+			{
+				execInstructionOff();
+				break;
+			}
+			default:
+			{
+				break;
+			}
+		}
+	}
+
+	private function RemovePlayerFromSecuritySystemBlacklist()
+	{
+		var i : Int32;
+		var removeFromBlacklist : RemoveFromBlacklistEvent;
+		if( !( m_player ) )
+		{
+			return;
+		}
+		removeFromBlacklist = new RemoveFromBlacklistEvent;
+		removeFromBlacklist.entityIDToRemove = m_player.GetEntityID();
+		for( i = 0; i < m_policeSecuritySystems.Size(); i += 1 )
+		{
+			if( PersistentID.IsDefined( m_policeSecuritySystems[ i ] ) )
+			{
+				GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( m_policeSecuritySystems[ i ], 'SecuritySystemControllerPS', removeFromBlacklist );
+			}
+		}
+	}
+
+	private function execInstructionSafe()
+	{
+		var i : Int32;
+		if( !( IsChasingPlayer() ) )
+		{
+			return;
+		}
+		m_systemDisabled = false;
+		WhipeBlinkData();
+		ChangeAgentsAttitude( EAIAttitude.AIA_Neutral );
+		WakeUpAllAgents( false );
+		WhipeHitNPC();
+		DespawnAllPolice();
+		RemovePlayerFromSecuritySystemBlacklist();
+		CancelAllDelayedEvents();
+		m_isHidingFromPolice = false;
+		m_generalPercent = 0.0;
+		if( SetHeatStage( EPreventionHeatStage.Heat_0 ) )
+		{
+			OnHeatChanged();
+		}
+		for( i = m_vehicles.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( IsVehicleValid( m_vehicles[ i ] ) )
+			{
+				GameInstance.GetPreventionSpawnSystem( GetGameInstance() ).JoinTraffic( m_vehicles[ i ] );
+			}
+		}
+	}
+
+	private function execInstructionActive( optional heatStage : EPreventionHeatStage )
+	{
+		m_systemDisabled = false;
+		SendInternalSystem( 1000.0, heatStage );
+	}
+
+	private function SendInternalSystem( damageValue : Float, optional heatStage : EPreventionHeatStage )
+	{
+		var preventionSystemRequest : PreventionDamageRequest;
+		var playerPos : Vector4;
+		m_systemDisabled = false;
+		playerPos = GetPlayer( GetGameInstance() ).GetWorldPosition();
+		preventionSystemRequest = new PreventionDamageRequest;
+		preventionSystemRequest.damagePercentValue = damageValue;
+		preventionSystemRequest.isInternal = true;
+		preventionSystemRequest.requestedHeat = heatStage;
+		preventionSystemRequest.targetPosition = playerPos;
+		QueueRequest( preventionSystemRequest );
+	}
+
+	private function execInstructionOn()
+	{
+		m_systemDisabled = false;
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+	}
+
+	private function execInstructionOff()
+	{
+		execInstructionSafe();
+		m_systemDisabled = true;
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+	}
+
+	private function RefreshDebug()
+	{
+		var i : Int32;
+		var sink : SDOSink;
+		var district : weak< District >;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		SDOSink.PushString( sink, "Heat", EnumValueToString( "EPreventionHeatStage", ( ( Int32 )( m_heatStage ) ) ) );
+		SDOSink.PushBool( sink, "Is marked as psycho", IsChasingPlayer() );
+		if( IsChasingPlayer() )
+		{
+			SDOSink.SetKeyColor( sink, "Is marked as psycho", Color( 255, 0, 0, 255 ) );
+		}
+		else
+		{
+			SDOSink.SetKeyColor( sink, "Is marked as psycho", Color( 0, 255, 0, 255 ) );
+		}
+		SDOSink.PushString( sink, "----DISTRICT----", "---------DISTRICT---------" );
+		SDOSink.SetKeyColor( sink, "----DISTRICT----", Color( 100, 200, 100, 255 ) );
+		district = m_districtManager.GetCurrentDistrict();
+		if( district )
+		{
+			SDOSink.PushString( sink, "District", TDBID.ToStringDEBUG( district.GetDistrictID() ) );
+			SDOSink.PushString( sink, "Preset", TDBID.ToStringDEBUG( district.GetPresetID() ) );
+		}
+		SDOSink.PushString( sink, "----REACTION---", "---------TYPE---------" );
+		SDOSink.SetKeyColor( sink, "----REACTION---", Color( 100, 100, 200, 255 ) );
+		SDOSink.PushString( sink, "ProcessInfo", EnumValueToString( "EPreventionDebugProcessReason", ( ( Int32 )( Debug_PorcessReason ) ) ) );
+		SDOSink.PushString( sink, "----ACTIVE----", "---------ACTIVE---------" );
+		SDOSink.SetKeyColor( sink, "----ACTIVE----", Color( 100, 100, 100, 255 ) );
+		SDOSink.PushFloat( sink, "General percent (0-1)", GetGeneralPercent() );
+		SDOSink.PushBool( sink, "Should reaction be aggressive", ShouldReactionBeAggressive() );
+		SDOSink.PushBool( sink, "Player is in seciurity area", m_playerIsInSecurityArea.Size() > 0 );
+		SDOSink.PushFloat( sink, "Threshold", GetDamagePercentThreshold() );
+		SDOSink.PushFloat( sink, "New damage percent", GetNewDamageValue() );
+		SDOSink.PushFloat( sink, "Part percent", GetPartGeneralPercent() );
+		SDOSink.PushString( sink, "----DISTANCE----", "---------DISTANCE---------" );
+		SDOSink.SetKeyColor( sink, "----DISTANCE----", Color( 0, 0, 0, 0 ) );
+		SDOSink.PushFloat( sink, "Distance", m_DEBUG_lastCrimeDistance );
+		SDOSink.PushString( sink, "----EVENTS----", "---------EVENTS---------" );
+		SDOSink.SetKeyColor( sink, "----EVENTS----", Color( 255, 255, 255, 255 ) );
+		SDOSink.PushBool( sink, "deescalationZeroCheck", m_deescalationZeroCheck );
+		SDOSink.PushBool( sink, "blinkingStatusDeescalationCheck", m_blinkingStatusDeescalationCheck );
+		SDOSink.PushBool( sink, "preventionTickCheck", m_preventionTickCheck );
+		SDOSink.PushBool( sink, "securityAreaResetCheck", m_securityAreaResetCheck );
+		for( i = 0; i < m_systemLockSources.Size(); i += 1 )
+		{
+			SDOSink.PushName( sink, "sourceName" + i, m_systemLockSources[ i ] );
+		}
+	}
+
+	private function RefreshDebugRemoveAllLockSources()
+	{
+		var i : Int32;
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		for( i = 0; i < m_systemLockSources.Size(); i += 1 )
+		{
+			SDOSink.PushName( sink, "locks/sourceName" + i, 'NONE - debug error ignore' );
+		}
+	}
+
+	private function RefreshDebugLockSources()
+	{
+		var i : Int32;
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		for( i = 0; i < m_systemLockSources.Size(); i += 1 )
+		{
+			SDOSink.PushName( sink, "locks/sourceName" + i, m_systemLockSources[ i ] );
+		}
+	}
+
+	private function RefreshDebugEvents()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		SDOSink.PushString( sink, "----EVENTS----", "---------EVENTS---------" );
+		SDOSink.SetKeyColor( sink, "----EVENTS----", Color( 255, 255, 255, 255 ) );
+		SDOSink.PushBool( sink, "deescalationZeroCheck", m_deescalationZeroCheck );
+		SDOSink.PushBool( sink, "blinkingStatusDeescalationCheck", m_blinkingStatusDeescalationCheck );
+		SDOSink.PushBool( sink, "preventionTickCheck", m_preventionTickCheck );
+		SDOSink.PushBool( sink, "securityAreaResetCheck", m_securityAreaResetCheck );
+	}
+
+	private function RefreshDebugProcessInfo()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		SDOSink.PushString( sink, "ProcessInfo", EnumValueToString( "EPreventionDebugProcessReason", ( ( Int32 )( Debug_PorcessReason ) ) ) );
+	}
+
+	private function RefreshDebugDistanceInfo()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		SDOSink.PushFloat( sink, "Distance", m_DEBUG_lastCrimeDistance );
+	}
+
+	private function RefreshDebugDistrictInfo()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		SDOSink.PushString( sink, "District", TDBID.ToStringDEBUG( m_districtManager.GetCurrentDistrict().GetDistrictID() ) );
+		SDOSink.PushString( sink, "Preset", TDBID.ToStringDEBUG( m_districtManager.GetCurrentDistrict().GetPresetID() ) );
+		SDOSink.PushFloat( sink, "Threshold", GetDamagePercentThreshold() );
+	}
+
+	private function RefreshDebugSecAreaInfo()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "Prevention" );
+		SDOSink.PushBool( sink, "Player is in seciurity area", m_playerIsInSecurityArea.Size() > 0 );
+	}
+
+}
+
+class PreventionDelayedSpawnUnitRequest extends ScriptableSystemRequest
+{
+	var recordID : TweakDBID;
+	var preventionLevel : Uint32;
+	var spawnTransform : WorldTransform;
+}
+
+class PreventionDamageRequest extends ScriptableSystemRequest
+{
+	var isInternal : Bool;
+	var damagePercentValue : Float;
+	var targetID : EntityID;
+	var targetPosition : Vector4;
+	var isTargetAlive : Bool;
+	var isTargetPrevention : Bool;
+	var requestedHeat : EPreventionHeatStage;
+	default requestedHeat = EPreventionHeatStage.Invalid;
+}
+
+class PreventionRegisterRequest extends ScriptableSystemRequest
+{
+	var requester : PersistentState;
+	var attitudeGroup : CName;
+	var register : Bool;
+}
+
+class PreventionVisibilityRequest extends ScriptableSystemRequest
+{
+	var requester : weak< GameObject >;
+	var seePlayer : Bool;
+}
+
+class PreventionCombatStartedRequest extends ScriptableSystemRequest
+{
+	var requesterPosition : Vector4;
+	var requester : weak< GameObject >;
+}
+
+class PreventionVehicleStolenRequest extends ScriptableSystemRequest
+{
+	var requesterPosition : Vector4;
+	var vehicleAffiliation : gamedataAffiliation;
+}
+
+class PreventionCrimeWitnessRequest extends ScriptableSystemRequest
+{
+	var criminalPosition : Vector4;
+}
+
+class PreventionConsoleInstructionRequest extends ScriptableSystemRequest
+{
+	var instruction : EPreventionSystemInstruction;
+	var heatStage : EPreventionHeatStage;
+	default heatStage = EPreventionHeatStage.Invalid;
+}
+
+class PreventionDelayed100SpawnPoliceRequest extends ScriptableSystemRequest
+{
+}
+
+class PreventionDelayedZeroRequest extends ScriptableSystemRequest
+{
+}
+
+class PreventionBlinkingStatusRequest extends ScriptableSystemRequest
+{
+}
+
+class PreventionSecurityAreaRequest extends ScriptableSystemRequest
+{
+	var playerIsIn : Bool;
+	var areaID : PersistentID;
+}
+
+class PreventionPoliceSecuritySystemRequest extends ScriptableSystemRequest
+{
+	var securitySystemID : PersistentID;
+}
+
+class PreventionDelayedSpawnRequest extends ScriptableSystemRequest
+{
+	var heatStage : EPreventionHeatStage;
+}
+
+class PreventionDelayedVehicleSpawnRequest extends ScriptableSystemRequest
+{
+	var heatStage : EPreventionHeatStage;
+}
+
+class PreventionForceSpawnPoliceRequest extends ScriptableSystemRequest
+{
+}
+
+class NoReactionPerformedRequest extends ScriptableSystemRequest
+{
+}
+
+class PreventionTickRequest extends ScriptableSystemRequest
+{
+}
+
+class SecurityAreaResetRequest extends ScriptableSystemRequest
+{
+}
+
+class BountyResetRequest extends ScriptableSystemRequest
+{
+}
+
+class RegisterVehicleRequest extends ScriptableSystemRequest
+{
+	var vehicle : weak< VehicleObject >;
+}
+
+class TogglePreventionSystem extends ScriptableSystemRequest
+{
+	editable var sourceName : CName;
+	editable var isActive : Bool;
+}
+
+class SetWantedLevel extends ScriptableSystemRequest
+{
+	editable var m_wantedLevel : EPreventionHeatStage;
+	default m_wantedLevel = EPreventionHeatStage.Heat_1;
+	hint m_wantedLevel = "Set how many stars player should receive. Use only for triggering the system.";
+	editable var m_forcePlayerPositionAsLastCrimePoint : Bool;
+	hint m_forcePlayerPositionAsLastCrimePoint = "If set to TRUE, will override last known crime posiition with Player position. If set to false will try to use cached crime point first, than the player";
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Set Wanted Level";
+	}
+
+}
+
+class PreventionAgents
+{
+	private var m_groupName : CName;
+	private var m_requsteredAgents : array< SPreventionAgentData >;
+
+	public function CreateGroup( groupName : CName, ps : weak< PersistentState > )
+	{
+		m_groupName = groupName;
+		AddAgent( ps );
+	}
+
+	public const function GetGroupName() : CName
+	{
+		return m_groupName;
+	}
+
+	public const function GetAgentsNumber() : Int32
+	{
+		return m_requsteredAgents.Size();
+	}
+
+	public const function GetAgetntByIndex( index : Int32 ) : weak< PersistentState >
+	{
+		return m_requsteredAgents[ index ].ps;
+	}
+
+	public const function IsAgentalreadyAdded( ps : weak< PersistentState > ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_requsteredAgents.Size(); i += 1 )
+		{
+			if( m_requsteredAgents[ i ].ps.GetID() == ps.GetID() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function HasAgents() : Bool
+	{
+		return m_requsteredAgents.Size() > 0;
+	}
+
+	public function AddAgent( ps : weak< PersistentState > )
+	{
+		var newData : SPreventionAgentData;
+		newData = new SPreventionAgentData;
+		newData.ps = ps;
+		m_requsteredAgents.PushBack( newData );
+	}
+
+	public function RemoveAgent( ps : weak< PersistentState > )
+	{
+		var i : Int32;
+		for( i = 0; i < m_requsteredAgents.Size(); i += 1 )
+		{
+			if( m_requsteredAgents[ i ].ps.GetID() == ps.GetID() )
+			{
+				m_requsteredAgents.Erase( i );
+				break;
+			}
+		}
+	}
+
+}
+
+class SPreventionAgentData
+{
+	var ps : weak< PersistentState >;
+}
+
+struct SHitNPC
+{
+	var entityID : EntityID;
+	var calls : Int32;
+}
+
+abstract class PreventionConditionAbstract extends AIbehaviorconditionScript
+{
+}
+
+class ShouldPoliceReactionBeAggressive extends PreventionConditionAbstract
+{
+
+	protected override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		if( GetPuppet( context ).IsPrevention() && !( PreventionSystem.ShouldReactionBeAgressive( ScriptExecutionContext.GetOwner( context ).GetGame() ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+}
+
+enum EPreventionHeatStage
+{
+	Heat_0 = 0,
+	Heat_1 = 1,
+	Heat_2 = 2,
+	Heat_3 = 3,
+	Heat_4 = 4,
+	Size = 5,
+	Invalid = 6,
+}
+
+enum EPreventionPsychoLogicType
+{
+	Start = 0,
+	PoliceKilled = 1,
+	PoliceSpawn = 2,
+	PoliceDespawn = 3,
+	DeescalationZeroExecutionLocked = 4,
+	DeescalationZeroExecute = 5,
+}
+
+enum EPreventionDebugProcessReason
+{
+	Redirected_IsPsycho = 0,
+	Process_NewDamage = 1,
+	Process_EntityCalls = 2,
+	Abort_EntitySame = 3,
+	Abort_DamageZero = 4,
+	Abort_SystemLockedBySceneTier = 5,
+}
+
+enum EPreventionSystemInstruction
+{
+	Safe = 0,
+	Active = 1,
+	Off = 2,
+	On = 3,
+}
+
+function IntToEPreventionHeatStage( index : Int32 ) : EPreventionHeatStage
+{
+	if( index < 0 )
+	{
+		index = 0;
+	}
+	if( index >= ( ( Int32 )( EPreventionHeatStage.Size ) ) )
+	{
+		index = ( ( Int32 )( EPreventionHeatStage.Size ) ) - 1;
+	}
+	return ( ( EPreventionHeatStage )( index ) );
+}
+
+exec function PrevSys_on( gameInstance : GameInstance )
+{
+	var request : PreventionConsoleInstructionRequest;
+	var system : PreventionSystem;
+	system = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'PreventionSystem' ) ) );
+	if( system )
+	{
+		request = new PreventionConsoleInstructionRequest;
+		request.instruction = EPreventionSystemInstruction.On;
+		system.QueueRequest( request );
+	}
+}
+
+exec function PrevSys_off( gameInstance : GameInstance )
+{
+	var request : PreventionConsoleInstructionRequest;
+	var system : PreventionSystem;
+	system = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'PreventionSystem' ) ) );
+	if( system )
+	{
+		request = new PreventionConsoleInstructionRequest;
+		request.instruction = EPreventionSystemInstruction.Off;
+		system.QueueRequest( request );
+	}
+}
+
+exec function PrevSys_safe( gameInstance : GameInstance )
+{
+	var request : PreventionConsoleInstructionRequest;
+	var system : PreventionSystem;
+	system = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'PreventionSystem' ) ) );
+	if( system )
+	{
+		request = new PreventionConsoleInstructionRequest;
+		request.instruction = EPreventionSystemInstruction.Safe;
+		system.QueueRequest( request );
+	}
+}
+
+exec function PrevSys_active( gameInstance : GameInstance, optional heatLevel : String )
+{
+	var request : PreventionConsoleInstructionRequest;
+	var system : PreventionSystem;
+	system = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'PreventionSystem' ) ) );
+	if( system )
+	{
+		request = new PreventionConsoleInstructionRequest;
+		request.instruction = EPreventionSystemInstruction.Active;
+		if( heatLevel != "" && IsStringNumber( heatLevel ) )
+		{
+			request.heatStage = IntToEPreventionHeatStage( StringToInt( heatLevel ) );
+		}
+		system.QueueRequest( request );
+	}
+}
+

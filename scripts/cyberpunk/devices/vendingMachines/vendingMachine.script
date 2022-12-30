@@ -1,0 +1,457 @@
+class VendingMachine extends InteractiveDevice
+{
+	default m_controllerTypeName = 'VendingMachineController';
+	private var m_vendorID : VendorComponent;
+	protected var m_advUiComponent : IComponent;
+	protected var m_isShortGlitchActive : Bool;
+	protected var m_shortGlitchDelayID : DelayID;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ui', 'worlduiWidgetComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'ads', 'AdvertisementWidgetComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'VendorID', 'VendorComponent', false );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_uiComponent = ( ( worlduiWidgetComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ui' ) ) );
+		m_advUiComponent = ( ( IComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ads' ) ) );
+		m_vendorID = ( ( VendorComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'VendorID' ) ) );
+		m_controller = ( ( VendingMachineController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected function AttachVendor()
+	{
+		GameInstance.GetDelaySystem( GetGame() ).QueueTask( this, NULL, 'AttachVendorTask', gameScriptTaskExecutionStage.Any );
+	}
+
+	protected export function AttachVendorTask( data : ScriptTaskData )
+	{
+		var request : AttachVendorRequest;
+		var vendorID : TweakDBID;
+		vendorID = GetVendorID();
+		if( TDBID.IsValid( vendorID ) )
+		{
+			request = new AttachVendorRequest;
+			request.owner = this;
+			request.vendorID = vendorID;
+			MarketSystem.GetInstance( GetGame() ).QueueRequest( request );
+		}
+	}
+
+	protected override function ResolveGameplayState()
+	{
+		super.ResolveGameplayState();
+		AttachVendor();
+		if( IsUIdirty() && m_isInsideLogicArea )
+		{
+			RefreshUI();
+		}
+	}
+
+	public virtual function GetVendorID() : TweakDBID
+	{
+		return m_vendorID.GetVendorID();
+	}
+
+	protected override function DeactivateDevice()
+	{
+		super.DeactivateDevice();
+		TurnOffDevice();
+	}
+
+	protected override function TurnOffDevice()
+	{
+		m_uiComponent.Toggle( false );
+		m_advUiComponent.Toggle( false );
+		ToggleLights( false );
+		super.TurnOffDevice();
+	}
+
+	protected override function TurnOnDevice()
+	{
+		m_uiComponent.Toggle( true );
+		m_advUiComponent.Toggle( true );
+		ToggleLights( true );
+		super.TurnOnDevice();
+	}
+
+	protected event OnAreaEnter( evt : AreaEnteredEvent )
+	{
+		RefreshUI();
+	}
+
+	protected virtual function GetProcessingSFX() : CName
+	{
+		return m_vendorID.GetProcessingSFX();
+	}
+
+	protected event OnDispenceItemFromVendor( evt : DispenceItemFromVendor )
+	{
+		var price : Int32;
+		var playerMoney : Int32;
+		var transactionSys : TransactionSystem;
+		if( evt.IsStarted() )
+		{
+			transactionSys = GameInstance.GetTransactionSystem( GetGame() );
+			price = MarketSystem.GetBuyPrice( this, evt.GetItemID() );
+			playerMoney = transactionSys.GetItemQuantity( GetPlayer( GetGame() ), MarketSystem.Money() );
+			if( playerMoney > price )
+			{
+				DelayVendingMachineEvent( GetDevicePS().GetTimeToCompletePurchase(), false, true, evt.GetItemID() );
+				PlaySoundEvent( this, GetProcessingSFX() );
+				SendDataToUIBlackboard( PaymentStatus.IN_PROGRESS );
+			}
+			else
+			{
+				SendDataToUIBlackboard( PaymentStatus.NO_MONEY );
+			}
+		}
+		else
+		{
+			SendDataToUIBlackboard( PaymentStatus.DEFAULT );
+		}
+	}
+
+	protected function DelayVendingMachineEvent( time : Float, isFree : Bool, isReady : Bool, optional itemID : ItemID )
+	{
+		var evt : VendingMachineFinishedEvent;
+		evt = new VendingMachineFinishedEvent;
+		if( ItemID.IsValid( itemID ) )
+		{
+			evt.itemID = itemID;
+		}
+		evt.isFree = isFree;
+		evt.isReady = isReady;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, time );
+	}
+
+	protected event OnVendingMachineFinishedEvent( evt : VendingMachineFinishedEvent )
+	{
+		if( GetDevicePS().IsSoldOut() )
+		{
+			SendSoldOutToUIBlackboard( true );
+		}
+		else if( evt.isReady )
+		{
+			GetDevicePS().SetIsReady( true );
+		}
+		DispenseItems( CreateDispenseRequest( !( evt.isFree ), evt.itemID ) );
+		PlayItemFall();
+		RefreshUI();
+	}
+
+	protected virtual function DispenseItems( request : DispenseRequest )
+	{
+		MarketSystem.GetInstance( GetGame() ).QueueRequest( request );
+	}
+
+	protected virtual function CreateDispenseRequest( shouldPay : Bool, item : ItemID ) : DispenseRequest
+	{
+		var dispenseRequest : DispenseRequest;
+		dispenseRequest = new DispenseRequest;
+		dispenseRequest.owner = this;
+		dispenseRequest.position = RandomizePosition();
+		dispenseRequest.shouldPay = shouldPay;
+		if( ItemID.IsValid( item ) )
+		{
+			dispenseRequest.itemID = item;
+		}
+		return dispenseRequest;
+	}
+
+	protected virtual function BuyItems( request : BuyRequest )
+	{
+		var uiSys : UISystem;
+		var evt : VendorBoughtItemEvent;
+		var i, limit : Int32;
+		uiSys = GameInstance.GetUISystem( GetGame() );
+		evt = new VendorBoughtItemEvent;
+		for( i = 0, limit = request.items.Size(); i < limit; i += 1 )
+		{
+			evt.items.PushBack( request.items[ i ].itemID );
+		}
+		uiSys.QueueEvent( evt );
+		MarketSystem.GetInstance( GetGame() ).QueueRequest( request );
+	}
+
+	protected function CreateBuyRequest( optional itemID : ItemID ) : BuyRequest
+	{
+		var buyRequest : BuyRequest;
+		var buyRequestData : TransactionRequestData;
+		if( ItemID.IsValid( itemID ) )
+		{
+			buyRequestData.itemID = itemID;
+		}
+		buyRequest = new BuyRequest;
+		buyRequest.owner = this;
+		buyRequest.items.PushBack( buyRequestData );
+		return buyRequest;
+	}
+
+	protected virtual function PlayItemFall()
+	{
+		PlaySoundEvent( this, m_vendorID.GetItemFallSFX() );
+	}
+
+	protected function RandomizePosition() : Vector4
+	{
+		var offset : Vector4;
+		var position : Vector4;
+		var transform : WorldTransform;
+		GetSlotComponent().GetSlotTransform( 'itemSpawn', transform );
+		offset.X = RandRangeF( -0.1, 0.1 );
+		offset.Y = RandRangeF( -0.02, 0.02 );
+		offset.Z = RandRangeF( -0.05, 0.02 );
+		offset.W = 1.0;
+		position = WorldPosition.ToVector4( WorldTransform.TransformPoint( transform, offset ) );
+		return position;
+	}
+
+	protected override function StartGlitching( glitchState : EGlitchState, optional intensity : Float )
+	{
+		HackedEffect();
+		AdvertGlitch( true, GetGlitchData( glitchState ) );
+		PlaySoundEvent( this, GetDevicePS().GetGlitchStartSFX() );
+		RefreshUI();
+	}
+
+	protected override function StopGlitching()
+	{
+		AdvertGlitch( false, GetGlitchData( EGlitchState.NONE ) );
+		PlaySoundEvent( this, GetDevicePS().GetGlitchStopSFX() );
+		GetDevicePS().SetIsReady( true );
+		RefreshUI();
+	}
+
+	protected function GetGlitchData( glitchState : EGlitchState ) : GlitchData
+	{
+		var data : GlitchData;
+		data.state = glitchState;
+		if( glitchState != EGlitchState.NONE )
+		{
+			data.intensity = 1.0;
+		}
+		return data;
+	}
+
+	protected virtual function HackedEffect()
+	{
+		var TS : TransactionSystem;
+		var junkItem : ItemID;
+		var junkPool : array< JunkItemRecord >;
+		var itemCount : Int32;
+		var index : Int32;
+		var max : Int32;
+		var i : Int32;
+		if( GetBlackboard().GetBool( GetAllBlackboardDefs().VendingMachineDeviceBlackboard.SoldOut ) )
+		{
+			return;
+		}
+		TS = GameInstance.GetTransactionSystem( GetGame() );
+		max = GetDevicePS().GetHackedItemCount();
+		itemCount = m_vendorID.GetJunkCount();
+		junkPool = m_vendorID.GetJunkItemIDs();
+		for( i = 0; i < max; i += 1 )
+		{
+			if( itemCount > 1 )
+			{
+				index = RandRange( 0, itemCount );
+			}
+			if( junkPool.Size() > 0 )
+			{
+				junkItem = ItemID.FromTDBID( junkPool[ index ].m_junkItemID );
+				if( ItemID.IsValid( junkItem ) )
+				{
+					TS.GiveItem( this, junkItem, 1 );
+					DelayHackedEvent( ( ( Float )( i ) ) / 5.0, junkItem );
+				}
+			}
+		}
+		if( GetDevicePS().IsSoldOut() )
+		{
+			SendSoldOutToUIBlackboard( true );
+		}
+	}
+
+	protected virtual function GetJunkItem() : ItemID
+	{
+		return ItemID.None();
+	}
+
+	protected function DelayHackedEvent( time : Float, itemID : ItemID )
+	{
+		var evt : DelayHackedEvent;
+		evt = new DelayHackedEvent;
+		if( ItemID.IsValid( itemID ) )
+		{
+			evt.itemID = itemID;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, time );
+		}
+	}
+
+	protected event OnDelayHackedEvent( evt : DelayHackedEvent )
+	{
+		GameInstance.GetLootManager( GetGame() ).SpawnItemDrop( this, evt.itemID, RandomizePosition() );
+		PlayItemFall();
+	}
+
+	protected function AdvertGlitch( start : Bool, data : GlitchData )
+	{
+		SimpleGlitch( start );
+		GetBlackboard().SetVariant( GetBlackboardDef().GlitchData, data, true );
+		GetBlackboard().FireCallbacks();
+	}
+
+	protected function SimpleGlitch( on : Bool )
+	{
+		var evt : AdvertGlitchEvent;
+		evt = new AdvertGlitchEvent;
+		if( on )
+		{
+			evt.SetShouldGlitch( 1.0 );
+		}
+		else
+		{
+			evt.SetShouldGlitch( 0.0 );
+		}
+		QueueEvent( evt );
+	}
+
+	protected event OnQuestDispenseFreeItem( evt : DispenseFreeItem )
+	{
+		DelayVendingMachineEvent( 0.5, true, true );
+	}
+
+	protected event OnQuestDispenseSpecificItem( evt : DispenseFreeSpecificItem )
+	{
+		DelayVendingMachineEvent( 0.5, true, true, ItemID.FromTDBID( evt.item ) );
+	}
+
+	protected function ToggleLights( on : Bool )
+	{
+		var evt : ToggleLightEvent;
+		evt = new ToggleLightEvent;
+		evt.toggle = on;
+		QueueEvent( evt );
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		return EGameplayRole.Distract;
+	}
+
+	private override function InitializeScreenDefinition()
+	{
+		if( !( TDBID.IsValid( m_screenDefinition.screenDefinition ) ) )
+		{
+			m_screenDefinition.screenDefinition = T"DevicesUIDefinitions.Terminal_4x3";
+		}
+		if( !( TDBID.IsValid( m_screenDefinition.style ) ) )
+		{
+			m_screenDefinition.style = T"DevicesUIStyles.None";
+		}
+	}
+
+	public const override function GetBlackboardDef() : VendingMachineDeviceBlackboardDef
+	{
+		return GetDevicePS().GetBlackboardDef();
+	}
+
+	protected override function CreateBlackboard()
+	{
+		m_blackboard = IBlackboard.Create( GetAllBlackboardDefs().VendingMachineDeviceBlackboard );
+	}
+
+	protected function SendDataToUIBlackboard( status : PaymentStatus )
+	{
+		GetBlackboard().SetVariant( GetAllBlackboardDefs().VendingMachineDeviceBlackboard.ActionStatus, status );
+		GetBlackboard().FireCallbacks();
+	}
+
+	protected function SendSoldOutToUIBlackboard( soldOut : Bool )
+	{
+		GetBlackboard().SetBool( GetAllBlackboardDefs().VendingMachineDeviceBlackboard.SoldOut, soldOut );
+		GetBlackboard().FireCallbacks();
+	}
+
+	protected const override function GetController() : VendingMachineController
+	{
+		return ( ( VendingMachineController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : VendingMachineControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	protected event OnHitEvent( hit : gameHitEvent )
+	{
+		super.OnHitEvent( hit );
+		StartShortGlitch();
+	}
+
+	private function StartShortGlitch()
+	{
+		var evt : StopShortGlitchEvent;
+		if( GetDevicePS().IsGlitching() )
+		{
+			return;
+		}
+		if( !( m_isShortGlitchActive ) )
+		{
+			evt = new StopShortGlitchEvent;
+			SimpleGlitch( true );
+			m_shortGlitchDelayID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 0.25 );
+			m_isShortGlitchActive = true;
+		}
+	}
+
+	protected event OnStopShortGlitch( evt : StopShortGlitchEvent )
+	{
+		m_isShortGlitchActive = false;
+		if( !( GetDevicePS().IsGlitching() ) )
+		{
+			SimpleGlitch( false );
+		}
+	}
+
+}
+
+class VendingMachineFinishedEvent extends Event
+{
+	var itemID : ItemID;
+	var isFree : Bool;
+	var isReady : Bool;
+}
+
+class DelayHackedEvent extends Event
+{
+	var itemID : ItemID;
+}
+
+class DispenseFreeItem extends Event
+{
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Dispense Free Item";
+	}
+
+}
+
+class DispenseFreeSpecificItem extends Event
+{
+	[ customEditor = "TweakDBGroupInheritance;Items.Drink;Items.Food" ]
+	editable var item : TweakDBID;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Dispense Specific Free Item";
+	}
+
+}
+

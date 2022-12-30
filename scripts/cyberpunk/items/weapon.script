@@ -1,0 +1,2109 @@
+import class WeaponObject extends ItemObject
+{
+	private var m_hasOverheat : Bool;
+	private var m_overheatEffectBlackboard : worldEffectBlackboard;
+	private var m_overheatListener : OverheatStatListener;
+	private var m_overheatDelaySent : Bool;
+	private var m_chargeEffectBlackboard : worldEffectBlackboard;
+	private var m_chargeStatListener : WeaponChargeStatListener;
+	private var m_triggerEffectName : CName;
+	private var m_meleeHitEffectBlackboard : worldEffectBlackboard;
+	private var m_meleeHitEffectValue : Float;
+	private var m_damageTypeListener : DamageStatListener;
+	private var m_trailName : String;
+	private var m_maxChargeThreshold : Float;
+	default m_maxChargeThreshold = 100.f;
+	private var m_animOwner : Int32;
+	private var m_lowAmmoEffectActive : Bool;
+	private var m_hasSecondaryTriggerMode : Bool;
+	private var m_weaponRecord : WeaponItem_Record;
+	private var m_isHeavyWeapon : Bool;
+	private var m_isMeleeWeapon : Bool;
+	private var m_isRangedWeapon : Bool;
+	private var m_AIBlackboard : IBlackboard;
+
+	public import function GetAttacks() : array< IAttack >;
+	public import function GetAttack( recordName : CName ) : IAttack;
+	public import function GetCurrentAttack() : IAttack;
+	public import function GetCurrentTriggerMode() : TriggerMode_Record;
+	public import function GetFxPackage() : weak< FxPackage >;
+	public import function GetFxPackageQuickMelee() : weak< FxPackage >;
+	public import function GetSharedData() : IBlackboard;
+	public import function GetTotalAmmoCount() : Int32;
+	public import function GetTriggerModes() : array< TriggerMode_Record >;
+	public import function HasAmmoChangeRequest() : Bool;
+	public import function HasPendingReload() : Bool;
+	public import function SetAttack( attackID : TweakDBID ) : Bool;
+	public import function StartContinuousAttack( startPos : Vector4, startDir : Vector4 ) : Bool;
+	public import function StopContinuousAttack();
+	public import function IsContinuousAttackStarted() : Bool;
+	public import function HasScope() : Bool;
+	public import function GetScopeOffset() : Vector4;
+	public import function GetIronSightOffset() : Vector4;
+	public import function GetMuzzleOffset() : Vector4;
+	public import function IsSilenced() : Bool;
+	public import function UpdateTargetingSight( targetID : EntityID, targetPosition : Vector4 ) : Bool;
+	public import function IsTargetLocked() : Bool;
+	public import function ShootStraight( shootStraight : Bool );
+	public import function SetTriggerDown( triggerDown : Bool );
+	public import function SetupBurstFireSound( numShotsInBurst : Int32 );
+	public import function StartReload( optional durationOverride : Float ) : Float;
+	public import function StopReload( optional reloadStatus : gameweaponReloadStatus );
+	public import function AI_SetAttackData( attack : weak< IAttack > );
+	public import function AI_PlayChargeStartedSound();
+	public import function AI_PlayMeleeAttackSound( isQuickMelee : Bool );
+	public import function AI_ShootAt( targetPositionProvider : IPositionProvider, targetObject : GameObject, instigator : weak< GameObject >, ammoCost : Uint16, projectileParams : gameprojectileWeaponParams, projectilesPerShot : Uint8, charge : Float, optional maxSpread : Float );
+	public import function AI_ShootForwards( instigator : weak< GameObject >, ammoCost : Uint16, projectileParams : gameprojectileWeaponParams, projectilesPerShot : Uint8, charge : Float, optional overridePos : Vector4, optional overrideForward : Vector4 );
+	public import function AI_ShootSelfOffScreen( targetObject : gamePuppet, ammoCost : Uint16, projectileParams : gameprojectileWeaponParams, projectilesPerShot : Uint8, charge : Float );
+	private import function SetWeaponEffects( weaponVFXActionRecord : array< weak< WeaponVFXAction_Record > > );
+	private import function RemoveWeaponEffects();
+
+	protected event OnGameAttached()
+	{
+		var weaponFxPackage : weak< WeaponFxPackage_Record >;
+		var weaponVFXActionRecord : array< weak< WeaponVFXAction_Record > >;
+		super.OnGameAttached();
+		m_weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( GetItemID() ) );
+		m_isHeavyWeapon = EquipmentSystem.GetEquipAreaType( GetItemID() ) == gamedataEquipmentArea.WeaponHeavy;
+		m_isMeleeWeapon = m_weaponRecord.TagsContains( WeaponObject.GetMeleeWeaponTag() );
+		m_isRangedWeapon = m_weaponRecord.TagsContains( WeaponObject.GetRangedWeaponTag() );
+		m_AIBlackboard = IBlackboard.Create( GetAllBlackboardDefs().AIShooting );
+		OnAttachSetStatPools();
+		RegisterStatPoolListeners();
+		RegisterStatListeners();
+		weaponFxPackage = m_weaponRecord.FxPackage();
+		if( this.GetOwner().IsNPC() )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new UpdateDamageChangeEvent, 0.00001 );
+		}
+		if( this.GetOwner().IsPlayer() )
+		{
+		}
+		else
+		{
+			weaponFxPackage.Npc_vfx_set().Actions( weaponVFXActionRecord );
+		}
+		SetWeaponEffects( weaponVFXActionRecord );
+		m_animOwner = ( ( Int32 )( animWeaponOwnerType.None ) );
+		SetWeaponOwner();
+		m_hasSecondaryTriggerMode = false;
+		if( m_weaponRecord.SecondaryTriggerMode() )
+		{
+			if( m_weaponRecord.PrimaryTriggerMode().Type() != m_weaponRecord.SecondaryTriggerMode().Type() )
+			{
+				m_hasSecondaryTriggerMode = true;
+			}
+		}
+	}
+
+	private function SetupWeaponEffects()
+	{
+		var weaponVFXActionRecord : array< weak< WeaponVFXAction_Record > >;
+		var localOwner : Int32;
+		localOwner = GetNextWeaponOwner();
+		if( localOwner == m_animOwner )
+		{
+			return;
+		}
+		if( this.GetOwner().IsPlayer() )
+		{
+			SendScopeData();
+			SendWeaponStatsAnimFeature();
+			HandleVisualEffectsSetup();
+			CatcheTriggerEffectFromWeaponType();
+			m_weaponRecord.FxPackage().Player_vfx_set().Actions( weaponVFXActionRecord );
+			SetWeaponEffects( weaponVFXActionRecord );
+		}
+		SetWeaponOwner( localOwner );
+		m_animOwner = localOwner;
+	}
+
+	protected event OnVisualSpawnAttached()
+	{
+		SetupWeaponEffects();
+		SetAnimWrappersOnItem( ( ( gamePuppetBase )( GetOwner() ) ) );
+	}
+
+	protected event OnPlayerWeaponSetupEvent( evt : PlayerWeaponSetupEvent )
+	{
+		SetupWeaponEffects();
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		RemoveWeaponEffects();
+		if( m_overheatListener )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( GetEntityID(), gamedataStatPoolType.WeaponOverheat, m_overheatListener );
+			m_overheatListener = NULL;
+			m_overheatDelaySent = false;
+		}
+		UnregisterChargeStatListener();
+		if( m_damageTypeListener )
+		{
+			GameInstance.GetStatsSystem( GetGame() ).UnregisterListener( GetEntityID(), m_damageTypeListener );
+			m_damageTypeListener = NULL;
+		}
+		if( this.GetOwner().IsPlayer() )
+		{
+			GameInstance.GetAudioSystem( GetGame() ).RemoveAllTriggerEffects();
+		}
+	}
+
+	public const function HasSecondaryTriggerMode() : Bool
+	{
+		return m_hasSecondaryTriggerMode;
+	}
+
+	public const function GetWeaponRecord() : WeaponItem_Record
+	{
+		return m_weaponRecord;
+	}
+
+	public const function IsHeavyWeapon() : Bool
+	{
+		return m_isHeavyWeapon;
+	}
+
+	public const function IsRanged() : Bool
+	{
+		return m_isRangedWeapon;
+	}
+
+	public const function IsMelee() : Bool
+	{
+		return m_isMeleeWeapon;
+	}
+
+	public const function WeaponHasTag( tag : CName ) : Bool
+	{
+		return m_weaponRecord.TagsContains( tag );
+	}
+
+	public const function GetAIBlackboard() : IBlackboard
+	{
+		return m_AIBlackboard;
+	}
+
+	public const function GetTriggerEffectName() : CName
+	{
+		return m_triggerEffectName;
+	}
+
+	public constexpr static function GetBaseMaxChargeThreshold() : Float
+	{
+		return 50.0;
+	}
+
+	public constexpr static function GetFullyChargedThreshold() : Float
+	{
+		return 75.0;
+	}
+
+	public constexpr static function GetOverchargeThreshold() : Float
+	{
+		return 100.0;
+	}
+
+	public function GetCurrentMeleeTrailEffectName() : CName
+	{
+		return StringToName( m_trailName );
+	}
+
+	public function SetMaxChargeThreshold( maxCharge : Float )
+	{
+		var evt : WeaponSetMaxChargeEvent;
+		if( m_maxChargeThreshold != maxCharge )
+		{
+			m_maxChargeThreshold = maxCharge;
+			evt = new WeaponSetMaxChargeEvent;
+			evt.maxCharge = maxCharge;
+			QueueEvent( evt );
+		}
+	}
+
+	public function GetMaxChargeTreshold() : Float
+	{
+		return m_maxChargeThreshold;
+	}
+
+	public static function ChangeTriggerMode( self : WeaponObject, triggerMode : gamedataTriggerMode )
+	{
+		var evt : WeaponChangeTriggerModeEvent;
+		evt = new WeaponChangeTriggerModeEvent;
+		evt.triggerMode = triggerMode;
+		self.QueueEvent( evt );
+	}
+
+	public static function GetMagazineAmmoCount( self : WeaponObject ) : Uint32
+	{
+		if( self )
+		{
+			return self.GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCount );
+		}
+		return 0;
+	}
+
+	public static function GetMagazineCapacity( self : WeaponObject ) : Uint32
+	{
+		if( self )
+		{
+			return self.GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCapacity );
+		}
+		return 0;
+	}
+
+	public static function GetMagazinePercentage( self : WeaponObject ) : Float
+	{
+		if( self )
+		{
+			return ( ( Float )( self.GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCount ) ) ) / ( ( Float )( self.GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCapacity ) ) );
+		}
+		return -1.0;
+	}
+
+	public static function HasAvailableAmmo( self : WeaponObject ) : Bool
+	{
+		if( self && ( self.GetTotalAmmoCount() > 0 ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function HasAvailableAmmoInInventory( self : WeaponObject ) : Bool
+	{
+		if( self && ( ( self.GetTotalAmmoCount() - ( ( Int32 )( GetMagazineAmmoCount( self ) ) ) ) > 0 ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsMagazineFull( self : WeaponObject ) : Bool
+	{
+		if( self && ( WeaponObject.GetMagazineAmmoCount( self ) == WeaponObject.GetMagazineCapacity( self ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public function IsMagazineEmpty() : Bool
+	{
+		return GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCount ) <= ( ( Uint32 )( 0 ) );
+	}
+
+	public static function IsMagazineEmpty( self : WeaponObject ) : Bool
+	{
+		if( self && ( WeaponObject.GetMagazineAmmoCount( self ) <= ( ( Uint32 )( 0 ) ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function CanReload( self : WeaponObject ) : Bool
+	{
+		if( ( self && WeaponObject.HasAvailableAmmoInInventory( self ) ) && !( WeaponObject.IsMagazineFull( self ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function CanCriticallyHit( self : WeaponObject ) : Bool
+	{
+		if( self )
+		{
+			return GameInstance.GetStatsSystem( self.GetGame() ).GetStatValue( self.GetEntityID(), gamedataStatType.CanWeaponCriticallyHit ) > 0.0;
+		}
+		return false;
+	}
+
+	public static function CanIgnoreArmor( self : WeaponObject ) : Bool
+	{
+		if( self )
+		{
+			return GameInstance.GetStatsSystem( self.GetGame() ).GetStatValue( self.GetEntityID(), gamedataStatType.CanWeaponIgnoreArmor ) > 0.0;
+		}
+		return false;
+	}
+
+	private function CatcheTriggerEffectFromWeaponType()
+	{
+		m_triggerEffectName = GetWeaponRecord().TriggerEffectName();
+		if( !( IsNameValid( m_triggerEffectName ) ) )
+		{
+			m_triggerEffectName = 'te_wea_aim_mid';
+		}
+	}
+
+	private function SendScopeData()
+	{
+		var animFeature : AnimFeature_WeaponScopeData;
+		var weaponRecord : WeaponItem_Record;
+		var weaponRecID : TweakDBID;
+		weaponRecord = GetWeaponRecord();
+		if( weaponRecord )
+		{
+			weaponRecID = weaponRecord.GetID();
+		}
+		animFeature = new AnimFeature_WeaponScopeData;
+		animFeature.hasScope = this.HasScope();
+		animFeature.ironsightAngleWithScope = TDB.GetFloat( weaponRecID + T".ironsightAngleWithScope" );
+		AnimationControllerComponent.ApplyFeature( this, 'ScopeData', animFeature );
+	}
+
+	private function SendWeaponStatsAnimFeature()
+	{
+		var animFeature : AnimFeature_WeaponStats;
+		var statSystem : StatsSystem;
+		var weaponStatsID : EntityID;
+		statSystem = GameInstance.GetStatsSystem( this.GetGame() );
+		weaponStatsID = this.GetEntityID();
+		animFeature = new AnimFeature_WeaponStats;
+		animFeature.cycleTime = statSystem.GetStatValue( weaponStatsID, gamedataStatType.CycleTime );
+		animFeature.magazineCapacity = ( ( Int32 )( statSystem.GetStatValue( weaponStatsID, gamedataStatType.MagazineCapacity ) ) );
+		AnimationControllerComponent.ApplyFeature( this, 'WeaponStats', animFeature );
+	}
+
+	private function OnUpdateWeaponStatsEvent( evt : UpdateWeaponStatsEvent )
+	{
+		SendWeaponStatsAnimFeature();
+	}
+
+	public static function GetAmmoType( weapon : weak< WeaponObject > ) : ItemID
+	{
+		var weaponID : ItemID;
+		var weaponRecord : WeaponItem_Record;
+		var ammoID : ItemID;
+		weaponID = weapon.GetItemID();
+		weaponRecord = ( ( WeaponItem_Record )( TweakDBInterface.GetItemRecord( ItemID.GetTDBID( weaponID ) ) ) );
+		ammoID = ItemID.CreateQuery( weaponRecord.Ammo().GetID() );
+		return ammoID;
+	}
+
+	public static function GetWeaponChargeNormalized( weapon : weak< WeaponObject > ) : Float
+	{
+		var statPoolSystem : StatPoolsSystem;
+		var result : Float;
+		var chargeVal : Float;
+		statPoolSystem = GameInstance.GetStatPoolsSystem( weapon.GetGame() );
+		result = 0.0;
+		chargeVal = statPoolSystem.GetStatPoolValue( weapon.GetEntityID(), gamedataStatPoolType.WeaponCharge, false );
+		result = ClampF( chargeVal / weapon.GetMaxChargeTreshold(), 0.0, 1.0 );
+		return result;
+	}
+
+	public static function GetAmmoType( weaponID : ItemID ) : ItemID
+	{
+		var weaponRecord : WeaponItem_Record;
+		var ammoID : ItemID;
+		weaponRecord = ( ( WeaponItem_Record )( TweakDBInterface.GetItemRecord( ItemID.GetTDBID( weaponID ) ) ) );
+		ammoID = ItemID.CreateQuery( weaponRecord.Ammo().GetID() );
+		return ammoID;
+	}
+
+	public static function GetWeaponType( weaponID : ItemID ) : gamedataItemType
+	{
+		var wpnRec : WeaponItem_Record;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			return wpnRec.ItemType().Type();
+		}
+		return gamedataItemType.Invalid;
+	}
+
+	public static function IsRanged( weaponID : ItemID ) : Bool
+	{
+		var tags : array< CName >;
+		var wpnRec : WeaponItem_Record;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			tags = wpnRec.Tags();
+			if( tags.Contains( WeaponObject.GetRangedWeaponTag() ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsRanged( wpnRec : weak< Item_Record > ) : Bool
+	{
+		var tags : array< CName >;
+		if( !( wpnRec ) )
+		{
+			return false;
+		}
+		tags = wpnRec.Tags();
+		if( tags.Contains( WeaponObject.GetRangedWeaponTag() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsOneHandedRanged( weaponID : ItemID ) : Bool
+	{
+		var tags : array< CName >;
+		var wpnRec : WeaponItem_Record;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			tags = wpnRec.Tags();
+			if( tags.Contains( WeaponObject.GetOneHandedRangedWeaponTag() ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsMelee( weaponID : ItemID ) : Bool
+	{
+		var tags : array< CName >;
+		var wpnRec : WeaponItem_Record;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			tags = wpnRec.Tags();
+			if( tags.Contains( WeaponObject.GetMeleeWeaponTag() ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function IsMelee( wpnRec : weak< WeaponItem_Record > ) : Bool
+	{
+		var tags : array< CName >;
+		if( !( wpnRec ) )
+		{
+			return false;
+		}
+		tags = wpnRec.Tags();
+		if( tags.Contains( WeaponObject.GetMeleeWeaponTag() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsFists( weaponID : ItemID ) : Bool
+	{
+		return IsOfType( weaponID, gamedataItemType.Wea_Fists );
+	}
+
+	public static function IsOfType( weaponID : ItemID, type : gamedataItemType ) : Bool
+	{
+		var wpnRec : WeaponItem_Record;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			if( wpnRec.ItemType().Type() == type )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public constexpr static function GetMeleeWeaponTag() : CName
+	{
+		return 'MeleeWeapon';
+	}
+
+	public constexpr static function GetRangedWeaponTag() : CName
+	{
+		return 'RangedWeapon';
+	}
+
+	public constexpr static function GetOneHandedRangedWeaponTag() : CName
+	{
+		return 'OneHandedRangedWeapon';
+	}
+
+	public static function IsCyberwareWeapon( weaponID : ItemID ) : Bool
+	{
+		var i : Int32;
+		var tags : array< CName >;
+		var wpnRec : WeaponItem_Record;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			tags = wpnRec.Tags();
+			for( i = 0; i < tags.Size(); i += 1 )
+			{
+				if( tags[ i ] == 'Meleeware' || tags[ i ] == 'Attack_Projectile' )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public const function GetAppearanceNameFromComponent( componentName : CName ) : CName
+	{
+		var appearanceComponent : IComponent;
+		var appearanceName : CName;
+		appearanceComponent = FindComponentByName( componentName );
+		appearanceName = appearanceComponent.GetAppearanceName();
+		return appearanceName;
+	}
+
+	public function GetNamePropertyFromWeaponDefinition( property : TweakDBID ) : CName
+	{
+		return TDB.GetCName( ItemID.GetTDBID( GetItemID() ) + property, '' );
+	}
+
+	public function GetBoolPropertyFromWeaponDefinition( property : TweakDBID ) : Bool
+	{
+		return TDB.GetBool( ItemID.GetTDBID( GetItemID() ) + property, false );
+	}
+
+	private function GetNextWeaponOwner() : Int32
+	{
+		if( this.GetOwner().IsPlayer() )
+		{
+			return ( ( Int32 )( animWeaponOwnerType.Player ) );
+		}
+		if( this.GetOwner().IsNPC() )
+		{
+			return ( ( Int32 )( animWeaponOwnerType.NPC ) );
+		}
+		return ( ( Int32 )( animWeaponOwnerType.None ) );
+	}
+
+	private function SetWeaponOwner( owner : Int32 )
+	{
+		var animFeature : AnimFeature_OwnerType;
+		animFeature = new AnimFeature_OwnerType;
+		animFeature.ownerEnum = owner;
+		AnimationControllerComponent.ApplyFeature( this, 'Owner', animFeature );
+	}
+
+	private function SetWeaponOwner()
+	{
+		var localOwner : Int32;
+		localOwner = GetNextWeaponOwner();
+		SetWeaponOwner( localOwner );
+	}
+
+	protected event OnSetWeaponOwner( evt : SetWeaponOwnerEvent )
+	{
+		SetWeaponOwner();
+	}
+
+	public static function SendMuzzleOffset( weapon : WeaponObject, owner : GameObject )
+	{
+		var animFeature : AnimFeature_MuzzleData;
+		animFeature = new AnimFeature_MuzzleData;
+		animFeature.muzzleOffset = weapon.GetMuzzleOffset();
+		AnimationControllerComponent.ApplyFeature( owner, 'MuzzleData', animFeature );
+	}
+
+	private function CheckLocked() {}
+
+	protected event OnWaponeventsOwnerAimEvent( evt : gameweaponeventsOwnerAimEvent )
+	{
+		if( evt.isAiming )
+		{
+			GameInstance.GetAudioSystem( GetGame() ).GlobalParameter( 'motion_weapon_panning', 0.0 );
+		}
+		else
+		{
+			GameInstance.GetAudioSystem( GetGame() ).GlobalParameter( 'motion_weapon_panning', 1.0 );
+		}
+	}
+
+	protected event OnOutlineRequestEvent( evt : OutlineRequestEvent )
+	{
+		Log( "WeaponObject \ OutlineRequestEvent " + EntityID.ToDebugString( GetEntityID() ) );
+		if( evt.flag == false )
+		{
+			evt.flag = true;
+			QueueEventToChildItems( evt );
+		}
+	}
+
+	protected event OnForceFadeOutlineEventForWeapon( evt : ForceFadeOutlineEventForWeapon )
+	{
+		Log( "WeaponObject \ ForceFadeOutlineEventForWeapon " + EntityID.ToDebugString( GetEntityID() ) );
+		if( evt.entityID != GetEntityID() )
+		{
+			evt.entityID = GetEntityID();
+			QueueEventToChildItems( evt );
+		}
+	}
+
+	private function HandleVisualEffectsSetup()
+	{
+		var damageType : gamedataDamageType;
+		if( IsMelee() )
+		{
+			damageType = GetCurrentDamageType();
+			StartIdleMeleeEffect( damageType );
+			SetCurrentMeleeTrailEffect( damageType );
+		}
+	}
+
+	private function GetCurrentDamageType() : gamedataDamageType
+	{
+		var returnType : gamedataDamageType;
+		var cachedThreshold : Float;
+		var statSystem : StatsSystem;
+		var weaponID : StatsObjectID;
+		var chemDmg : Float;
+		var thermDmg : Float;
+		var elecDmg : Float;
+		statSystem = GameInstance.GetStatsSystem( this.GetGame() );
+		weaponID = this.GetEntityID();
+		chemDmg = statSystem.GetStatValue( weaponID, gamedataStatType.ChemicalDamage );
+		thermDmg = statSystem.GetStatValue( weaponID, gamedataStatType.ThermalDamage );
+		elecDmg = statSystem.GetStatValue( weaponID, gamedataStatType.ElectricDamage );
+		if( ( ( chemDmg + thermDmg ) + elecDmg ) > 0.0 )
+		{
+			cachedThreshold = thermDmg;
+			returnType = gamedataDamageType.Thermal;
+			if( elecDmg > cachedThreshold )
+			{
+				cachedThreshold = elecDmg;
+				returnType = gamedataDamageType.Electric;
+			}
+			if( chemDmg > cachedThreshold )
+			{
+				cachedThreshold = chemDmg;
+				returnType = gamedataDamageType.Chemical;
+			}
+		}
+		else
+		{
+			returnType = gamedataDamageType.Physical;
+		}
+		return returnType;
+	}
+
+	private function SetCurrentMeleeTrailEffect( damageType : gamedataDamageType )
+	{
+		switch( damageType )
+		{
+			case gamedataDamageType.Physical:
+				m_trailName = "trail_physical";
+			break;
+			case gamedataDamageType.Thermal:
+				m_trailName = "trail_thermal";
+			break;
+			case gamedataDamageType.Chemical:
+				m_trailName = "trail_chemical";
+			break;
+			case gamedataDamageType.Electric:
+				m_trailName = "trail_electric";
+			break;
+			default:
+				m_trailName = "trail_physical";
+			break;
+		}
+	}
+
+	protected event OnUpdateMeleeTrailEffect( evt : UpdateMeleeTrailEffectEvent )
+	{
+		if( evt.instigator.IsPlayer() )
+		{
+			switch( GetCurrentDamageType() )
+			{
+				case gamedataDamageType.Physical:
+					m_trailName = "trail_physical";
+				break;
+				case gamedataDamageType.Thermal:
+					m_trailName = "trail_thermal";
+				break;
+				case gamedataDamageType.Chemical:
+					m_trailName = "trail_chemical";
+				break;
+				case gamedataDamageType.Electric:
+					m_trailName = "trail_electric";
+				break;
+				default:
+					m_trailName = "trail_physical";
+				break;
+			}
+		}
+		else
+		{
+			switch( GetCurrentDamageType() )
+			{
+				case gamedataDamageType.Physical:
+					m_trailName = "trail_physical_npc";
+				break;
+				case gamedataDamageType.Thermal:
+					m_trailName = "trail_thermal_npc";
+				break;
+				case gamedataDamageType.Chemical:
+					m_trailName = "trail_chemical_npc";
+				break;
+				case gamedataDamageType.Electric:
+					m_trailName = "trail_electric_npc";
+				break;
+				default:
+					m_trailName = "trail_physical_npc";
+				break;
+			}
+		}
+	}
+
+	private function StartIdleMeleeEffect( damageType : gamedataDamageType )
+	{
+		var vfx_name : CName;
+		switch( damageType )
+		{
+			case gamedataDamageType.Physical:
+				vfx_name = 'idle_physical';
+			break;
+			case gamedataDamageType.Thermal:
+				vfx_name = 'idle_thermal';
+			break;
+			case gamedataDamageType.Chemical:
+				vfx_name = 'idle_chemical';
+			break;
+			case gamedataDamageType.Electric:
+				vfx_name = 'idle_electric';
+			break;
+			default:
+				vfx_name = 'idle_physical';
+			break;
+		}
+		GameObjectEffectHelper.StartEffectEvent( this, vfx_name, false, m_chargeEffectBlackboard );
+	}
+
+	public function StartCurrentMeleeTrailEffect( optional attackSide : String )
+	{
+		var trailName : String;
+		if( IsStringValid( attackSide ) )
+		{
+			trailName = ( m_trailName + "_" ) + attackSide;
+		}
+		else
+		{
+			trailName = m_trailName;
+		}
+		GameObjectEffectHelper.StartEffectEvent( this, StringToName( trailName ), false, m_chargeEffectBlackboard );
+	}
+
+	public function StopCurrentMeleeTrailEffect( optional attackSide : String )
+	{
+		var trailName : String;
+		if( IsStringValid( attackSide ) )
+		{
+			trailName = ( m_trailName + "_" ) + attackSide;
+		}
+		else
+		{
+			trailName = m_trailName;
+		}
+		GameObjectEffectHelper.BreakEffectLoopEvent( this, StringToName( trailName ) );
+	}
+
+	public import static function TriggerWeaponEffects( weapon : weak< WeaponObject >, fxAction : gamedataFxAction, optional fxBlackboard : worldEffectBlackboard );
+
+	public static function StopWeaponEffects( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, fxAction : gamedataFxAction, optional fxBlackboard : worldEffectBlackboard )
+	{
+		var weaponFxPackage : weak< WeaponFxPackage_Record >;
+		var weaponFxSet : weak< WeaponVFXSet_Record >;
+		weaponFxPackage = weapon.m_weaponRecord.FxPackage();
+		if( !( weaponFxPackage ) )
+		{
+			return;
+		}
+		if( weaponOwner.IsPlayer() )
+		{
+			weaponFxSet = weaponFxPackage.Player_vfx_set();
+		}
+		else
+		{
+			weaponFxSet = weaponFxPackage.Npc_vfx_set();
+		}
+		if( weaponFxSet )
+		{
+			KillFXActionFromSet( weapon, weaponFxSet, fxAction, fxBlackboard );
+		}
+	}
+
+	private static function KillFXActionFromSet( weapon : weak< WeaponObject >, weaponFxSet : weak< WeaponVFXSet_Record >, fxAction : gamedataFxAction, optional fxBlackboard : worldEffectBlackboard )
+	{
+		var i : Int32;
+		var weaponFxActions : array< weak< WeaponVFXAction_Record > >;
+		weaponFxSet.Actions( weaponFxActions );
+		for( i = 0; i < weaponFxActions.Size(); i += 1 )
+		{
+			if( weaponFxActions[ i ] && weaponFxActions[ i ].FxAction().Type() == fxAction )
+			{
+				GameObjectEffectHelper.ActivateEffectAction( weapon, gamedataFxActionType.Kill, weaponFxActions[ i ].FxName(), fxBlackboard );
+			}
+		}
+	}
+
+	public static function SendAmmoUpdateEvent( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject > )
+	{
+		var evt : AmmoStateChangeEvent;
+		evt = new AmmoStateChangeEvent;
+		evt.weaponOwner = weaponOwner;
+		weapon.QueueEventForEntityID( weapon.GetEntityID(), evt );
+	}
+
+	private function OnAttachSetStatPools()
+	{
+		var statPoolSystem : StatPoolsSystem;
+		statPoolSystem = GameInstance.GetStatPoolsSystem( GetGame() );
+		if( IsOfType( GetItemID(), gamedataItemType.Cyb_NanoWires ) )
+		{
+			statPoolSystem.RequestSettingStatPoolValue( GetEntityID(), gamedataStatPoolType.WeaponCharge, 100.0, this );
+		}
+		else if( IsMelee() && statPoolSystem.IsStatPoolAdded( GetEntityID(), gamedataStatPoolType.WeaponCharge ) )
+		{
+			statPoolSystem.RequestSettingStatPoolValue( GetEntityID(), gamedataStatPoolType.WeaponCharge, 0.0, this );
+		}
+	}
+
+	private function RegisterStatPoolListeners()
+	{
+		var statPoolsSystem : StatPoolsSystem;
+		var wpnRec : WeaponItem_Record;
+		var statPoolList : array< weak< StatPool_Record > >;
+		var i : Int32;
+		var hasCharge : Bool;
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( GetGame() );
+		if( !( statPoolsSystem ) )
+		{
+			return;
+		}
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( GetItemID() ) );
+		if( !( wpnRec ) )
+		{
+			return;
+		}
+		wpnRec.StatPools( statPoolList );
+		for( i = 0; i < statPoolList.Size(); i += 1 )
+		{
+			switch( statPoolList[ i ].StatPoolType() )
+			{
+				case gamedataStatPoolType.WeaponOverheat:
+					m_hasOverheat = true;
+				break;
+				case gamedataStatPoolType.WeaponCharge:
+					hasCharge = true;
+				break;
+				default:
+					break;
+			}
+		}
+		if( hasCharge && IsMelee() )
+		{
+			RegisterChargeStatListener();
+		}
+	}
+
+	protected event OnWeaponRegisterChargeStatListener( evt : WeaponRegisterChargeStatListener )
+	{
+		if( evt.register )
+		{
+			RegisterChargeStatListener();
+		}
+		else
+		{
+			UnregisterChargeStatListener();
+		}
+	}
+
+	public static function RegisterChargeStatListener( weapon : weak< WeaponObject >, register : Bool )
+	{
+		var evt : WeaponRegisterChargeStatListener;
+		evt = new WeaponRegisterChargeStatListener;
+		if( !( weapon ) )
+		{
+			return;
+		}
+		evt = new WeaponRegisterChargeStatListener;
+		evt.register = register;
+		weapon.QueueEvent( evt );
+	}
+
+	private function RegisterChargeStatListener()
+	{
+		m_chargeStatListener = new WeaponChargeStatListener;
+		m_chargeStatListener.weapon = this;
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestRegisteringListener( GetEntityID(), gamedataStatPoolType.WeaponCharge, m_chargeStatListener );
+		m_chargeEffectBlackboard = NULL;
+	}
+
+	private function UnregisterChargeStatListener()
+	{
+		if( m_chargeStatListener )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( GetEntityID(), gamedataStatPoolType.WeaponCharge, m_chargeStatListener );
+			m_chargeStatListener = NULL;
+			if( IsRanged() )
+			{
+				GameInstance.GetAudioSystem( GetGame() ).RemoveTriggerEffect( 'WeaponObject_UpdateCharge_chargeRumble' );
+				GameInstance.GetAudioSystem( GetGame() ).RemoveTriggerEffect( 'WeaponObject_UpdateCharge_chargeRumble_t2' );
+				GameInstance.GetAudioSystem( GetGame() ).RemoveTriggerEffect( 'WeaponObject_UpdateCharge_chargeRumble_t3' );
+			}
+		}
+	}
+
+	private function RegisterStatListeners()
+	{
+		m_damageTypeListener = new DamageStatListener;
+		m_damageTypeListener.weapon = this;
+		GameInstance.GetStatsSystem( GetGame() ).RegisterListener( GetEntityID(), m_damageTypeListener );
+	}
+
+	protected event OnUpdateOverheat( evt : UpdateOverheatEvent )
+	{
+		var startEvt : StartOverheatEffectEvent;
+		var value : Float;
+		if( !( m_overheatEffectBlackboard ) && !( m_overheatDelaySent ) )
+		{
+			startEvt = new StartOverheatEffectEvent;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, startEvt, 0.30000001 );
+			m_overheatDelaySent = true;
+		}
+		else
+		{
+			value = ( 100.0 - evt.value ) / 100.0;
+			m_overheatEffectBlackboard.SetValue( 'overheatValue', value );
+		}
+	}
+
+	protected function StartOverheatEffect()
+	{
+		var spawnEffectEvent : entSpawnEffectEvent;
+		m_overheatEffectBlackboard = new worldEffectBlackboard;
+		spawnEffectEvent = new entSpawnEffectEvent;
+		m_overheatEffectBlackboard.SetValue( 'overheatValue', 1.0 );
+		spawnEffectEvent.effectName = 'overheat';
+		spawnEffectEvent.blackboard = m_overheatEffectBlackboard;
+		QueueEventToChildItems( spawnEffectEvent );
+	}
+
+	protected event OnSetActiveWeapon( evt : SetActiveWeaponEvent )
+	{
+		if( m_hasOverheat )
+		{
+			m_overheatListener = new OverheatStatListener;
+			m_overheatListener.weapon = this;
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestRegisteringListener( GetEntityID(), gamedataStatPoolType.WeaponOverheat, m_overheatListener );
+			m_overheatEffectBlackboard = NULL;
+		}
+	}
+
+	protected event OnRemoveActiveWeapon( evt : RemoveActiveWeaponEvent )
+	{
+		if( m_overheatListener )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( GetEntityID(), gamedataStatPoolType.WeaponOverheat, m_overheatListener );
+			m_overheatListener = NULL;
+		}
+	}
+
+	protected event OnUpdateWeaponCharge( evt : UpdateWeaponChargeEvent )
+	{
+		if( !( m_chargeEffectBlackboard ) )
+		{
+			m_chargeEffectBlackboard = new worldEffectBlackboard;
+			m_chargeEffectBlackboard.SetValue( 'chargeValue', evt.newValue / 100.0 );
+			GameObjectEffectHelper.StartEffectEvent( this, 'charge', false, m_chargeEffectBlackboard );
+		}
+		else
+		{
+			m_chargeEffectBlackboard.SetValue( 'chargeValue', evt.newValue / 100.0 );
+		}
+		if( IsRanged() )
+		{
+			if( evt.newValue >= 90.0 )
+			{
+				GameInstance.GetAudioSystem( GetGame() ).AddTriggerEffect( 'te_wea_charge_full_t3', 'WeaponObject_UpdateCharge_chargeRumble_t3' );
+				GameInstance.GetAudioSystem( GetGame() ).Play( 'motion_heavy_pulse_2d' );
+			}
+			else if( evt.newValue >= 70.0 )
+			{
+				GameInstance.GetAudioSystem( GetGame() ).AddTriggerEffect( 'te_wea_charge_full_t2', 'WeaponObject_UpdateCharge_chargeRumble_t2' );
+				GameInstance.GetAudioSystem( GetGame() ).Play( 'motion_medium_pulse_2d' );
+			}
+			else if( evt.newValue >= 40.0 )
+			{
+				GameInstance.GetAudioSystem( GetGame() ).AddTriggerEffect( 'te_wea_charge_full', 'WeaponObject_UpdateCharge_chargeRumble' );
+				GameInstance.GetAudioSystem( GetGame() ).Play( 'motion_light_pulse_2d' );
+			}
+		}
+	}
+
+	protected event OnStartOverheatEffectEvent( evt : StartOverheatEffectEvent )
+	{
+		StartOverheatEffect();
+	}
+
+	protected event OnUpdateDamageChangeEvent( evt : UpdateDamageChangeEvent )
+	{
+		HandleVisualEffectsSetup();
+	}
+
+	protected event OnMeleeHitEvent( evt : MeleeHitEvent )
+	{
+		if( ( evt.instigator && evt.instigator.IsPlayer() ) && ( ( PlayerPuppet )( evt.instigator ) ).IsControlledByLocalPeer() )
+		{
+			if( ( !( evt.target ) || evt.hitBlocked ) || !( ( evt.target.IsPuppet() || evt.target.IsDevice() ) ) )
+			{
+				GameObject.PlaySound( evt.instigator, TDB.GetCName( T"rumble.local.heavy_pulse" ) );
+				GameInstance.GetAudioSystem( GetGame() ).SetTriggerEffectModeTimed( 'te_wea_melee_hitblocked', 0.40000001 );
+			}
+			else
+			{
+				GameObject.PlaySound( evt.instigator, TDB.GetCName( T"rumble.local.light_pulse" ) );
+				GameInstance.GetAudioSystem( GetGame() ).SetTriggerEffectModeTimed( 'te_wea_melee_hit', 0.40000001 );
+			}
+		}
+		if( ( ( evt.hitBlocked && evt.target ) && evt.target.IsPlayer() ) && ( ( PlayerPuppet )( evt.target ) ).IsControlledByLocalPeer() )
+		{
+			GameObject.PlaySound( evt.instigator, TDB.GetCName( T"rumble.local.light_pulse" ) );
+			if( StatusEffectSystem.ObjectHasStatusEffect( evt.target, T"BaseStatusEffect.BlockBroken" ) )
+			{
+				GameInstance.GetAudioSystem( GetGame() ).SetTriggerEffectModeTimed( 'te_wea_melee_block_lowstamina', 0.40000001 );
+			}
+			else
+			{
+				GameInstance.GetAudioSystem( GetGame() ).SetTriggerEffectModeTimed( 'te_wea_melee_block', 0.40000001 );
+			}
+		}
+		if( ( !( evt.hitBlocked ) && evt.target ) && evt.target.IsPuppet() )
+		{
+			if( m_meleeHitEffectBlackboard )
+			{
+				m_meleeHitEffectValue += 0.25;
+				m_meleeHitEffectBlackboard.SetValue( 'value', m_meleeHitEffectValue );
+			}
+			else
+			{
+				m_meleeHitEffectBlackboard = new worldEffectBlackboard;
+				m_meleeHitEffectValue = 0.25;
+				m_meleeHitEffectBlackboard.SetValue( 'value', m_meleeHitEffectValue );
+				WeaponObject.TriggerWeaponEffects( this, gamedataFxAction.MeleeHit, m_meleeHitEffectBlackboard );
+			}
+		}
+	}
+
+	protected event OnAmmoStateChangeEvent( evt : AmmoStateChangeEvent )
+	{
+		if( ( WeaponObject.GetMagazinePercentage( this ) <= 0.25 ) && !( m_lowAmmoEffectActive ) )
+		{
+			WeaponObject.TriggerWeaponEffects( this, gamedataFxAction.EnterLowAmmo );
+			m_lowAmmoEffectActive = true;
+		}
+		else if( ( WeaponObject.GetMagazinePercentage( this ) > 0.25 ) && m_lowAmmoEffectActive )
+		{
+			WeaponObject.TriggerWeaponEffects( this, gamedataFxAction.ExitLowAmmo );
+			m_lowAmmoEffectActive = false;
+		}
+	}
+
+	private function SetAnimWrappersOnItem( weaponOwner : weak< gamePuppetBase > )
+	{
+		var affiliation : weak< Affiliation_Record >;
+		var animWrappers : array< CName >;
+		var i : Int32;
+		if( !( weaponOwner ) )
+		{
+			return;
+		}
+		affiliation = TweakDBInterface.GetCharacterRecord( weaponOwner.GetRecordID() ).Affiliation();
+		if( !( affiliation ) )
+		{
+			return;
+		}
+		animWrappers = affiliation.AnimWrappers();
+		for( i = 0; i < animWrappers.Size(); i += 1 )
+		{
+			if( IsNameValid( animWrappers[ i ] ) )
+			{
+				AnimationControllerComponent.SetAnimWrapperWeight( this, animWrappers[ i ], 1.0 );
+			}
+		}
+	}
+
+}
+
+importonly class WeaponCycleTriggerModeEvent extends Event
+{
+}
+
+importonly class WeaponChangeTriggerModeEvent extends Event
+{
+	import var triggerMode : gamedataTriggerMode;
+}
+
+importonly class WeaponSetMaxChargeEvent extends Event
+{
+	import var maxCharge : Float;
+}
+
+importonly class WeaponConsumeMagazineAmmoEvent extends Event
+{
+	import var amount : Uint16;
+}
+
+import class AIAttackAttemptEvent extends Event
+{
+	import var instigator : weak< GameObject >;
+	import var target : weak< GameObject >;
+	import var isWindUp : Bool;
+	import var continuousMode : gameEContinuousMode;
+	import var minimumOpacity : Float;
+}
+
+importonly class ForwardEventToProjectileEvent extends Event
+{
+	import var eventToForward : Event;
+}
+
+class ForceFadeOutlineEventForWeapon extends Event
+{
+	var entityID : EntityID;
+}
+
+importonly class SetActiveWeaponEvent extends Event
+{
+}
+
+importonly class RemoveActiveWeaponEvent extends Event
+{
+}
+
+importonly class IFxPackage extends IScriptable
+{
+}
+
+importonly class FxPackage extends IFxPackage
+{
+	public import function GetVfxGroundThrow() : FxResource;
+}
+
+abstract class AIWeapon extends IScriptable
+{
+
+	public static function GetShotTimeStamp( const weapon : weak< WeaponObject > ) : Float
+	{
+		return weapon.GetAIBlackboard().GetFloat( GetAllBlackboardDefs().AIShooting.shotTimeStamp );
+	}
+
+	public static function GetNextShotTimeStamp( const weapon : weak< WeaponObject > ) : Float
+	{
+		return weapon.GetAIBlackboard().GetFloat( GetAllBlackboardDefs().AIShooting.nextShotTimeStamp );
+	}
+
+	public static function GetTotalNumberOfShots( const weapon : weak< WeaponObject > ) : Int32
+	{
+		return weapon.GetAIBlackboard().GetInt( GetAllBlackboardDefs().AIShooting.totalShotsFired );
+	}
+
+	public static function GetDesiredNumberOfShots( const weapon : weak< WeaponObject > ) : Int32
+	{
+		return weapon.GetAIBlackboard().GetInt( GetAllBlackboardDefs().AIShooting.desiredNumberOfShots );
+	}
+
+	public static function GetIsFullyCharged( const weapon : weak< WeaponObject > ) : Bool
+	{
+		return weapon.GetAIBlackboard().GetBool( GetAllBlackboardDefs().AIShooting.fullyCharged );
+	}
+
+	public constexpr static function UpdateSniperEffect( weapon : WeaponObject, duration : Float ) : Bool
+	{
+		return false;
+	}
+
+	public static function UpdateCharging( weapon : weak< WeaponObject >, const timeStamp : Float, weaponOwner : weak< GameObject >, out chargeLevel : Float ) : Bool
+	{
+		var chargeDuration : Float;
+		if( GetIsFullyCharged( weapon ) )
+		{
+			return false;
+		}
+		if( GetChargeLevel( weapon, timeStamp, chargeLevel ) )
+		{
+			if( chargeLevel >= 1.0 )
+			{
+				chargeLevel = 1.0;
+				OnFullyCharged( weapon );
+			}
+			return true;
+		}
+		chargeDuration = GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.ChargeTime );
+		if( chargeDuration <= 0.0 )
+		{
+			chargeDuration = GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.BaseChargeTime );
+			if( chargeDuration <= 0.0 )
+			{
+				return false;
+			}
+		}
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.chargeStartTimeStamp, timeStamp );
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.maxChargedTimeStamp, timeStamp + chargeDuration );
+		WeaponObject.TriggerWeaponEffects( weapon, gamedataFxAction.EnterCharge );
+		AIActionHelper.PlayWeaponEffect( weapon, 'charging_tpp' );
+		weapon.AI_PlayChargeStartedSound();
+		return true;
+	}
+
+	public static function GetChargeLevel( const weapon : weak< WeaponObject >, const actionDuration : Float, out chargeLevel : Float ) : Bool
+	{
+		var maxChargedTimeStamp : Float;
+		var chargeStartTimeStamp : Float;
+		var chargingDuration : Float;
+		maxChargedTimeStamp = weapon.GetAIBlackboard().GetFloat( GetAllBlackboardDefs().AIShooting.maxChargedTimeStamp );
+		chargeStartTimeStamp = weapon.GetAIBlackboard().GetFloat( GetAllBlackboardDefs().AIShooting.chargeStartTimeStamp );
+		if( ( ( maxChargedTimeStamp <= 0.0 ) || ( chargeStartTimeStamp <= 0.0 ) ) || ( maxChargedTimeStamp == chargeStartTimeStamp ) )
+		{
+			chargeLevel = 0.0;
+			return false;
+		}
+		chargingDuration = actionDuration - chargeStartTimeStamp;
+		chargeLevel = MinF( 1.0, chargingDuration / ( maxChargedTimeStamp - chargeStartTimeStamp ) );
+		return chargeLevel >= 0.0;
+	}
+
+	public static function HasExceededDesiredNumberOfShots( const weapon : weak< WeaponObject > ) : Bool
+	{
+		var total, desired : Int32;
+		desired = GetDesiredNumberOfShots( weapon );
+		if( desired > 0 )
+		{
+			total = GetTotalNumberOfShots( weapon );
+			return total >= desired;
+		}
+		return desired == 0;
+	}
+
+	public static function GetShootingPatternPackage( const weapon : weak< WeaponObject > ) : weak< AIPatternsPackage_Record >
+	{
+		return ( ( weak< weak< AIPatternsPackage_Record > > )( weapon.GetAIBlackboard().GetVariant( GetAllBlackboardDefs().AIShooting.shootingPatternPackage ) ) );
+	}
+
+	public static function SetShootingPatternPackage( const weapon : weak< WeaponObject >, patternPackage : weak< AIPatternsPackage_Record > )
+	{
+		weapon.GetAIBlackboard().SetVariant( GetAllBlackboardDefs().AIShooting.shootingPatternPackage, patternPackage );
+	}
+
+	public static function GetShootingPattern( const weapon : weak< WeaponObject > ) : weak< AIPattern_Record >
+	{
+		var patternVariant : Variant;
+		patternVariant = weapon.GetAIBlackboard().GetVariant( GetAllBlackboardDefs().AIShooting.shootingPattern );
+		if( patternVariant.IsValid() )
+		{
+			return ( ( weak< weak< AIPattern_Record > > )patternVariant );
+		}
+		return NULL;
+	}
+
+	public static function SetShootingPattern( const weapon : weak< WeaponObject >, pattern : weak< AIPattern_Record > )
+	{
+		weapon.GetAIBlackboard().SetVariant( GetAllBlackboardDefs().AIShooting.shootingPattern, pattern );
+	}
+
+	public static function GetPatternRange( const weapon : weak< WeaponObject > ) : array< weak< AIPattern_Record > >
+	{
+		var patternVariant : Variant;
+		var result : array< weak< AIPattern_Record > >;
+		patternVariant = weapon.GetAIBlackboard().GetVariant( GetAllBlackboardDefs().AIShooting.patternList );
+		if( patternVariant.IsValid() )
+		{
+			result = ( ( array< weak< AIPattern_Record > > )patternVariant );
+		}
+		return result;
+	}
+
+	public static function SetPatternRange( const weapon : weak< WeaponObject >, patternList : array< weak< AIPattern_Record > > )
+	{
+		weapon.GetAIBlackboard().SetVariant( GetAllBlackboardDefs().AIShooting.patternList, patternList );
+	}
+
+	public static function QueueNextShot( weapon : weak< WeaponObject >, requestedTriggerMode : gamedataTriggerMode, const timeStamp : Float, optional delayForNextShot : Float )
+	{
+		var nextShotDelta : Float;
+		var weaponCycleTime : Float;
+		var shotsInBurstFired : Int32;
+		var maxShotsInBurst : Int32;
+		var chargeDuration : Float;
+		var isFirstShot : Bool;
+		chargeDuration = GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.ChargeTime );
+		if( chargeDuration <= 0.0 )
+		{
+			chargeDuration = GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.BaseChargeTime );
+		}
+		shotsInBurstFired = weapon.GetAIBlackboard().GetInt( GetAllBlackboardDefs().AIShooting.shotsInBurstFired );
+		maxShotsInBurst = ( ( Int32 )( GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.NumShotsInBurst ) ) );
+		isFirstShot = shotsInBurstFired == 1;
+		if( ( AIActionHelper.WeaponHasTriggerMode( weapon, gamedataTriggerMode.Burst ) && ( shotsInBurstFired >= 0 ) ) && ( shotsInBurstFired < maxShotsInBurst ) )
+		{
+			nextShotDelta = GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.CycleTime_Burst );
+		}
+		else if( requestedTriggerMode == gamedataTriggerMode.Charge && ( chargeDuration > ( delayForNextShot + weaponCycleTime ) ) )
+		{
+			nextShotDelta = chargeDuration;
+		}
+		else
+		{
+			weapon.GetAIBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.shotsInBurstFired, 0 );
+			weaponCycleTime = GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.CycleTime );
+			if( delayForNextShot > 0.0 )
+			{
+				nextShotDelta = MaxF( weaponCycleTime, delayForNextShot );
+			}
+			else
+			{
+				nextShotDelta = weaponCycleTime;
+			}
+		}
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.nextShotTimeStamp, timeStamp + nextShotDelta );
+		if( isFirstShot )
+		{
+			if( weapon.GetCurrentTriggerMode().Type() == gamedataTriggerMode.Burst || ( maxShotsInBurst > 0 ) )
+			{
+				weapon.SetupBurstFireSound( maxShotsInBurst );
+			}
+		}
+	}
+
+	private static function OnShotFired( weapon : weak< WeaponObject >, requestedTriggerMode : gamedataTriggerMode, const timeStamp : Float )
+	{
+		var totalShotsFired : Int32;
+		var shotsInBurstFired : Int32;
+		var maxShotsInBurst : Int32;
+		maxShotsInBurst = ( ( Int32 )( GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.NumShotsInBurst ) ) );
+		shotsInBurstFired = weapon.GetAIBlackboard().GetInt( GetAllBlackboardDefs().AIShooting.shotsInBurstFired );
+		if( AIActionHelper.WeaponHasTriggerMode( weapon, gamedataTriggerMode.Burst ) )
+		{
+			shotsInBurstFired += 1;
+			weapon.GetAIBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.shotsInBurstFired, shotsInBurstFired );
+		}
+		if( shotsInBurstFired >= maxShotsInBurst )
+		{
+			totalShotsFired = weapon.GetAIBlackboard().GetInt( GetAllBlackboardDefs().AIShooting.totalShotsFired );
+			totalShotsFired += 1;
+			weapon.GetAIBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.totalShotsFired, totalShotsFired );
+		}
+		AIActionHelper.KillWeaponEffect( weapon, 'd_turret_laser' );
+		AIActionHelper.KillWeaponEffect( weapon, 'scan' );
+		if( requestedTriggerMode == gamedataTriggerMode.Charge )
+		{
+			AIActionHelper.KillWeaponEffect( weapon, 'charging_tpp' );
+		}
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.shotTimeStamp, timeStamp );
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.nextShotTimeStamp, -1.0 );
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.maxChargedTimeStamp, -1.0 );
+		weapon.GetAIBlackboard().SetBool( GetAllBlackboardDefs().AIShooting.fullyCharged, false );
+	}
+
+	public static function CanWeaponOverheat( gameObject : weak< WeaponObject > ) : Bool
+	{
+		var statPoolsSystem : StatPoolsSystem;
+		if( !( gameObject ) )
+		{
+			return false;
+		}
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( gameObject.GetGame() );
+		return statPoolsSystem.IsStatPoolAdded( gameObject.GetEntityID(), gamedataStatPoolType.WeaponOverheat );
+	}
+
+	public static function GetWeaponOverheatStatPool( gameObject : weak< WeaponObject > ) : Float
+	{
+		var statPoolsSystem : StatPoolsSystem;
+		if( !( gameObject ) )
+		{
+			return 0.0;
+		}
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( gameObject.GetGame() );
+		return statPoolsSystem.GetStatPoolValue( gameObject.GetEntityID(), gamedataStatPoolType.WeaponOverheat, false );
+	}
+
+	private static function ProcessWeaponOverheatStatPool( gameObject : weak< WeaponObject >, weaponOwner : weak< GameObject >, optional forceOverheat : Bool )
+	{
+		var statPoolsSystem : StatPoolsSystem;
+		var isOverheated : Bool;
+		var overheatPercentage : Float;
+		if( !( gameObject ) )
+		{
+			return;
+		}
+		overheatPercentage = gameObject.GetSharedData().GetFloat( GetAllBlackboardDefs().Weapon.OverheatPercentage );
+		isOverheated = gameObject.GetSharedData().GetBool( GetAllBlackboardDefs().Weapon.IsInForcedOverheatCooldown );
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( gameObject.GetGame() );
+		if( ( isOverheated && !( GetWeaponOverheatBB( gameObject ) ) ) || forceOverheat )
+		{
+			WeaponOverheated( gameObject );
+			WeaponObject.TriggerWeaponEffects( gameObject, gamedataFxAction.EnterOverheat );
+		}
+		else if( ( ( overheatPercentage > 0.0 ) && isOverheated ) && GetWeaponOverheatBB( gameObject ) )
+		{
+		}
+		else if( ( overheatPercentage <= 0.0 ) && GetWeaponOverheatBB( gameObject ) )
+		{
+			WeaponObject.TriggerWeaponEffects( gameObject, gamedataFxAction.ExitOverheat );
+			WeaponCooledDownFromOverheat( gameObject );
+		}
+		else
+		{
+			statPoolsSystem.RequestChangingStatPoolValue( gameObject.GetEntityID(), gamedataStatPoolType.WeaponOverheat, 7.0, NULL, false, false );
+		}
+	}
+
+	private static function GetWeaponOverheatBB( weapon : weak< WeaponObject > ) : Bool
+	{
+		return weapon.GetAIBlackboard().GetBool( GetAllBlackboardDefs().AIShooting.weaponOverheated );
+	}
+
+	public static function ForceWeaponOverheat( weapon : weak< WeaponObject >, weaponOwner : weak< GameObject > )
+	{
+		var statPoolsSystem : StatPoolsSystem;
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( weapon.GetGame() );
+		if( CanWeaponOverheat( weapon ) )
+		{
+			statPoolsSystem.RequestChangingStatPoolValue( weapon.GetEntityID(), gamedataStatPoolType.WeaponOverheat, 100.0, NULL, false, true );
+			ProcessWeaponOverheatStatPool( weapon, weaponOwner, true );
+		}
+	}
+
+	private static function OnFullyCharged( weapon : weak< WeaponObject > )
+	{
+		weapon.GetAIBlackboard().SetBool( GetAllBlackboardDefs().AIShooting.fullyCharged, true );
+	}
+
+	private static function WeaponOverheated( weapon : weak< WeaponObject > )
+	{
+		weapon.GetAIBlackboard().SetBool( GetAllBlackboardDefs().AIShooting.weaponOverheated, true );
+		AnimationControllerComponent.PushEventToReplicate( weapon, 'Overheat' );
+	}
+
+	private static function WeaponCooledDownFromOverheat( weapon : weak< WeaponObject > )
+	{
+		weapon.GetAIBlackboard().SetBool( GetAllBlackboardDefs().AIShooting.weaponOverheated, false );
+	}
+
+	public static function OnStartShooting( weapon : weak< WeaponObject >, optional const desiredNumberOfShots : Int32 )
+	{
+		weapon.GetAIBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.shotsInBurstFired, 0 );
+		weapon.GetAIBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.desiredNumberOfShots, desiredNumberOfShots );
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.nextShotTimeStamp, 0.0 );
+	}
+
+	public static function OnStopShooting( weapon : weak< WeaponObject >, const actionDuration : Float )
+	{
+		var chargeLevel : Float;
+		AIActionHelper.KillWeaponEffect( weapon, 'd_turret_laser' );
+		AIActionHelper.KillWeaponEffect( weapon, 'scan' );
+		AIActionHelper.KillWeaponEffect( weapon, 'charging_tpp' );
+		AIActionHelper.BreakWeaponEffectLoop( weapon, 'charged' );
+		WeaponObject.TriggerWeaponEffects( weapon, gamedataFxAction.ExitShoot );
+		if( AIWeapon.GetChargeLevel( weapon, actionDuration, chargeLevel ) && ( chargeLevel < 1.0 ) )
+		{
+			AIActionHelper.PlayWeaponEffect( weapon, 'discharge_tpp' );
+		}
+		weapon.GetAIBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.totalShotsFired, 0 );
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.nextShotTimeStamp, -1.0 );
+		weapon.GetAIBlackboard().SetFloat( GetAllBlackboardDefs().AIShooting.maxChargedTimeStamp, -1.0 );
+		weapon.GetAIBlackboard().SetBool( GetAllBlackboardDefs().AIShooting.fullyCharged, false );
+	}
+
+	public static function Fire( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, const timeStamp : Float, tbhCoefficient : Float, requestedTriggerMode : gamedataTriggerMode, optional targetPosition : Vector4, optional target : GameObject, optional rangedAttack : TweakDBID, optional maxSpreadOverride : Float, optional aimingDelay : Float, optional offset : Vector4, optional shouldTrackTarget : Bool, optional predictionTime : Float, optional posProviderOverride : IPositionProvider )
+	{
+		var statsSystem : StatsSystem;
+		var weaponID : EntityID;
+		var projectileParams : gameprojectileWeaponParams;
+		var attackAttemptEvent : AIAttackAttemptEvent;
+		var chargeLevel : Float;
+		var ammoPerShot : Int32;
+		var projectilesPerShot : Int32;
+		var maxSpread : Float;
+		var targetShootComponent : TargetShootComponent;
+		var bestTargetingComponent : weak< TargetingComponent >;
+		var miss : Bool;
+		var broadcaster : StimBroadcasterComponent;
+		var cameraTransform : Transform;
+		var playerShotOrigin : Vector4;
+		var playerShotOffset : Float;
+		var positionProvider : IPositionProvider;
+		var currentShootAtPos : Vector4;
+		var worldPos : WorldPosition;
+		var targetAsPuppet : ScriptedPuppet;
+		playerShotOffset = 0.40000001;
+		targetAsPuppet = ( ( ScriptedPuppet )( target ) );
+		if( !( weapon ) || !( weapon.IsAttached() ) )
+		{
+			return;
+		}
+		weaponOwner.QueueEventForEntityID( weapon.GetEntityID(), new SetWeaponOwnerEvent );
+		WeaponObject.SendMuzzleOffset( weapon, weaponOwner );
+		if( CanWeaponOverheat( weapon ) )
+		{
+			ProcessWeaponOverheatStatPool( weapon, weaponOwner );
+			if( GetWeaponOverheatBB( weapon ) )
+			{
+				return;
+			}
+		}
+		weaponID = weapon.GetEntityID();
+		statsSystem = GameInstance.GetStatsSystem( weapon.GetGame() );
+		maxSpread = statsSystem.GetStatValue( weaponID, gamedataStatType.SpreadMaxAI );
+		ammoPerShot = ( ( Int32 )( statsSystem.GetStatValue( weaponID, gamedataStatType.NumShotsToFire ) ) );
+		projectilesPerShot = ( ( Int32 )( statsSystem.GetStatValue( weaponID, gamedataStatType.ProjectilesPerShot ) ) );
+		if( GetChargeLevel( weapon, timeStamp, chargeLevel ) )
+		{
+			projectileParams.charge = chargeLevel;
+		}
+		if( RPGManager.GetWeaponEvolution( weapon.GetItemID() ) != gamedataWeaponEvolution.Tech && RPGManager.IsTechPierceEnabled( weaponOwner.GetGame(), weaponOwner, weapon.GetItemID() ) )
+		{
+			projectileParams.charge = 1.0;
+		}
+		chargeLevel *= 100.0;
+		positionProvider = posProviderOverride;
+		if( ( aimingDelay > 0.0 ) && targetAsPuppet )
+		{
+			positionProvider = IPositionProvider.CreateEntityHistoryPositionProvider( targetAsPuppet.GetTransformHistoryComponent(), aimingDelay );
+		}
+		if( target )
+		{
+			if( target.IsPlayer() )
+			{
+				bestTargetingComponent = ( ( PlayerPuppet )( target ) ).GetPrimaryTargetingComponent();
+			}
+			else
+			{
+				bestTargetingComponent = GameInstance.GetTargetingSystem( weaponOwner.GetGame() ).GetBestComponentOnTargetObject( weapon.GetWorldPosition(), weapon.GetWorldForward(), target, TargetComponentFilterType.Shooting );
+			}
+			if( weaponOwner.GetSensesComponent().IsAgentVisible( target ) || shouldTrackTarget )
+			{
+				if( bestTargetingComponent )
+				{
+					positionProvider = ( ( positionProvider ) ? ( positionProvider ) : ( IPositionProvider.CreatePlacedComponentPositionProvider( bestTargetingComponent ) ) );
+					if( shouldTrackTarget )
+					{
+						projectileParams.smartGunAccuracy = 1.0;
+						projectileParams.smartGunIsProjectileGuided = true;
+						projectileParams.trackedTargetComponent = bestTargetingComponent;
+					}
+				}
+				else
+				{
+					positionProvider = ( ( positionProvider ) ? ( positionProvider ) : ( IPositionProvider.CreateSlotPositionProvider( target, 'Head' ) ) );
+				}
+				positionProvider.CalculatePosition( currentShootAtPos );
+				if( target.IsPlayer() )
+				{
+					currentShootAtPos.Z -= 0.15000001;
+				}
+				if( maxSpreadOverride > 0.0 )
+				{
+					maxSpread = maxSpreadOverride;
+				}
+				targetShootComponent = target.GetTargetShootComponent();
+				if( targetShootComponent && ( aimingDelay == 0.0 ) )
+				{
+					offset += targetShootComponent.HandleWeaponShoot( weaponOwner, weapon, currentShootAtPos, maxSpread, tbhCoefficient, miss );
+					if( miss && shouldTrackTarget )
+					{
+						gameprojectileWeaponParams.AddObjectToIgnoreCollisionWith( projectileParams, target.GetEntityID() );
+					}
+				}
+			}
+		}
+		else
+		{
+			WorldPosition.SetVector4( worldPos, targetPosition );
+			positionProvider = ( ( positionProvider ) ? ( positionProvider ) : ( IPositionProvider.CreateStaticPositionProvider( worldPos ) ) );
+			currentShootAtPos = targetPosition;
+		}
+		if( rangedAttack == T"Attacks.SuicideBullet" )
+		{
+			projectileParams.ignoreWeaponOwnerCollision = false;
+		}
+		else
+		{
+			projectileParams.shootingOffset = statsSystem.GetStatValue( weaponID, gamedataStatType.ShootingOffsetAI );
+		}
+		AIWeapon.SetAttackBasedOnTimeDilation( weaponOwner, weapon, rangedAttack );
+		projectileParams.hitPlaneOffset = offset;
+		if( ( rangedAttack == T"Attacks.SuicideBullet" ) && !( GameInstance.GetTargetingSystem( weapon.GetGame() ).IsVisibleTarget( GameInstance.GetPlayerSystem( weapon.GetGame() ).GetLocalPlayerMainGameObject(), weaponOwner ) ) )
+		{
+			GameObject.ToggleForcedVisibilityInAnimSystemEvent( weaponOwner, 'SuicideBullet', true );
+			weapon.AI_ShootSelfOffScreen( ( ( gamePuppet )( target ) ), ( ( Uint16 )( ammoPerShot ) ), projectileParams, ( ( Uint8 )( projectilesPerShot ) ), chargeLevel );
+		}
+		else if( ( ( PlayerPuppet )( weaponOwner ) ) )
+		{
+			if( GameInstance.GetCameraSystem( weaponOwner.GetGame() ).GetActiveCameraWorldTransform( cameraTransform ) )
+			{
+				playerShotOrigin = Transform.GetPosition( cameraTransform ) + ( Transform.GetForward( cameraTransform ) * playerShotOffset );
+				weapon.AI_ShootForwards( weaponOwner, ( ( Uint16 )( ammoPerShot ) ), projectileParams, ( ( Uint8 )( projectilesPerShot ) ), chargeLevel, playerShotOrigin, Transform.GetForward( cameraTransform ) );
+			}
+		}
+		else if( AIActionHelper.ShouldShootDirectlyAtTarget( weaponOwner, weapon, currentShootAtPos ) )
+		{
+			if( predictionTime > 0.0 )
+			{
+				offset += ( Vector4.ClampLength( ( ( gamePuppet )( target ) ).GetVelocity(), 0.0, 15.0 ) * predictionTime );
+			}
+			positionProvider.SetWorldOffset( offset );
+			weapon.AI_ShootAt( positionProvider, target, weaponOwner, ( ( Uint16 )( ammoPerShot ) ), projectileParams, ( ( Uint8 )( projectilesPerShot ) ), chargeLevel, maxSpread );
+		}
+		else if( ( !( Vector4.IsZero( currentShootAtPos ) ) && weaponOwner.GetTargetTrackerComponent().IsPositionValid( currentShootAtPos ) ) && ( !( target ) || shouldTrackTarget ) )
+		{
+			positionProvider.SetWorldOffset( offset );
+			weapon.AI_ShootAt( positionProvider, target, weaponOwner, ( ( Uint16 )( ammoPerShot ) ), projectileParams, ( ( Uint8 )( projectilesPerShot ) ), chargeLevel, maxSpread );
+		}
+		else
+		{
+			weapon.AI_ShootForwards( weaponOwner, ( ( Uint16 )( ammoPerShot ) ), projectileParams, ( ( Uint8 )( projectilesPerShot ) ), chargeLevel );
+		}
+		if( target )
+		{
+			attackAttemptEvent = new AIAttackAttemptEvent;
+			attackAttemptEvent.instigator = weaponOwner;
+			attackAttemptEvent.target = target;
+			weaponOwner.QueueEvent( attackAttemptEvent );
+		}
+		AnimationControllerComponent.PushEventToReplicate( weaponOwner, 'Shoot' );
+		AnimationControllerComponent.PushEventToReplicate( weapon, 'Shoot' );
+		WeaponObject.TriggerWeaponEffects( weapon, gamedataFxAction.Shoot );
+		WeaponObject.SendAmmoUpdateEvent( weaponOwner, weapon );
+		broadcaster = weaponOwner.GetStimBroadcasterComponent();
+		if( broadcaster && !( weaponOwner.IsPlayer() ) )
+		{
+			broadcaster.TriggerSingleBroadcast( weapon, gamedataStimType.Gunshot );
+		}
+		ScriptedPuppet.SendActionSignal( ( ( ScriptedPuppet )( weaponOwner ) ), 'ShootingSignal', 0.25 );
+		OnShotFired( weapon, requestedTriggerMode, timeStamp );
+	}
+
+	public static function SetAttackBasedOnTimeDilation( owner : weak< GameObject >, weapon : weak< WeaponObject >, optional overrideRangedAttack : TweakDBID )
+	{
+		var weaponRecord : WeaponItem_Record;
+		var rangedAttack : RangedAttack_Record;
+		var attackID : TweakDBID;
+		var ownerAttitude : CName;
+		var playerAttitude : CName;
+		var useProjectile : Bool;
+		var isFriendlySource : Bool;
+		var magazine : weak< ItemObject >;
+		var magazineAttack : TweakDBID;
+		weaponRecord = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
+		useProjectile = GameInstance.GetTimeSystem( weapon.GetGame() ).IsTimeDilationActive();
+		if( owner.IsNPC() && StatusEffectSystem.ObjectHasStatusEffect( owner, T"BaseStatusEffect.SuicideWithWeapon" ) )
+		{
+			useProjectile = false;
+		}
+		playerAttitude = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerMainGameObject().GetAttitudeAgent().GetAttitudeGroup();
+		ownerAttitude = owner.GetAttitudeAgent().GetAttitudeGroup();
+		isFriendlySource = ownerAttitude == playerAttitude;
+		if( TDBID.IsValid( overrideRangedAttack ) )
+		{
+			rangedAttack = TweakDBInterface.GetRangedAttackRecord( overrideRangedAttack );
+		}
+		else
+		{
+			magazine = GameInstance.GetTransactionSystem( weapon.GetGame() ).GetItemInSlot( weapon, T"AttachmentSlots.DamageMod" );
+			if( magazine )
+			{
+				magazineAttack = TDBID.Create( TweakDBInterface.GetString( ItemID.GetTDBID( magazine.GetItemID() ) + T".overrideAttack", "" ) );
+			}
+			if( TDBID.IsValid( magazineAttack ) )
+			{
+				rangedAttack = TweakDBInterface.GetRangedAttackPackageRecord( magazineAttack ).DefaultFire();
+			}
+			else
+			{
+				rangedAttack = weaponRecord.RangedAttacks().DefaultFire();
+			}
+		}
+		if( owner.IsNPC() || !( isFriendlySource ) )
+		{
+			if( useProjectile )
+			{
+				attackID = rangedAttack.NPCTimeDilated().GetID();
+			}
+			else
+			{
+				attackID = rangedAttack.NPCAttack().GetID();
+			}
+		}
+		else if( isFriendlySource )
+		{
+			if( useProjectile )
+			{
+				attackID = rangedAttack.PlayerTimeDilated().GetID();
+			}
+			else
+			{
+				attackID = rangedAttack.PlayerAttack().GetID();
+			}
+		}
+		weapon.SetAttack( attackID );
+	}
+
+	public static function GetShootingPatternDelayBetweenShots( totalShotsFired : Int32, pattern : weak< AIPattern_Record > ) : Float
+	{
+		var delays : array< weak< AIPatternDelay_Record > >;
+		var patternSize, shotNumber, i : Int32;
+		var debugRecordName : String;
+		var shotDelay : Float;
+		pattern.Delays( delays );
+		if( !( IsFinal() ) )
+		{
+			debugRecordName = TDBID.ToStringDEBUG( pattern.GetID() );
+			if( AIActionHelper.ActionDebugHelper( "", debugRecordName ) )
+			{
+				LogAI( "GetShootingPatternDelayBetweenShots Debug Breakpoint" );
+			}
+		}
+		patternSize = pattern.PatternSize();
+		if( patternSize < 1 )
+		{
+			patternSize = delays.Size();
+		}
+		shotNumber = ( ( Int32 )( ModF( ( ( Float )( totalShotsFired ) ), ( ( Float )( patternSize ) ) ) ) );
+		if( ( shotNumber < delays.Size() ) && ( delays[ shotNumber ].ShotNumber() == shotNumber ) )
+		{
+			shotDelay = delays[ shotNumber ].Delay();
+		}
+		else
+		{
+			for( i = 0; i < delays.Size(); i += 1 )
+			{
+				if( delays[ i ].ShotNumber() == shotNumber )
+				{
+					shotDelay = delays[ i ].Delay();
+				}
+			}
+		}
+		return MaxF( 0.0, shotDelay );
+	}
+
+	public static function SelectShootingPattern( record : weak< AISubActionShootWithWeapon_Record >, weapon : weak< WeaponObject >, weaponOwner : weak< GameObject >, optional forceReselection : Bool )
+	{
+		var shootingPatternPackages : array< weak< AIPatternsPackage_Record > >;
+		var chosenPackage : weak< AIPatternsPackage_Record >;
+		var patternsList : array< weak< AIPattern_Record > >;
+		var selectedPattern : weak< AIPattern_Record >;
+		var debugRecordName : String;
+		record.ShootingPatternPackages( shootingPatternPackages );
+		chosenPackage = SelectShootingPatternPackage( weaponOwner, weapon, shootingPatternPackages );
+		if( !( IsFinal() ) )
+		{
+			debugRecordName = TDBID.ToStringDEBUG( chosenPackage.GetID() );
+			if( AIActionHelper.ActionDebugHelper( "", weaponOwner, debugRecordName ) )
+			{
+				LogAI( "SelectShootingPattern Debug Breakpoint" );
+			}
+		}
+		if( GetShootingPatternsList( weaponOwner, weapon, chosenPackage, patternsList ) || forceReselection )
+		{
+			if( patternsList.Size() > 0 )
+			{
+				SelectShootingPatternFromList( weapon, patternsList, selectedPattern );
+			}
+		}
+		if( selectedPattern )
+		{
+			if( !( IsFinal() ) )
+			{
+				debugRecordName = TDBID.ToStringDEBUG( selectedPattern.GetID() );
+				if( AIActionHelper.ActionDebugHelper( "", weaponOwner, debugRecordName ) )
+				{
+					LogAI( "SelectShootingPattern Debug Breakpoint" );
+				}
+			}
+			AIWeapon.SetShootingPattern( weapon, selectedPattern );
+			SetShootingPatternPackage( weapon, chosenPackage );
+			SetPatternRange( weapon, patternsList );
+		}
+	}
+
+	public static function SelectShootingPatternPackage( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, optional records : array< weak< AIPatternsPackage_Record > > ) : weak< AIPatternsPackage_Record >
+	{
+		var candidate : weak< AIPatternsPackage_Record >;
+		var weaponRecord : WeaponItem_Record;
+		var archetypeData : weak< ArchetypeData_Record >;
+		var characterRecord : Character_Record;
+		if( records.Size() > 0 )
+		{
+			if( GetPatternPackagesMeetingConditionChecks( weaponOwner, records, candidate ) )
+			{
+				return candidate;
+			}
+		}
+		characterRecord = TweakDBInterface.GetCharacterRecord( ( ( ScriptedPuppet )( weaponOwner ) ).GetRecordID() );
+		if( characterRecord )
+		{
+			archetypeData = characterRecord.ArchetypeData();
+			if( archetypeData )
+			{
+				archetypeData.ShootingPatternPackages( records );
+				if( records.Size() > 0 )
+				{
+					if( GetPatternPackagesMeetingConditionChecks( weaponOwner, records, candidate ) )
+					{
+						return candidate;
+					}
+				}
+			}
+		}
+		records.Clear();
+		weaponRecord = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
+		weaponRecord.ShootingPatternPackages( records );
+		if( records.Size() > 0 )
+		{
+			if( GetPatternPackagesMeetingConditionChecks( weaponOwner, records, candidate ) )
+			{
+				return candidate;
+			}
+		}
+		records.Clear();
+		AIActionHelper.GetBaseShootingPatternPackages( records );
+		if( records.Size() > 0 )
+		{
+			if( GetPatternPackagesMeetingConditionChecks( weaponOwner, records, candidate ) )
+			{
+				return candidate;
+			}
+		}
+		return NULL;
+	}
+
+	public static function GetPatternPackagesMeetingConditionChecks( weaponOwner : weak< GameObject >, records : array< weak< AIPatternsPackage_Record > >, out package : weak< AIPatternsPackage_Record > ) : Bool
+	{
+		var conditions : array< weak< AIActionCondition_Record > >;
+		var context : ScriptExecutionContext;
+		var res : Bool;
+		var i : Int32;
+		res = AIHumanComponent.GetScriptContext( ( ( ScriptedPuppet )( weaponOwner ) ), context );
+		for( i = 0; i < records.Size(); i += 1 )
+		{
+			conditions.Clear();
+			records[ i ].ActivationConditions( conditions );
+			if( conditions.Size() > 0 )
+			{
+				if( res && AICondition.CheckActionConditions( context, conditions ) )
+				{
+					package = records[ i ];
+					return true;
+				}
+			}
+			else
+			{
+				package = records[ i ];
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function GetShootingPatternsList( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, chosenPackage : weak< AIPatternsPackage_Record >, out patternsList : array< weak< AIPattern_Record > > ) : Bool
+	{
+		var conditions : array< weak< AIActionCondition_Record > >;
+		var previousList : array< weak< AIPattern_Record > >;
+		var patterns : array< weak< AIPattern_Record > >;
+		var context : ScriptExecutionContext;
+		var debugRecordName : String;
+		var res : Bool;
+		var i : Int32;
+		res = AIHumanComponent.GetScriptContext( ( ( ScriptedPuppet )( weaponOwner ) ), context );
+		chosenPackage.Patterns( patterns );
+		for( i = 0; i < patterns.Size(); i += 1 )
+		{
+			if( !( IsFinal() ) )
+			{
+				debugRecordName = TDBID.ToStringDEBUG( patterns[ i ].GetID() );
+				if( AIActionHelper.ActionDebugHelper( "", weaponOwner, debugRecordName ) )
+				{
+					LogAI( "SelectShootingPattern Debug Breakpoint" );
+				}
+			}
+			conditions.Clear();
+			patterns[ i ].ActivationConditions( conditions );
+			if( conditions.Size() > 0 )
+			{
+				if( res && AICondition.CheckActionConditions( context, conditions ) )
+				{
+					patternsList.PushBack( patterns[ i ] );
+				}
+			}
+			else
+			{
+				patternsList.PushBack( patterns[ i ] );
+			}
+		}
+		previousList = GetPatternRange( weapon );
+		if( CompareAIPatternRecordArrays( previousList, patternsList ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function CompareAIPatternRecordArrays( const arr1 : array< weak< AIPattern_Record > >, const arr2 : array< weak< AIPattern_Record > > ) : Bool
+	{
+		var i, size : Int32;
+		size = arr1.Size();
+		if( size != arr2.Size() )
+		{
+			return false;
+		}
+		while( i < size )
+		{
+			if( arr1[ i ] != arr2[ i ] )
+			{
+				return false;
+			}
+			i += 1;
+		}
+		return true;
+	}
+
+	public static function SelectShootingPatternFromList( weapon : weak< WeaponObject >, const patternsList : array< weak< AIPattern_Record > >, out selectedPattern : weak< AIPattern_Record > )
+	{
+		var lastPattern : weak< AIPattern_Record >;
+		lastPattern = AIWeapon.GetShootingPattern( weapon );
+		if( lastPattern && ( patternsList.Size() > 1 ) )
+		{
+			do
+			{
+				selectedPattern = patternsList[ RandRange( 0, patternsList.Size() ) ];
+			}
+			while( selectedPattern == lastPattern );
+		}
+		else
+		{
+			selectedPattern = patternsList[ RandRange( 0, patternsList.Size() ) ];
+		}
+	}
+
+}
+
+class OverheatStatListener extends ScriptStatPoolsListener
+{
+	var weapon : weak< WeaponObject >;
+	private var updateEvt : UpdateOverheatEvent;
+	private var startEvt : StartOverheatEffectEvent;
+
+	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		updateEvt = new UpdateOverheatEvent;
+		updateEvt.value = newValue;
+		weapon.QueueEventForEntityID( weapon.GetEntityID(), updateEvt );
+	}
+
+}
+
+class UpdateOverheatEvent extends Event
+{
+	var value : Float;
+}
+
+class DamageStatListener extends ScriptStatsListener
+{
+	var weapon : weak< WeaponObject >;
+	private var updateEvt : UpdateDamageChangeEvent;
+
+	public export override function OnStatChanged( ownerID : StatsObjectID, statType : gamedataStatType, diff : Float, total : Float )
+	{
+		if( ( ( statType == gamedataStatType.ChemicalDamage || statType == gamedataStatType.PhysicalDamage ) || statType == gamedataStatType.ThermalDamage ) || statType == gamedataStatType.ElectricDamage )
+		{
+			updateEvt = new UpdateDamageChangeEvent;
+			weapon.QueueEventForEntityID( weapon.GetEntityID(), updateEvt );
+		}
+	}
+
+}
+
+class UpdateDamageChangeEvent extends Event
+{
+}
+
+class UpdateMeleeTrailEffectEvent extends Event
+{
+	var instigator : weak< GameObject >;
+}
+
+class StartOverheatEffectEvent extends Event
+{
+}
+
+class UpdateWeaponChargeEvent extends Event
+{
+	var newValue : Float;
+	var oldValue : Float;
+}
+
+class WeaponChargeStatListener extends CustomValueStatPoolsListener
+{
+	var weapon : weak< WeaponObject >;
+
+	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		var updateEvt : UpdateWeaponChargeEvent;
+		updateEvt = new UpdateWeaponChargeEvent;
+		updateEvt.newValue = newValue;
+		updateEvt.oldValue = oldValue;
+		weapon.QueueEventForEntityID( weapon.GetEntityID(), updateEvt );
+	}
+
+}
+
+class WeaponRegisterChargeStatListener extends Event
+{
+	var register : Bool;
+}
+
+class UpdateWeaponStatsEvent extends Event
+{
+}
+
+class AmmoStateChangeEvent extends Event
+{
+	var weaponOwner : weak< GameObject >;
+}
+
+class SetWeaponOwnerEvent extends Event
+{
+}
+
+class PlayerWeaponSetupEvent extends Event
+{
+}
+
+import enum gameEContinuousMode
+{
+	None,
+	Start,
+	Stop,
+}
+
+import enum gameweaponReloadStatus
+{
+	Standard,
+	Interrupted,
+}
+
+exec function SilenceWeapon( gameInstance : GameInstance, flag : String )
+{
+	var blackboardSystem : BlackboardSystem;
+	var blackboard : IBlackboard;
+	var playerPuppet : PlayerPuppet;
+	playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( gameInstance ).GetLocalPlayerMainGameObject() ) );
+	blackboardSystem = GameInstance.GetBlackboardSystem( gameInstance );
+	blackboard = blackboardSystem.GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+	blackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.DEBUG_SilencedWeapon, StringToBool( flag ) );
+}
+

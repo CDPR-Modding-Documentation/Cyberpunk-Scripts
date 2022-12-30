@@ -1,0 +1,205 @@
+class EffectExecutor_GameObjectOutline extends EffectExecutor_Scripted
+{
+	editable var m_outlineType : EOutlineType;
+
+	public function Process( ctx : EffectScriptContext, applierCtx : EffectExecutionScriptContext ) : Bool
+	{
+		var target : Entity;
+		var outlineEvent : OutlineRequestEvent;
+		var data : OutlineData;
+		var id : CName;
+		var revealEvent : RevealObjectEvent;
+		var lifetime : Float;
+		lifetime = 30.0;
+		if( m_outlineType == EOutlineType.RED )
+		{
+			id = 'EffectExecutor_GameObjectOutline_RED';
+		}
+		else
+		{
+			id = 'EffectExecutor_GameObjectOutline_GREEN';
+		}
+		target = EffectExecutionScriptContext.GetTarget( applierCtx );
+		outlineEvent = new OutlineRequestEvent;
+		data.outlineType = m_outlineType;
+		data.outlineOpacity = 1.0;
+		outlineEvent.outlineRequest = OutlineRequest.CreateRequest( id, data, lifetime );
+		target.QueueEvent( outlineEvent );
+		revealEvent = new RevealObjectEvent;
+		revealEvent.reveal = true;
+		revealEvent.reason.reason = 'tag';
+		revealEvent.lifetime = lifetime;
+		target.QueueEvent( revealEvent );
+		return true;
+	}
+
+}
+
+class AddTargetToHighlightEvent extends Event
+{
+	var m_target : CombatTarget;
+
+	public function Create( puppet : ScriptedPuppet )
+	{
+		m_target.m_puppet = puppet;
+		m_target.m_hasTime = false;
+	}
+
+	public function Create( puppet : ScriptedPuppet, highlightTime : Float )
+	{
+		m_target.m_puppet = puppet;
+		m_target.m_hasTime = true;
+		m_target.m_highlightTime = highlightTime;
+	}
+
+}
+
+class RemoveTargetFromHighlightEvent extends Event
+{
+	var m_target : weak< ScriptedPuppet >;
+}
+
+class ToggleChargeHighlightEvent extends Event
+{
+	var m_active : Bool;
+}
+
+struct CombatTarget
+{
+	var m_puppet : weak< ScriptedPuppet >;
+	var m_hasTime : Bool;
+	var m_highlightTime : Float;
+}
+
+class CombatHUDManager extends ScriptableComponent
+{
+	var m_isRunning : Bool;
+	var m_targets : array< CombatTarget >;
+	var m_interval : Float;
+	default m_interval = 1.0f;
+	var m_timeSinceLastUpdate : Float;
+
+	private function OnAddTargetToHighlightEvent( evt : AddTargetToHighlightEvent )
+	{
+		var revealEvent : RevealRequestEvent;
+		var removeTargetEvent : RemoveTargetFromHighlightEvent;
+		revealEvent = new RevealRequestEvent;
+		revealEvent.CreateRequest( true, GetOwner().GetEntityID() );
+		if( !( TargetExists( evt.m_target.m_puppet ) ) )
+		{
+			evt.m_target.m_puppet.QueueEvent( revealEvent );
+			m_targets.PushBack( evt.m_target );
+			if( evt.m_target.m_hasTime )
+			{
+				removeTargetEvent = new RemoveTargetFromHighlightEvent;
+				removeTargetEvent.m_target = evt.m_target.m_puppet;
+				GetDelaySystem().DelayEvent( GetOwner(), removeTargetEvent, evt.m_target.m_highlightTime );
+			}
+		}
+	}
+
+	private function OnRemoveTargetFromHighlightEvent( evt : RemoveTargetFromHighlightEvent )
+	{
+		var revealEvent : RevealRequestEvent;
+		revealEvent = new RevealRequestEvent;
+		revealEvent.CreateRequest( false, GetOwner().GetEntityID() );
+		if( TargetExists( evt.m_target ) )
+		{
+			RemoveTarget( evt.m_target );
+			evt.m_target.QueueEvent( revealEvent );
+		}
+	}
+
+	private function TargetExists( puppet : ScriptedPuppet ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_targets.Size(); i += 1 )
+		{
+			if( m_targets[ i ].m_puppet == puppet )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function OnToggleChargeHighlightEvent( evt : ToggleChargeHighlightEvent )
+	{
+		if( evt.m_active )
+		{
+			HandleChargeMode();
+		}
+		else
+		{
+			ClearHUD();
+		}
+	}
+
+	private function RemoveTarget( target : weak< ScriptedPuppet > )
+	{
+		var i : Int32;
+		for( i = 0; i < m_targets.Size(); i += 1 )
+		{
+			if( m_targets[ i ].m_puppet == target )
+			{
+				m_targets.Erase( i );
+				break;
+			}
+		}
+	}
+
+	private function ClearHUD()
+	{
+		var revealRequestEvent : RevealRequestEvent;
+		var i : Int32;
+		revealRequestEvent = new RevealRequestEvent;
+		revealRequestEvent.CreateRequest( false, GetOwner().GetEntityID() );
+		for( i = 0; i < m_targets.Size(); i += 1 )
+		{
+			GetOwner().QueueEventForEntityID( m_targets[ i ].m_puppet.GetEntityID(), revealRequestEvent );
+		}
+		m_targets.Clear();
+	}
+
+	private function DetermineProperHandlingMode( activeWeapon : WeaponObject )
+	{
+		var triggerMode : TriggerMode_Record;
+		var triggerType : gamedataTriggerMode;
+		triggerMode = activeWeapon.GetCurrentTriggerMode();
+		triggerType = triggerMode.Type();
+		switch( triggerType )
+		{
+			case gamedataTriggerMode.Charge:
+				HandleChargeMode();
+			break;
+		}
+	}
+
+	private function HandleChargeMode()
+	{
+		var distanceRecord : HudEnhancer_Record;
+		var distance : Float;
+		var effectCone : EffectInstance;
+		var effectRaycast : EffectInstance;
+		var aimPosition : Vector4;
+		var aimForward : Vector4;
+		var coneAngle : Float;
+		GetTargetingSystem().GetDefaultCrosshairData( GetOwner(), aimPosition, aimForward );
+		distanceRecord = TDB.GetHudEnhancerRecord( T"HudEnhancer.ChargeWeapon" );
+		distance = distanceRecord.Distance();
+		coneAngle = TDB.GetFloat( T"HudEnhancer.ChargeWeapon.coneAngle" );
+		effectCone = GetGameEffectSystem().CreateEffectStatic( 'weaponShoot', 'pierce_preview_cone', GetOwner() );
+		EffectData.SetVector( effectCone.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, aimPosition );
+		EffectData.SetVector( effectCone.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.forward, aimForward );
+		EffectData.SetFloat( effectCone.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, distance );
+		EffectData.SetFloat( effectCone.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.angle, coneAngle );
+		effectRaycast = GetGameEffectSystem().CreateEffectStatic( 'weaponShoot', 'pierce_preview_raycast', GetOwner() );
+		EffectData.SetVector( effectRaycast.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, aimPosition );
+		EffectData.SetVector( effectRaycast.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.forward, aimForward );
+		EffectData.SetFloat( effectRaycast.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.range, distance );
+		EffectData.SetBool( effectRaycast.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.fallback_weaponPierce, true );
+		EffectData.SetFloat( effectRaycast.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.fallback_weaponPierceChargeLevel, 0.0 );
+	}
+
+}
+

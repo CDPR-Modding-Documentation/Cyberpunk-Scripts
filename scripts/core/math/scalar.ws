@@ -1,0 +1,134 @@
+constexpr function Pi() : Float
+{
+	return 3.14159274;
+}
+
+constexpr function HalfPi() : Float
+{
+	return 1.57079637;
+}
+
+import function Abs( a : Int32 ) : Int32;
+import function Min( a : Int32, b : Int32 ) : Int32;
+import function Max( a : Int32, b : Int32 ) : Int32;
+import function Clamp( v, min, max : Int32 ) : Int32;
+import function Deg2Rad( deg : Float ) : Float;
+import function Rad2Deg( rad : Float ) : Float;
+import function AbsF( a : Float ) : Float;
+
+function SgnF( a : Float ) : Float
+{
+	if( a > 0.0 )
+	{
+		return 1.0;
+	}
+	return -1.0;
+}
+
+function ModF( a : Float, b : Float ) : Float
+{
+	if( ( b <= 0.0 ) || ( a <= 0.0 ) )
+	{
+		return 0.0;
+	}
+	return a - ( ( ( Float )( FloorF( a / b ) ) ) * b );
+}
+
+import function SinF( a : Float ) : Float;
+import function AsinF( a : Float ) : Float;
+import function CosF( a : Float ) : Float;
+import function AcosF( a : Float ) : Float;
+import function TanF( a : Float ) : Float;
+import function AtanF( a : Float, b : Float ) : Float;
+import function ExpF( a : Float ) : Float;
+import function PowF( a : Float, x : Float ) : Float;
+import function LogF( a : Float ) : Float;
+import function SqrtF( a : Float ) : Float;
+import function SqrF( a : Float ) : Float;
+import function CalcSeed( object : IScriptable ) : Int32;
+import function MinF( a : Float, b : Float ) : Float;
+import function MaxF( a : Float, b : Float ) : Float;
+import function ClampF( v, min, max : Float ) : Float;
+import function LerpF( alpha, a, b : Float, optional clamp : Bool ) : Float;
+import function CeilF( a : Float ) : Int32;
+import function FloorF( a : Float ) : Int32;
+import function RoundF( a : Float ) : Int32;
+
+function ProportionalClampF( inMin, inMax, v, outMin, outMax : Float ) : Float
+{
+	var lerp : Float;
+	var inputRange : Float;
+	inputRange = inMax - inMin;
+	v = ClampF( v, inMin, inMax );
+	if( AbsF( inputRange ) > 0.0005 )
+	{
+		lerp = ( v - inMin ) / inputRange;
+	}
+	else
+	{
+		lerp = 0.0;
+	}
+	v = LerpF( lerp, outMin, outMax );
+	return v;
+}
+
+function RoundMath( f : Float ) : Int32
+{
+	if( f == 0.0 )
+	{
+		return ( ( Int32 )( f ) );
+	}
+	else if( f > 0.0 )
+	{
+		if( ( f - ( ( Float )( FloorF( f ) ) ) ) >= 0.5 )
+		{
+			return CeilF( f );
+		}
+		return FloorF( f );
+	}
+	else
+	{
+		if( ( f + ( ( Float )( FloorF( f ) ) ) ) >= -0.5 )
+		{
+			return FloorF( f );
+		}
+		return CeilF( f );
+	}
+}
+
+function RoundTo( f : Float, decimal : Int32 ) : Float
+{
+	var i, digit : Int32;
+	var ret : Float;
+	var isNeg : Bool;
+	if( decimal < 0 )
+	{
+		decimal = 0;
+	}
+	ret = ( ( Float )( FloorF( AbsF( f ) ) ) );
+	isNeg = false;
+	if( f < 0.0 )
+	{
+		isNeg = true;
+		f *= -1.0;
+	}
+	f -= ret;
+	for( i = 0; i < decimal; i += 1 )
+	{
+		f *= 10.0;
+		digit = FloorF( f );
+		ret += ( ( ( Float )( digit ) ) / PowF( 10.0, ( ( Float )( i + 1 ) ) ) );
+		f -= ( ( Float )( digit ) );
+	}
+	if( isNeg )
+	{
+		ret *= -1.0;
+	}
+	return ret;
+}
+
+function FloatIsEqual( f : Float, to : Float ) : Bool
+{
+	return AbsF( f - to ) <= 0.000002;
+}
+

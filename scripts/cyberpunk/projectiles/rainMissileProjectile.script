@@ -1,0 +1,415 @@
+class RainMissileProjectile extends BaseProjectile
+{
+	private var m_meshComponent : IComponent;
+	private editable var m_effect : EffectRef;
+	private var m_damage : EffectInstance;
+	private var m_owner : weak< GameObject >;
+	private var m_weapon : weak< WeaponObject >;
+	private var m_countTime : Float;
+	default m_countTime = 0;
+	private editable var m_startVelocity : Float;
+	private editable var m_lifetime : Float;
+	private var m_alive : Bool;
+	default m_alive = true;
+	private var m_hit : Bool;
+	default m_hit = false;
+	private var m_arrived : Bool;
+	default m_arrived = false;
+	private var m_spawnPosition : Vector4;
+	private var m_phase1Duration : Float;
+	private editable var m_landIndicatorFX : FxResource;
+	private var m_fxInstance : FxInstance;
+	private var m_hasExploded : Bool;
+	default m_hasExploded = false;
+	private var m_missileDBID : TweakDBID;
+	private var m_missileAttackRecord : weak< Attack_Record >;
+	private var m_timeToDestory : Float;
+	default m_timeToDestory = -1.f;
+	private var m_initialTargetPosition : Vector4;
+	private var m_initialTargetOffset : Vector4;
+	private var m_finalTargetPosition : Vector4;
+	private var m_finalTargetOffset : Vector4;
+	private var m_finalTargetPositionCalculationDelay : Float;
+	private var m_targetComponent : weak< IPlacedComponent >;
+	private var m_followTargetInPhase2 : Bool;
+	private var m_puppetBroadphaseHitRadiusSquared : Float;
+	private var m_phase : EMissileRainPhase;
+	private var m_spiralParams : SpiralControllerParams;
+	private var m_useSpiralParams : Bool;
+	private var m_randStartVelocity : Float;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'MeshComponent', 'IComponent', true );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_meshComponent = EntityResolveComponentsInterface.GetComponent( ri, 'MeshComponent' );
+		m_spiralParams = new SpiralControllerParams;
+		m_spiralParams.rampUpDistanceStart = 0.40000001;
+		m_spiralParams.rampUpDistanceEnd = 1.0;
+		m_spiralParams.rampDownDistanceStart = 7.5;
+		m_spiralParams.rampDownDistanceEnd = 5.0;
+		m_spiralParams.rampDownFactor = 1.0;
+		m_spiralParams.randomizePhase = true;
+	}
+
+	protected event OnProjectileInitialize( eventData : gameprojectileSetUpEvent )
+	{
+		var missileDB : weak< Attack_Record >;
+		var statsSystem : StatsSystem;
+		var weaponID : EntityID;
+		var velVariance : Float;
+		super.OnProjectileInitialize( eventData );
+		m_owner = eventData.owner;
+		m_weapon = ( ( WeaponObject )( eventData.weapon ) );
+		if( m_weapon )
+		{
+			statsSystem = GameInstance.GetStatsSystem( eventData.weapon.GetGame() );
+			weaponID = eventData.weapon.GetEntityID();
+			m_useSpiralParams = statsSystem.GetStatValue( weaponID, gamedataStatType.SmartGunAddSpiralTrajectory ) > 0.0;
+			m_spiralParams.radius = statsSystem.GetStatValue( weaponID, gamedataStatType.SmartGunSpiralRadius );
+			m_spiralParams.cycleTimeMin = statsSystem.GetStatValue( weaponID, gamedataStatType.SmartGunSpiralCycleTimeMin );
+			m_spiralParams.cycleTimeMax = statsSystem.GetStatValue( weaponID, gamedataStatType.SmartGunSpiralCycleTimeMax );
+			m_spiralParams.randomizeDirection = ( ( Bool )( statsSystem.GetStatValue( weaponID, gamedataStatType.SmartGunSpiralRandomizeDirection ) ) );
+			velVariance = statsSystem.GetStatValue( weaponID, gamedataStatType.SmartGunProjectileVelocityVariance );
+			m_randStartVelocity = RandRangeF( m_startVelocity - ( m_startVelocity * velVariance ), m_startVelocity + ( m_startVelocity * velVariance ) );
+		}
+		else
+		{
+			m_spiralParams.enabled = false;
+			m_spiralParams.radius = 0.01;
+			m_spiralParams.cycleTimeMin = 0.1;
+			m_spiralParams.cycleTimeMax = 0.1;
+			m_randStartVelocity = m_startVelocity;
+			m_useSpiralParams = false;
+		}
+		missileDB = m_weapon.GetAttack( 'RainMissile' ).GetRecord();
+		if( TDBID.IsValid( missileDB.GetID() ) )
+		{
+			m_missileDBID = missileDB.GetID();
+			m_missileAttackRecord = missileDB;
+		}
+		m_meshComponent.Toggle( false );
+		m_timeToDestory = -1.0;
+		m_hasExploded = false;
+		m_alive = true;
+		m_hit = false;
+		m_phase = EMissileRainPhase.Init;
+		m_countTime = 0.0;
+		m_initialTargetPosition = Vector4.EmptyVector();
+		m_initialTargetOffset = Vector4.EmptyVector();
+		m_finalTargetPositionCalculationDelay = 0.0;
+		m_finalTargetPosition = Vector4.EmptyVector();
+		m_finalTargetOffset = Vector4.EmptyVector();
+		m_followTargetInPhase2 = false;
+		m_arrived = false;
+		m_puppetBroadphaseHitRadiusSquared = AITweakParams.GetFloatFromTweak( m_missileDBID, "puppetBroadphaseHitRadiusSquared" );
+	}
+
+	private function StartTrailEffect()
+	{
+		GameObjectEffectHelper.StartEffectEvent( this, 'trail', true );
+	}
+
+	protected event OnShoot( eventData : gameprojectileShootEvent )
+	{
+		var linearParams : LinearTrajectoryParams;
+		if( m_owner.IsPlayer() )
+		{
+			linearParams = new LinearTrajectoryParams;
+			linearParams.startVel = m_startVelocity;
+			m_projectileComponent.SetOnCollisionAction( gameprojectileOnCollisionAction.Stop );
+			m_projectileComponent.AddLinear( linearParams );
+			m_projectileComponent.LockOrientation( false );
+			StartTrailEffect();
+		}
+		else
+		{
+			Log( "RainMissleProjectile : OnShoot called instead of OnShootTarget. This will not set a proper target position. Aborting projectile" );
+			DelayDestroyBullet();
+		}
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		Explode( evt.hitPosition );
+		DelayDestroyBullet();
+	}
+
+	protected event OnShootTarget( eventData : gameprojectileShootTargetEvent )
+	{
+		if( !( m_weapon ) )
+		{
+			Log( "RainMissleProjectile : Projectile has no valid weapon that it is being fired from. Aborting projectile as rest of logic will not work correctly" );
+			DelayDestroyBullet();
+		}
+		m_targetComponent = eventData.params.trackedTargetComponent;
+		m_initialTargetPosition = eventData.params.targetPosition;
+		m_initialTargetOffset = eventData.params.hitPlaneOffset;
+		m_spawnPosition = eventData.startPoint;
+		m_followTargetInPhase2 = AITweakParams.GetBoolFromTweak( m_missileDBID, "followTargetInPhase2" );
+		m_finalTargetPositionCalculationDelay = AITweakParams.GetFloatFromTweak( m_missileDBID, "finalTargetPositionCalculationDelay" );
+		if( m_finalTargetPositionCalculationDelay == 0.0 )
+		{
+			CalcFinalTargetPositionAndOffset();
+		}
+		StartPhase1( eventData.startPoint );
+	}
+
+	protected event OnAcceleratedMovement( eventData : gameprojectileAcceleratedMovementEvent ) {}
+
+	protected event OnLinearMovement( eventData : gameprojectileLinearMovementEvent )
+	{
+		var distance : Vector4;
+		distance = Matrix.GetTranslation( m_projectileComponent.GetLocalToWorld() ) - eventData.targetPosition;
+		GameObject.SetAudioParameter( this, 'RTPC_Height_Difference', distance.Z );
+		GameObject.PlaySoundEvent( this, 'Smart_21301_bullet_trail_whistle' );
+	}
+
+	protected event OnTick( eventData : gameprojectileTickEvent )
+	{
+		m_countTime += eventData.deltaTime;
+		if( m_phase == EMissileRainPhase.Phase1 )
+		{
+			if( ( m_finalTargetPositionCalculationDelay > 0.0 ) && ( m_countTime >= m_finalTargetPositionCalculationDelay ) )
+			{
+				CalcFinalTargetPositionAndOffset();
+			}
+			if( m_countTime >= m_phase1Duration )
+			{
+				StartPhase2();
+			}
+		}
+		if( m_countTime >= m_lifetime )
+		{
+			DestroyBullet();
+		}
+		if( m_timeToDestory > 0.0 )
+		{
+			m_timeToDestory -= eventData.deltaTime;
+			if( m_timeToDestory <= 0.0 )
+			{
+				DestroyBullet();
+			}
+		}
+		if( m_arrived )
+		{
+			if( m_phase == EMissileRainPhase.Phase2 )
+			{
+				Explode( Matrix.GetTranslation( m_projectileComponent.GetLocalToWorld() ) );
+				DelayDestroyBullet();
+			}
+			m_arrived = false;
+		}
+	}
+
+	protected event OnCollision( eventData : gameprojectileHitEvent )
+	{
+		super.OnCollision( eventData );
+		OnCollideWithEntity( eventData.hitInstances[ 0 ].projectilePosition );
+	}
+
+	protected event OnGameprojectileBroadPhaseHitEvent( eventData : gameprojectileBroadPhaseHitEvent )
+	{
+		var hitObject : Entity;
+		var hitPosition : Vector4;
+		hitObject = eventData.hitObject;
+		hitPosition = eventData.position;
+		if( ( m_puppetBroadphaseHitRadiusSquared >= 0.0 ) && ( ( ScriptedPuppet )( hitObject ) ) )
+		{
+			if( Vector4.DistanceSquared( hitPosition, hitObject.GetWorldPosition() ) > m_puppetBroadphaseHitRadiusSquared )
+			{
+				return false;
+			}
+		}
+		OnCollideWithEntity( hitPosition );
+	}
+
+	private function OnCollideWithEntity( projectilePosition : Vector4 )
+	{
+		Explode( projectilePosition );
+		DelayDestroyBullet();
+	}
+
+	protected function DelayDestroyBullet()
+	{
+		if( m_timeToDestory < 0.0 )
+		{
+			m_timeToDestory = 0.2;
+		}
+	}
+
+	private function DestroyBullet()
+	{
+		if( m_alive )
+		{
+			KillLandVFX( m_fxInstance );
+			m_alive = false;
+			m_meshComponent.Toggle( false );
+			m_projectileComponent.ClearTrajectories();
+			m_hasExploded = true;
+			Release();
+		}
+	}
+
+	private function Explode( projectilePosition : Vector4 )
+	{
+		var explosionAttackRecord : Attack_Record;
+		if( !( m_hasExploded ) )
+		{
+			m_hasExploded = true;
+			m_meshComponent.Toggle( false );
+			explosionAttackRecord = IAttack.GetExplosiveHitAttack( m_missileAttackRecord );
+			if( explosionAttackRecord )
+			{
+				ProjectileGameEffectHelper.FillProjectileHitAoEData( m_user, m_user, projectilePosition, AITweakParams.GetFloatFromTweak( m_missileDBID, "explosionRadius" ), explosionAttackRecord, m_weapon );
+				GameInstance.GetAudioSystem( GetGame() ).PlayShockwave( 'explosion', projectilePosition );
+			}
+		}
+	}
+
+	protected event OnFollowSuccess( eventData : gameprojectileFollowEvent )
+	{
+		m_arrived = true;
+	}
+
+	protected function StartPhase1( targetPos : Vector4 )
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		var targetDirection : Vector4;
+		var forwardOffset : Vector4;
+		var lateralOffset : Vector4;
+		var orientation : Quaternion;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		if( EMissileRainPhase.Phase1 != m_phase )
+		{
+			m_phase = EMissileRainPhase.Phase1;
+			m_phase1Duration = RandRangeF( AITweakParams.GetFloatFromTweak( m_missileDBID, "p1DurationMin" ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p1DurationMax" ) );
+			m_meshComponent.Toggle( true );
+			targetDirection = m_initialTargetPosition - m_spawnPosition;
+			targetDirection.Z = 0.0;
+			orientation = Quaternion.BuildFromDirectionVector( targetDirection );
+			forwardOffset.Y = RandRangeF( AITweakParams.GetFloatFromTweak( m_missileDBID, "p1PositionForwardOffsetMin" ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p1PositionForwardOffsetMax" ) );
+			forwardOffset = Quaternion.Transform( orientation, forwardOffset );
+			forwardOffset.Z = 0.0;
+			lateralOffset.X = RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "p1PositionLateralOffset" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p1PositionLateralOffset" ) );
+			lateralOffset = Quaternion.Transform( orientation, lateralOffset );
+			lateralOffset.Z = 0.0;
+			targetPos += ( forwardOffset + lateralOffset );
+			targetPos.Z += AITweakParams.GetFloatFromTweak( m_missileDBID, "p1PositionZOffset" );
+			m_projectileComponent.ClearTrajectories();
+			followCurveParams.startVelocity = AITweakParams.GetFloatFromTweak( m_missileDBID, "p1StartVelocity" );
+			followCurveParams.targetPosition = targetPos;
+			followCurveParams.bendTimeRatio = AITweakParams.GetFloatFromTweak( m_missileDBID, "p1BendTimeRatio" );
+			followCurveParams.bendFactor = AITweakParams.GetFloatFromTweak( m_missileDBID, "p1BendFactor" );
+			followCurveParams.angleInHitPlane = RandRangeF( AITweakParams.GetFloatFromTweak( m_missileDBID, "p1AngleInHitPlaneMin" ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p1AngleInHitPlaneMax" ) );
+			followCurveParams.angleInVerticalPlane = RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "p1AngleInVerticalPlane" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p1AngleInVerticalPlane" ) );
+			followCurveParams.snapRadius = AITweakParams.GetFloatFromTweak( m_missileDBID, "p1SnapRadius" );
+			followCurveParams.sendFollowEvent = false;
+			m_projectileComponent.AddFollowCurve( followCurveParams );
+			m_projectileComponent.SetOnCollisionAction( gameprojectileOnCollisionAction.Stop );
+			m_spiralParams.enabled = m_useSpiralParams;
+			m_projectileComponent.SetSpiral( m_spiralParams );
+			StartTrailEffect();
+		}
+	}
+
+	protected function StartPhase2()
+	{
+		var followCurveParams : FollowCurveTrajectoryParams;
+		followCurveParams = new FollowCurveTrajectoryParams;
+		m_phase = EMissileRainPhase.Phase2;
+		if( m_followTargetInPhase2 && m_targetComponent )
+		{
+			CalcFinalTargetPositionAndOffset();
+			followCurveParams.target = ( ( weak< weak< GameObject > > )( m_targetComponent.GetEntity() ) );
+		}
+		else if( ( m_countTime < m_finalTargetPositionCalculationDelay ) || ( m_finalTargetPositionCalculationDelay < 0.0 ) )
+		{
+			CalcFinalTargetPositionAndOffset();
+		}
+		m_projectileComponent.ClearTrajectories();
+		followCurveParams.startVelocity = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2StartVelocity" );
+		followCurveParams.targetPosition = m_finalTargetPosition;
+		followCurveParams.bendTimeRatio = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2BendRation" );
+		followCurveParams.bendFactor = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2BendFactor" );
+		followCurveParams.angleInHitPlane = RandRangeF( AITweakParams.GetFloatFromTweak( m_missileDBID, "p2AngleInHitPlaneMin" ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p2AngleInHitPlaneMax" ) );
+		followCurveParams.angleInVerticalPlane = RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "p2AngleInVerticalPlane" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p2AngleInVerticalPlane" ) );
+		followCurveParams.shouldRotate = AITweakParams.GetBoolFromTweak( m_missileDBID, "p2ShouldRotate" );
+		followCurveParams.accuracy = 1.0;
+		followCurveParams.offset = m_finalTargetOffset;
+		m_projectileComponent.AddFollowCurve( followCurveParams );
+		m_spiralParams.enabled = m_useSpiralParams;
+		m_projectileComponent.SetSpiral( m_spiralParams );
+		StartTrailEffect();
+	}
+
+	private function CalcFinalTargetPositionAndOffset()
+	{
+		var offset : Float;
+		var directionOffset : Vector4;
+		m_finalTargetOffset = m_initialTargetOffset;
+		if( m_targetComponent )
+		{
+			m_finalTargetPosition = m_targetComponent.GetEntity().GetWorldPosition();
+			m_finalTargetOffset.Z = 0.0;
+		}
+		else
+		{
+			m_finalTargetPosition = m_initialTargetPosition;
+		}
+		offset = AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionOffset" );
+		if( offset > 0.0 )
+		{
+			directionOffset = m_spawnPosition - m_finalTargetPosition;
+			directionOffset = Vector4.Normalize( directionOffset ) * offset;
+			m_finalTargetOffset.X += directionOffset.X;
+			m_finalTargetOffset.Y += directionOffset.Y;
+			m_finalTargetOffset.X += RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) );
+			m_finalTargetOffset.Y += RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) );
+		}
+		if( !( m_followTargetInPhase2 ) || !( m_targetComponent ) )
+		{
+			SpawnLandVFXs( m_landIndicatorFX, m_finalTargetPosition + m_finalTargetOffset );
+		}
+	}
+
+	private function SpawnLandVFXs( fx : FxResource, fxposition : Vector4 )
+	{
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		if( FxResource.IsValid( fx ) )
+		{
+			WorldPosition.SetVector4( position, fxposition );
+			WorldTransform.SetWorldPosition( transform, position );
+			m_fxInstance = CreateFxInstance( fx, transform );
+		}
+	}
+
+	private function KillLandVFX( fxInstance : FxInstance )
+	{
+		fxInstance.BreakLoop();
+	}
+
+	private function CreateFxInstance( resource : FxResource, transform : WorldTransform ) : FxInstance
+	{
+		var fx : FxInstance;
+		var fxSystem : FxSystem;
+		fxSystem = GameInstance.GetFxSystem( GetGame() );
+		fx = fxSystem.SpawnEffect( resource, transform );
+		return fx;
+	}
+
+}
+
+enum EMissileRainPhase
+{
+	Init = 0,
+	Phase1 = 1,
+	Phase2 = 2,
+}
+

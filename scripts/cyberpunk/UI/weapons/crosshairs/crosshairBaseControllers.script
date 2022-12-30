@@ -1,0 +1,380 @@
+import class gameuiCrosshairBaseGameController extends inkGameController
+{
+	protected var m_rootWidget : weak< inkWidget >;
+	private var m_crosshairState : gamePSMCrosshairStates;
+	private var m_visionState : gamePSMVision;
+	private var m_crosshairStateBlackboardId : CallbackHandle;
+	private var m_bulletSpreedBlackboardId : CallbackHandle;
+	private var m_bbNPCStatsId : Uint32;
+	private var m_isTargetDead : Bool;
+	private var m_lastGUIStateUpdateFrame : Uint64;
+	protected var m_targetBB : weak< IBlackboard >;
+	protected var m_weaponBB : weak< IBlackboard >;
+	private var m_currentAimTargetBBID : CallbackHandle;
+	private var m_targetDistanceBBID : CallbackHandle;
+	private var m_targetAttitudeBBID : CallbackHandle;
+	protected var m_targetEntity : weak< Entity >;
+	private var m_healthListener : CrosshairHealthChangeListener;
+	private var m_isActive : Bool;
+
+	protected event OnInitialize()
+	{
+		m_rootWidget = GetRootWidget();
+		m_crosshairState = gamePSMCrosshairStates.Default;
+		m_healthListener = CrosshairHealthChangeListener.Create( this );
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_targetEntity )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( m_targetEntity.GetEntityID(), gamedataStatPoolType.Health, m_healthListener );
+		}
+		m_healthListener = NULL;
+		m_isActive = false;
+	}
+
+	protected function IsActive() : Bool
+	{
+		return m_isActive;
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		var playerSMBB : IBlackboard;
+		playerSMBB = GetPSMBlackboard( playerPuppet );
+		m_crosshairStateBlackboardId = playerSMBB.RegisterDelayedListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Crosshair, this, 'OnPSMCrosshairStateChanged' );
+		OnPSMCrosshairStateChanged( playerSMBB.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Crosshair ) );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		var playerSMBB : IBlackboard;
+		if( m_crosshairStateBlackboardId )
+		{
+			playerSMBB = GetPSMBlackboard( playerPuppet );
+			playerSMBB.UnregisterDelayedListener( GetAllBlackboardDefs().PlayerStateMachine.Crosshair, m_crosshairStateBlackboardId );
+		}
+	}
+
+	protected event OnPreIntro()
+	{
+		m_targetBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_TargetingInfo );
+		if( m_targetBB )
+		{
+			m_currentAimTargetBBID = m_targetBB.RegisterDelayedListenerEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget, this, 'OnCurrentAimTarget' );
+			m_targetDistanceBBID = m_targetBB.RegisterDelayedListenerFloat( GetAllBlackboardDefs().UI_TargetingInfo.VisibleTargetDistance, this, 'OnTargetDistanceChanged' );
+			m_targetAttitudeBBID = m_targetBB.RegisterDelayedListenerInt( GetAllBlackboardDefs().UI_TargetingInfo.VisibleTargetAttitude, this, 'OnTargetAttitudeChanged' );
+			OnCurrentAimTarget( m_targetBB.GetEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget ) );
+		}
+		m_weaponBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveWeaponData );
+		if( m_weaponBB )
+		{
+			m_bulletSpreedBlackboardId = m_weaponBB.RegisterDelayedListenerVector2( GetAllBlackboardDefs().UI_ActiveWeaponData.BulletSpread, this, 'OnBulletSpreadChanged' );
+			OnBulletSpreadChanged( m_weaponBB.GetVector2( GetAllBlackboardDefs().UI_ActiveWeaponData.BulletSpread ) );
+		}
+		m_isActive = true;
+		UpdateCrosshairState();
+	}
+
+	protected event OnPreOutro()
+	{
+		if( m_targetBB )
+		{
+			m_targetBB.UnregisterDelayedListener( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget, m_currentAimTargetBBID );
+			m_targetBB.UnregisterDelayedListener( GetAllBlackboardDefs().UI_TargetingInfo.VisibleTargetDistance, m_targetDistanceBBID );
+			m_targetBB.UnregisterDelayedListener( GetAllBlackboardDefs().UI_TargetingInfo.VisibleTargetAttitude, m_targetAttitudeBBID );
+		}
+		if( m_weaponBB )
+		{
+			m_weaponBB.UnregisterDelayedListener( GetAllBlackboardDefs().UI_ActiveWeaponData.BulletSpread, m_bulletSpreedBlackboardId );
+		}
+		m_targetBB = NULL;
+		m_weaponBB = NULL;
+		m_targetEntity = NULL;
+		m_isActive = false;
+	}
+
+	protected import function GetWeaponRecordID() : ItemID;
+	protected import function GetWeaponLocalBlackboard() : IBlackboard;
+	protected import function GetWeaponItemObject() : ItemObject;
+
+	protected function GetUIActiveWeaponBlackboard() : IBlackboard
+	{
+		return m_weaponBB;
+	}
+
+	protected import function IsTargetWithinWeaponEffectiveRange( distanceToTarget : Float ) : Bool;
+
+	public virtual function GetIntroAnimation( firstEquip : Bool ) : inkAnimDef
+	{
+		return NULL;
+	}
+
+	public virtual function GetOutroAnimation() : inkAnimDef
+	{
+		return NULL;
+	}
+
+	protected virtual function GetCrosshairState() : gamePSMCrosshairStates
+	{
+		return m_crosshairState;
+	}
+
+	protected function GetVisionState() : gamePSMVision
+	{
+		return m_visionState;
+	}
+
+	protected event OnNPCStatsChanged( value : Variant )
+	{
+		var incomingData : NPCNextToTheCrosshair;
+		incomingData = ( ( NPCNextToTheCrosshair )value );
+		m_isTargetDead = incomingData.currentHealth < 1;
+	}
+
+	protected event OnPSMCrosshairStateChanged( value : Int32 )
+	{
+		var oldState, newState : gamePSMCrosshairStates;
+		oldState = m_crosshairState;
+		newState = ( ( gamePSMCrosshairStates )( value ) );
+		if( oldState != newState )
+		{
+			m_crosshairState = newState;
+			OnCrosshairStateChange( oldState, newState );
+		}
+	}
+
+	protected virtual function OnCrosshairStateChange( oldState : gamePSMCrosshairStates, newState : gamePSMCrosshairStates )
+	{
+		UpdateCrosshairState();
+	}
+
+	protected function UpdateCrosshairState()
+	{
+		if( IsActive() )
+		{
+			switch( m_crosshairState )
+			{
+				case gamePSMCrosshairStates.Safe:
+					OnState_Safe();
+				break;
+				case gamePSMCrosshairStates.Scanning:
+					OnState_Scanning();
+				break;
+				case gamePSMCrosshairStates.GrenadeCharging:
+					OnState_GrenadeCharging();
+				break;
+				case gamePSMCrosshairStates.HipFire:
+					OnState_HipFire();
+				break;
+				case gamePSMCrosshairStates.Aim:
+					OnState_Aim();
+				break;
+				case gamePSMCrosshairStates.Reload:
+					OnState_Reload();
+				break;
+				case gamePSMCrosshairStates.Sprint:
+					OnState_Sprint();
+				break;
+				case gamePSMCrosshairStates.LeftHandCyberware:
+					OnState_LeftHandCyberware();
+				break;
+			}
+		}
+	}
+
+	protected event OnBulletSpreadChanged( spread : Vector2 ) {}
+
+	protected virtual function OnState_Aim()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function OnState_HipFire()
+	{
+		m_rootWidget.SetVisible( true );
+	}
+
+	protected virtual function OnState_GrenadeCharging()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function OnState_Reload()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function OnState_Safe()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function OnState_Sprint()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function OnState_Scanning()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function OnState_LeftHandCyberware()
+	{
+		m_rootWidget.SetVisible( false );
+	}
+
+	protected virtual function ApplyCrosshairGUIState( state : CName, aimedAtEntity : Entity ) {}
+
+	protected function GetGame() : GameInstance
+	{
+		return ( ( GameObject )( GetOwnerEntity() ) ).GetGame();
+	}
+
+	protected function UpdateCrosshairGUIState( force : Bool )
+	{
+		var currentFrameNumber : Uint64;
+		currentFrameNumber = GameInstance.GetFrameNumber( GetGame() );
+		if( !( force ) && ( m_lastGUIStateUpdateFrame == currentFrameNumber ) )
+		{
+			return;
+		}
+		ApplyCrosshairGUIState( GetCurrentCrosshairGUIState(), m_targetEntity );
+		m_lastGUIStateUpdateFrame = currentFrameNumber;
+	}
+
+	protected function GetCurrentCrosshairGUIState() : CName
+	{
+		var targetGameObject : GameObject;
+		var attitudeTowardsPlayer : EAIAttitude;
+		var puppet : ScriptedPuppet;
+		var device : Device;
+		var distanceToTarget : Float;
+		targetGameObject = ( ( GameObject )( m_targetEntity ) );
+		if( !( targetGameObject ) )
+		{
+			return 'Civilian';
+		}
+		puppet = ( ( ScriptedPuppet )( targetGameObject ) );
+		device = ( ( Device )( targetGameObject ) );
+		attitudeTowardsPlayer = GameObject.GetAttitudeTowards( targetGameObject, ( ( GameObject )( GetOwnerEntity() ) ) );
+		if( ( puppet && puppet.IsDead() ) || ( device && device.GetDevicePS().IsBroken() ) )
+		{
+			return 'Dead';
+		}
+		else if( device && !( device.GetDevicePS().IsON() ) )
+		{
+			return 'Civilian';
+		}
+		else if( attitudeTowardsPlayer == EAIAttitude.AIA_Friendly )
+		{
+			return 'Friendly';
+		}
+		else if( attitudeTowardsPlayer == EAIAttitude.AIA_Hostile || ( puppet && puppet.IsAggressive() ) )
+		{
+			distanceToTarget = GetDistanceToTarget();
+			if( IsTargetWithinWeaponEffectiveRange( distanceToTarget ) )
+			{
+				return 'Hostile';
+			}
+		}
+		return 'Civilian';
+	}
+
+	protected function RegisterTargetCallbacks( register : Bool )
+	{
+		if( !( m_targetEntity ) || !( m_healthListener ) )
+		{
+			return;
+		}
+		if( register )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestRegisteringListener( m_targetEntity.GetEntityID(), gamedataStatPoolType.Health, m_healthListener );
+		}
+		else
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( m_targetEntity.GetEntityID(), gamedataStatPoolType.Health, m_healthListener );
+		}
+	}
+
+	protected event OnCurrentAimTarget( entId : EntityID )
+	{
+		RegisterTargetCallbacks( false );
+		m_targetEntity = GameInstance.FindEntityByID( GetGame(), entId );
+		RegisterTargetCallbacks( true );
+		UpdateCrosshairGUIState( true );
+	}
+
+	protected event OnTargetDistanceChanged( distance : Float )
+	{
+		UpdateCrosshairGUIState( false );
+	}
+
+	protected event OnTargetAttitudeChanged( attitude : Int32 )
+	{
+		UpdateCrosshairGUIState( false );
+	}
+
+	protected event OnRefreshCrosshairEvent( evt : RefreshCrosshairEvent )
+	{
+		UpdateCrosshairGUIState( evt.force );
+	}
+
+	public function QueueCrosshairRefresh()
+	{
+		var evt : RefreshCrosshairEvent;
+		evt = new RefreshCrosshairEvent;
+		evt.force = false;
+		QueueEvent( evt );
+	}
+
+	protected virtual function GetDistanceToTarget() : Float
+	{
+		var targetID : EntityID;
+		var distance : Float;
+		distance = 0.0;
+		targetID = m_targetBB.GetEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget );
+		if( EntityID.IsDefined( targetID ) )
+		{
+			distance = m_targetBB.GetFloat( GetAllBlackboardDefs().UI_TargetingInfo.VisibleTargetDistance );
+		}
+		return distance;
+	}
+
+}
+
+class RefreshCrosshairEvent extends Event
+{
+	var force : Bool;
+}
+
+class gameuiCrosshairBaseMelee extends gameuiCrosshairBaseGameController
+{
+	private var m_meleeStateBlackboardId : CallbackHandle;
+	private var m_playerSMBB : weak< IBlackboard >;
+
+	protected event OnPreIntro()
+	{
+		m_playerSMBB = GetBlackboardSystem().GetLocalInstanced( GetOwnerEntity().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		m_meleeStateBlackboardId = m_playerSMBB.RegisterDelayedListenerInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, this, 'OnGamePSMMeleeWeapon' );
+		super.OnPreIntro();
+	}
+
+	protected event OnPreOutro()
+	{
+		m_playerSMBB.UnregisterDelayedListener( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, m_meleeStateBlackboardId );
+		super.OnPreOutro();
+	}
+
+	protected event OnGamePSMMeleeWeapon( value : Int32 )
+	{
+		var newState : gamePSMMeleeWeapon;
+		newState = ( ( gamePSMMeleeWeapon )( value ) );
+		OnMeleeState_Update( newState );
+	}
+
+	protected virtual function OnMeleeState_Update( value : gamePSMMeleeWeapon ) {}
+}
+

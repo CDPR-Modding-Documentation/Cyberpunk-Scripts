@@ -1,0 +1,262 @@
+class MessengerContactSelectedEvent extends Event
+{
+	var m_type : MessengerContactType;
+	var m_entryHash : Int32;
+	var m_level : Int32;
+}
+
+class MessengerContactSyncBackEvent extends Event
+{
+}
+
+class MessengerThreadSelectedEvent extends Event
+{
+	var m_hash : Uint32;
+}
+
+class MessengerContactSyncData extends IScriptable
+{
+	var m_type : MessengerContactType;
+	var m_entryHash : Int32;
+	var m_level : Int32;
+}
+
+class MessengerForceSelectionEvent extends Event
+{
+	var m_selectionIndex : Int32;
+	var m_hash : Int32;
+}
+
+class MessengerContactsVirtualNestedListController extends VirtualNestedListController
+{
+	private var m_currentDataView : weak< MessengerContactDataView >;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+		m_defaultCollapsed = false;
+	}
+
+	protected override function GetDataView() : VirtualNestedListDataView
+	{
+		var view : MessengerContactDataView;
+		view = new MessengerContactDataView;
+		m_currentDataView = view;
+		return view;
+	}
+
+	public function GetIndexByJournalHash( hash : Int32 ) : Int32
+	{
+		var i : Int32;
+		var dataSize : Int32;
+		var currentContactData : weak< ContactData >;
+		var listData : weak< VirutalNestedListData >;
+		if( m_currentDataView == NULL )
+		{
+			return -1;
+		}
+		dataSize = ( ( Int32 )( m_currentDataView.Size() ) );
+		for( i = 0; i < dataSize; i = i + 1 )
+		{
+			listData = ( ( VirutalNestedListData )( ( ( IScriptable )( m_currentDataView.GetItem( ( ( Uint32 )( i ) ) ) ) ) ) );
+			currentContactData = ( ( ContactData )( listData.m_data ) );
+			if( currentContactData.hash == ( ( Int32 )( hash ) ) )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+}
+
+class MessengerGameController extends gameuiMenuGameController
+{
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_contactsRef : inkWidgetRef;
+	private editable var m_dialogRef : inkWidgetRef;
+	private editable var m_virtualList : inkWidgetRef;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_dialogController : weak< MessengerDialogViewController >;
+	private var m_listController : weak< MessengerContactsVirtualNestedListController >;
+	private var m_journalManager : weak< JournalManager >;
+	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_activeData : MessengerContactSyncData;
+
+	protected event OnInitialize()
+	{
+		var hintsWidget : weak< inkWidget >;
+		hintsWidget = SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' );
+		m_buttonHintsController = ( ( ButtonHints )( hintsWidget.GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		m_dialogController = ( ( MessengerDialogViewController )( inkWidgetRef.GetController( m_dialogRef ) ) );
+		m_listController = ( ( MessengerContactsVirtualNestedListController )( inkWidgetRef.GetController( m_contactsRef ) ) );
+		m_activeData = new MessengerContactSyncData;
+		PlayLibraryAnimation( 'contacts_intro' );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_journalManager = GameInstance.GetJournalManager( GetPlayerControlledObject().GetGame() );
+		m_dialogController.AttachJournalManager( m_journalManager );
+		PopulateData();
+		m_journalManager.RegisterScriptCallback( this, 'OnJournalUpdate', gameJournalListenerType.Visited );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		m_dialogController.DetachJournalManager();
+		m_journalManager.UnregisterScriptCallback( this, 'OnJournalUpdate' );
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		m_menuEventDispatcher = menuEventDispatcher;
+		m_menuEventDispatcher.RegisterToEvent( 'OnBack', this, 'OnBack' );
+	}
+
+	protected event OnJournalUpdate( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
+	{
+		var selectedEvent : MessengerThreadSelectedEvent;
+		var cashSelectedIdx : Uint32;
+		if( ( className == 'gameJournalPhoneMessage' || className == 'gameJournalPhoneChoiceGroup' ) || className == 'gameJournalPhoneChoiceEntry' )
+		{
+			cashSelectedIdx = m_listController.GetToggledIndex();
+			m_listController.SelectItem( cashSelectedIdx );
+			m_listController.ToggleItem( cashSelectedIdx );
+			ForceSelectIndex( cashSelectedIdx );
+			selectedEvent = new MessengerThreadSelectedEvent;
+			selectedEvent.m_hash = entryHash;
+			QueueEvent( selectedEvent );
+		}
+	}
+
+	protected event OnBack( userData : IScriptable )
+	{
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) )
+		{
+			m_menuEventDispatcher.SpawnEvent( 'OnCloseHubMenu' );
+		}
+	}
+
+	protected event OnMessengerGameControllerDelayInit( evt : MessengerForceSelectionEvent )
+	{
+		var entry : weak< JournalEntry >;
+		var contactEntry : weak< JournalContact >;
+		var threadEntry : weak< JournalPhoneConversation >;
+		var contactHash : Int32;
+		var locatedIndex : Int32;
+		var newIndex : Uint32;
+		if( evt.m_selectionIndex != -1 )
+		{
+			newIndex = ( ( Uint32 )( evt.m_selectionIndex ) );
+		}
+		else
+		{
+			entry = m_journalManager.GetEntry( ( ( Uint32 )( evt.m_hash ) ) );
+			threadEntry = ( ( JournalPhoneConversation )( entry ) );
+			if( threadEntry != NULL )
+			{
+				contactEntry = ( ( JournalContact )( m_journalManager.GetParentEntry( threadEntry ) ) );
+				contactHash = m_journalManager.GetEntryHash( contactEntry );
+				if( !( m_listController.IsLevelToggled( contactHash ) ) )
+				{
+					m_listController.ToggleLevel( contactHash );
+				}
+			}
+			locatedIndex = m_listController.GetIndexByJournalHash( evt.m_hash );
+			if( locatedIndex != -1 )
+			{
+				newIndex = ( ( Uint32 )( locatedIndex ) );
+			}
+			else
+			{
+				newIndex = 0;
+			}
+		}
+		m_listController.SelectItem( newIndex );
+		m_listController.ToggleItem( newIndex );
+	}
+
+	protected event OnSetUserData( userData : IScriptable )
+	{
+		var linkData : MessageMenuAttachmentData;
+		linkData = ( ( MessageMenuAttachmentData )( userData ) );
+		if( linkData )
+		{
+			ForceSelectEntry( linkData.m_entryHash );
+		}
+		else
+		{
+			ForceSelectIndex( 0 );
+		}
+	}
+
+	private function ForceSelectIndex( idx : Uint32 )
+	{
+		var initEvent : MessengerForceSelectionEvent;
+		initEvent = new MessengerForceSelectionEvent;
+		initEvent.m_selectionIndex = ( ( Int32 )( idx ) );
+		QueueEvent( initEvent );
+	}
+
+	private function ForceSelectEntry( hash : Int32 )
+	{
+		var initEvent : MessengerForceSelectionEvent;
+		initEvent = new MessengerForceSelectionEvent;
+		initEvent.m_selectionIndex = -1;
+		initEvent.m_hash = hash;
+		QueueEvent( initEvent );
+	}
+
+	private function PopulateData()
+	{
+		var data : array< VirutalNestedListData >;
+		data = MessengerUtils.GetContactDataArray( m_journalManager, true, true, m_activeData );
+		m_listController.SetData( data, true );
+	}
+
+	protected event OnContactActivated( evt : MessengerContactSelectedEvent )
+	{
+		switch( evt.m_type )
+		{
+			case MessengerContactType.Group:
+				m_listController.ToggleLevel( evt.m_level );
+			break;
+			case MessengerContactType.Contact:
+				SyncActiveData( evt );
+			m_dialogController.ShowDialog( m_journalManager.GetEntry( ( ( Uint32 )( evt.m_entryHash ) ) ) );
+			break;
+			case MessengerContactType.Thread:
+				SyncActiveData( evt );
+			m_dialogController.ShowThread( m_journalManager.GetEntry( ( ( Uint32 )( evt.m_entryHash ) ) ) );
+			break;
+			default:
+				break;
+		}
+	}
+
+	private function SyncActiveData( evt : MessengerContactSelectedEvent )
+	{
+		var syncEvent : MessengerContactSyncBackEvent;
+		m_activeData.m_type = evt.m_type;
+		m_activeData.m_entryHash = evt.m_entryHash;
+		m_activeData.m_level = evt.m_level;
+		syncEvent = new MessengerContactSyncBackEvent;
+		QueueEvent( syncEvent );
+	}
+
+}
+
+enum MessengerContactType : Uint8
+{
+	Contact = 0,
+	Group = 1,
+	Thread = 2,
+}
+

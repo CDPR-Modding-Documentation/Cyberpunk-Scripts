@@ -1,0 +1,862 @@
+import class FastTravelPointData extends IScriptable
+{
+	private import instanceeditable persistent var pointRecord : TweakDBID;
+	private import instanceeditable persistent var markerRef : NodeRef;
+	private import persistent var requesterID : EntityID;
+	var mappinID : NewMappinID;
+
+	public import function IsValid() : Bool;
+
+	public const function GetPointDisplayName() : String
+	{
+		return TweakDBInterface.GetFastTravelPointRecord( pointRecord ).DisplayName();
+	}
+
+	public const function GetPointDisplayDescription() : String
+	{
+		return TweakDBInterface.GetFastTravelPointRecord( pointRecord ).Description();
+	}
+
+	public const function GetDistrictDisplayName() : String
+	{
+		return TweakDBInterface.GetFastTravelPointRecord( pointRecord ).District().LocalizedName();
+	}
+
+	public const function ShouldShowMappinOnWorldMap() : Bool
+	{
+		return TweakDBInterface.GetFastTravelPointRecord( pointRecord ).ShowOnWorldMap();
+	}
+
+	public const function ShouldShowMappinInWorld() : Bool
+	{
+		return TweakDBInterface.GetFastTravelPointRecord( pointRecord ).ShowInWorld();
+	}
+
+	public const function GetPointRecord() : TweakDBID
+	{
+		return pointRecord;
+	}
+
+	public const function GetMarkerRef() : NodeRef
+	{
+		return markerRef;
+	}
+
+	public const function GetRequesterID() : EntityID
+	{
+		return requesterID;
+	}
+
+	public const function HasReqesterID() : Bool
+	{
+		return EntityID.IsDefined( requesterID );
+	}
+
+	public function SetRequesterID( id : EntityID )
+	{
+		requesterID = id;
+	}
+
+}
+
+class FastTravelMenuToggledEvent extends ScriptableSystemRequest
+{
+	var isEnabled : Bool;
+}
+
+class UpdateFastTravelPointRecordRequest extends ScriptableSystemRequest
+{
+	var pointRecord : TweakDBID;
+}
+
+class AutoSaveRequest extends ScriptableSystemRequest
+{
+}
+
+class EnableFastTravelRequest extends ScriptableSystemRequest
+{
+	editable var isEnabled : Bool;
+	editable var forceRefreshUI : Bool;
+	default forceRefreshUI = true;
+	editable var reason : CName;
+	default reason = 'quest';
+	var linkedStatusEffectID : TweakDBID;
+
+	public constexpr export function GetFriendlyDescription() : String
+	{
+		return "Enable Fast Travel";
+	}
+
+}
+
+class RemoveAllFastTravelLocksRequest extends ScriptableSystemRequest
+{
+}
+
+class RegisterFastTravelPointsRequest extends ScriptableSystemRequest
+{
+	mutable editable inlined var fastTravelNodes : array< FastTravelPointData >;
+	editable var register : Bool;
+	default register = true;
+
+	public constexpr export function GetFriendlyDescription() : String
+	{
+		return "Register Fast Travel Points";
+	}
+
+}
+
+class FastTravelPointsUpdated extends Event
+{
+	var updateTrackingAlternative : Bool;
+}
+
+struct FastTravelSystemLock
+{
+	persistent var lockReason : CName;
+	persistent var linkedStatusEffectID : TweakDBID;
+}
+
+class RegisterFastTravelPointRequest extends ScriptableSystemRequest
+{
+	var pointData : FastTravelPointData;
+	var requesterID : EntityID;
+}
+
+class UnregisterFastTravelPointRequest extends ScriptableSystemRequest
+{
+	var pointData : FastTravelPointData;
+	var requesterID : EntityID;
+}
+
+class PerformFastTravelRequest extends ScriptableSystemRequest
+{
+	var pointData : FastTravelPointData;
+	var player : weak< GameObject >;
+}
+
+class FastTravelSystem extends ScriptableSystem
+{
+	private persistent var m_fastTravelNodes : array< FastTravelPointData >;
+	private var m_isFastTravelEnabledOnMap : Bool;
+	default m_isFastTravelEnabledOnMap = false;
+	private persistent var m_fastTravelPointsTotal : Int32;
+	default m_fastTravelPointsTotal = 155;
+	private persistent var m_lastUpdatedAchievementCount : Int32;
+	default m_lastUpdatedAchievementCount = -1;
+	private persistent var m_fastTravelLocks : array< FastTravelSystemLock >;
+	private var m_loadingScreenCallbackID : CallbackHandle;
+	private var m_requestAutoSafeAfterLoadingScreen : Bool;
+	private var m_fastTravelSystemRecord : weak< FastTravelSystem_Record >;
+	private var m_lockLisenerID : CName;
+	private var m_unlockLisenerID : CName;
+	private var m_removeAllLocksLisenerID : CName;
+
+	private export override function OnAttach()
+	{
+		RegisterLoadingScreenCallback();
+		m_fastTravelSystemRecord = TweakDBInterface.GetFastTravelSystemRecord( T"FastTravel.FastTravelSystemDefault" );
+		if( m_fastTravelSystemRecord )
+		{
+			m_fastTravelPointsTotal = m_fastTravelSystemRecord.FastTravelPointsTotal();
+		}
+		if( !( IsFinal() ) )
+		{
+			InitializeDebugButtons();
+			ShowDebug();
+		}
+	}
+
+	private export override function OnDetach()
+	{
+		UnregisterLoadingCallback();
+		if( !( IsFinal() ) )
+		{
+			UninitializeDebugButtons();
+		}
+	}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		RestoreFastTravelMappins();
+		EvaluateFastTravelLocksOnRestore();
+		CheckForScottieAchievement();
+	}
+
+	protected function RegisterLoadingScreenCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().FastTRavelSystem );
+		if( blackboard && !( m_loadingScreenCallbackID ) )
+		{
+			m_loadingScreenCallbackID = blackboard.RegisterListenerBool( GetAllBlackboardDefs().FastTRavelSystem.FastTravelLoadingScreenFinished, this, 'OnLoadingScreenFinished' );
+		}
+	}
+
+	protected function UnregisterLoadingCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().FastTRavelSystem );
+		if( ( blackboard != NULL ) && m_loadingScreenCallbackID )
+		{
+			blackboard.UnregisterListenerBool( GetAllBlackboardDefs().FastTRavelSystem.FastTravelLoadingScreenFinished, m_loadingScreenCallbackID );
+		}
+	}
+
+	private function AddFastTravelPoint( nodeData : FastTravelPointData )
+	{
+		var existingData : FastTravelPointData;
+		if( nodeData && nodeData.IsValid() )
+		{
+			existingData = GetFastTravelPoint( nodeData );
+			if( existingData )
+			{
+				if( !( existingData.HasReqesterID() ) && nodeData.HasReqesterID() )
+				{
+					UnregisterMappin( existingData );
+					existingData.SetRequesterID( nodeData.GetRequesterID() );
+					RegisterMappin( existingData );
+				}
+				if( nodeData.GetRequesterID() == existingData.GetRequesterID() )
+				{
+					nodeData.mappinID = existingData.mappinID;
+				}
+			}
+			else
+			{
+				m_fastTravelNodes.PushBack( nodeData );
+				RegisterMappin( nodeData );
+				TutorialAddFastTravelFact();
+				if( nodeData.ShouldShowMappinOnWorldMap() )
+				{
+					CheckForScottieAchievement();
+				}
+			}
+			if( !( IsFinal() ) )
+			{
+				ShowDebug();
+			}
+		}
+	}
+
+	protected event OnLoadingScreenFinished( value : Bool )
+	{
+		if( value )
+		{
+			if( m_requestAutoSafeAfterLoadingScreen )
+			{
+				RequestAutoSaveWithDelay();
+			}
+			m_requestAutoSafeAfterLoadingScreen = false;
+		}
+	}
+
+	private function SetFastTravelStarted()
+	{
+		var uiSystem : UISystem;
+		uiSystem = GameInstance.GetUISystem( GetGameInstance() );
+		uiSystem.NotifyFastTravelStart();
+	}
+
+	private function CheckForScottieAchievement()
+	{
+		var dataTrackingSystem : DataTrackingSystem;
+		var achievementRequest : AddAchievementRequest;
+		var achievementProgressRequest : SetAchievementProgressRequest;
+		var achievement : gamedataAchievement;
+		var pointsOnMap : Int32;
+		achievement = gamedataAchievement.GetMeThereScottie;
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'DataTrackingSystem' ) ) );
+		pointsOnMap = GetAmmountOfFastTravelPointsOnMap();
+		if( m_lastUpdatedAchievementCount <= 0 )
+		{
+			m_lastUpdatedAchievementCount = 0;
+		}
+		if( ( ( pointsOnMap % 2 ) == 0 ) && ( pointsOnMap != m_lastUpdatedAchievementCount ) )
+		{
+			achievementProgressRequest = new SetAchievementProgressRequest;
+			achievementProgressRequest.achievement = achievement;
+			achievementProgressRequest.currentValue = pointsOnMap;
+			achievementProgressRequest.maxValue = m_fastTravelPointsTotal;
+			dataTrackingSystem.QueueRequest( achievementProgressRequest );
+			m_lastUpdatedAchievementCount = pointsOnMap;
+		}
+		if( pointsOnMap >= m_fastTravelPointsTotal )
+		{
+			achievementRequest = new AddAchievementRequest;
+			achievementRequest.achievement = achievement;
+			dataTrackingSystem.QueueRequest( achievementRequest );
+		}
+	}
+
+	private function RemoveFastTravelPoint( nodeData : FastTravelPointData )
+	{
+		var i : Int32;
+		for( i = m_fastTravelNodes.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_fastTravelNodes[ i ].GetMarkerRef() == nodeData.GetMarkerRef() && ( m_fastTravelNodes[ i ].GetPointRecord() == nodeData.GetPointRecord() ) )
+			{
+				UnregisterMappin( m_fastTravelNodes[ i ] );
+				m_fastTravelNodes[ i ] = NULL;
+				m_fastTravelNodes.Erase( i );
+			}
+		}
+		if( !( IsFinal() ) )
+		{
+			ShowDebug();
+		}
+	}
+
+	public const function HasFastTravelPoint( nodeData : FastTravelPointData ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_fastTravelNodes.Size(); i += 1 )
+		{
+			if( m_fastTravelNodes[ i ].GetMarkerRef() == nodeData.GetMarkerRef() && ( m_fastTravelNodes[ i ].GetPointRecord() == nodeData.GetPointRecord() ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function GetFastTravelPoint( nodeData : FastTravelPointData ) : FastTravelPointData
+	{
+		var i : Int32;
+		for( i = 0; i < m_fastTravelNodes.Size(); i += 1 )
+		{
+			if( m_fastTravelNodes[ i ].GetMarkerRef() == nodeData.GetMarkerRef() && ( m_fastTravelNodes[ i ].GetPointRecord() == nodeData.GetPointRecord() ) )
+			{
+				return m_fastTravelNodes[ i ];
+			}
+		}
+		return NULL;
+	}
+
+	public const function IsFastTravelEnabledOnMap() : Bool
+	{
+		return m_isFastTravelEnabledOnMap && ( m_fastTravelLocks.Size() <= 0 );
+	}
+
+	public const function GetFastTravelPoints() : array< FastTravelPointData >
+	{
+		var points : array< FastTravelPointData >;
+		points = m_fastTravelNodes;
+		return points;
+	}
+
+	public const function GetAmmountOfFastTravelPointsOnMap() : Int32
+	{
+		var i : Int32;
+		var count : Int32;
+		for( i = 0; i < m_fastTravelNodes.Size(); i += 1 )
+		{
+			if( m_fastTravelNodes[ i ].ShouldShowMappinOnWorldMap() )
+			{
+				count += 1;
+			}
+		}
+		return count;
+	}
+
+	private function PerformFastTravel( player : GameObject, nodeData : FastTravelPointData )
+	{
+		var blackBoard : IBlackboard;
+		var playerPuppet : PlayerPuppet;
+		var startPointId, destinationPointId : TweakDBID;
+		if( HasFastTravelPoint( nodeData ) )
+		{
+			PlayerGameplayRestrictions.RemoveAllGameplayRestrictions( player );
+			blackBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().FastTRavelSystem );
+			blackBoard.SetVariant( GetAllBlackboardDefs().FastTRavelSystem.DestinationPoint, nodeData.GetPointRecord() );
+			startPointId = ( ( TweakDBID )( blackBoard.GetVariant( GetAllBlackboardDefs().FastTRavelSystem.StartingPoint ) ) );
+			destinationPointId = ( ( TweakDBID )( blackBoard.GetVariant( GetAllBlackboardDefs().FastTRavelSystem.DestinationPoint ) ) );
+			m_requestAutoSafeAfterLoadingScreen = true;
+			if( destinationPointId != startPointId )
+			{
+				playerPuppet = ( ( PlayerPuppet )( player ) );
+				if( playerPuppet )
+				{
+					playerPuppet.GetFPPCameraComponent().ResetPitch();
+				}
+				GameInstance.GetTeleportationFacility( GetGameInstance() ).TeleportToNode( player, nodeData.GetMarkerRef() );
+				SetFastTravelStarted();
+			}
+		}
+	}
+
+	private function AddFastTravelLock( reason : CName, optional statusEffectID : TweakDBID )
+	{
+		var i : Int32;
+		var newLock : FastTravelSystemLock;
+		if( IsNameValid( reason ) )
+		{
+			for( i = 0; i < m_fastTravelLocks.Size(); i += 1 )
+			{
+				if( m_fastTravelLocks[ i ].lockReason == reason )
+				{
+					return;
+				}
+			}
+			newLock.lockReason = reason;
+			newLock.linkedStatusEffectID = statusEffectID;
+			m_fastTravelLocks.PushBack( newLock );
+			if( !( IsFinal() ) )
+			{
+				ShowDebug();
+			}
+		}
+	}
+
+	private function RemoveFastTravelLock( reason : CName )
+	{
+		var i : Int32;
+		if( IsNameValid( reason ) )
+		{
+			for( i = 0; i < m_fastTravelLocks.Size(); i += 1 )
+			{
+				if( m_fastTravelLocks[ i ].lockReason == reason )
+				{
+					m_fastTravelLocks.EraseFast( i );
+					if( !( IsFinal() ) )
+					{
+						ShowDebug();
+					}
+					return;
+				}
+			}
+		}
+	}
+
+	private function EvaluateFastTravelLocksOnRestore()
+	{
+		var i : Int32;
+		var isCurrentlyEnabled : Bool;
+		var player : weak< PlayerPuppet >;
+		if( m_fastTravelLocks.Size() == 0 )
+		{
+			return;
+		}
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+		isCurrentlyEnabled = IsFastTravelEnabled();
+		for( i = m_fastTravelLocks.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( TDBID.IsValid( m_fastTravelLocks[ i ].linkedStatusEffectID ) )
+			{
+				if( !( StatusEffectSystem.ObjectHasStatusEffect( player, m_fastTravelLocks[ i ].linkedStatusEffectID ) ) )
+				{
+					m_fastTravelLocks.Erase( i );
+				}
+			}
+		}
+		if( isCurrentlyEnabled != IsFastTravelEnabled() )
+		{
+			RefreshFastTravelNodes();
+		}
+	}
+
+	public const function IsFastTravelEnabled() : Bool
+	{
+		return m_fastTravelLocks.Size() <= 0;
+	}
+
+	private function RegisterFastTravelPoint( pointData : FastTravelPointData, requesterID : EntityID )
+	{
+		var evt : FastTravelPointsUpdated;
+		var player : weak< PlayerPuppet >;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( player, 'BlockFastTravel' ) )
+		{
+			TutorialAddFastTravelFact();
+			return;
+		}
+		pointData.SetRequesterID( requesterID );
+		AddFastTravelPoint( pointData );
+		if( EntityID.IsDefined( requesterID ) )
+		{
+			evt = new FastTravelPointsUpdated;
+			evt.updateTrackingAlternative = true;
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( requesterID, evt );
+		}
+	}
+
+	private function UnregisterFastTravelPoint( pointData : FastTravelPointData, requesterID : EntityID )
+	{
+		var evt : FastTravelPointsUpdated;
+		RemoveFastTravelPoint( pointData );
+		if( EntityID.IsDefined( requesterID ) )
+		{
+			evt = new FastTravelPointsUpdated;
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( requesterID, evt );
+		}
+	}
+
+	private function RefreshFastTravelNodes()
+	{
+		var i : Int32;
+		var requesterID : EntityID;
+		var evt : FastTravelPointsUpdated;
+		for( i = 0; i < m_fastTravelNodes.Size(); i += 1 )
+		{
+			requesterID = m_fastTravelNodes[ i ].GetRequesterID();
+			if( EntityID.IsDefined( requesterID ) )
+			{
+				evt = new FastTravelPointsUpdated;
+				GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( requesterID, evt );
+			}
+		}
+	}
+
+	private function RegisterMappin( nodeData : FastTravelPointData )
+	{
+		var mappinData : MappinData;
+		if( !( nodeData.ShouldShowMappinOnWorldMap() ) )
+		{
+			return;
+		}
+		mappinData.mappinType = T"Mappins.FastTravelStaticMappin";
+		mappinData.variant = gamedataMappinVariant.FastTravelVariant;
+		mappinData.active = true;
+		nodeData.mappinID = GameInstance.GetMappinSystem( GetGameInstance() ).RegisterFastTravelMappin( mappinData, nodeData );
+	}
+
+	private function UnregisterMappin( nodeData : FastTravelPointData )
+	{
+		var invalidID : NewMappinID;
+		if( !( nodeData.ShouldShowMappinOnWorldMap() ) )
+		{
+			return;
+		}
+		GameInstance.GetMappinSystem( GetGameInstance() ).UnregisterMappin( nodeData.mappinID );
+		nodeData.mappinID = invalidID;
+	}
+
+	private export function OnRegisterFastTravelPointsRequest( request : RegisterFastTravelPointsRequest )
+	{
+		var i : Int32;
+		var requesterID : EntityID;
+		for( i = 0; i < request.fastTravelNodes.Size(); i += 1 )
+		{
+			if( request.register )
+			{
+				RegisterFastTravelPoint( request.fastTravelNodes[ i ], requesterID );
+			}
+			else
+			{
+				UnregisterFastTravelPoint( request.fastTravelNodes[ i ], requesterID );
+			}
+		}
+	}
+
+	private export function OnEnableFastTravelRequest( request : EnableFastTravelRequest )
+	{
+		var isCurrentlyEnabled : Bool;
+		isCurrentlyEnabled = IsFastTravelEnabled();
+		if( request.isEnabled )
+		{
+			RemoveFastTravelLock( request.reason );
+		}
+		else
+		{
+			AddFastTravelLock( request.reason, request.linkedStatusEffectID );
+		}
+		if( request.forceRefreshUI )
+		{
+			if( isCurrentlyEnabled != IsFastTravelEnabled() )
+			{
+				RefreshFastTravelNodes();
+			}
+		}
+	}
+
+	private function OnRemoveAllFastTravelLocksRequest( request : RemoveAllFastTravelLocksRequest )
+	{
+		var isCurrentlyEnabled : Bool;
+		isCurrentlyEnabled = IsFastTravelEnabled();
+		if( m_fastTravelLocks.Size() > 0 )
+		{
+			m_fastTravelLocks.Clear();
+			if( isCurrentlyEnabled != IsFastTravelEnabled() )
+			{
+				RefreshFastTravelNodes();
+			}
+			if( !( IsFinal() ) )
+			{
+				ShowDebug();
+			}
+		}
+	}
+
+	private export function OnRegisterFastTravelPointRequest( request : RegisterFastTravelPointRequest )
+	{
+		RegisterFastTravelPoint( request.pointData, request.requesterID );
+	}
+
+	private function OnUnregisterFastTravelPointRequest( request : UnregisterFastTravelPointRequest )
+	{
+		UnregisterFastTravelPoint( request.pointData, request.requesterID );
+	}
+
+	private function OnPerformFastTravelRequest( request : PerformFastTravelRequest )
+	{
+		PerformFastTravel( request.player, request.pointData );
+	}
+
+	private export function OnToggleFastTravelAvailabilityOnMapRequest( evt : FastTravelMenuToggledEvent )
+	{
+		m_isFastTravelEnabledOnMap = evt.isEnabled;
+		if( evt.isEnabled )
+		{
+			if( GameInstance.GetQuestsSystem( GetGameInstance() ).GetFact( 'tutorial_fast_travel' ) == 0 )
+			{
+				GameInstance.GetQuestsSystem( GetGameInstance() ).SetFact( 'tutorial_fast_travel', 1 );
+			}
+		}
+	}
+
+	private export function OnUpdateFastTravelPointRecordRequest( evt : UpdateFastTravelPointRecordRequest )
+	{
+		var blackBoard : IBlackboard;
+		blackBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().FastTRavelSystem );
+		blackBoard.SetVariant( GetAllBlackboardDefs().FastTRavelSystem.StartingPoint, evt.pointRecord );
+	}
+
+	private function OnRequestAutoSave( request : AutoSaveRequest )
+	{
+		RequestAutoSave();
+	}
+
+	private function RequestAutoSaveWithDelay()
+	{
+		var request : AutoSaveRequest;
+		request = new AutoSaveRequest;
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( GetClassName(), request, 0.5, false );
+	}
+
+	private function RequestAutoSave()
+	{
+		GameInstance.GetAutoSaveSystem( GetGameInstance() ).RequestCheckpoint();
+	}
+
+	private function RestoreFastTravelMappins()
+	{
+		var i : Int32;
+		for( i = m_fastTravelNodes.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( !( m_fastTravelNodes[ i ].IsValid() ) )
+			{
+				m_fastTravelNodes[ i ] = NULL;
+				m_fastTravelNodes.Erase( i );
+			}
+			else
+			{
+				RegisterMappin( m_fastTravelNodes[ i ] );
+			}
+		}
+	}
+
+	private function TutorialAddFastTravelFact()
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( GetGameInstance() );
+		if( ( questSystem.GetFact( 'fast_travel_tutorial' ) != 0 ) && ( questSystem.GetFact( 'fast_travel_tutorial_seen' ) == 0 ) )
+		{
+			questSystem.SetFact( 'fast_travel_tutorial', 0 );
+		}
+		else if( ( ( ( questSystem.GetFact( 'fast_travel_tutorial' ) == 0 ) && ( questSystem.GetFact( 'disable_tutorials' ) == 0 ) ) && ( questSystem.GetFact( 'q001_in_v_room' ) != 0 ) ) && IsFastTravelEnabled() )
+		{
+			questSystem.SetFact( 'fast_travel_tutorial', 1 );
+		}
+	}
+
+	public static function AddFastTravelLock( reason : CName, game : GameInstance, optional statusEffectID : TweakDBID )
+	{
+		FastTravelSystem.ManageFastTravelLock( false, reason, game, statusEffectID );
+	}
+
+	public static function RemoveFastTravelLock( reason : CName, game : GameInstance, optional statusEffectID : TweakDBID )
+	{
+		FastTravelSystem.ManageFastTravelLock( true, reason, game, statusEffectID );
+	}
+
+	public static function RemoveAllFastTravelLocks( game : GameInstance )
+	{
+		var request : RemoveAllFastTravelLocksRequest;
+		var ftSystem : FastTravelSystem;
+		request = new RemoveAllFastTravelLocksRequest;
+		ftSystem = ( ( FastTravelSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'FastTravelSystem' ) ) );
+		ftSystem.QueueRequest( request );
+	}
+
+	public static function ManageFastTravelLock( enable : Bool, reason : CName, game : GameInstance, optional statusEffectID : TweakDBID )
+	{
+		var request : EnableFastTravelRequest;
+		var ftSystem : FastTravelSystem;
+		request = new EnableFastTravelRequest;
+		request.isEnabled = enable;
+		request.reason = reason;
+		request.linkedStatusEffectID = statusEffectID;
+		ftSystem = ( ( FastTravelSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'FastTravelSystem' ) ) );
+		ftSystem.QueueRequest( request );
+	}
+
+	protected function OnFastTravelConsoleInstructionRequest( request : FastTravelConsoleInstructionRequest )
+	{
+		switch( request.instruction )
+		{
+			case EFastTravelSystemInstruction.Forward:
+			{
+				execInstructionForward( request.magicFloat );
+				break;
+			}
+			case EFastTravelSystemInstruction.Previous:
+			{
+				execInstructionPrevious();
+				break;
+			}
+			default:
+			{
+				break;
+			}
+		}
+	}
+
+	private function execInstructionForward( magicFloat : Float )
+	{
+		var player : GameObject;
+		var position : Vector4;
+		var rotation : EulerAngles;
+		player = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject();
+		if( !( player ) )
+		{
+			return;
+		}
+		position = player.GetWorldPosition() + ( WorldTransform.GetForward( player.GetWorldTransform() ) * magicFloat );
+		GameInstance.GetTeleportationFacility( GetGameInstance() ).Teleport( player, position, rotation );
+	}
+
+	private function execInstructionPrevious() {}
+
+	private function UninitializeDebugButtons()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "FastTravel" );
+		SDOSink.UnregisterListener_OnClicked( sink, this, m_lockLisenerID );
+		SDOSink.UnregisterListener_OnClicked( sink, this, m_unlockLisenerID );
+		SDOSink.UnregisterListener_OnClicked( sink, this, m_removeAllLocksLisenerID );
+	}
+
+	private function InitializeDebugButtons()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "FastTravel" );
+		SDOSink.PushString( sink, "Lock", "EXECUTE" );
+		SDOSink.PushString( sink, "Unlock", "EXECUTE" );
+		SDOSink.PushString( sink, "RemoveAllLocks", "EXECUTE" );
+		m_lockLisenerID = SDOSink.RegisterListener_OnClicked( sink, this, "Lock" );
+		m_unlockLisenerID = SDOSink.RegisterListener_OnClicked( sink, this, "Unlock" );
+		m_removeAllLocksLisenerID = SDOSink.RegisterListener_OnClicked( sink, this, "RemoveAllLocks" );
+	}
+
+	private function OnDebugButtonClicked( request : SDOClickedRequest )
+	{
+		if( request.key == 'Lock' )
+		{
+			FastTravelSystem.AddFastTravelLock( 'DEBUG', GetGameInstance() );
+		}
+		else if( request.key == 'Unlock' )
+		{
+			FastTravelSystem.RemoveFastTravelLock( 'DEBUG', GetGameInstance() );
+		}
+		else if( request.key == 'RemoveAllLocks' )
+		{
+			FastTravelSystem.RemoveAllFastTravelLocks( GetGameInstance() );
+		}
+	}
+
+	private function ShowDebug()
+	{
+		var sink : SDOSink;
+		var i : Int32;
+		var markerRef : String;
+		var dataTermID : String;
+		var record : String;
+		var lockReason : String;
+		var statusEffect : String;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "FastTravel" );
+		SDOSink.PushInt32( sink, "TOTAL_POINTS_ON_MAP:", ( ( Int32 )( m_fastTravelPointsTotal ) ) );
+		SDOSink.PushInt32( sink, "CURRENT_POINTS_ON_MAP:", ( ( Int32 )( GetAmmountOfFastTravelPointsOnMap() ) ) );
+		SDOSink.PushString( sink, "ALL_REGISTERED_POINTS:", ( ( String )( m_fastTravelNodes.Size() ) ) );
+		SDOSink.PushString( sink, "ACTIVE_LOCKS:", ( ( String )( m_fastTravelLocks.Size() ) ) );
+		if( m_fastTravelNodes.Size() <= 0 )
+		{
+			SDOSink.SetRoot( sink, "FastTravel/ALL_REGISTERED_POINTS:/POINT0" );
+			SDOSink.PushString( sink, "", "NONE" );
+			SDOSink.PushString( sink, "record", "NONE" );
+			SDOSink.PushString( sink, "marker_ref", "NONE" );
+			SDOSink.PushString( sink, "data_term_id", "NONE" );
+			SDOSink.PushBool( sink, "show_on_world_map", false );
+			SDOSink.PushBool( sink, "show_in_world", false );
+		}
+		for( i = 0; i < m_fastTravelNodes.Size(); i += 1 )
+		{
+			markerRef = ( ( String )( m_fastTravelNodes[ i ].GetMarkerRef() ) );
+			dataTermID = EntityID.ToDebugString( m_fastTravelNodes[ i ].GetRequesterID() );
+			record = TDBID.ToStringDEBUG( m_fastTravelNodes[ i ].GetPointRecord() );
+			SDOSink.SetRoot( sink, "FastTravel/ALL_REGISTERED_POINTS:/POINT" + ( ( String )( i ) ) );
+			SDOSink.PushString( sink, "", record );
+			SDOSink.PushString( sink, "record", record );
+			SDOSink.PushString( sink, "marker_ref", markerRef );
+			SDOSink.PushString( sink, "data_term_id", dataTermID );
+			SDOSink.PushBool( sink, "show_on_world_map", m_fastTravelNodes[ i ].ShouldShowMappinOnWorldMap() );
+			SDOSink.PushBool( sink, "show_in_world", m_fastTravelNodes[ i ].ShouldShowMappinInWorld() );
+		}
+		if( m_fastTravelLocks.Size() <= 0 )
+		{
+			SDOSink.SetRoot( sink, "FastTravel/ACTIVE_LOCKS:/LOCK0" );
+			SDOSink.PushString( sink, "", "NONE" );
+			SDOSink.PushString( sink, "reason", "NONE" );
+			SDOSink.PushString( sink, "status_effect", "NONE" );
+		}
+		for( i = 0; i < m_fastTravelLocks.Size(); i += 1 )
+		{
+			lockReason = ( ( String )( m_fastTravelLocks[ i ].lockReason ) );
+			statusEffect = TDBID.ToStringDEBUG( m_fastTravelLocks[ i ].linkedStatusEffectID );
+			SDOSink.SetRoot( sink, "FastTravel/ACTIVE_LOCKS:/LOCK" + ( ( String )( i ) ) );
+			SDOSink.PushString( sink, "", lockReason );
+			SDOSink.PushString( sink, "reason", lockReason );
+			SDOSink.PushString( sink, "status_effect", statusEffect );
+		}
+	}
+
+}
+
+class FastTravelConsoleInstructionRequest extends ScriptableSystemRequest
+{
+	var instruction : EFastTravelSystemInstruction;
+	var magicFloat : Float;
+}
+
+enum EFastTravelSystemInstruction
+{
+	Forward = 0,
+	Previous = 1,
+}
+
+exec function FastTravel_f( gameInstance : GameInstance, magicFloat : String )
+{
+	var request : FastTravelConsoleInstructionRequest;
+	var system : FastTravelSystem;
+	system = ( ( FastTravelSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'FastTravelSystem' ) ) );
+	if( system )
+	{
+		request = new FastTravelConsoleInstructionRequest;
+		request.instruction = EFastTravelSystemInstruction.Forward;
+		request.magicFloat = StringToFloat( magicFloat );
+		system.QueueRequest( request );
+	}
+}
+

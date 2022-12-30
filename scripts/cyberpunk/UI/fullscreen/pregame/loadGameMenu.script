@@ -1,0 +1,689 @@
+import class SaveMetadataInfo extends IScriptable
+{
+	import var saveIndex : Int32;
+	import var saveID : Uint32;
+	import var internalName : String;
+	import var locationName : String;
+	import var trackedQuest : String;
+	import var gameVersion : String;
+	import var lifePath : inkLifePath;
+	import var saveType : inkSaveType;
+	import var saveStatus : inkSaveStatus;
+	import var timestamp : Uint64;
+	import var playTime : Double;
+	import var playthroughTime : Double;
+	import var initialLoadingScreenID : Uint64;
+	import var level : Double;
+	import var isValid : Bool;
+	import var isModded : Bool;
+}
+
+class LoadGameMenuGameController extends gameuiSaveHandlingController
+{
+	private editable var m_list : inkCompoundRef;
+	private editable var m_noSavedGamesLabel : inkWidgetRef;
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_transitToLoadingAnimName : CName;
+	private editable var m_transitToLoadingSlotAnimName : CName;
+	private editable var m_animDelayBetweenSlots : Float;
+	private editable var m_animDelayForMainSlot : Float;
+	private editable var m_enableLoadingTransition : Bool;
+	private editable var m_gogButtonWidgetRef : inkWidgetRef;
+	private editable var m_gogContainer : inkWidgetRef;
+	private editable var m_laodingSpinner : inkWidgetRef;
+	private editable var m_scrollbar : inkWidgetRef;
+	private var m_eventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_loadComplete : Bool;
+	private var m_saveInfo : SaveMetadataInfo;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_saveToLoadIndex : Int32;
+	private var m_isInputDisabled : Bool;
+	private var m_saveTransferPopupToken : inkGameNotificationToken;
+	private var m_saves : array< String >;
+	private var m_saveFilesReady : Bool;
+	private var m_cloudSynced : Bool;
+	private var m_onlineSystem : weak< IOnlineSystem >;
+	private var m_systemHandler : weak< inkISystemRequestsHandler >;
+	private var m_pendingRegistration : Bool;
+
+	protected event OnInitialize()
+	{
+		m_onlineSystem = GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() );
+		m_systemHandler = GetSystemRequestsHandler();
+		m_systemHandler.RegisterToCallback( 'OnSavesForLoadReady', this, 'OnSavesForLoadReady' );
+		m_systemHandler.RegisterToCallback( 'OnSaveMetadataReady', this, 'OnSaveMetadataReady' );
+		m_systemHandler.RegisterToCallback( 'OnSaveDeleted', this, 'OnSaveDeleted' );
+		m_systemHandler.RegisterToCallback( 'OnGogLoginStatusChanged', this, 'OnGogLoginStatusChanged' );
+		m_systemHandler.RegisterToCallback( 'OnCloudSavesQueryStatusChanged', this, 'OnCloudSavesQueryStatusChanged' );
+		m_systemHandler.RequestSavesForLoad();
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+		PlayLibraryAnimation( 'intro' );
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		UpdateButtonHints( 1 );
+		m_isInputDisabled = false;
+		InitCrossProgression();
+		PlayLoadingAnimation();
+	}
+
+	protected event OnUninitialize()
+	{
+		m_systemHandler.CancelSavesRequest();
+		m_systemHandler.CancelSavedGameScreenshotRequests();
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
+		if( GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ) )
+		{
+			inkWidgetRef.UnregisterFromCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+		}
+	}
+
+	protected event OnRefreshGOGState( evt : RefreshGOGState )
+	{
+		if( evt.status == GOGRewardsSystemStatus.RegistrationPending )
+		{
+			m_pendingRegistration = true;
+		}
+		else if( m_pendingRegistration && evt.status == GOGRewardsSystemStatus.Registered )
+		{
+			m_pendingRegistration = false;
+			m_saveFilesReady = false;
+			m_cloudSynced = false;
+			PlayLoadingAnimation();
+			m_systemHandler.RequestSavesForLoad();
+		}
+	}
+
+	private function InitCrossProgression()
+	{
+		var hudGroup : ConfigGroup;
+		var settingsVar : ConfigVarBool;
+		var gameInst : GameInstance;
+		gameInst = GetPlayerControlledObject().GetGame();
+		hudGroup = GameInstance.GetSettingsSystem( gameInst ).GetGroup( '/gameplay/misc' );
+		settingsVar = ( ( ConfigVarBool )( hudGroup.GetVar( 'EnableCloudSaves' ) ) );
+		if( ( GameInstance.GetOnlineSystem( gameInst ) && settingsVar.GetValue() ) && settingsVar.IsVisible() )
+		{
+			inkWidgetRef.RegisterToCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, true );
+			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, false );
+			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, false );
+		}
+	}
+
+	private function PlayLoadingAnimation()
+	{
+		var i : Int32;
+		inkCompoundRef.RemoveAllChildren( m_list );
+		for( i = 0; i < 7; i += 1 )
+		{
+			SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListItemPlaceholder' );
+		}
+		inkWidgetRef.SetVisible( m_scrollbar, false );
+	}
+
+	private function StopLoadingAnimation()
+	{
+		inkWidgetRef.SetVisible( m_scrollbar, true );
+	}
+
+	protected event OnButtonRelease( evt : inkPointerEvent )
+	{
+		var transferSaveData : TransferSaveData;
+		if( evt.IsAction( 'back' ) )
+		{
+			m_eventDispatcher.SpawnEvent( 'OnMainMenuBack' );
+		}
+		else if( evt.IsAction( 'transfer_save' ) && IsTransferSavedImportSupported() )
+		{
+			transferSaveData = new TransferSaveData;
+			transferSaveData.action = TransferSaveAction.Import;
+			TransferSavedGame( transferSaveData );
+		}
+		else if( evt.IsAction( 'next_menu' ) )
+		{
+			GogLogin();
+			evt.Handle();
+		}
+	}
+
+	private function UpdateButtonHints( savesCount : Int32 )
+	{
+		m_buttonHintsController.ClearButtonHints();
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		if( IsTransferSavedImportSupported() )
+		{
+			m_buttonHintsController.AddButtonHint( 'transfer_save', "UI-Menus-ImportSave" );
+		}
+		if( savesCount > 0 )
+		{
+			m_buttonHintsController.AddButtonHint( 'delete_save', GetLocalizedText( "UI-Menus-DeleteSave" ) );
+			m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-UserActions-Select" ) );
+		}
+	}
+
+	private function SetupLoadItems( saves : array< String > )
+	{
+		var i : Int32;
+		for( i = 0; i < saves.Size(); i += 1 )
+		{
+			CreateLoadItem( i );
+		}
+	}
+
+	private function CreateLoadItem( index : Int32 )
+	{
+		var currButton : weak< inkCompoundWidget >;
+		var currLogic : weak< LoadListItem >;
+		currButton = ( ( inkCompoundWidget )( SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListItem' ) ) );
+		currButton.RegisterToCallback( 'OnRelease', this, 'OnRelease' );
+		currLogic = ( ( LoadListItem )( currButton.GetController() ) );
+		currLogic.SetData( index );
+		GetSystemRequestsHandler().RequestSavedGameScreenshot( index, currLogic.GetPreviewImageWidget() );
+	}
+
+	protected event OnRelease( e : inkPointerEvent )
+	{
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		if( !( m_isInputDisabled ) )
+		{
+			button = ( ( inkWidget )( e.GetCurrentTarget() ) );
+			controller = ( ( LoadListItem )( button.GetController() ) );
+			if( e.IsAction( 'click' ) && m_loadComplete == true )
+			{
+				if( controller.ValidSlot() )
+				{
+					LoadGame( controller );
+				}
+				PlaySound( 'Button', 'OnPress' );
+			}
+			if( e.IsAction( 'delete_save' ) && m_loadComplete == true )
+			{
+				PlaySound( 'SaveDeleteButton', 'OnPress' );
+				if( controller.IsCloud() )
+				{
+					GetSystemRequestsHandler().RequestSystemNotificationGeneric( 'UI-CrossProgression-Title', 'UI-CrossProgression-DeleteSaveRestriction' );
+				}
+				else
+				{
+					DeleteSavedGame( controller.Index() );
+				}
+			}
+		}
+	}
+
+	private function LoadGame( controller : LoadListItem )
+	{
+		var animOptions : inkAnimOptions;
+		var animProxy : inkAnimProxy;
+		if( controller.IsModded() )
+		{
+			LoadModdedSave( controller.Index() );
+		}
+		else if( GetSystemRequestsHandler().IsPreGame() )
+		{
+			PreSpawnInitialLoadingScreen( controller.GetInitialLoadingID() );
+			animProxy = PlayLibraryAnimation( m_transitToLoadingAnimName, animOptions );
+			if( m_enableLoadingTransition )
+			{
+				PlayTransitionAnimOnButtons( controller.Index() );
+				animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnTransitionFinished' );
+				m_saveToLoadIndex = controller.Index();
+				m_isInputDisabled = true;
+			}
+			else
+			{
+				LoadSaveInGame( controller.Index() );
+			}
+		}
+		else
+		{
+			LoadSaveInGame( controller.Index() );
+		}
+	}
+
+	private function PlayTransitionAnimOnButtons( sourceIndex : Int32 )
+	{
+		var i : Int32;
+		for( i = 0; i < sourceIndex; i += 1 )
+		{
+			PlayTransitionAnimOnButton( i, sourceIndex - i );
+		}
+		for( i = sourceIndex + 1; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+		{
+			PlayTransitionAnimOnButton( i, i - sourceIndex );
+		}
+		PlayTransitionAnimOnButton( sourceIndex, m_animDelayForMainSlot );
+	}
+
+	private function PlayTransitionAnimOnButton( index : Int32, distanceFromSource : Int32 )
+	{
+		PlayTransitionAnimOnButton( index, m_animDelayBetweenSlots * ( ( Float )( distanceFromSource ) ) );
+	}
+
+	private function PlayTransitionAnimOnButton( index : Int32, delay : Float )
+	{
+		var animOptions : inkAnimOptions;
+		var targetWidget : weak< inkWidget >;
+		animOptions.executionDelay = delay;
+		targetWidget = inkCompoundRef.GetWidgetByIndex( m_list, index );
+		targetWidget.GetController().PlayLibraryAnimation( m_transitToLoadingSlotAnimName, animOptions );
+	}
+
+	private function GogLogin()
+	{
+		var container : weak< inkCompoundWidget >;
+		var gogPopupWidget : inkWidget;
+		var gogPopupController : weak< GOGProfileLogicController >;
+		var hudGroup : ConfigGroup;
+		var settingsVar : ConfigVarBool;
+		var gameInst : GameInstance;
+		gameInst = GetPlayerControlledObject().GetGame();
+		hudGroup = GameInstance.GetSettingsSystem( gameInst ).GetGroup( '/gameplay/misc' );
+		settingsVar = ( ( ConfigVarBool )( hudGroup.GetVar( 'EnableCloudSaves' ) ) );
+		if( !( settingsVar.GetValue() ) || !( settingsVar.IsVisible() ) )
+		{
+			return;
+		}
+		PlaySound( 'Button', 'OnPress' );
+		container = ( ( inkCompoundWidget )( inkWidgetRef.Get( m_gogContainer ) ) );
+		if( container.GetNumChildren() )
+		{
+			container.RemoveAllChildren();
+		}
+		else
+		{
+			gogPopupWidget = SpawnFromExternal( container, R"base\gameplay\gui\fullscreen\main_menu\gog_popup.inkwidget", 'Root' );
+			if( gogPopupWidget != NULL )
+			{
+				gogPopupController = ( ( GOGProfileLogicController )( gogPopupWidget.GetController() ) );
+				if( gogPopupController != NULL )
+				{
+					gogPopupController.SetMenuState( EGOGMenuState.LoadGame );
+				}
+			}
+		}
+	}
+
+	protected event OnTransitionFinished( anim : inkAnimProxy )
+	{
+		LoadSaveInGame( m_saveToLoadIndex );
+	}
+
+	protected event OnSaveDeleted( result : Bool, idx : Int32 )
+	{
+		var i : Int32;
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		var savesCount : Int32;
+		if( result )
+		{
+			for( i = 0; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+			{
+				button = inkCompoundRef.GetWidgetByIndex( m_list, i );
+				controller = ( ( LoadListItem )( button.GetController() ) );
+				if( controller.Index() == idx )
+				{
+					inkCompoundRef.RemoveChild( m_list, button );
+					break;
+				}
+			}
+		}
+		savesCount = inkCompoundRef.GetNumChildren( m_list );
+		inkWidgetRef.SetVisible( m_noSavedGamesLabel, savesCount == 0 );
+		UpdateButtonHints( savesCount );
+	}
+
+	protected event OnGogLoginStatusChanged( bIsSignedIn : Bool )
+	{
+		var handler : weak< inkISystemRequestsHandler >;
+		handler = GetSystemRequestsHandler();
+		handler.CancelSavesRequest();
+		handler.RequestSavesForLoad();
+	}
+
+	protected event OnSavesForLoadReady( saves : array< String > )
+	{
+		m_saves = saves;
+		m_saveFilesReady = true;
+		UpdateSavesList();
+	}
+
+	protected event OnCloudSavesQueryStatusChanged( status : CloudSavesQueryStatus )
+	{
+		m_cloudSynced = true;
+		UpdateSavesList();
+	}
+
+	private function UpdateSavesList()
+	{
+		var savesCount : Int32;
+		if( m_saveFilesReady && m_cloudSynced )
+		{
+			m_saveFilesReady = false;
+			m_cloudSynced = false;
+			StopLoadingAnimation();
+			inkCompoundRef.RemoveAllChildren( m_list );
+			SetupLoadItems( m_saves );
+			savesCount = m_saves.Size();
+			inkWidgetRef.SetVisible( m_noSavedGamesLabel, savesCount == 0 );
+			UpdateButtonHints( savesCount );
+			m_loadComplete = true;
+		}
+	}
+
+	protected event OnSaveMetadataReady( info : SaveMetadataInfo )
+	{
+		var i : Int32;
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		var characterCustomizationSystem : gameuiICharacterCustomizationSystem;
+		characterCustomizationSystem = GameInstance.GetCharacterCustomizationSystem( GetPlayerControlledObject().GetGame() );
+		for( i = 0; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+		{
+			button = inkCompoundRef.GetWidgetByIndex( m_list, i );
+			controller = ( ( LoadListItem )( button.GetController() ) );
+			if( controller.Index() == info.saveIndex )
+			{
+				if( info.isValid )
+				{
+					controller.SetMetadata( info );
+					controller.CheckThumbnailCensorship( !( characterCustomizationSystem.IsNudityAllowed() ) );
+				}
+				else
+				{
+					controller.SetInvalid( info.internalName );
+				}
+				break;
+			}
+		}
+	}
+
+	protected event OnGogPressed( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			GogLogin();
+			evt.Handle();
+		}
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		m_eventDispatcher = menuEventDispatcher;
+	}
+
+}
+
+class LoadListItem extends AnimatedListItemController
+{
+	private editable var m_imageReplacement : inkImageRef;
+	private editable var m_label : inkTextRef;
+	private editable var m_labelDate : inkTextRef;
+	private editable var m_type : inkTextRef;
+	private editable var m_quest : inkTextRef;
+	private editable var m_level : inkTextRef;
+	private editable var m_lifepath : inkImageRef;
+	private editable var m_cloudStatus : inkImageRef;
+	private editable var m_playTime : inkTextRef;
+	private editable var m_characterLevel : inkTextRef;
+	private editable var m_characterLevelLabel : inkTextRef;
+	private editable var m_gameVersion : inkTextRef;
+	private editable var m_emptySlotWrapper : inkWidgetRef;
+	private editable var m_wrapper : inkWidgetRef;
+	private var m_versionParams : inkTextParams;
+	private var m_index : Int32;
+	private var m_emptySlot : Bool;
+	private var m_validSlot : Bool;
+	private var m_initialLoadingID : Uint64;
+	private var m_metadata : SaveMetadataInfo;
+	private const var m_defaultAtlasPath : ResRef;
+	default m_defaultAtlasPath = R"base\gameplay\gui\fullscreen\load_game\save_game.inkatlas";
+
+	protected event OnInitialize()
+	{
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+		super.OnInitialize();
+		m_validSlot = true;
+		inkWidgetRef.SetVisible( m_emptySlotWrapper, false );
+		inkWidgetRef.SetVisible( m_wrapper, false );
+		inkTextRef.SetVisible( m_label, false );
+		inkTextRef.SetVisible( m_labelDate, false );
+		inkTextRef.SetVisible( m_type, false );
+		inkTextRef.SetVisible( m_playTime, false );
+		inkImageRef.SetVisible( m_lifepath, false );
+		inkImageRef.SetVisible( m_cloudStatus, false );
+		inkTextRef.SetVisible( m_level, false );
+		inkTextRef.SetVisible( m_quest, false );
+		inkTextRef.SetVisible( m_characterLevel, false );
+		inkTextRef.SetVisible( m_characterLevelLabel, false );
+		inkTextRef.SetVisible( m_gameVersion, false );
+		m_versionParams = new inkTextParams;
+		m_versionParams.AddString( "version_num", "--" );
+		inkTextRef.SetLocalizedText( m_gameVersion, 'UI-Settings-Audio-GameVersion', m_versionParams );
+	}
+
+	public function SetMetadata( metadata : SaveMetadataInfo )
+	{
+		var hrs, mins, lvl : Int32;
+		var shrs, smins : String;
+		var finalString : String;
+		var playthroughTime : Float;
+		m_metadata = metadata;
+		inkWidgetRef.SetVisible( m_wrapper, true );
+		inkTextRef.SetVisible( m_label, true );
+		inkTextRef.SetVisible( m_labelDate, true );
+		inkTextRef.SetVisible( m_type, true );
+		inkTextRef.SetVisible( m_playTime, true );
+		inkImageRef.SetVisible( m_imageReplacement, true );
+		inkImageRef.SetVisible( m_lifepath, true );
+		inkImageRef.SetVisible( m_cloudStatus, true );
+		inkTextRef.SetVisible( m_level, true );
+		inkTextRef.SetVisible( m_quest, true );
+		inkTextRef.SetVisible( m_characterLevel, true );
+		inkTextRef.SetVisible( m_characterLevelLabel, true );
+		inkTextRef.SetVisible( m_gameVersion, true );
+		inkTextRef.SetText( m_label, metadata.trackedQuest );
+		inkTextRef.SetText( m_quest, metadata.internalName );
+		inkTextRef.SetText( m_type, metadata.locationName );
+		m_versionParams.UpdateString( "version_num", metadata.gameVersion );
+		m_initialLoadingID = metadata.initialLoadingScreenID;
+		playthroughTime = MaxF( ( ( Float )( metadata.playthroughTime ) ), ( ( Float )( metadata.playTime ) ) );
+		hrs = RoundF( playthroughTime / 3600.0 );
+		mins = RoundF( ( playthroughTime % 3600.0 ) / 60.0 );
+		if( hrs > 9 )
+		{
+			shrs = ( ( String )( hrs ) );
+		}
+		else
+		{
+			shrs = ( ( String )( hrs ) );
+		}
+		if( mins > 9 )
+		{
+			smins = ( ( String )( mins ) );
+		}
+		else
+		{
+			smins = ( ( String )( mins ) );
+		}
+		if( hrs != 0 )
+		{
+			finalString = shrs + GetLocalizedText( "UI-Labels-Units-Hours" );
+		}
+		if( mins != 0 )
+		{
+			finalString = ( ( hrs != 0 ) ? ( finalString + " " ) : ( finalString ) );
+			finalString = ( finalString + smins ) + GetLocalizedText( "UI-Labels-Units-Minutes" );
+		}
+		inkTextRef.SetText( m_playTime, finalString );
+		inkTextRef.SetDateTimeByTimestamp( m_labelDate, metadata.timestamp );
+		lvl = RoundF( ( ( Float )( metadata.level ) ) );
+		inkTextRef.SetText( m_characterLevel, ( ( String )( lvl ) ) );
+		if( lvl == 0 )
+		{
+			inkTextRef.SetVisible( m_characterLevel, false );
+			inkTextRef.SetVisible( m_characterLevelLabel, false );
+		}
+		if( metadata.lifePath == inkLifePath.Corporate )
+		{
+			inkImageRef.SetTexturePart( m_lifepath, 'LifepathCorpo1' );
+			inkTextRef.SetText( m_level, "Gameplay-LifePaths-Corporate" );
+		}
+		if( metadata.lifePath == inkLifePath.Nomad )
+		{
+			inkImageRef.SetTexturePart( m_lifepath, 'LifepathNomad1' );
+			inkTextRef.SetText( m_level, "Gameplay-LifePaths-Nomad" );
+		}
+		if( metadata.lifePath == inkLifePath.StreetKid )
+		{
+			inkImageRef.SetTexturePart( m_lifepath, 'LifepathStreetKid1' );
+			inkTextRef.SetText( m_level, "Gameplay-LifePaths-Streetkid" );
+		}
+		switch( metadata.saveStatus )
+		{
+			case inkSaveStatus.Invalid:
+			case inkSaveStatus.Local:
+				inkImageRef.SetVisible( m_cloudStatus, false );
+			break;
+			case inkSaveStatus.Upload:
+				inkImageRef.SetTexturePart( m_cloudStatus, 'icon_cloud_upload' );
+			inkImageRef.SetVisible( m_cloudStatus, true );
+			break;
+			case inkSaveStatus.Cloud:
+				inkImageRef.SetTexturePart( m_cloudStatus, 'icon_cloud' );
+			inkImageRef.SetVisible( m_cloudStatus, true );
+			break;
+			case inkSaveStatus.InSync:
+				inkImageRef.SetTexturePart( m_cloudStatus, 'icon_cloud_insync' );
+			inkImageRef.SetVisible( m_cloudStatus, true );
+			break;
+		}
+	}
+
+	public function SetInvalid( label : String )
+	{
+		m_validSlot = false;
+		inkWidgetRef.SetVisible( m_wrapper, true );
+		inkTextRef.SetVisible( m_label, true );
+		inkTextRef.SetVisible( m_quest, true );
+		inkTextRef.SetText( m_label, "UI-Menus-Saving-CorruptedSaveTitle" );
+		inkTextRef.SetText( m_quest, label );
+	}
+
+	public function SetData( index : Int32, optional emptySlot : Bool )
+	{
+		m_index = index;
+		if( emptySlot )
+		{
+			m_emptySlot = true;
+			inkWidgetRef.SetVisible( m_wrapper, false );
+			inkWidgetRef.SetVisible( m_emptySlotWrapper, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_wrapper, false );
+			inkWidgetRef.SetVisible( m_emptySlotWrapper, false );
+		}
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		PlayLibraryAnimation( 'pause_button_hover_over_anim' );
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		PlayLibraryAnimation( 'pause_button_hover_out_anim' );
+	}
+
+	public function IsCloud() : Bool
+	{
+		return ( m_metadata.saveStatus == inkSaveStatus.Upload || m_metadata.saveStatus == inkSaveStatus.Cloud ) || m_metadata.saveStatus == inkSaveStatus.InSync;
+	}
+
+	public function IsModded() : Bool
+	{
+		return m_metadata.isModded;
+	}
+
+	public function Index() : Int32
+	{
+		return m_index;
+	}
+
+	public function EmptySlot() : Bool
+	{
+		return m_emptySlot;
+	}
+
+	public function ValidSlot() : Bool
+	{
+		return m_validSlot;
+	}
+
+	public function GetInitialLoadingID() : Uint64
+	{
+		return m_initialLoadingID;
+	}
+
+	public function GetPreviewImageWidget() : weak< inkImage >
+	{
+		return ( ( inkImage )( inkImageRef.Get( m_imageReplacement ) ) );
+	}
+
+	public function CheckThumbnailCensorship( IsBuildCensored : Bool )
+	{
+		if( IsBuildCensored && IsCloud() )
+		{
+			inkImageRef.SetAtlasResource( m_imageReplacement, m_defaultAtlasPath );
+			inkImageRef.SetActiveTextureType( m_imageReplacement, inkTextureType.StaticTexture );
+			inkImageRef.SetTexturePart( m_imageReplacement, 'cross_prog_icon' );
+		}
+	}
+
+}
+
+import enum inkLifePath : Uint8
+{
+	Corporate,
+	StreetKid,
+	Nomad,
+	Invalid,
+}
+
+import enum inkSaveType : Uint8
+{
+	ManualSave,
+	QuickSave,
+	AutoSave,
+	PointOfNoReturn,
+	EndGameSave,
+}
+
+import enum inkSaveStatus : Uint8
+{
+	Invalid,
+	Local,
+	Upload,
+	Cloud,
+	InSync,
+}
+
+import enum inkSaveTransferStatus : Uint8
+{
+	ExportStarted,
+	ExportSuccess,
+	ExportFailed,
+	ImportChecking,
+	ImportStarted,
+	ImportSuccess,
+	ImportNoSave,
+	ImportFailed,
+	ImportNotEnoughSpace,
+}
+

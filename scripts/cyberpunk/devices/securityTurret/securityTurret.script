@@ -1,0 +1,875 @@
+class TurretShootingIntervalEvent extends Event
+{
+}
+
+class TurretBurstShootingDelayEvent extends Event
+{
+}
+
+class AutoKillDelayEvent extends Event
+{
+}
+
+class GrabReferenceToWeaponEvent extends Event
+{
+}
+
+class SecurityTurretReplicatedState extends DeviceReplicatedState
+{
+	var m_isOn : Bool;
+	var m_isShooting : Bool;
+	var m_isDead : Bool;
+	var m_health : Float;
+}
+
+class SecurityTurret extends SensorDevice
+{
+	default m_defaultSensePreset = T"Senses.BasicTurret";
+	default m_controllerTypeName = 'SecurityTurretController';
+	default m_idleSound = 'idleStart';
+	default m_idleSoundStop = 'idleStop';
+	default m_soundDeviceON = 'activated';
+	default m_soundDeviceOFF = 'deactivated';
+	default m_soundDeviceDestroyed = 'destroyed';
+	private var m_animFeature : AnimFeature_SecurityTurretData;
+	private var m_animFeatureName : CName;
+	default m_animFeatureName = 'SecurityTurretData';
+	private var m_lookAtSlot : SlotComponent;
+	private var m_laserMesh : MeshComponent;
+	private var m_targetingComp : TargetingComponent;
+	protected var m_triggerSideOne : TriggerComponent;
+	protected var m_triggerSideTwo : TriggerComponent;
+	protected var m_weapon : weak< WeaponObject >;
+	protected var itemID : ItemID;
+	protected var m_laserGameEffect : EffectInstance;
+	protected var m_laserFXSlotName : CName;
+	default m_laserFXSlotName = 'laser';
+	private var m_burstDelayEvtID : DelayID;
+	private var m_isBurstDelayOngoing : Bool;
+	private var m_nextShootCycleDelayEvtID : DelayID;
+	private var m_isShootingOngoing : Bool;
+	private var m_timeToNextShot : Float;
+	private var optim_CheckTargetParametersShots : Int32;
+	private var m_netClientCurrentlyAppliedState : SecurityTurretReplicatedState;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'updateComponent', 'UpdateComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'slot', 'SlotComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'laserMesh', 'MeshComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'targeting', 'gameTargetingComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'SideOne', 'gameStaticTriggerAreaComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'SideTwo', 'gameStaticTriggerAreaComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'light_guns', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'light_arm', 'gameLightComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'light_cam', 'gameLightComponent', false );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		m_lookAtSlot = ( ( SlotComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'slot' ) ) );
+		m_laserMesh = ( ( MeshComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'laserMesh' ) ) );
+		m_targetingComp = ( ( TargetingComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'targeting' ) ) );
+		m_triggerSideOne = ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'SideOne' ) ) );
+		m_triggerSideTwo = ( ( TriggerComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'SideTwo' ) ) );
+		m_lightScanRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'light_guns' ) ) ) );
+		m_lightScanRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'light_arm' ) ) ) );
+		m_lightScanRefs.PushBack( ( ( gameLightComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'light_cam' ) ) ) );
+		m_animFeature = new AnimFeature_SecurityTurretData;
+		super.OnTakeControl( ri );
+		m_controller = ( ( SecurityTurretController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
+	}
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		if( IsClient() )
+		{
+			m_netClientCurrentlyAppliedState = new SecurityTurretReplicatedState;
+		}
+		GiveWeaponToTurret();
+		SetSenseObjectType( gamedataSenseObjectType.Turret );
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		TerminateGameEffect( m_laserGameEffect );
+		GameInstance.GetTransactionSystem( GetGame() ).RemoveItemFromSlot( this, T"AttachmentSlots.WeaponRight" );
+	}
+
+	public export const override function IsTurret() : Bool
+	{
+		return true;
+	}
+
+	protected const override function GetScannerName() : String
+	{
+		return "LocKey#2056";
+	}
+
+	protected override function PushPersistentData()
+	{
+		GetDevicePS().PushPersistentData();
+		super.PushPersistentData();
+	}
+
+	private const override function GetController() : SecurityTurretController
+	{
+		return ( ( SecurityTurretController )( m_controller ) );
+	}
+
+	public const override function GetDevicePS() : SecurityTurretControllerPS
+	{
+		return GetController().GetPS();
+	}
+
+	protected override function SetLookAtPositionProviderOnFollowedTarget( evt : LookAtAddEvent, optional otherTarget : GameObject )
+	{
+		var collisionPositionProvider : IPositionProvider;
+		var targetPositionProvider : IPositionProvider;
+		var ownerPositionProvider : IPositionProvider;
+		var targetVelocityProvider : IVelocityProvider;
+		if( ( ( ( ScriptedPuppet )( GetCurrentlyFollowedTarget() ) ) == NULL ) && ( ( ( ScriptedPuppet )( otherTarget ) ) == NULL ) )
+		{
+			super.SetLookAtPositionProviderOnFollowedTarget( evt, otherTarget );
+			return;
+		}
+		if( otherTarget )
+		{
+			evt.SetEntityTarget( otherTarget, 'Chest', Vector4.EmptyVector() );
+			targetVelocityProvider = MoveComponentVelocityProvider.CreateMoveComponentVelocityProvider( ( ( ScriptedPuppet )( otherTarget ) ) );
+		}
+		else
+		{
+			evt.SetEntityTarget( GetCurrentlyFollowedTarget(), 'Chest', Vector4.EmptyVector() );
+			targetVelocityProvider = MoveComponentVelocityProvider.CreateMoveComponentVelocityProvider( ( ( ScriptedPuppet )( GetCurrentlyFollowedTarget() ) ) );
+		}
+		targetPositionProvider = evt.targetPositionProvider;
+		evt.targetPositionProvider = NULL;
+		ownerPositionProvider = IPositionProvider.CreateSlotPositionProvider( GetWeapon(), 'Muzzle' );
+		collisionPositionProvider = IPositionProvider.CreateCollisionPredictionPositionProvider( targetPositionProvider, ownerPositionProvider, targetVelocityProvider, 140.0 );
+		evt.SetPositionProvider( collisionPositionProvider );
+	}
+
+	protected override function TurnOffDevice()
+	{
+		super.TurnOffDevice();
+		ShootStop();
+		m_animFeature.Shoot = false;
+		ToggleAreaIndicator( false );
+		m_targetingComp.Toggle( false );
+		TerminateGameEffect( m_laserGameEffect );
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+		ReplicateIsOn( false );
+	}
+
+	protected override function CutPower()
+	{
+		TurnOffDevice();
+		if( GetDevicePS().IsBroken() )
+		{
+			DestroySensor();
+		}
+	}
+
+	protected override function TurnOnDevice()
+	{
+		if( GetDevicePS().GetDurabilityState() == EDeviceDurabilityState.BROKEN )
+		{
+			return;
+		}
+		ReplicateIsOn( true );
+		super.TurnOnDevice();
+		RunGameEffect( m_laserGameEffect, GetDevicePS().GetLaserGameEffectRef(), m_laserFXSlotName, 10.0 );
+		m_targetingComp.Toggle( true );
+		m_animFeature.isRippedOff = false;
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+	}
+
+	protected event OnTCSTakeOverControlActivate( evt : TCSTakeOverControlActivate )
+	{
+		super.OnTCSTakeOverControlActivate( evt );
+		GameInstance.GetAudioSystem( GetGame() ).AddTriggerEffect( 'te_wea_trigger_trigger', 'TCS_turretTrigger' );
+		if( IsTaggedinFocusMode() )
+		{
+			TerminateGameEffect( m_laserGameEffect );
+		}
+	}
+
+	protected event OnTCSTakeOverControlDeactivate( evt : TCSTakeOverControlDeactivate )
+	{
+		super.OnTCSTakeOverControlDeactivate( evt );
+		ShootStop();
+		GameInstance.GetAudioSystem( GetGame() ).RemoveTriggerEffect( 'TCS_turretTrigger' );
+		GameInstance.GetAudioSystem( GetGame() ).RemoveTriggerEffect( 'TCS_Shoot' );
+		GameInstance.GetAudioSystem( GetGame() ).Play( 'motion_loop_heavy_stop' );
+		if( IsTaggedinFocusMode() )
+		{
+			RunGameEffect( m_laserGameEffect, GetDevicePS().GetLaserGameEffectRef(), m_laserFXSlotName, 10.0 );
+		}
+	}
+
+	protected function GetWeapon() : weak< WeaponObject >
+	{
+		GrabReferenceToWeapon();
+		return m_weapon;
+	}
+
+	protected function GiveWeaponToTurret()
+	{
+		var transactionSystem : TransactionSystem;
+		var slotsIDs : array< TweakDBID >;
+		var grabWeaponEvent : GrabReferenceToWeaponEvent;
+		if( !( m_weapon ) )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( GetGame() );
+			if( GetDevicePS().GetWeaponItemRecordString() == "" )
+			{
+				itemID = ItemID.FromTDBID( T"Items.w_special_flak" );
+			}
+			else
+			{
+				itemID = ItemID.FromTDBID( TDBID.Create( "Items." + ( ( SecurityTurretControllerPS )( GetDevicePS() ) ).GetWeaponItemRecordString() ) );
+			}
+			if( transactionSystem.GiveItem( this, itemID, 1 ) )
+			{
+				slotsIDs.PushBack( T"AttachmentSlots.WeaponRight" );
+				transactionSystem.InitializeSlots( this, slotsIDs );
+				if( transactionSystem.CanPlaceItemInSlot( this, slotsIDs[ 0 ], itemID ) )
+				{
+					transactionSystem.AddItemToSlot( this, slotsIDs[ 0 ], itemID );
+					grabWeaponEvent = new GrabReferenceToWeaponEvent;
+					GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, grabWeaponEvent, 0.5 );
+				}
+			}
+		}
+	}
+
+	protected event OnGrabReferenceToWeaponEvent( evt : GrabReferenceToWeaponEvent )
+	{
+		GrabReferenceToWeapon();
+	}
+
+	protected function GrabReferenceToWeapon()
+	{
+		if( !( m_weapon ) )
+		{
+			m_weapon = ( ( WeaponObject )( GameInstance.GetTransactionSystem( this.GetGame() ).GetItemInSlot( this, T"AttachmentSlots.WeaponRight" ) ) );
+			if( IsClient() && m_netClientCurrentlyAppliedState.m_isShooting )
+			{
+				ShootStart();
+			}
+		}
+	}
+
+	public override function SetAsIntrestingTarget( target : weak< GameObject > ) : Bool
+	{
+		return super.SetAsIntrestingTarget( target );
+	}
+
+	public override function OnCurrentTargetAppears( target : weak< GameObject > )
+	{
+		if( !( m_animFeature.Shoot ) )
+		{
+			m_laserMesh.Toggle( true );
+			super.OnCurrentTargetAppears( target );
+			if( GetDevicePS().IsPartOfPrevention() )
+			{
+				PlaySoundEvent( this, 'gmp_ui_prevention_turret_aim' );
+				PreventionSystem.CombatStartedRequestToPreventionSystem( GetGame(), this );
+			}
+		}
+	}
+
+	protected event OnTargetLocked( evt : TargetLockedEvent )
+	{
+		if( IsHost() )
+		{
+			if( GetDevicePS().IsBroken() )
+			{
+				return false;
+			}
+			super.OnTargetLocked( evt );
+			SelectShootingPattern( GetWeapon(), this, true );
+			ShootStart();
+		}
+	}
+
+	public override function OnAllValidTargetsDisappears()
+	{
+		if( IsHost() )
+		{
+			super.OnAllValidTargetsDisappears();
+			if( GetDevicePS().IsPartOfPrevention() )
+			{
+				PlaySoundEvent( this, 'gmp_turret_prevention_aim_off' );
+			}
+			ShootStop();
+			if( m_laserMesh )
+			{
+				m_laserMesh.Toggle( false );
+			}
+		}
+	}
+
+	public override function ControlledDeviceInputAction( isPressed : Bool )
+	{
+		if( isPressed )
+		{
+			ShootStart();
+			GameInstance.GetAudioSystem( GetGame() ).AddTriggerEffect( 'te_wea_turret_shoot', 'TCS_Shoot' );
+			GameInstance.GetAudioSystem( GetGame() ).Play( 'motion_loop_heavy_2d' );
+			if( IsTemporaryAttitudeChanged() )
+			{
+				ChangeTemporaryAttitude();
+			}
+		}
+		else
+		{
+			GameInstance.GetAudioSystem( GetGame() ).RemoveTriggerEffect( 'TCS_Shoot' );
+			GameInstance.GetAudioSystem( GetGame() ).Play( 'motion_loop_heavy_stop' );
+			ShootStop();
+		}
+	}
+
+	protected function SelectShootingPattern( weapon : weak< WeaponObject >, weaponOwner : weak< GameObject >, optional forceReselection : Bool )
+	{
+		var chosenPackage : weak< AIPatternsPackage_Record >;
+		var patternsList : array< weak< AIPattern_Record > >;
+		var selectedPattern : weak< AIPattern_Record >;
+		if( GetDevicePS().IsPartOfPrevention() || GetDevicePS().IsControlledByPlayer() )
+		{
+			return;
+		}
+		chosenPackage = TweakDBInterface.GetAIPatternsPackageRecord( T"ShootingPatterns.TurretShootingPackage" );
+		if( AIWeapon.GetShootingPatternsList( weaponOwner, weapon, chosenPackage, patternsList ) || forceReselection )
+		{
+			if( patternsList.Size() > 0 )
+			{
+				AIWeapon.SelectShootingPatternFromList( weapon, patternsList, selectedPattern );
+			}
+		}
+		if( selectedPattern )
+		{
+			AIWeapon.SetShootingPattern( weapon, selectedPattern );
+			AIWeapon.SetShootingPatternPackage( weapon, chosenPackage );
+			AIWeapon.SetPatternRange( weapon, patternsList );
+		}
+	}
+
+	private function ShootStart()
+	{
+		var ps : SecurityTurretControllerPS;
+		if( m_isBurstDelayOngoing )
+		{
+			return;
+		}
+		ps = GetDevicePS();
+		if( !( ps.IsON() ) || ( ( GetSensorDeviceState() != ESensorDeviceStates.TARGETLOCK && !( ps.IsInFollowMode() ) ) && !( ps.IsControlledByPlayer() ) ) )
+		{
+			return;
+		}
+		if( !( GetWeapon() ) )
+		{
+			return;
+		}
+		ReplicateIsShooting( true );
+		m_animFeature.Shoot = true;
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+		ShootAttachedWeapon( true );
+	}
+
+	private function ShootStop()
+	{
+		ReplicateIsShooting( false );
+		m_animFeature.Shoot = false;
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+		if( m_isBurstDelayOngoing )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_burstDelayEvtID );
+			m_isBurstDelayOngoing = false;
+		}
+		if( m_isShootingOngoing )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_nextShootCycleDelayEvtID );
+			m_isShootingOngoing = false;
+		}
+	}
+
+	protected function GetFirerate() : Float
+	{
+		return m_timeToNextShot;
+	}
+
+	private function SetFirerate( value : Float )
+	{
+		m_timeToNextShot = value;
+	}
+
+	private function MultiplyBaseAIRecoil() : Float
+	{
+		return GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetWeapon().GetEntityID(), gamedataStatType.SpreadMaxAI ) * 0.1;
+	}
+
+	private function ShootAttachedWeapon( optional shootStart : Bool )
+	{
+		var weaponRecord : weak< WeaponItem_Record >;
+		var simTime : Float;
+		var shouldTrackTarget : Bool;
+		var vehicle : weak< VehicleObject >;
+		var shootObject : weak< GameObject >;
+		var timeToNextShot : Float;
+		if( !( m_animFeature.Shoot ) )
+		{
+			return;
+		}
+		simTime = EngineTime.ToFloat( GameInstance.GetSimTime( GetGame() ) );
+		if( shootStart )
+		{
+			timeToNextShot = AIWeapon.GetNextShotTimeStamp( GetWeapon() ) - simTime;
+			if( timeToNextShot > 0.0 )
+			{
+				QueueNextShot( timeToNextShot );
+				return;
+			}
+		}
+		weaponRecord = ( ( WeaponItem_Record )( TweakDBInterface.GetItemRecord( ItemID.GetTDBID( GetWeapon().GetItemID() ) ) ) );
+		SelectShootingPattern( GetWeapon(), this );
+		if( GetDevicePS().IsPartOfPrevention() )
+		{
+			AIWeapon.Fire( this, GetWeapon(), simTime, 1.0, weaponRecord.PrimaryTriggerMode().Type(), GetCurrentlyFollowedTarget().GetWorldPosition(), GetCurrentlyFollowedTarget(), , 1.5, , , , , m_currentLookAtEventHor.targetPositionProvider );
+		}
+		else if( GetDevicePS().IsControlledByPlayer() )
+		{
+			AIWeapon.Fire( GetPlayer( GetGame() ), GetWeapon(), simTime, 1.0, weaponRecord.PrimaryTriggerMode().Type() );
+		}
+		else
+		{
+			shouldTrackTarget = ( GetCurrentlyFollowedTarget().GetEntityID() == GetDevicePS().GetForcedTargetID() ) && GetDevicePS().IsInFollowMode();
+			shootObject = GetCurrentlyFollowedTarget();
+			if( shootObject.IsPlayer() )
+			{
+				if( VehicleComponent.GetVehicle( GetCurrentlyFollowedTarget().GetGame(), GetCurrentlyFollowedTarget().GetEntityID(), vehicle ) )
+				{
+					if( ( ( TankObject )( vehicle ) ) )
+					{
+						shootObject = vehicle;
+					}
+				}
+			}
+			AIWeapon.Fire( this, GetWeapon(), simTime, 1.0, weaponRecord.PrimaryTriggerMode().Type(), shootObject.GetWorldPosition(), shootObject, , , , , shouldTrackTarget, , m_currentLookAtEventHor.targetPositionProvider );
+		}
+		AnimationControllerComponent.PushEvent( this, 'Shoot' );
+		AIWeapon.QueueNextShot( GetWeapon(), weaponRecord.PrimaryTriggerMode().Type(), simTime );
+		SetFirerate( AIWeapon.GetNextShotTimeStamp( GetWeapon() ) - simTime );
+		ApplyShootingInterval();
+		optim_CheckTargetParametersShots += 1;
+		CheckTargetParameters();
+		GameObjectEffectHelper.StartEffectEvent( this, StringToName( GetDevicePS().GetVfxNameOnShoot() ) );
+	}
+
+	private function ProcessShootingPattern() {}
+
+	private function ApplyShootingInterval()
+	{
+		var intervalDelay : TurretBurstShootingDelayEvent;
+		var pattern : weak< AIPattern_Record >;
+		var delay : Float;
+		pattern = AIWeapon.GetShootingPattern( GetWeapon() );
+		delay = AIWeapon.GetShootingPatternDelayBetweenShots( AIWeapon.GetTotalNumberOfShots( GetWeapon() ), pattern );
+		if( delay > 0.0 )
+		{
+			ShootStop();
+			intervalDelay = new TurretBurstShootingDelayEvent;
+			m_burstDelayEvtID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, intervalDelay, delay );
+			m_isBurstDelayOngoing = true;
+		}
+		else
+		{
+			QueueNextShot( GetFirerate() );
+		}
+	}
+
+	private function QueueNextShot( delay : Float )
+	{
+		var interval : TurretShootingIntervalEvent;
+		if( m_nextShootCycleDelayEvtID != GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_nextShootCycleDelayEvtID );
+		}
+		interval = new TurretShootingIntervalEvent;
+		m_nextShootCycleDelayEvtID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, interval, GetFirerate() );
+		m_isShootingOngoing = true;
+	}
+
+	protected event OnTurretShootingIntervalEvent( evt : TurretShootingIntervalEvent )
+	{
+		ShootAttachedWeapon();
+	}
+
+	protected event OnTurretBurstShootingDelayEvent( evt : TurretBurstShootingDelayEvent )
+	{
+		m_isBurstDelayOngoing = false;
+		ShootStart();
+	}
+
+	protected function CheckTargetParameters()
+	{
+		if( optim_CheckTargetParametersShots > 5 )
+		{
+			if( GetAttitudeBetween( this, GetCurrentlyFollowedTarget() ) == EAIAttitude.AIA_Friendly )
+			{
+				ReevaluateTargets();
+				optim_CheckTargetParametersShots = 0;
+			}
+		}
+	}
+
+	protected event OnRipOff( evt : RipOff )
+	{
+		RipOffTurret();
+		GrabReferenceToWeapon();
+		UpdateDeviceState();
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new AutoKillDelayEvent, 3.0 );
+		m_animFeature.isRippedOff = true;
+		if( GetRipOffTriggerSide( evt.GetExecutor() ) == EDoorTriggerSide.ONE )
+		{
+			m_animFeature.ripOffSide = true;
+		}
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+		m_senseComponent.RequestRemovingSenseMappin();
+		GetDevicePS().TriggerSecuritySystemNotification( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject(), GetWorldPosition(), ESecurityNotificationType.COMBAT, true );
+	}
+
+	protected event OnAutoKillDelayEvent( evt : AutoKillDelayEvent )
+	{
+		GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolMinValue( GetEntityID(), gamedataStatPoolType.Health, NULL );
+	}
+
+	protected event OnQuestResetDeviceToInitialState( evt : QuestResetDeviceToInitialState )
+	{
+		var determineForcedRole : EvaluateGameplayRoleEvent;
+		determineForcedRole = new EvaluateGameplayRoleEvent;
+		determineForcedRole.force = true;
+		GiveWeaponToTurret();
+		ToggleTurretVisuals( true );
+		m_interaction.Toggle( true );
+		QueueEvent( determineForcedRole );
+		m_animFeature.isRippedOff = false;
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+	}
+
+	private function RipOffTurret()
+	{
+		ToggleTurretVisuals( false );
+	}
+
+	protected function ToggleTurretVisuals( toggle : Bool )
+	{
+		GameObjectEffectHelper.StopEffectEvent( this, 'broken' );
+	}
+
+	protected event OnDisassembleDevice( evt : DisassembleDevice )
+	{
+		var player : PlayerPuppet;
+		var playerStateMachineBlackboard : IBlackboard;
+		super.OnDisassembleDevice( evt );
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		EnterWorkspot( player, true, 'disassemblePlayerWorkspot' );
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().PlayerStateMachine );
+		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, true );
+		m_targetingComp.Toggle( false );
+	}
+
+	protected override function EnterWorkspot( activator : GameObject, optional freeCamera : Bool, optional componentName : CName, optional deviceData : CName )
+	{
+		super.EnterWorkspot( activator, freeCamera, componentName, deviceData );
+		m_interaction.Toggle( false );
+	}
+
+	protected event OnWorkspotFinished( componentName : CName )
+	{
+		super.OnWorkspotFinished( componentName );
+		m_targetingComp.Toggle( false );
+		if( componentName == 'disassemblePlayerWorkspot' )
+		{
+			GetDevicePS().UnpowerDevice();
+			CutPower();
+			GameInstance.GetActivityLogSystem( GetGame() ).AddLog( "Extracted weapon frame from the turret  " );
+			m_interaction.Toggle( false );
+			m_laserMesh.Toggle( false );
+			UpdateDeviceState();
+		}
+		GameInstance.GetTransactionSystem( GetGame() ).RemoveItemFromSlot( this, T"AttachmentSlots.WeaponRight" );
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		var dissableEvent : QuestForceUnpower;
+		var weapon : weak< WeaponObject >;
+		if( GetDevicePS().IsControlledByPlayer() )
+		{
+			TakeOverControlSystem.ReleaseControl( GetGame() );
+		}
+		ReplicateIsDead( true );
+		GetDevicePS().SetDurabilityState( EDeviceDurabilityState.BROKEN );
+		if( m_visibleObjectComponent )
+		{
+			m_visibleObjectComponent.Toggle( false );
+		}
+		m_senseComponent.RemoveSenseMappin();
+		m_laserMesh.Toggle( false );
+		m_targetingComp.Toggle( false );
+		dissableEvent = new QuestForceUnpower;
+		SendEventToDefaultPS( dissableEvent );
+		weapon = GetWeapon();
+		if( weapon )
+		{
+			weapon.QueueEvent( evt );
+		}
+		GameObject.UntagObject( this );
+	}
+
+	protected event OnActionEngineering( evt : ActionEngineering )
+	{
+		ApplyAnimFeatureToReplicate( this, 'SecurityTurretData', m_animFeature );
+		OnAllValidTargetsDisappears();
+		RestoreDeviceState();
+		UpdateDeviceState();
+	}
+
+	protected event OnQuestForceReload( evt : QuestForceReload )
+	{
+		var intervalDelay : TurretBurstShootingDelayEvent;
+		if( m_isBurstDelayOngoing )
+		{
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_burstDelayEvtID );
+		}
+		ShootStop();
+		intervalDelay = new TurretBurstShootingDelayEvent;
+		m_burstDelayEvtID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, intervalDelay, 4.0 );
+		m_isBurstDelayOngoing = true;
+	}
+
+	protected event OnQuestForceOverheat( evt : QuestForceOverheat )
+	{
+		ShootStop();
+		AIWeapon.ForceWeaponOverheat( GetWeapon(), this );
+	}
+
+	protected event OnQuestRemoveWeapon( evt : QuestRemoveWeapon )
+	{
+		ShootStop();
+		if( !( m_weapon ) )
+		{
+			GameInstance.GetTransactionSystem( this.GetGame() ).RemoveItemFromSlot( this, T"AttachmentSlots.WeaponRight" );
+		}
+	}
+
+	public export const override function GetDeviceStateClass() : CName
+	{
+		return 'SecurityTurretReplicatedState';
+	}
+
+	protected event OnDamageReceived( evt : gameDamageReceivedEvent )
+	{
+		ProcessDamageReceived( evt );
+	}
+
+	protected event OnHit( evt : gameHitEvent )
+	{
+		super.OnHit( evt );
+	}
+
+	protected export override function DamagePipelineFinalized( evt : gameHitEvent )
+	{
+		var serverState : SecurityTurretReplicatedState;
+		super.DamagePipelineFinalized( evt );
+		serverState = ( ( SecurityTurretReplicatedState )( GetServerState() ) );
+		if( serverState )
+		{
+			serverState.m_health = GetCurrentHealth();
+		}
+	}
+
+	public const override function ShouldShowDamageNumber() : Bool
+	{
+		return true;
+	}
+
+	protected override function ApplyReplicatedState( const state : DeviceReplicatedState )
+	{
+		const var turretState : SecurityTurretReplicatedState;
+		super.ApplyReplicatedState( state );
+		turretState = ( ( SecurityTurretReplicatedState )( state ) );
+		if( m_netClientCurrentlyAppliedState.m_isOn != turretState.m_isOn )
+		{
+			if( turretState.m_isOn )
+			{
+				TurnOnDevice();
+			}
+			else
+			{
+				TurnOffDevice();
+			}
+		}
+		if( m_netClientCurrentlyAppliedState.m_isShooting != turretState.m_isShooting )
+		{
+			if( turretState.m_isShooting )
+			{
+				ShootStart();
+			}
+			else
+			{
+				ShootStop();
+			}
+		}
+		if( m_netClientCurrentlyAppliedState.m_health != turretState.m_health )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValue( this.GetEntityID(), gamedataStatPoolType.Health, turretState.m_health, NULL, true );
+			m_netClientCurrentlyAppliedState.m_health = turretState.m_health;
+		}
+		if( m_netClientCurrentlyAppliedState.m_isDead != turretState.m_isDead )
+		{
+			if( turretState.m_isDead )
+			{
+				OnDeath( NULL );
+			}
+			else
+			{
+			}
+		}
+	}
+
+	public static function CreateInputHint( context : GameInstance, isVisible : Bool )
+	{
+		var data : InputHintData;
+		data.action = 'DeviceAttack';
+		data.source = 'SecurityTurret';
+		data.localizedLabel = "LocKey#36197";
+		SendInputHintData( context, isVisible, data );
+	}
+
+	private function GetReplicationStateToUpdate() : SecurityTurretReplicatedState
+	{
+		if( IsServer() )
+		{
+			return ( ( SecurityTurretReplicatedState )( GetServerState() ) );
+		}
+		else if( IsClient() )
+		{
+			return m_netClientCurrentlyAppliedState;
+		}
+		return NULL;
+	}
+
+	private function ReplicateIsShooting( isShooting : Bool )
+	{
+		var stateToUpdate : SecurityTurretReplicatedState;
+		stateToUpdate = GetReplicationStateToUpdate();
+		if( stateToUpdate )
+		{
+			stateToUpdate.m_isShooting = isShooting;
+		}
+	}
+
+	private function ReplicateHealth( health : Float )
+	{
+		var stateToUpdate : SecurityTurretReplicatedState;
+		stateToUpdate = GetReplicationStateToUpdate();
+		if( stateToUpdate )
+		{
+			stateToUpdate.m_health = health;
+		}
+	}
+
+	private function ReplicateIsOn( isOn : Bool )
+	{
+		var stateToUpdate : SecurityTurretReplicatedState;
+		stateToUpdate = GetReplicationStateToUpdate();
+		if( stateToUpdate )
+		{
+			stateToUpdate.m_isOn = isOn;
+		}
+	}
+
+	private function ReplicateIsDead( isDead : Bool )
+	{
+		var stateToUpdate : SecurityTurretReplicatedState;
+		stateToUpdate = GetReplicationStateToUpdate();
+		if( stateToUpdate )
+		{
+			stateToUpdate.m_isDead = isDead;
+		}
+	}
+
+	public function GetRipOffTriggerSide( forEntity : Entity ) : EDoorTriggerSide
+	{
+		if( ( !( forEntity ) || !( m_triggerSideOne ) ) || !( m_triggerSideOne ) )
+		{
+			return EDoorTriggerSide.OUTSIDE;
+		}
+		if( m_triggerSideOne.IsEntityOverlapping( forEntity ) )
+		{
+			return EDoorTriggerSide.ONE;
+		}
+		if( m_triggerSideTwo.IsEntityOverlapping( forEntity ) )
+		{
+			return EDoorTriggerSide.TWO;
+		}
+		return EDoorTriggerSide.OUTSIDE;
+	}
+
+	public const override function DeterminGameplayRole() : EGameplayRole
+	{
+		if( GetDevicePS().IsPartOfPrevention() )
+		{
+			if( GetDevicePS().IsON() )
+			{
+				return EGameplayRole.Shoot;
+			}
+			return EGameplayRole.None;
+		}
+		return EGameplayRole.Shoot;
+	}
+
+	public const override function DeterminGameplayRoleMappinRange( data : SDeviceMappinData ) : Float
+	{
+		return GetDistractionRange( DeviceStimType.Distract );
+	}
+
+	public const function GetTurretWeapon() : weak< WeaponObject >
+	{
+		return m_weapon;
+	}
+
+	public const override function GetObjectToForwardHighlight() : array< weak< GameObject > >
+	{
+		var weapon : weak< WeaponObject >;
+		var weapons : array< weak< GameObject > >;
+		weapon = GetTurretWeapon();
+		if( weapon )
+		{
+			weapons.PushBack( weapon );
+		}
+		return weapons;
+	}
+
+}
+
+enum ESecurityTurretStatus
+{
+	THREAT = -1,
+	SHOOTING = 0,
+	WORKING = 1,
+	SCANING = 2,
+	DAMAGED = 3,
+}
+
+enum ESecurityTurretType
+{
+	SIMPLE = 0,
+}
+

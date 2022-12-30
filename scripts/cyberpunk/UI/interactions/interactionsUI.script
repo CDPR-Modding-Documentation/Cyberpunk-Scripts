@@ -1,0 +1,276 @@
+class interactionWidgetGameController extends inkHUDGameController
+{
+	private var m_root : weak< inkWidget >;
+	private var m_titleLabel : weak< inkText >;
+	private var m_titleBorder : weak< inkWidget >;
+	private var m_optionsList : weak< inkHorizontalPanel >;
+	private var m_widgetsPool : array< weak< inkWidget > >;
+	private var m_widgetsCallbacks : array< CallbackHandle >;
+	private var m_bbInteraction : weak< IBlackboard >;
+	private var m_bbPlayerStateMachine : weak< IBlackboard >;
+	private var m_bbInteractionDefinition : UIInteractionsDef;
+	private var m_updateInteractionId : CallbackHandle;
+	private var m_activeHubListenerId : CallbackHandle;
+	private var m_contactsActiveListenerId : CallbackHandle;
+	private var m_id : Int32;
+	private var m_isActive : Bool;
+	private var m_areContactsOpen : Bool;
+	private var m_progressBarHolder : inkWidgetRef;
+	private var m_progressBar : weak< DialogChoiceTimerController >;
+	private var m_hasProgressBar : Bool;
+	private var m_bb : weak< IBlackboard >;
+	private var m_bbUIInteractionsDef : UIInteractionsDef;
+	private var m_bbLastAttemptedChoiceCallbackId : CallbackHandle;
+	private var m_OnZoneChangeCallback : CallbackHandle;
+	private var m_pendingRequests : Int32;
+	private var m_spawnTokens : array< weak< inkAsyncSpawnRequest > >;
+	private var m_currentOptions : array< InteractionChoiceData >;
+
+	protected event OnInitialize()
+	{
+		m_root = GetRootWidget();
+		m_titleLabel = ( ( inkText )( GetWidget( 'titleCanvas\titleFlex\titleText' ) ) );
+		m_titleBorder = ( ( inkWidget )( GetWidget( 'titleCanvas\titleFlex' ) ) );
+		m_optionsList = ( ( inkHorizontalPanel )( GetWidget( 'optionsList' ) ) );
+		m_root.SetVisible( false );
+		m_bbPlayerStateMachine = GetPSMBlackboard( ( ( PlayerPuppet )( GetOwnerEntity() ) ) );
+		m_bbInteractionDefinition = GetAllBlackboardDefs().UIInteractions;
+		m_bbInteraction = GetBlackboardSystem().Get( m_bbInteractionDefinition );
+		m_updateInteractionId = m_bbInteraction.RegisterDelayedListenerVariant( m_bbInteractionDefinition.InteractionChoiceHub, this, 'OnUpdateInteraction' );
+		m_activeHubListenerId = m_bbInteraction.RegisterDelayedListenerVariant( m_bbInteractionDefinition.VisualizersInfo, this, 'OnChangeActiveVisualizer' );
+		if( m_bbPlayerStateMachine )
+		{
+			m_OnZoneChangeCallback = m_bbPlayerStateMachine.RegisterDelayedListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Zones, this, 'OnZoneChange' );
+		}
+		m_bbUIInteractionsDef = GetAllBlackboardDefs().UIInteractions;
+		m_bb = GetBlackboardSystem().Get( m_bbUIInteractionsDef );
+		m_bbLastAttemptedChoiceCallbackId = m_bb.RegisterListenerVariant( m_bbUIInteractionsDef.LastAttemptedChoice, this, 'OnLastAttemptedChoice' );
+		m_id = 0;
+		OnChangeActiveVisualizer( m_bbInteraction.GetVariant( m_bbInteractionDefinition.VisualizersInfo ) );
+		if( m_bbPlayerStateMachine )
+		{
+			OnZoneChange( m_bbPlayerStateMachine.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Zones ) );
+		}
+		OnUpdateInteraction( m_bbInteraction.GetVariant( m_bbInteractionDefinition.InteractionChoiceHub ) );
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_bbInteraction )
+		{
+			m_bbInteraction.UnregisterDelayedListener( m_bbInteractionDefinition.InteractionChoiceHub, m_updateInteractionId );
+			m_bbInteraction.UnregisterDelayedListener( m_bbInteractionDefinition.ActiveChoiceHubID, m_activeHubListenerId );
+		}
+		if( m_bbLastAttemptedChoiceCallbackId )
+		{
+			m_bb.UnregisterListenerVariant( m_bbUIInteractionsDef.LastAttemptedChoice, m_bbLastAttemptedChoiceCallbackId );
+		}
+	}
+
+	protected event OnLastAttemptedChoice( value : Variant )
+	{
+		var choiceData : InteractionAttemptedChoice;
+		var curChoiceLogicController : interactionItemLogicController;
+		choiceData = ( ( InteractionAttemptedChoice )value );
+		if( ( choiceData.choiceIdx >= 0 ) && ( choiceData.choiceIdx < m_widgetsPool.Size() ) )
+		{
+			curChoiceLogicController = ( ( interactionItemLogicController )( m_widgetsPool[ choiceData.choiceIdx ].GetController() ) );
+		}
+		if( curChoiceLogicController )
+		{
+			if( choiceData.isSuccess && choiceData.visualizerType == EVisualizerType.Device )
+			{
+				curChoiceLogicController.PlayLibraryAnimation( 'success' );
+			}
+			else if( !( choiceData.isSuccess ) && choiceData.visualizerType == EVisualizerType.Device )
+			{
+				curChoiceLogicController.PlayLibraryAnimation( 'fail' );
+			}
+		}
+	}
+
+	private function GetOwner() : GameObject
+	{
+		var owner : GameObject;
+		owner = ( ( GameObject )( GetOwnerEntity() ) );
+		return owner;
+	}
+
+	protected event OnUpdateInteraction( argValue : Variant )
+	{
+		var data : InteractionChoiceHubData;
+		var count : Int32;
+		var currentItem : weak< inkWidget >;
+		var timedProgress, timedDuration : Float;
+		var isTimed : Bool;
+		var curSpawnRequest : weak< inkAsyncSpawnRequest >;
+		isTimed = false;
+		data = ( ( InteractionChoiceHubData )argValue );
+		m_id = data.id;
+		if( data.active )
+		{
+			m_currentOptions = data.choices;
+			m_titleBorder.SetVisible( ( StrLen( data.title ) > 0 ) && data.title != " " );
+			m_titleLabel.SetLetterCase( textLetterCase.UpperCase );
+			m_titleLabel.SetText( data.title );
+			count = m_currentOptions.Size();
+			while( ( m_pendingRequests > 0 ) && ( ( m_widgetsPool.Size() + m_pendingRequests ) > count ) )
+			{
+				curSpawnRequest = m_spawnTokens.PopBack();
+				if( curSpawnRequest )
+				{
+					curSpawnRequest.Cancel();
+					m_pendingRequests -= 1;
+				}
+			}
+			while( m_widgetsPool.Size() > count )
+			{
+				currentItem = m_widgetsPool.PopBack();
+				m_widgetsCallbacks.PopBack();
+				m_optionsList.RemoveChild( currentItem );
+			}
+			while( ( m_widgetsPool.Size() + m_pendingRequests ) < count )
+			{
+				curSpawnRequest = AsyncSpawnFromLocal( m_optionsList, 'choice', this, 'OnItemSpawned' );
+				m_spawnTokens.PushBack( curSpawnRequest );
+				m_pendingRequests += 1;
+			}
+			if( m_pendingRequests <= 0 )
+			{
+				UpadateChoiceData();
+			}
+			if( data.timeProvider )
+			{
+				isTimed = true;
+				timedProgress = data.timeProvider.GetCurrentProgress();
+				timedDuration = data.timeProvider.GetDuration();
+			}
+			if( isTimed )
+			{
+				if( !( m_hasProgressBar ) )
+				{
+					m_hasProgressBar = true;
+					m_progressBar = ( ( DialogChoiceTimerController )( SpawnFromExternal( inkWidgetRef.Get( m_progressBarHolder ), R"base\gameplay\gui\widgets\interactions\dialog.inkwidget", 'progress_bar' ).GetController() ) );
+					m_progressBar.StartProgressBarAnim( timedDuration, timedProgress );
+				}
+			}
+		}
+		if( ( !( isTimed ) || !( data.active ) ) && m_hasProgressBar )
+		{
+			m_hasProgressBar = false;
+			GetRootCompoundWidget().RemoveChild( m_progressBar.GetRootWidget() );
+		}
+		m_root.SetVisible( data.active );
+	}
+
+	protected event OnItemSpawned( newItem : inkWidget, userData : IScriptable )
+	{
+		var newItemCallback : CallbackHandle;
+		newItemCallback = m_bbPlayerStateMachine.RegisterDelayedListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Zones, newItem, 'OnZoneChange' );
+		m_widgetsPool.PushBack( newItem );
+		m_widgetsCallbacks.PushBack( newItemCallback );
+		m_pendingRequests -= 1;
+		if( m_pendingRequests <= 0 )
+		{
+			m_spawnTokens.Clear();
+			UpadateChoiceData();
+		}
+	}
+
+	private function UpadateChoiceData()
+	{
+		var curLogicControler : interactionItemLogicController;
+		var skillCheck : UIInteractionSkillCheck;
+		var i, count : Int32;
+		count = m_currentOptions.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			curLogicControler = ( ( interactionItemLogicController )( m_widgetsPool[ i ].GetController() ) );
+			if( GetSkillcheck( m_currentOptions[ i ], skillCheck ) )
+			{
+				curLogicControler.SetData( m_currentOptions[ i ], skillCheck );
+			}
+			else
+			{
+				curLogicControler.SetData( m_currentOptions[ i ] );
+			}
+			curLogicControler.SetButtonVisibility( m_isActive && !( m_areContactsOpen ) );
+		}
+	}
+
+	private function GetSkillchecks( choiceHubData : InteractionChoiceHubData ) : array< UIInteractionSkillCheck >
+	{
+		var skillChecks : array< UIInteractionSkillCheck >;
+		var i : Int32;
+		var k : Int32;
+		var action : DeviceAction;
+		var skillCheckAction : ActionSkillCheck;
+		for( i = 0; i < choiceHubData.choices.Size(); i += 1 )
+		{
+			for( k = 0; k < choiceHubData.choices[ i ].data.Size(); k += 1 )
+			{
+				action = ( ( DeviceAction )( choiceHubData.choices[ i ].data[ k ] ) );
+				skillCheckAction = ( ( ActionSkillCheck )( action ) );
+				if( skillCheckAction != NULL )
+				{
+					skillChecks.PushBack( skillCheckAction.GetSkillcheckInfo() );
+				}
+			}
+		}
+		return skillChecks;
+	}
+
+	private function GetSkillcheck( choice : InteractionChoiceData, out skillcheck : UIInteractionSkillCheck ) : Bool
+	{
+		var i : Int32;
+		var action : DeviceAction;
+		var skillCheckAction : ActionSkillCheck;
+		for( i = 0; i < choice.data.Size(); i += 1 )
+		{
+			action = ( ( DeviceAction )( choice.data[ i ] ) );
+			skillCheckAction = ( ( ActionSkillCheck )( action ) );
+			if( skillCheckAction != NULL )
+			{
+				skillcheck = skillCheckAction.GetSkillcheckInfo();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected event OnZoneChange( value : Int32 )
+	{
+		var i : Int32;
+		var widgetCount : Int32;
+		var currLogic : interactionItemLogicController;
+		widgetCount = m_widgetsPool.Size();
+		for( i = 0; i < widgetCount; i += 1 )
+		{
+			currLogic = ( ( interactionItemLogicController )( m_widgetsPool[ i ].GetController() ) );
+			currLogic.SetZoneChange( value );
+		}
+	}
+
+	protected event OnChangeActiveVisualizer( value : Variant )
+	{
+		var info : VisualizersInfo;
+		info = ( ( VisualizersInfo )value );
+		m_isActive = ( m_isActive && ( info.activeVisId == -1 ) ) || ( info.activeVisId == m_id );
+		UpdateVisibility();
+	}
+
+	private function UpdateVisibility()
+	{
+		var i : Int32;
+		var widgetCount : Int32;
+		var currLogic : interactionItemLogicController;
+		widgetCount = m_widgetsPool.Size();
+		for( i = 0; i < widgetCount; i += 1 )
+		{
+			currLogic = ( ( interactionItemLogicController )( m_widgetsPool[ i ].GetController() ) );
+			currLogic.SetButtonVisibility( m_isActive && !( m_areContactsOpen ) );
+		}
+	}
+
+}
+

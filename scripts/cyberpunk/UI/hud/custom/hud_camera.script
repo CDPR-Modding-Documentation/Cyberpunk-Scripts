@@ -1,0 +1,267 @@
+class hudCameraController extends inkHUDGameController
+{
+	private var pitch_min : Float;
+	default pitch_min = -360;
+	private var pitch_max : Float;
+	default pitch_max = 360;
+	private var yaw_min : Float;
+	default yaw_min = -640;
+	private var yaw_max : Float;
+	default yaw_max = 640;
+	private var tele_min : Float;
+	default tele_min = -360;
+	private var tele_max : Float;
+	default tele_max = 360;
+	private var tele_scale : Float;
+	default tele_scale = .75;
+	private var max_zoom_level : Float;
+	default max_zoom_level = 4;
+	private editable var m_Date : inkTextRef;
+	private editable var m_Timer : inkTextRef;
+	private editable var m_CameraID : inkTextRef;
+	private editable var m_timerHrs : inkTextRef;
+	private editable var m_timerMin : inkTextRef;
+	private editable var m_timerSec : inkTextRef;
+	private editable var m_watermark : inkWidgetRef;
+	private editable var m_yawCounter : inkTextRef;
+	private editable var m_pitchCounter : inkTextRef;
+	private editable var m_pitch : inkCanvasRef;
+	private editable var m_yaw : inkCanvasRef;
+	private editable var m_tele : inkCanvasRef;
+	private editable var m_teleScale : inkCanvasRef;
+	private var m_psmBlackboard : weak< IBlackboard >;
+	private var m_tcsBlackboard : weak< IBlackboard >;
+	private var m_PSM_BBID : CallbackHandle;
+	private var m_tcs_BBID : CallbackHandle;
+	private var m_deviceChain_BBID : CallbackHandle;
+	private var m_root : weak< inkCompoundWidget >;
+	private var m_currentZoom : Float;
+	private var m_controlledObjectRef : weak< GameObject >;
+	private var m_alpha_fadein : inkAnimDef;
+	private var m_AnimProxy : inkAnimProxy;
+	private var m_AnimOptions : inkAnimOptions;
+	private var m_ownerObject : weak< GameObject >;
+	private var m_maxZoomLevel : Int32;
+
+	protected event OnInitialize()
+	{
+		var delayInitialize : DelayedHUDInitializeEvent;
+		var alphaInterpolator : inkAnimTransparency;
+		m_root = ( ( inkCompoundWidget )( GetRootWidget() ) );
+		m_ownerObject = ( ( GameObject )( GetOwnerEntity() ) );
+		m_tcsBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().DeviceTakeControl );
+		if( m_tcsBlackboard )
+		{
+			m_tcs_BBID = m_tcsBlackboard.RegisterDelayedListenerEntityID( GetAllBlackboardDefs().DeviceTakeControl.ActiveDevice, this, 'OnChangeControlledDevice' );
+			m_deviceChain_BBID = m_tcsBlackboard.RegisterListenerVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain, this, 'OnTakeControllOverDevice' );
+			OnChangeControlledDevice( m_tcsBlackboard.GetEntityID( GetAllBlackboardDefs().DeviceTakeControl.ActiveDevice ) );
+			OnTakeControllOverDevice( m_tcsBlackboard.GetVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain ) );
+		}
+		UpdateTime();
+		UpdateRulers();
+		m_alpha_fadein = new inkAnimDef;
+		alphaInterpolator = new inkAnimTransparency;
+		alphaInterpolator.SetDuration( 1.0 );
+		alphaInterpolator.SetStartTransparency( 1.0 );
+		alphaInterpolator.SetEndTransparency( 1.0 );
+		alphaInterpolator.SetType( inkanimInterpolationType.Linear );
+		alphaInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+		m_alpha_fadein.AddInterpolator( alphaInterpolator );
+		m_AnimOptions.playReversed = false;
+		m_AnimOptions.executionDelay = 0.0;
+		m_AnimOptions.loopType = inkanimLoopType.Cycle;
+		m_AnimOptions.loopInfinite = true;
+		m_AnimProxy = m_root.PlayAnimationWithOptions( m_alpha_fadein, m_AnimOptions );
+		m_AnimProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnEndLoop' );
+		GetPlayerControlledObject().RegisterInputListener( this );
+		OnZoomChange( 1.0 );
+		delayInitialize = new DelayedHUDInitializeEvent;
+		GameInstance.GetDelaySystem( GetPlayerControlledObject().GetGame() ).DelayEvent( GetPlayerControlledObject(), delayInitialize, 0.1 );
+		GameInstance.GetAudioSystem( GetPlayerControlledObject().GetGame() ).Play( 'global_menu_hacking_close' );
+		GameInstance.GetAudioSystem( GetPlayerControlledObject().GetGame() ).Play( 'ui_hacking_close' );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_tcsBlackboard.UnregisterListenerEntityID( GetAllBlackboardDefs().DeviceTakeControl.ActiveDevice, m_tcs_BBID );
+		m_tcsBlackboard.UnregisterListenerVariant( GetAllBlackboardDefs().DeviceTakeControl.DevicesChain, m_deviceChain_BBID );
+		m_AnimProxy.UnregisterFromCallback( inkanimEventType.OnEndLoop, this, 'OnEndLoop' );
+		m_AnimProxy.Stop();
+		TakeOverControlSystem.CreateInputHint( GetPlayerControlledObject().GetGame(), false );
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		UpdateTime();
+		UpdateRulers();
+	}
+
+	protected event OnEndLoop( proxy : inkAnimProxy )
+	{
+		UpdateTime();
+		UpdateRulers();
+	}
+
+	protected event OnTakeControllOverDevice( value : Variant )
+	{
+		var widgets : array< SWidgetPackage >;
+		widgets = ( ( array< SWidgetPackage > )value );
+		if( widgets.Size() <= 1 )
+		{
+			inkWidgetRef.SetVisible( m_watermark, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_watermark, false );
+		}
+	}
+
+	private function UpdateRulers()
+	{
+		var data : CameraRotationData;
+		var euAngles : EulerAngles;
+		var pitchPt : Float;
+		var yawPt : Float;
+		var m_yawMargin : Float;
+		var m_pitchMargin : Float;
+		data = ( ( SensorDevice )( m_controlledObjectRef ) ).GetRotationData();
+		euAngles = ( ( SensorDevice )( m_controlledObjectRef ) ).GetRotationFromSlotRotation();
+		if( data.m_maxPitch == 0.0 )
+		{
+			data.m_maxPitch = 360.0;
+		}
+		pitchPt = euAngles.Pitch / AbsF( data.m_maxPitch - data.m_minPitch );
+		m_pitchMargin = AbsF( pitch_max - pitch_min ) * pitchPt;
+		inkCanvasRef.SetMargin( m_pitch, 0.0, m_pitchMargin, 0.0, 0.0 );
+		if( data.m_maxYaw == 0.0 )
+		{
+			data.m_maxYaw = 360.0;
+		}
+		yawPt = -( euAngles.Yaw ) / AbsF( data.m_maxYaw - data.m_minYaw );
+		m_yawMargin = AbsF( yaw_max - yaw_min ) * yawPt;
+		inkCanvasRef.SetMargin( m_yaw, m_yawMargin, 0.0, 0.0, 0.0 );
+		inkTextRef.SetText( m_yawCounter, ( ( String )( RoundF( -( euAngles.Yaw ) ) ) ) );
+		inkTextRef.SetText( m_pitchCounter, ( ( String )( RoundF( -( euAngles.Pitch ) ) ) ) );
+	}
+
+	private function UpdateTime()
+	{
+		var hours : Int32;
+		var minutes : Int32;
+		var seconds : Int32;
+		var hoursStr : String;
+		var minutesStr : String;
+		var secondsStr : String;
+		var currentTime : GameTime;
+		if( !( m_ownerObject ) )
+		{
+			m_ownerObject = ( ( GameObject )( GetOwnerEntity() ) );
+		}
+		currentTime = GameInstance.GetTimeSystem( m_ownerObject.GetGame() ).GetGameTime();
+		hours = GameTime.Hours( currentTime );
+		minutes = GameTime.Minutes( currentTime );
+		seconds = GameTime.Seconds( currentTime );
+		hoursStr = ( ( hours >= 10 ) ? ( ( ( String )( hours ) ) ) : ( "0" + ( ( String )( hours ) ) ) );
+		minutesStr = ( ( minutes >= 10 ) ? ( ( ( String )( minutes ) ) ) : ( "0" + ( ( String )( minutes ) ) ) );
+		secondsStr = ( ( seconds >= 10 ) ? ( ( ( String )( seconds ) ) ) : ( "0" + ( ( String )( seconds ) ) ) );
+		inkTextRef.SetText( m_timerHrs, hoursStr + ":" );
+		inkTextRef.SetText( m_timerMin, minutesStr + ":" );
+		inkTextRef.SetText( m_timerSec, secondsStr );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_psmBlackboard = GetPSMBlackboard( playerPuppet );
+		if( m_psmBlackboard )
+		{
+			m_PSM_BBID = m_psmBlackboard.RegisterDelayedListenerFloat( GetAllBlackboardDefs().PlayerStateMachine.ZoomLevel, this, 'OnZoomChange' );
+			m_maxZoomLevel = m_psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.MaxZoomLevel );
+		}
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		m_psmBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().PlayerStateMachine.ZoomLevel, m_PSM_BBID );
+	}
+
+	protected event OnZoomChange( curZoom : Float )
+	{
+		var zoomRange : Float;
+		var zoomFactor : Float;
+		var zoomPointPosition : Float;
+		var maxZoomLevel : Float;
+		m_currentZoom = curZoom;
+		maxZoomLevel = ( ( m_maxZoomLevel == 0 ) ? ( max_zoom_level ) : ( ( ( Float )( m_maxZoomLevel ) ) ) );
+		zoomFactor = m_currentZoom / maxZoomLevel;
+		zoomRange = AbsF( tele_max - tele_min );
+		zoomPointPosition = tele_max - ( zoomRange * zoomFactor );
+		inkCanvasRef.SetMargin( m_tele, 0.0, zoomPointPosition, 0.0, 0.0 );
+		inkCanvasRef.SetScale( m_teleScale, Vector2( tele_scale + zoomFactor, tele_scale + zoomFactor ) );
+	}
+
+	protected event OnChangeControlledDevice( value : EntityID )
+	{
+		if( m_ownerObject )
+		{
+			m_controlledObjectRef = m_ownerObject.GetTakeOverControlSystem().GetControlledObject();
+		}
+		ChangeCameraName();
+		ResolveState();
+	}
+
+	protected function ChangeCameraName()
+	{
+		inkTextRef.SetText( m_CameraID, GetEntityNameFromEntityID( m_controlledObjectRef ) );
+	}
+
+	protected function GetEntityNameFromEntityID( obj : GameObject ) : String
+	{
+		var device : Device;
+		if( obj )
+		{
+			device = ( ( Device )( obj ) );
+			if( device )
+			{
+				return device.GetDeviceName();
+			}
+		}
+		return "CAM:#####";
+	}
+
+	protected event OnDelayedHUDInitializeEvent( evt : DelayedHUDInitializeEvent )
+	{
+		TakeOverControlSystem.CreateInputHint( GetPlayerControlledObject().GetGame(), true );
+	}
+
+	private function ResolveState()
+	{
+		var stateName : CName;
+		var ownerObject : GameObject;
+		if( m_controlledObjectRef )
+		{
+			ownerObject = m_controlledObjectRef.GetOwner();
+			if( ownerObject && ( ownerObject.IsDrone() || ownerObject.IsVehicle() ) )
+			{
+				stateName = 'Drone';
+			}
+			else if( EntityID.IsDynamic( m_controlledObjectRef.GetEntityID() ) )
+			{
+				stateName = 'Drone';
+			}
+			else
+			{
+				stateName = 'Default';
+			}
+		}
+		else
+		{
+			stateName = 'Default';
+		}
+		if( m_root )
+		{
+			m_root.SetState( stateName );
+		}
+	}
+
+}
+

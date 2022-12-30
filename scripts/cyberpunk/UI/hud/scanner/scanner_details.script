@@ -1,0 +1,337 @@
+class scannerDetailsGameController extends inkHUDGameController
+{
+	private editable var m_scannerCountainer : inkCompoundRef;
+	private editable var m_quickhackContainer : inkCompoundRef;
+	private editable var m_cluesContainer : inkCompoundRef;
+	private editable var m_bg : inkWidgetRef;
+	private editable var m_toggleDescirptionHackPart : inkWidgetRef;
+	private editable var m_toggleDescriptionScanIcon : inkWidgetRef;
+	private editable var m_fitToContentBackground : inkWidgetRef;
+	private editable var m_kiroshiLogo : inkWidgetRef;
+	private var m_player : weak< GameObject >;
+	private var m_gameInstance : GameInstance;
+	private var m_objectTypeCallbackID : CallbackHandle;
+	private var m_uiScannerChunkBlackboard : weak< IBlackboard >;
+	private var m_scanningState : gameScanningState;
+	private var m_scanStatusCallbackID : CallbackHandle;
+	private var m_scanObjectCallbackID : CallbackHandle;
+	private var m_uiBlackboard : weak< IBlackboard >;
+	private var m_quickSlotsBoard : weak< IBlackboard >;
+	private var m_quickSlotsCallbackID : CallbackHandle;
+	private var m_quickhackStartedCallbackID : CallbackHandle;
+	private var m_scannedObjectType : ScannerObjectType;
+	private var m_showScanAnimProxy : inkAnimProxy;
+	private var m_hideScanAnimProxy : inkAnimProxy;
+	private var m_toggleScanDescriptionAnimProxy : inkAnimProxy;
+	private var m_previousToggleAnimName : CName;
+	private var m_hasHacks : Bool;
+	private var m_lastScannedObject : EntityID;
+	private var m_isDescriptionVisible : Bool;
+	default m_isDescriptionVisible = true;
+	private var m_asyncSpawnRequests : array< weak< inkAsyncSpawnRequest > >;
+
+	protected event OnInitialize()
+	{
+		GetRootWidget().SetVisible( false );
+		m_uiBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_Scanner );
+		m_uiScannerChunkBlackboard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ScannerModules );
+		m_quickSlotsBoard = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_QuickSlotsData );
+		if( m_uiBlackboard )
+		{
+			m_scanStatusCallbackID = m_uiBlackboard.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UI_Scanner.CurrentState, this, 'OnStateChanged' );
+			m_scanObjectCallbackID = m_uiBlackboard.RegisterDelayedListenerEntityID( GetAllBlackboardDefs().UI_Scanner.ScannedObject, this, 'OnScannedObjectChanged' );
+		}
+		if( m_uiScannerChunkBlackboard )
+		{
+			m_objectTypeCallbackID = m_uiScannerChunkBlackboard.RegisterDelayedListenerInt( GetAllBlackboardDefs().UI_ScannerModules.ObjectType, this, 'OnObjectTypeChanged' );
+		}
+		if( m_quickSlotsBoard )
+		{
+			m_quickSlotsCallbackID = m_quickSlotsBoard.RegisterDelayedListenerBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickHackDescritpionVisible, this, 'OnQHDescriptionChanged' );
+			m_quickhackStartedCallbackID = m_quickSlotsBoard.RegisterDelayedListenerBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelOpen, this, 'OnQuickhackStarted' );
+		}
+		AsyncSpawnFromLocal( inkCompoundRef.Get( m_cluesContainer ), 'ScannerQuestEntries' );
+	}
+
+	protected event OnUnitialize()
+	{
+		GetRootWidget().SetVisible( false );
+		if( m_uiScannerChunkBlackboard )
+		{
+			m_uiScannerChunkBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UI_ScannerModules.ObjectType, m_objectTypeCallbackID );
+		}
+		if( m_uiBlackboard )
+		{
+			m_uiBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UI_Scanner.CurrentState, m_scanStatusCallbackID );
+			m_uiBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UI_Scanner.ScannedObject, m_scanObjectCallbackID );
+		}
+		if( m_quickSlotsBoard && m_quickSlotsCallbackID )
+		{
+			m_quickSlotsBoard.UnregisterDelayedListener( GetAllBlackboardDefs().UI_QuickSlotsData.quickHackDescritpionVisible, m_quickSlotsCallbackID );
+		}
+		if( m_quickSlotsBoard && m_quickhackStartedCallbackID )
+		{
+			m_quickSlotsBoard.UnregisterDelayedListener( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelOpen, m_quickhackStartedCallbackID );
+		}
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_player = GetPlayerControlledObject();
+		m_gameInstance = playerPuppet.GetGame();
+	}
+
+	protected event OnScannedObjectChanged( value : EntityID )
+	{
+		var gameObject : GameObject;
+		m_lastScannedObject = value;
+		if( EntityID.IsDefined( value ) )
+		{
+			gameObject = ( ( GameObject )( GameInstance.FindEntityByID( m_gameInstance, value ) ) );
+			m_hasHacks = gameObject.IsQuickHackAble();
+			inkWidgetRef.SetVisible( m_kiroshiLogo, GameInstance.GetStatsSystem( m_gameInstance ).GetStatValue( m_player.GetEntityID(), gamedataStatType.HasLinkToBountySystem ) > 0.0 );
+			SetupToggleVisibility();
+		}
+		else
+		{
+			m_hasHacks = false;
+			m_scannedObjectType = ScannerObjectType.INVALID;
+			PlayCloseScannerAnimation();
+		}
+	}
+
+	protected event OnObjectTypeChanged( value : Int32 )
+	{
+		m_scannedObjectType = ( ( ScannerObjectType )( value ) );
+		RefreshLayout();
+	}
+
+	protected event OnQHDescriptionChanged( value : Bool )
+	{
+		ToggleDescriptionAnimation( value );
+	}
+
+	protected event OnStateChanged( val : Variant )
+	{
+		var state : gameScanningState;
+		var shouldRefresh : Bool;
+		state = ( ( gameScanningState )val );
+		if( m_scanningState == gameScanningState.Default || state == gameScanningState.Stopped )
+		{
+			shouldRefresh = true;
+		}
+		m_scanningState = state;
+		if( shouldRefresh )
+		{
+			RefreshLayout();
+		}
+	}
+
+	public function RefreshLayout()
+	{
+		var i : Int32;
+		BreakAniamtions();
+		if( HUDManager.GetActiveMode( m_gameInstance ) != ActiveMode.FOCUS )
+		{
+			PlayCloseScannerAnimation();
+		}
+		if( ( m_scanningState == gameScanningState.Complete || m_scanningState == gameScanningState.ShallowComplete ) || m_scanningState == gameScanningState.Started )
+		{
+			for( i = 0; i < m_asyncSpawnRequests.Size(); i += 1 )
+			{
+				m_asyncSpawnRequests[ i ].Cancel();
+			}
+			m_asyncSpawnRequests.Clear();
+			inkCompoundRef.RemoveAllChildren( m_scannerCountainer );
+			inkCompoundRef.RemoveAllChildren( m_quickhackContainer );
+			inkWidgetRef.SetVisible( m_bg, true );
+			GetRootWidget().SetVisible( false );
+			m_asyncSpawnRequests.PushBack( AsyncSpawnFromLocal( inkCompoundRef.Get( m_quickhackContainer ), 'QuickHackDescription' ) );
+			switch( m_scannedObjectType )
+			{
+				case ScannerObjectType.PUPPET:
+					GetRootWidget().SetVisible( true );
+				AsyncSpawnScannerModule( 'ScannerNPCHeaderWidget' );
+				AsyncSpawnScannerModule( 'ScannerNPCBodyWidget' );
+				AsyncSpawnScannerModule( 'ScannerBountySystemWidget' );
+				AsyncSpawnScannerModule( 'ScannerRequirementsWidget' );
+				AsyncSpawnScannerModule( 'ScannerAbilitiesWidget' );
+				AsyncSpawnScannerModule( 'ScannerResistancesWidget' );
+				AsyncSpawnScannerModule( 'ScannerDeviceDescriptionWidget' );
+				break;
+				case ScannerObjectType.DEVICE:
+					GetRootWidget().SetVisible( true );
+				AsyncSpawnScannerModule( 'ScannerDeviceHeaderWidget' );
+				AsyncSpawnScannerModule( 'ScannerVulnerabilitiesWidget' );
+				AsyncSpawnScannerModule( 'ScannerRequirementsWidget' );
+				AsyncSpawnScannerModule( 'ScannerDeviceDescriptionWidget' );
+				break;
+				case ScannerObjectType.VEHICLE:
+					GetRootWidget().SetVisible( true );
+				AsyncSpawnScannerModule( 'ScannerVehicleBody' );
+				AsyncSpawnScannerModule( 'ScannerDeviceDescriptionWidget' );
+				break;
+				case ScannerObjectType.GENERIC:
+					GetRootWidget().SetVisible( true );
+				AsyncSpawnScannerModule( 'ScannerDeviceHeaderWidget' );
+				AsyncSpawnScannerModule( 'ScannerDeviceDescriptionWidget' );
+				inkWidgetRef.SetVisible( m_toggleDescirptionHackPart, false );
+				break;
+				default:
+					return;
+			}
+			m_showScanAnimProxy = PlayLibraryAnimation( 'intro' );
+			m_showScanAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnScannerDetailsShown' );
+		}
+		if( m_scanningState == gameScanningState.Stopped || m_scanningState == gameScanningState.Default )
+		{
+			PlayCloseScannerAnimation();
+		}
+	}
+
+	private function AsyncSpawnScannerModule( scannerWidgetLibraryName : CName )
+	{
+		m_asyncSpawnRequests.PushBack( AsyncSpawnFromLocal( inkCompoundRef.Get( m_scannerCountainer ), scannerWidgetLibraryName ) );
+	}
+
+	private function BreakAniamtions()
+	{
+		if( m_showScanAnimProxy != NULL )
+		{
+			m_showScanAnimProxy.Stop();
+			m_showScanAnimProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_showScanAnimProxy = NULL;
+		}
+		if( m_hideScanAnimProxy != NULL )
+		{
+			m_hideScanAnimProxy.Stop();
+			m_hideScanAnimProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_hideScanAnimProxy = NULL;
+		}
+	}
+
+	private function PlayCloseScannerAnimation()
+	{
+		BreakAniamtions();
+		m_hideScanAnimProxy = PlayLibraryAnimation( 'outro' );
+		m_hideScanAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnScannerDetailsHidden' );
+	}
+
+	private function ToggleDescriptionAnimation( value : Bool )
+	{
+		if( value )
+		{
+			if( !( inkCompoundRef.IsVisible( m_quickhackContainer ) ) )
+			{
+				inkCompoundRef.SetVisible( m_quickhackContainer, true );
+			}
+			if( m_previousToggleAnimName != 'scan_to_hack' )
+			{
+				m_toggleScanDescriptionAnimProxy.Stop();
+				m_toggleScanDescriptionAnimProxy = PlayLibraryAnimation( 'scan_to_hack' );
+				m_previousToggleAnimName = 'scan_to_hack';
+			}
+		}
+		else
+		{
+			if( m_previousToggleAnimName != 'hack_to_scan' )
+			{
+				m_toggleScanDescriptionAnimProxy.Stop();
+				m_toggleScanDescriptionAnimProxy = PlayLibraryAnimation( 'hack_to_scan' );
+				m_previousToggleAnimName = 'hack_to_scan';
+			}
+		}
+		m_isDescriptionVisible = value;
+	}
+
+	private function SetupToggleVisibility()
+	{
+		if( m_hasHacks )
+		{
+			if( !( inkWidgetRef.IsVisible( m_toggleDescirptionHackPart ) ) )
+			{
+				inkWidgetRef.SetVisible( m_toggleDescirptionHackPart, true );
+				inkWidgetRef.SetVisible( m_toggleDescriptionScanIcon, true );
+			}
+		}
+		else
+		{
+			if( inkWidgetRef.IsVisible( m_toggleDescirptionHackPart ) )
+			{
+				inkWidgetRef.SetVisible( m_toggleDescirptionHackPart, false );
+				inkWidgetRef.SetVisible( m_toggleDescriptionScanIcon, true );
+			}
+		}
+	}
+
+	protected event OnScannerDetailsHidden( animationProxy : inkAnimProxy )
+	{
+		inkWidgetRef.SetVisible( m_bg, false );
+		GetRootWidget().SetVisible( false );
+		inkCompoundRef.RemoveAllChildren( m_scannerCountainer );
+	}
+
+	protected event OnScannerDetailsShown( animationProxy : inkAnimProxy )
+	{
+		ToggleDescriptionAnimation( m_hasHacks && HUDManager.IsQuickHackDescriptionVisible( m_gameInstance ) );
+	}
+
+	protected event OnDescriptionTransitionFinish( animationProxy : inkAnimProxy )
+	{
+		var evt : FitToContetDelay;
+		evt = new FitToContetDelay;
+		inkWidgetRef.SetFitToContent( m_fitToContentBackground, false );
+		GameInstance.GetDelaySystem( m_gameInstance ).DelayEvent( m_player, evt, 0.01, false );
+	}
+
+	protected event OnFitToContentRest( evt : FitToContetDelay )
+	{
+		inkWidgetRef.SetFitToContent( m_fitToContentBackground, true );
+	}
+
+	private function ConvertActorTypeToObjectType( actorType : HUDActorType ) : ScannerObjectType
+	{
+		switch( actorType )
+		{
+			case HUDActorType.UNINITIALIZED:
+			{
+				return ScannerObjectType.INVALID;
+			}
+			case HUDActorType.GAME_OBJECT:
+			{
+				return ScannerObjectType.GENERIC;
+			}
+			case HUDActorType.VEHICLE:
+			{
+				return ScannerObjectType.VEHICLE;
+			}
+			case HUDActorType.DEVICE:
+			{
+				return ScannerObjectType.DEVICE;
+			}
+			case HUDActorType.BODY_DISPOSAL_DEVICE:
+			{
+				return ScannerObjectType.DEVICE;
+			}
+			case HUDActorType.PUPPET:
+			{
+				return ScannerObjectType.PUPPET;
+			}
+			case HUDActorType.ITEM:
+			{
+				return ScannerObjectType.GENERIC;
+			}
+		}
+	}
+
+}
+
+class FitToContetDelay extends Event
+{
+}
+
+class QuickHackDataEvent extends Event
+{
+	var selectedData : QuickhackData;
+}
+

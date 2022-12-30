@@ -1,0 +1,646 @@
+class WardrobeSetEditorUIDelayCallback extends DelayCallback
+{
+	var m_owner : weak< WardrobeSetEditorUIController >;
+
+	public override function Call()
+	{
+		m_owner.EquipCurrentSetVisuals();
+	}
+
+}
+
+class WardrobeSetEditorUIController extends inkLogicController
+{
+	private editable var m_itemsGridWidget : inkWidgetRef;
+	private editable var m_itemGridText : inkTextRef;
+	private editable var m_sortingDropdown : inkWidgetRef;
+	private editable var m_sortingButton : inkWidgetRef;
+	private editable var m_hideFaceButton : inkWidgetRef;
+	private editable var m_hideHeadButton : inkWidgetRef;
+	private editable var m_emptyGridText : inkWidgetRef;
+	private editable var m_wearButton : inkWidgetRef;
+	private editable var m_takeOffButton : inkWidgetRef;
+	private editable var m_resetButton : inkWidgetRef;
+	private var m_itemGridClassifier : ItemModeGridClassifier;
+	private var m_itemGridDataView : WardrobeItemGridView;
+	private var m_itemGridDataSource : ScriptableDataSource;
+	private var m_tooltipsManager : weak< gameuiTooltipsManager >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_InventoryManager : InventoryDataManagerV2;
+	private var m_uiScriptableSystem : weak< UIScriptableSystem >;
+	private var m_equipmentSystem : weak< EquipmentSystem >;
+	private var m_wardrobeSystem : weak< WardrobeSystem >;
+	private var m_equipmentAreaCategoryEventQueue : array< EquipmentAreaCategoryCreated >;
+	private var m_equipmentAreaCategories : array< EquipmentAreaCategory >;
+	private var m_itemsPositionProvider : ItemPositionProvider;
+	private var m_comparisonResolver : ItemPreferredComparisonResolver;
+	private var m_wardrobeGameController : weak< WardrobeUIGameController >;
+	private var m_areaSlotControllers : array< weak< InventoryItemDisplayController > >;
+	private var m_hiddenEquipmentAreas : array< gamedataEquipmentArea >;
+	private var m_currentEquipmentArea : gamedataEquipmentArea;
+	private var m_currentSet : ClothingSet;
+	private var m_setButtonController : weak< ClothingSetController >;
+	private var m_previewController : weak< WardrobeSetPreviewGameController >;
+	private var m_delaySystem : weak< DelaySystem >;
+	private var m_delayedTimeoutCallbackId : DelayID;
+	private var m_timeoutPeroid : Float;
+	default m_timeoutPeroid = 0.5f;
+
+	public function Initialize( player : weak< PlayerPuppet >, tooltipsManager : weak< gameuiTooltipsManager >, buttonHintsController : weak< ButtonHints >, gameController : weak< WardrobeUIGameController > )
+	{
+		var virtualGrid : inkGridController;
+		m_player = player;
+		m_InventoryManager = new InventoryDataManagerV2;
+		m_InventoryManager.Initialize( m_player );
+		m_wardrobeGameController = gameController;
+		m_tooltipsManager = tooltipsManager;
+		m_buttonHintsController = buttonHintsController;
+		m_uiScriptableSystem = UIScriptableSystem.GetInstance( m_player.GetGame() );
+		m_equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( m_player.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		m_wardrobeSystem = ( ( WardrobeSystem )( GameInstance.GetWardrobeSystem( m_player.GetGame() ) ) );
+		m_delaySystem = GameInstance.GetDelaySystem( m_player.GetGame() );
+		m_itemGridClassifier = new ItemModeGridClassifier;
+		m_itemGridDataView = new WardrobeItemGridView;
+		m_itemGridDataSource = new ScriptableDataSource;
+		m_itemsPositionProvider = new ItemPositionProvider;
+		virtualGrid = ( ( inkGridController )( inkWidgetRef.Get( m_itemsGridWidget ).GetController() ) );
+		m_itemGridDataView.SetSource( m_itemGridDataSource );
+		virtualGrid.SetClassifier( m_itemGridClassifier );
+		virtualGrid.SetSource( m_itemGridDataView );
+		virtualGrid.SetProvider( m_itemsPositionProvider );
+		m_itemGridDataView.EnableSorting();
+		m_itemGridDataView.SetSortMode( ItemSortMode.Default );
+		m_itemGridDataView.SetFilterType( ItemFilterCategory.Invalid );
+		inkWidgetRef.SetVisible( m_itemsGridWidget, false );
+		m_comparisonResolver = ItemPreferredComparisonResolver.Make( m_InventoryManager );
+		m_itemGridDataView.BindUIScriptableSystem( m_uiScriptableSystem );
+		m_currentSet = new ClothingSet;
+		SetupDropdown();
+		SetupControlButtons();
+	}
+
+	private function SetupDropdown()
+	{
+		var controller : DropdownListController;
+		var sortingButtonController : DropdownButtonController;
+		var data : DropdownItemData;
+		inkWidgetRef.RegisterToCallback( m_sortingButton, 'OnRelease', this, 'OnSortingButtonClicked' );
+		controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
+		sortingButtonController = ( ( DropdownButtonController )( inkWidgetRef.GetController( m_sortingButton ) ) );
+		controller.Setup( this, SortingDropdownData.GeVisualsDropdownOptions() );
+		data = SortingDropdownData.GetDropdownOption( controller.GetData(), ItemSortMode.Default );
+		sortingButtonController.SetData( data );
+		m_itemGridDataView.SetSortMode( ( ( ItemSortMode )data.identifier ) );
+	}
+
+	private function SetupControlButtons()
+	{
+		inkWidgetRef.RegisterToCallback( m_wearButton, 'OnRelease', this, 'OnWearButtonClicked' );
+		inkWidgetRef.RegisterToCallback( m_takeOffButton, 'OnRelease', this, 'OnTakeOffButtonClicked' );
+		inkWidgetRef.RegisterToCallback( m_resetButton, 'OnRelease', this, 'OnResetButtonClicked' );
+	}
+
+	protected event OnWearButtonClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			if( m_setButtonController != NULL )
+			{
+				SaveSet();
+				m_wardrobeGameController.SetEquippedState( m_setButtonController.GetClothingSet().setID );
+				UpdateButtonVisibility();
+			}
+		}
+	}
+
+	protected event OnTakeOffButtonClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			if( m_setButtonController != NULL )
+			{
+				SaveSet();
+				m_wardrobeGameController.SetEquippedState( gameWardrobeClothingSetIndex.INVALID );
+				UpdateButtonVisibility();
+			}
+		}
+	}
+
+	protected event OnResetButtonClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			if( m_setButtonController != NULL )
+			{
+				m_wardrobeGameController.ResetSet( m_setButtonController.GetClothingSet().setID );
+				OpenSet( m_setButtonController );
+				UpdateButtonVisibility();
+			}
+		}
+	}
+
+	private function UpdateButtonVisibility()
+	{
+		inkWidgetRef.SetVisible( m_wearButton, !( m_setButtonController.GetEquipped() ) );
+		inkWidgetRef.SetVisible( m_takeOffButton, m_setButtonController.GetEquipped() );
+		inkWidgetRef.SetVisible( m_resetButton, m_setButtonController.GetClothingSetChanged() );
+	}
+
+	protected event OnDropdownItemClickedEvent( evt : DropdownItemClickedEvent )
+	{
+		var identifier : ItemSortMode;
+		var sortingButtonController : DropdownButtonController;
+		var data : DropdownItemData;
+		identifier = ( ( ItemSortMode )evt.identifier );
+		data = SortingDropdownData.GetDropdownOption( ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) ).GetData(), identifier );
+		if( data )
+		{
+			sortingButtonController = ( ( DropdownButtonController )( inkWidgetRef.GetController( m_sortingButton ) ) );
+			sortingButtonController.SetData( data );
+			m_itemGridDataView.SetSortMode( identifier );
+		}
+	}
+
+	protected event OnSortingButtonClicked( evt : inkPointerEvent )
+	{
+		var controller : DropdownListController;
+		if( evt.IsAction( 'click' ) )
+		{
+			m_wardrobeGameController.PlayWardrobeSound( 'Button', 'OnPress' );
+			controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
+			controller.Toggle();
+		}
+	}
+
+	public function OpenSet( setButtonController : weak< ClothingSetController > )
+	{
+		var callback : WardrobeSetEditorUIDelayCallback;
+		callback = new WardrobeSetEditorUIDelayCallback;
+		callback.m_owner = this;
+		m_setButtonController = setButtonController;
+		m_currentSet = setButtonController.GetClothingSet();
+		inkTextRef.SetText( m_itemGridText, " " );
+		inkWidgetRef.SetVisible( m_itemsGridWidget, false );
+		if( m_delaySystem )
+		{
+			m_delaySystem.CancelCallback( m_delayedTimeoutCallbackId );
+			m_delayedTimeoutCallbackId = m_delaySystem.DelayCallback( callback, m_timeoutPeroid, false );
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		m_delaySystem.CancelCallback( m_delayedTimeoutCallbackId );
+		inkWidgetRef.UnregisterFromCallback( m_wearButton, 'OnRelease', this, 'OnWearButtonClicked' );
+		inkWidgetRef.UnregisterFromCallback( m_takeOffButton, 'OnRelease', this, 'OnTakeOffButtonClicked' );
+		inkWidgetRef.UnregisterFromCallback( m_resetButton, 'OnRelease', this, 'OnResetButtonClicked' );
+		m_InventoryManager.UnInitialize();
+	}
+
+	protected event OnEquipmentAreaCategoryCreated( e : EquipmentAreaCategoryCreated )
+	{
+		var i, j, numberOfSlots : Int32;
+		var equipmentAreas : array< gamedataEquipmentArea >;
+		var equipmentAreaDisplays : EquipmentAreaDisplays;
+		var equipmentAreaCategory : EquipmentAreaCategory;
+		var equipmentAreaController : InventoryItemDisplayEquipmentArea;
+		if( m_InventoryManager )
+		{
+			equipmentAreaCategory = new EquipmentAreaCategory;
+			equipmentAreaCategory.parentCategory = e.categoryController;
+			m_equipmentAreaCategories.PushBack( equipmentAreaCategory );
+			for( i = 0; i < e.equipmentAreasControllers.Size(); i += 1 )
+			{
+				equipmentAreaController = e.equipmentAreasControllers[ i ];
+				equipmentAreaDisplays = new EquipmentAreaDisplays;
+				equipmentAreas = equipmentAreaController.GetEquipmentAreas();
+				for( j = 0; j < equipmentAreas.Size(); j += 1 )
+				{
+					equipmentAreaDisplays.equipmentAreas.PushBack( equipmentAreas[ j ] );
+				}
+				equipmentAreaDisplays.displaysRoot = equipmentAreaController.GetRootWidget();
+				equipmentAreaCategory.areaDisplays.PushBack( equipmentAreaDisplays );
+				numberOfSlots = equipmentAreaController.GetNumberOfSlots();
+				PopulateArea( ( ( inkCompoundWidget )( equipmentAreaDisplays.displaysRoot ) ), equipmentAreaDisplays, numberOfSlots, equipmentAreas );
+			}
+		}
+		else
+		{
+			m_equipmentAreaCategoryEventQueue.PushBack( e );
+		}
+	}
+
+	private function PopulateArea( targetRoot : weak< inkCompoundWidget >, container : EquipmentAreaDisplays, numberOfSlots : Int32, equipmentAreas : array< gamedataEquipmentArea > )
+	{
+		var slot : weak< InventoryItemDisplayController >;
+		var i, itemCount : Int32;
+		var currentEquipmentArea : gamedataEquipmentArea;
+		var availableItems : array< InventoryItemData >;
+		while( container.displayControllers.Size() > numberOfSlots )
+		{
+			slot = container.displayControllers.PopBack();
+			targetRoot.RemoveChild( slot.GetRootWidget() );
+		}
+		while( container.displayControllers.Size() < numberOfSlots )
+		{
+			slot = ( ( InventoryItemDisplayController )( ItemDisplayUtils.SpawnCommonSlotController( this, targetRoot, 'visualDisplay' ) ) );
+			container.displayControllers.PushBack( slot );
+		}
+		for( i = 0; i < numberOfSlots; i += 1 )
+		{
+			currentEquipmentArea = gamedataEquipmentArea.Invalid;
+			if( container.displayControllers[ i ] )
+			{
+				currentEquipmentArea = equipmentAreas[ 0 ];
+				availableItems = m_wardrobeSystem.GetFilteredInventoryItemsData( currentEquipmentArea, m_InventoryManager );
+				itemCount = availableItems.Size();
+				container.displayControllers[ i ].BindVisualSlot( currentEquipmentArea, itemCount, , i, ItemDisplayContext.GearPanel );
+				m_areaSlotControllers.PushBack( container.displayControllers[ i ] );
+			}
+		}
+	}
+
+	private function SetAreaSlotHighlights( equipmentArea : gamedataEquipmentArea )
+	{
+		var i : Int32;
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			m_areaSlotControllers[ i ].SetHighlighted( m_areaSlotControllers[ i ].GetEquipmentArea() == equipmentArea );
+		}
+	}
+
+	public function SaveSet()
+	{
+		var i : Int32;
+		var displayData : InventoryItemDisplayData;
+		var slotInfo : SSlotVisualInfo;
+		var wardrobeSetAddedEvent : UIScriptableSystemWardrobeSetAdded;
+		m_currentSet.clothingList.Clear();
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			if( m_hiddenEquipmentAreas.Contains( m_areaSlotControllers[ i ].GetEquipmentArea() ) )
+			{
+				UpdateEquipementSlot( m_areaSlotControllers[ i ], m_areaSlotControllers[ i ].GetEquipmentArea() );
+				SetAreaSlotCovered( m_areaSlotControllers[ i ], true );
+			}
+			displayData = m_areaSlotControllers[ i ].GetItemDisplayData();
+			slotInfo.areaType = displayData.m_equipmentArea;
+			slotInfo.visualItem = m_wardrobeSystem.GetStoredItemID( ItemID.GetTDBID( displayData.m_itemID ) );
+			m_currentSet.clothingList.PushBack( slotInfo );
+		}
+		if( m_currentSet.clothingList.Size() > 0 )
+		{
+			m_wardrobeSystem.PushBackClothingSet( m_currentSet );
+		}
+		m_setButtonController.SetClothingSetChanged( false );
+		if( !( m_setButtonController.GetDefined() ) )
+		{
+			wardrobeSetAddedEvent = new UIScriptableSystemWardrobeSetAdded;
+			wardrobeSetAddedEvent.wardrobeSet = m_currentSet.setID;
+			m_uiScriptableSystem.QueueRequest( wardrobeSetAddedEvent );
+		}
+		m_setButtonController.SetDefined( true );
+	}
+
+	public function EquipCurrentSetVisuals()
+	{
+		EquipSetVisuals( m_currentSet );
+		m_setButtonController.SetClothingSetChanged( false );
+		UpdateButtonVisibility();
+		SetAreaSlotHighlights( gamedataEquipmentArea.Invalid );
+	}
+
+	protected function EquipSetVisuals( set : ClothingSet )
+	{
+		var i : Int32;
+		var j : Int32;
+		var itemInventoryData : InventoryItemData;
+		var itemEquipped : Bool;
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			itemEquipped = false;
+			for( j = 0; j < set.clothingList.Size(); j += 1 )
+			{
+				if( m_areaSlotControllers[ i ].GetEquipmentArea() == set.clothingList[ j ].areaType )
+				{
+					itemInventoryData = m_InventoryManager.GetInventoryItemDataFromItemID( set.clothingList[ j ].visualItem );
+					if( ItemID.IsValid( InventoryItemData.GetID( itemInventoryData ) ) )
+					{
+						EquipItem( m_areaSlotControllers[ i ].GetEquipmentArea(), itemInventoryData );
+						itemEquipped = true;
+					}
+					break;
+				}
+			}
+			if( !( itemEquipped ) )
+			{
+				UnequipItem( m_areaSlotControllers[ i ].GetEquipmentArea() );
+			}
+		}
+	}
+
+	public function SendVisualEquipRequest()
+	{
+		var request : EquipWardrobeSetRequest;
+		request = new EquipWardrobeSetRequest;
+		request.owner = m_player;
+		request.setID = m_currentSet.setID;
+		m_equipmentSystem.QueueRequest( request );
+	}
+
+	protected event OnEquipmentClick( evt : ItemDisplayClickEvent )
+	{
+		var eventDisplayData : InventoryItemDisplayData;
+		var currentDisplayData : InventoryItemDisplayData;
+		eventDisplayData = evt.display.GetItemDisplayData();
+		currentDisplayData = GetItemDisplayByEquipmentArea( m_currentEquipmentArea ).GetItemDisplayData();
+		if( m_hiddenEquipmentAreas.Contains( evt.display.GetEquipmentArea() ) )
+		{
+			if( evt.actionName.IsAction( 'click' ) )
+			{
+				m_wardrobeGameController.PlayWardrobeSound( 'Item', 'OnCraftFailed' );
+			}
+			return true;
+		}
+		if( evt.actionName.IsAction( 'click' ) && evt.display.GetDisplayContext() == ItemDisplayContext.GearPanel )
+		{
+			m_wardrobeGameController.PlayWardrobeSound( 'Button', 'OnPress' );
+			m_currentEquipmentArea = evt.display.GetEquipmentArea();
+			SetAreaSlotHighlights( m_currentEquipmentArea );
+			UpdateAvailableItems( m_currentEquipmentArea );
+			inkTextRef.SetText( m_itemGridText, GetLocalizedText( evt.display.GetSlotName() ) );
+		}
+		else if( evt.actionName.IsAction( 'equip_item' ) && evt.display.GetDisplayContext() != ItemDisplayContext.GearPanel )
+		{
+			if( eventDisplayData.m_itemID != currentDisplayData.m_itemID )
+			{
+				m_wardrobeGameController.PlayWardrobeSound( 'Item', 'OnBuy' );
+				EquipItem( m_currentEquipmentArea, evt.itemData );
+				UpdateAvailableItems( m_currentEquipmentArea );
+			}
+		}
+		else if( evt.actionName.IsAction( 'unequip_item' ) && evt.display.GetDisplayContext() == ItemDisplayContext.GearPanel )
+		{
+			if( ItemID.IsValid( eventDisplayData.m_itemID ) )
+			{
+				UnequipItem( evt.display.GetEquipmentArea() );
+				UpdateAvailableItems( evt.display.GetEquipmentArea() );
+				m_buttonHintsController.RemoveButtonHint( 'unequip_item' );
+			}
+		}
+	}
+
+	protected event OnEquipmentkHoverOver( evt : ItemDisplayHoverOverEvent )
+	{
+		var itemTooltipData : ATooltipData;
+		var slotName : String;
+		var slotHidden : Bool;
+		slotHidden = m_hiddenEquipmentAreas.Contains( evt.display.GetEquipmentArea() );
+		if( !( slotHidden ) && !( InventoryItemData.IsEmpty( evt.itemData ) ) )
+		{
+			itemTooltipData = m_InventoryManager.GetTooltipDataForVisualItem( evt.itemData, InventoryItemData.IsEquipped( evt.itemData ) );
+			m_tooltipsManager.ShowTooltipAtWidget( 'visualTooltip', evt.widget, itemTooltipData, gameuiETooltipPlacement.RightTop, true );
+			WardrobeSystem.SendWardrobeInspectItemRequest( m_player.GetGame(), InventoryItemData.GetID( evt.itemData ) );
+		}
+		else
+		{
+			slotName = GetLocalizedText( evt.display.GetSlotName() );
+			m_tooltipsManager.ShowTooltipAtWidget( 0, evt.widget, m_InventoryManager.GetTooltipForEmptySlot( slotName ), gameuiETooltipPlacement.RightTop, true );
+		}
+		if( !( slotHidden ) )
+		{
+			SetButtonHintsHoverOver( evt.display );
+		}
+	}
+
+	protected event OnEquipmentHoverOut( evt : ItemDisplayHoverOutEvent )
+	{
+		m_tooltipsManager.HideTooltips();
+		SetButtonHintsHoverOut();
+	}
+
+	private function SetButtonHintsHoverOver( display : InventoryItemDisplayController )
+	{
+		if( display.GetDisplayContext() == ItemDisplayContext.GearPanel )
+		{
+			m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-Settings-ButtonMappings-Actions-Select" ) );
+			if( !( InventoryItemData.IsEmpty( display.GetItemData() ) ) )
+			{
+				m_buttonHintsController.AddButtonHint( 'unequip_item', GetLocalizedText( "UI-UserActions-Unequip" ) );
+			}
+		}
+		else
+		{
+			m_buttonHintsController.AddButtonHint( 'equip_item', GetLocalizedText( "UI-UserActions-Equip" ) );
+		}
+	}
+
+	private function EquipItem( equipmentArea : gamedataEquipmentArea, inventoryItemData : InventoryItemData )
+	{
+		m_setButtonController.SetClothingSetChanged( true );
+		UpdateButtonVisibility();
+		m_previewController.PreviewEquipItem( InventoryItemData.GetID( inventoryItemData ) );
+		UpdateEquipementSlot( GetItemDisplayByEquipmentArea( equipmentArea ), equipmentArea, inventoryItemData );
+		ProcessHiddenSlots();
+	}
+
+	private function UnequipItem( equipmentArea : gamedataEquipmentArea )
+	{
+		m_setButtonController.SetClothingSetChanged( true );
+		UpdateButtonVisibility();
+		m_previewController.PreviewUnequipFromEquipmentArea( equipmentArea );
+		UpdateEquipementSlot( GetItemDisplayByEquipmentArea( equipmentArea ), equipmentArea );
+		ProcessHiddenSlots();
+	}
+
+	private function GetItemInSlot( area : gamedataEquipmentArea ) : ItemID
+	{
+		var i : Int32;
+		var displayData : InventoryItemDisplayData;
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			displayData = m_areaSlotControllers[ i ].GetItemDisplayData();
+			if( displayData.m_equipmentArea == area )
+			{
+				return displayData.m_itemID;
+			}
+		}
+		return ItemID.None();
+	}
+
+	private function UpdateEquipementSlot( itemDisplay : weak< InventoryItemDisplayController >, equipmentArea : gamedataEquipmentArea, optional inventoryItemData : InventoryItemData )
+	{
+		var itemsCount : Int32;
+		var availableItems : array< InventoryItemData >;
+		if( InventoryItemData.IsEmpty( inventoryItemData ) )
+		{
+			availableItems = m_wardrobeSystem.GetFilteredInventoryItemsData( equipmentArea, m_InventoryManager );
+			itemsCount = availableItems.Size();
+		}
+		itemDisplay.InvalidateVisualContent( inventoryItemData, itemsCount, !( InventoryItemData.IsEmpty( inventoryItemData ) ) );
+	}
+
+	private function UpdateAvailableItems( equipmentArea : gamedataEquipmentArea )
+	{
+		var i : Int32;
+		var virtualWrappedData : array< IScriptable >;
+		var data : WardrobeWrappedInventoryItemData;
+		var availableItems : array< InventoryItemData >;
+		var itemRecord : weak< Item_Record >;
+		var itemTDBIDInSlot, availableItemTDBID : TweakDBID;
+		if( equipmentArea == gamedataEquipmentArea.Invalid )
+		{
+			return;
+		}
+		availableItems = m_wardrobeSystem.GetFilteredInventoryItemsData( equipmentArea, m_InventoryManager );
+		itemTDBIDInSlot = ItemID.GetTDBID( GetItemInSlot( equipmentArea ) );
+		inkWidgetRef.SetVisible( m_itemsGridWidget, true );
+		for( i = 0; i < availableItems.Size(); i += 1 )
+		{
+			availableItemTDBID = ItemID.GetTDBID( InventoryItemData.GetID( availableItems[ i ] ) );
+			if( itemTDBIDInSlot == availableItemTDBID )
+			{
+				continue;
+			}
+			data = new WardrobeWrappedInventoryItemData;
+			data.ItemData = availableItems[ i ];
+			data.ItemTemplate = ( ( Uint32 )( 0 ) );
+			data.ComparisonState = m_comparisonResolver.GetItemComparisonState( data.ItemData );
+			data.IsNew = m_uiScriptableSystem.IsWardrobeItemNew( InventoryItemData.GetID( availableItems[ i ] ) );
+			itemRecord = TweakDBInterface.GetItemRecord( availableItemTDBID );
+			data.AppearanceName = NameToString( itemRecord.AppearanceName() );
+			InventoryItemData.SetGameItemData( data.ItemData, m_InventoryManager.GetPlayerItemData( InventoryItemData.GetID( availableItems[ i ] ) ) );
+			virtualWrappedData.PushBack( ( ( IScriptable )( data ) ) );
+		}
+		inkWidgetRef.SetVisible( m_emptyGridText, availableItems.Size() <= 0 );
+		m_itemGridDataSource.Reset( virtualWrappedData );
+	}
+
+	private function SetButtonHintsHoverOut()
+	{
+		m_buttonHintsController.RemoveButtonHint( 'unequip_item' );
+		m_buttonHintsController.RemoveButtonHint( 'equip_item' );
+		m_buttonHintsController.RemoveButtonHint( 'select' );
+	}
+
+	private function GetItemDisplayByEquipmentArea( equipmentArea : gamedataEquipmentArea ) : weak< InventoryItemDisplayController >
+	{
+		var i : Int32;
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			if( m_areaSlotControllers[ i ].GetEquipmentArea() == equipmentArea )
+			{
+				return m_areaSlotControllers[ i ];
+			}
+		}
+		return NULL;
+	}
+
+	private function ProcessHiddenSlots()
+	{
+		var i, j : Int32;
+		var transactionSystem : TransactionSystem;
+		var slotArea, tagArea : gamedataEquipmentArea;
+		var itemID : ItemID;
+		var viusaltags : array< CName >;
+		transactionSystem = GameInstance.GetTransactionSystem( m_player.GetGame() );
+		m_hiddenEquipmentAreas.Clear();
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			slotArea = m_areaSlotControllers[ i ].GetEquipmentArea();
+			itemID = m_areaSlotControllers[ i ].GetItemID();
+			if( InventoryItemData.IsEmpty( m_areaSlotControllers[ i ].GetItemData() ) )
+			{
+				continue;
+			}
+			viusaltags = transactionSystem.GetVisualTagsByItemID( itemID, m_previewController.GetGamePuppet() );
+			for( j = 0; j < viusaltags.Size(); j += 1 )
+			{
+				tagArea = VisualTagToEquipmentArea( viusaltags[ j ] );
+				if( tagArea != gamedataEquipmentArea.Invalid && !( m_hiddenEquipmentAreas.Contains( tagArea ) ) )
+				{
+					m_hiddenEquipmentAreas.PushBack( tagArea );
+				}
+			}
+		}
+		for( i = 0; i < m_areaSlotControllers.Size(); i += 1 )
+		{
+			slotArea = m_areaSlotControllers[ i ].GetEquipmentArea();
+			SetAreaSlotCovered( m_areaSlotControllers[ i ], m_hiddenEquipmentAreas.Contains( slotArea ) );
+		}
+	}
+
+	private function SetAreaSlotCovered( slotConstroller : weak< InventoryItemDisplayController >, isCovered : Bool )
+	{
+		var itemsCount : Int32;
+		var availableItems : array< InventoryItemData >;
+		var inventoryItemData : InventoryItemData;
+		var showEquipped : Bool;
+		slotConstroller.SetWardrobeDisabled( isCovered );
+		inventoryItemData = slotConstroller.GetItemData();
+		if( InventoryItemData.IsEmpty( inventoryItemData ) && !( isCovered ) )
+		{
+			availableItems = m_wardrobeSystem.GetFilteredInventoryItemsData( slotConstroller.GetEquipmentArea(), m_InventoryManager );
+			itemsCount = availableItems.Size();
+		}
+		showEquipped = !( InventoryItemData.IsEmpty( inventoryItemData ) ) && !( isCovered );
+		slotConstroller.InvalidateVisualContent( inventoryItemData, itemsCount, showEquipped );
+		( ( VisualDisplayController )( slotConstroller ) ).SetIconsVisible( !( isCovered ) );
+	}
+
+	private function VisualTagToEquipmentArea( tag : CName ) : gamedataEquipmentArea
+	{
+		switch( tag )
+		{
+			case 'hide_H1':
+				return gamedataEquipmentArea.Head;
+			case 'hide_F1':
+				return gamedataEquipmentArea.Face;
+			case 'hide_T2':
+				return gamedataEquipmentArea.OuterChest;
+			case 'hide_T1':
+				return gamedataEquipmentArea.InnerChest;
+			case 'hide_L1':
+				return gamedataEquipmentArea.Legs;
+			case 'hide_S1':
+				return gamedataEquipmentArea.Feet;
+			default:
+				return gamedataEquipmentArea.Invalid;
+		}
+	}
+
+	protected event OnRegisterPreviewControllerEvent( evt : RegisterPreviewControllerEvent )
+	{
+		m_previewController = evt.controller;
+		m_previewController.PreviewUnequipFromSlot( T"AttachmentSlots.Outfit" );
+		m_previewController.PreviewUnequipFromSlot( T"AttachmentSlots.WeaponLeft" );
+		m_previewController.PreviewUnequipFromSlot( T"AttachmentSlots.WeaponRight" );
+		OpenSet( m_setButtonController );
+	}
+
+	public function GetPreviewController() : weak< WardrobeSetPreviewGameController >
+	{
+		return m_previewController;
+	}
+
+}
+
+class WardrobeWrappedInventoryItemData extends WrappedInventoryItemData
+{
+	var AppearanceName : String;
+}
+
+class WardrobeItemGridView extends CommonItemsGridView
+{
+
+	public override function SortItem( left : IScriptable, right : IScriptable ) : Bool
+	{
+		var leftItem, rightItem : WardrobeWrappedInventoryItemData;
+		leftItem = ( ( WardrobeWrappedInventoryItemData )( ( ( IScriptable )( left ) ) ) );
+		rightItem = ( ( WardrobeWrappedInventoryItemData )( ( ( IScriptable )( right ) ) ) );
+		return UnicodeStringCompare( leftItem.AppearanceName, rightItem.AppearanceName ) > 0;
+	}
+
+}
+

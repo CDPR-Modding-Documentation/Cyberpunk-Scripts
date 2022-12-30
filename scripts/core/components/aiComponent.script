@@ -1,0 +1,1024 @@
+import class AIComponent extends GameComponent
+{
+	public import function SetBehaviorArgument( n : CName, nv : Variant );
+	public import const function GetBehaviorArgument( n : CName ) : Variant;
+	public import const function GetFriendlyFireSystem() : IFriendlyFireSystem;
+	public import const function GetLoSFinderSystem() : ILoSFinderSystem;
+	public import const function GetSignals() : gameBoolSignalTable;
+	public import function SendCommand( cmd : AICommand ) : Bool;
+	public import function CancelCommand( cmd : AICommand ) : Bool;
+	public import function CancelCommandById( cmdId : Uint32, optional doNotRepeat : Bool ) : Bool;
+	public import function StartExecutingCommand( cmd : AICommand ) : Bool;
+	public import function StopExecutingCommand( cmd : AICommand, success : Bool ) : Bool;
+	public import const function IsCommandExecuting( commandName : CName, useInheritance : Bool ) : Bool;
+	public import const function IsCommandWaiting( commandName : CName, useInheritance : Bool ) : Bool;
+	public import const function GetCommandState( cmd : AICommand ) : AICommandState;
+	public import const function DebugLog( category : CName, message : String );
+	public import const function GetHighLevelState() : gamedataNPCHighLevelState;
+	public import const function GetAIRole() : AIRole;
+	public import const function SetAIRole( role : AIRole );
+	public import const function InvokeBehaviorCallback( cbName : CName );
+	public import const function GetLOD() : Int32;
+	public import const function GetCombatMode() : AIbehaviorCombatModes;
+	public import const function GetStoryTier() : gameStoryTier;
+	public import function SetCombatSpaceSize( combatSpaceSize : AICombatSpaceSize );
+	public import const function GetCombatSpaceSize() : AICombatSpaceSize;
+	public import function SetCombatSpaceSizeMultiplier( multiplier : Float );
+	public import const function GetCombatSpaceSizeMultiplier() : Float;
+	public import const function GetUpdateTickCount() : Uint32;
+	public import function ForceTickNextFrame();
+	public import function EnableCollider();
+	public import function DisableCollider();
+	public import function GetOrCreateBlackboard( definition : BlackboardDefinition, cache : ref< weak< IBlackboard > > ) : IBlackboard;
+
+	public function GetCurrentReactionPreset() : weak< ReactionPreset_Record >
+	{
+		return ( ( ScriptedPuppet )( GetEntity() ) ).GetStimReactionComponent().GetReactionPreset();
+	}
+
+	public static function InvokeBehaviorCallback( obj : weak< ScriptedPuppet >, cbName : CName )
+	{
+		var aiComponent : AIHumanComponent;
+		if( AIHumanComponent.Get( obj, aiComponent ) )
+		{
+			aiComponent.InvokeBehaviorCallback( cbName );
+		}
+	}
+
+	public static function SendCommand( obj : weak< ScriptedPuppet >, cmd : AICommand )
+	{
+		var aiComponent : AIHumanComponent;
+		if( !( obj ) || !( cmd ) )
+		{
+			return;
+		}
+		if( AIHumanComponent.Get( obj, aiComponent ) )
+		{
+			aiComponent.SendCommand( cmd );
+		}
+	}
+
+	public static function CancelCommand( obj : weak< ScriptedPuppet >, cmd : AICommand )
+	{
+		var aiComponent : AIHumanComponent;
+		if( !( obj ) || !( cmd ) )
+		{
+			return;
+		}
+		if( AIHumanComponent.Get( obj, aiComponent ) )
+		{
+			aiComponent.CancelCommand( cmd );
+		}
+	}
+
+}
+
+class StartGrenadeThrowQueryEvent extends Event
+{
+	var queryParams : gameGrenadeThrowQueryParams;
+}
+
+import class AIHumanComponent extends AIComponent
+{
+	private var m_shootingBlackboard : weak< IBlackboard >;
+	private var m_gadgetBlackboard : weak< IBlackboard >;
+	private var m_coverBlackboard : weak< IBlackboard >;
+	private var m_actionBlackboard : weak< IBlackboard >;
+	private var m_patrolBlackboard : weak< IBlackboard >;
+	private var m_alertedPatrolBlackboard : weak< IBlackboard >;
+	private var m_friendlyFireCheckID : Uint32;
+	private var m_ffs : IFriendlyFireSystem;
+	private var m_LoSFinderCheckID : Uint32;
+	private var m_loSFinderSystem : ILoSFinderSystem;
+	private var m_LoSFinderVisibleObject : weak< VisibleObject >;
+	private var m_actionAnimationScriptProxy : ActionAnimationScriptProxy;
+	private var m_lastOwnerBlockedAttackEventID : DelayID;
+	private var m_lastOwnerParriedAttackEventID : DelayID;
+	private var m_lastOwnerDodgedAttackEventID : DelayID;
+	private var m_grenadeThrowQueryTarget : weak< GameObject >;
+	private var m_grenadeThrowQueryId : Int32;
+	default m_grenadeThrowQueryId = -1;
+	private var m_scriptContext : ScriptExecutionContext;
+	private var m_scriptContextInitialized : Bool;
+	private var m_kerenzikovAbilityRecord : GameplayAbility_Record;
+	private var m_highLevelCb : Uint32;
+	private var m_activeCommands : AIActiveCommandList;
+
+	public import function SetMovementParams( params : MovementParameters );
+	public import function GetMovementParams( type : moveMovementType ) : MovementParameters;
+	public import function SetTDBMovementParams( paramsID : TweakDBID ) : Bool;
+
+	public function GetFriendlyFireCheckID() : Uint32
+	{
+		return m_friendlyFireCheckID;
+	}
+
+	public static function Get( owner : weak< ScriptedPuppet >, out aiComponent : AIHumanComponent ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		aiComponent = owner.GetAIControllerComponent();
+		return aiComponent != NULL;
+	}
+
+	private final function GetGame() : GameInstance
+	{
+		return ( ( GameObject )( GetEntity() ) ).GetGame();
+	}
+
+	private export function OnAttach()
+	{
+		var spawnAIRole : AIRole;
+		spawnAIRole = GetAIRole();
+		if( spawnAIRole && spawnAIRole.GetRoleEnum() != EAIRole.None )
+		{
+			OnAIRoleChanged( spawnAIRole, NULL );
+		}
+		ResetBehaviorCoverArguments();
+		m_kerenzikovAbilityRecord = TweakDBInterface.GetGameplayAbilityRecord( T"Ability.HasKerenzikov" );
+	}
+
+	private function ResetBehaviorCoverArguments()
+	{
+		ScriptExecutionContext.SetArgumentUint64( m_scriptContext, 'DesiredCoverID', 0 );
+		ScriptExecutionContext.SetArgumentUint64( m_scriptContext, 'CoverID', 0 );
+		ScriptExecutionContext.SetArgumentUint64( m_scriptContext, 'CommandCoverID', 0 );
+	}
+
+	private export function OnDetach()
+	{
+		m_actionAnimationScriptProxy = NULL;
+		ResetBehaviorCoverArguments();
+	}
+
+	protected event OnDeath( evt : gameDeathEvent )
+	{
+		ResetBehaviorCoverArguments();
+	}
+
+	protected event OnDefeated( evt : DefeatedEvent )
+	{
+		ResetBehaviorCoverArguments();
+	}
+
+	protected event OnPlayerCombatChanged( value : Int32 )
+	{
+		InvokeBehaviorCallback( 'OnPlayerCombatChanged' );
+	}
+
+	protected event OnDelayPassiveConditionEvaluationEvent( evt : DelayPassiveConditionEvaluationEvent )
+	{
+		InvokeBehaviorCallback( 'OnDelayPassiveConditionEvaluation' );
+	}
+
+	public import const function GetNPCRarity() : gamedataNPCRarity;
+	public import const function IsOfficer() : Bool;
+
+	public function GetCoverBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().AICover, m_coverBlackboard );
+	}
+
+	public function GetShootingBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().AIShooting, m_shootingBlackboard );
+	}
+
+	public function GetCombatGadgetBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().CombatGadget, m_gadgetBlackboard );
+	}
+
+	public function GetActionBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().AIAction, m_actionBlackboard );
+	}
+
+	public function GetAIPatrolBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().AIPatrol, m_patrolBlackboard );
+	}
+
+	public function GetAIAlertedPatrolBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().AIAlertedPatrol, m_alertedPatrolBlackboard );
+	}
+
+	public const function GetCurrentRole() : AIRole
+	{
+		return GetAIRole();
+	}
+
+	public import const function GetAssignedVehicleId() : EntityID;
+	public import const function GetAssignedVehicleSlot() : MountingSlotId;
+	public import const function HasVehicleAssigned() : Bool;
+
+	protected event OnVehicleAssign( evt : MountAIEvent )
+	{
+		if( evt.name == 'Mount' )
+		{
+			VehicleComponent.SetAnimsetOverrideForPassenger( ( ( GameObject )( GetEntity() ) ), evt.data.mountParentEntityId, evt.data.slotName, 1.0 );
+		}
+	}
+
+	public const function GetAssignedVehicleData( out vehicleID : EntityID, out vehicleSlot : MountingSlotId ) : Bool
+	{
+		if( !( HasVehicleAssigned() ) )
+		{
+			return false;
+		}
+		vehicleID = GetAssignedVehicleId();
+		vehicleSlot = GetAssignedVehicleSlot();
+		return true;
+	}
+
+	public const function GetAssignedVehicle( gi : GameInstance, out vehicle : weak< GameObject > ) : Bool
+	{
+		if( !( HasVehicleAssigned() ) )
+		{
+			return false;
+		}
+		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( gi, GetAssignedVehicleId() ) ) );
+		return vehicle != NULL;
+	}
+
+	public static function GetLastUsedVehicleSlot( owner : weak< ScriptedPuppet >, out vehicleSlotName : CName ) : Bool
+	{
+		var vehicleSlot : MountingSlotId;
+		if( !( GetLastUsedVehicleSlot( owner, vehicleSlot ) ) )
+		{
+			return false;
+		}
+		vehicleSlotName = vehicleSlot.id;
+		return IsNameValid( vehicleSlotName );
+	}
+
+	public static function GetLastUsedVehicleSlot( owner : weak< ScriptedPuppet >, out vehicleSlot : MountingSlotId ) : Bool
+	{
+		var vehicleID : EntityID;
+		if( !( owner ) || !( owner.GetAIControllerComponent() ) )
+		{
+			return false;
+		}
+		if( !( owner.GetAIControllerComponent().GetAssignedVehicleData( vehicleID, vehicleSlot ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function GetAssignedVehicle( owner : weak< ScriptedPuppet >, out vehicle : weak< GameObject > ) : Bool
+	{
+		if( !( owner ) || !( owner.GetAIControllerComponent() ) )
+		{
+			return false;
+		}
+		return owner.GetAIControllerComponent().GetAssignedVehicle( owner.GetGame(), vehicle );
+	}
+
+	private export function OnAIRoleChanged( newRole : AIRole, oldRole : AIRole )
+	{
+		var glpSystem : GameplayLogicPackageSystem;
+		var gameObject : GameObject;
+		gameObject = ( ( GameObject )( GetEntity() ) );
+		glpSystem = GameInstance.GetGameplayLogicPackageSystem( GetGame() );
+		if( oldRole && oldRole.GetRoleEnum() != EAIRole.None )
+		{
+			glpSystem.RemovePackage( gameObject, oldRole.GetRoleTweakRecord().RolePackage().GetID() );
+			oldRole.OnRoleCleared( gameObject );
+		}
+		newRole.OnRoleSet( gameObject );
+		if( newRole && newRole.GetRoleEnum() != EAIRole.None )
+		{
+			glpSystem.ApplyPackage( gameObject, gameObject, newRole.GetRoleTweakRecord().RolePackage().GetID() );
+		}
+	}
+
+	public static function SetCurrentRole( owner : GameObject, newRole : AIRole )
+	{
+		var evt : NPCRoleChangeEvent;
+		var puppet : ScriptedPuppet;
+		var ai : AIHumanComponent;
+		puppet = ( ( ScriptedPuppet )( owner ) );
+		if( puppet )
+		{
+			ai = puppet.GetAIControllerComponent();
+			if( ai )
+			{
+				ai.SetAIRole( newRole );
+				if( newRole.GetRoleEnum() == EAIRole.Follower )
+				{
+					puppet.SetSenseObjectType( gamedataSenseObjectType.Follower );
+					if( ( ( NPCPuppet )( puppet ) ) )
+					{
+						( ( NPCPuppet )( puppet ) ).ResetCompanionRoleCacheTimeStamp();
+					}
+				}
+				else
+				{
+					puppet.SetSenseObjectType( gamedataSenseObjectType.Npc );
+				}
+			}
+		}
+		evt = new NPCRoleChangeEvent;
+		evt.m_newRole = newRole;
+		if( owner )
+		{
+			owner.QueueEvent( evt );
+		}
+	}
+
+	public const function IsPlayerCompanion() : Bool
+	{
+		var friendlyTarget : weak< GameObject >;
+		if( !( GetAIRole() ) || GetAIRole().GetRoleEnum() != EAIRole.Follower )
+		{
+			return false;
+		}
+		friendlyTarget = ( ( weak< weak< GameObject > > )( GetBehaviorArgument( 'FriendlyTarget' ) ) );
+		if( !( friendlyTarget ) || !( friendlyTarget.IsAttached() ) )
+		{
+			return false;
+		}
+		if( friendlyTarget.IsPlayer() )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function GetFriendlyTargetAsPlayer( out player : weak< PlayerPuppet > ) : Bool
+	{
+		var friendlyTarget : weak< GameObject >;
+		if( !( GetFriendlyTarget( friendlyTarget ) ) )
+		{
+			return false;
+		}
+		player = ( ( PlayerPuppet )( friendlyTarget ) );
+		if( player )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function GetFriendlyTarget( out friendlyTarget : weak< GameObject > ) : Bool
+	{
+		if( !( GetAIRole() ) || GetAIRole().GetRoleEnum() != EAIRole.Follower )
+		{
+			return false;
+		}
+		friendlyTarget = ( ( weak< weak< GameObject > > )( GetBehaviorArgument( 'FriendlyTarget' ) ) );
+		if( !( friendlyTarget ) || !( friendlyTarget.IsAttached() ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public function GetActionAnimationScriptProxy() : ActionAnimationScriptProxy
+	{
+		if( !( m_actionAnimationScriptProxy ) )
+		{
+			m_actionAnimationScriptProxy = new ActionAnimationScriptProxy;
+			m_actionAnimationScriptProxy.Bind( ( ( GameObject )( GetEntity() ) ) );
+		}
+		return m_actionAnimationScriptProxy;
+	}
+
+	public export function OnSignalCombatQueriesRequest( signalId : Uint16, newValue : Bool )
+	{
+		if( newValue )
+		{
+			FriendlyFireCheckInit();
+			CombatQueriesSystemInit();
+			FriendlyFireTargetUpdateInit();
+			LoSFinderCheckInit();
+		}
+	}
+
+	public const function IsFriendlyFiring() : Bool
+	{
+		if( !( m_ffs ) )
+		{
+			return false;
+		}
+		if( m_friendlyFireCheckID == ( ( Uint32 )( 0 ) ) )
+		{
+			return false;
+		}
+		return !( m_ffs.Check( m_friendlyFireCheckID ) );
+	}
+
+	public const function FriendlyFireCheck() : Bool
+	{
+		var puppet : ScriptedPuppet;
+		if( m_friendlyFireCheckID == ( ( Uint32 )( 0 ) ) )
+		{
+			return false;
+		}
+		puppet = ( ( ScriptedPuppet )( GetEntity() ) );
+		if( !( puppet ) )
+		{
+			return false;
+		}
+		if( puppet.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Combat )
+		{
+			return false;
+		}
+		return !( m_ffs.Check( m_friendlyFireCheckID ) );
+	}
+
+	private function FriendlyFireCheckInit() : Bool
+	{
+		var puppet : ScriptedPuppet;
+		var ffp : FriendlyFireParams;
+		if( !( m_ffs ) )
+		{
+			m_ffs = GetFriendlyFireSystem();
+		}
+		puppet = ( ( ScriptedPuppet )( GetEntity() ) );
+		if( !( ScriptedPuppet.IsActive( puppet ) ) || puppet.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Combat )
+		{
+			if( m_friendlyFireCheckID != ( ( Uint32 )( 0 ) ) )
+			{
+				m_ffs.StopChecking( m_friendlyFireCheckID );
+				m_friendlyFireCheckID = 0;
+			}
+			return false;
+		}
+		if( m_friendlyFireCheckID == ( ( Uint32 )( 0 ) ) )
+		{
+			ffp = new FriendlyFireParams;
+			ffp.SetShooter( puppet.GetAttitudeAgent(), 'RightHand', 'AttachmentSlots.WeaponRight' );
+			ffp.SetGeometry( 0.2, 50.0 );
+			m_friendlyFireCheckID = m_ffs.StartChecking( ffp );
+		}
+		return true;
+	}
+
+	private function FriendlyFireTargetUpdateInit()
+	{
+		var owner : ScriptedPuppet;
+		var friendlyFireCheckID : Uint32;
+		var bestTargetingComponent : weak< TargetingComponent >;
+		var ownerWeaponSlotTransform : WorldTransform;
+		var shotOriginPosition : Vector4;
+		var shotForward : Vector4;
+		var target : weak< GameObject >;
+		var slotComponent : SlotComponent;
+		bestTargetingComponent = NULL;
+		owner = ( ( ScriptedPuppet )( GetEntity() ) );
+		target = ( ( weak< weak< GameObject > > )( GetBehaviorArgument( 'CombatTarget' ) ) );
+		if( !( owner ) || !( target ) )
+		{
+			return;
+		}
+		friendlyFireCheckID = GetFriendlyFireCheckID();
+		if( friendlyFireCheckID != ( ( Uint32 )( 0 ) ) )
+		{
+			if( target.IsPlayer() )
+			{
+				bestTargetingComponent = ( ( PlayerPuppet )( target ) ).GetPrimaryTargetingComponent();
+			}
+			else
+			{
+				slotComponent = owner.GetSlotComponent();
+				if( slotComponent && slotComponent.GetSlotTransform( 'RightHand', ownerWeaponSlotTransform ) )
+				{
+					shotOriginPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( ownerWeaponSlotTransform ) );
+					if( !( AIActionHelper.GetTargetSlotPosition( target, 'Head', shotForward ) ) )
+					{
+						shotForward = target.GetWorldPosition();
+					}
+					shotForward -= shotOriginPosition;
+					Vector4.Normalize( shotForward );
+					bestTargetingComponent = GameInstance.GetTargetingSystem( owner.GetGame() ).GetBestComponentOnTargetObject( shotOriginPosition, shotForward, target, TargetComponentFilterType.Shooting );
+				}
+			}
+			if( bestTargetingComponent != NULL )
+			{
+				GetFriendlyFireSystem().UpdateCurrentTargetComponent( friendlyFireCheckID, bestTargetingComponent );
+			}
+			else
+			{
+				GetFriendlyFireSystem().UpdateCurrentTargetObject( friendlyFireCheckID, target );
+			}
+		}
+	}
+
+	private function LoSFinderCheckInit() : Bool
+	{
+		var puppet : ScriptedPuppet;
+		var targetGO : weak< GameObject >;
+		var target : ScriptedPuppet;
+		var visibleObject : VisibleObject;
+		var params : LoSFinderParams;
+		var sensesComponent : SenseComponent;
+		var visibleObjectComponent : VisibleObjectComponent;
+		if( !( m_loSFinderSystem ) )
+		{
+			m_loSFinderSystem = GetLoSFinderSystem();
+		}
+		puppet = ( ( ScriptedPuppet )( GetEntity() ) );
+		targetGO = ( ( weak< weak< GameObject > > )( GetBehaviorArgument( 'CombatTarget' ) ) );
+		target = ( ( ScriptedPuppet )( targetGO ) );
+		if( target )
+		{
+			sensesComponent = target.GetSensesComponent();
+			if( sensesComponent )
+			{
+				visibleObject = sensesComponent.visibleObject;
+			}
+			if( !( visibleObject ) )
+			{
+				visibleObjectComponent = target.GetVisibleObjectComponent();
+				if( visibleObjectComponent )
+				{
+					visibleObject = visibleObjectComponent.visibleObject;
+				}
+			}
+		}
+		if( ( ( !( ScriptedPuppet.IsActive( puppet ) ) || puppet.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Combat ) || !( target ) ) || !( visibleObject ) )
+		{
+			if( m_LoSFinderCheckID != ( ( Uint32 )( 0 ) ) )
+			{
+				m_loSFinderSystem.StopChecking( m_LoSFinderCheckID );
+				m_LoSFinderCheckID = 0;
+				m_LoSFinderVisibleObject = NULL;
+			}
+			return false;
+		}
+		if( ( m_LoSFinderCheckID == ( ( Uint32 )( 0 ) ) ) || ( m_LoSFinderVisibleObject != visibleObject ) )
+		{
+			m_LoSFinderVisibleObject = visibleObject;
+			params = new LoSFinderParams;
+			params.SetSeeker( puppet );
+			params.SetTarget( visibleObject );
+			params.SetTracesAmountMultiplier( ( ( ScriptedPuppet.IsPlayerCompanion( puppet ) ) ? ( ( ( Uint32 )( 2 ) ) ) : ( ( ( Uint32 )( 1 ) ) ) ) );
+			if( puppet && puppet.GetNPCType() == gamedataNPCType.Drone )
+			{
+				params.SetOverrideCheckHeight( 2.0 );
+			}
+			if( m_LoSFinderCheckID == ( ( Uint32 )( 0 ) ) )
+			{
+				m_LoSFinderCheckID = m_loSFinderSystem.StartChecking( params );
+			}
+			else
+			{
+				m_loSFinderSystem.UpdateParams( m_LoSFinderCheckID, params );
+			}
+		}
+		return true;
+	}
+
+	public function GetReachedLoSPosition( ownerId : EntityID, entityPos : Vector4, losMode : Int32, radiusXY : Float, radiusZ : Float, maxNotFoundTime : Float ) : Bool
+	{
+		var losPosition : Vector3;
+		var currentSearchTime : Float;
+		if( !( m_loSFinderSystem ) || m_loSFinderSystem.GetLoSMode( ownerId ) == gameLoSMode.Invalid )
+		{
+			return true;
+		}
+		if( radiusXY <= 0.0 )
+		{
+			return true;
+		}
+		if( !( m_loSFinderSystem.GetLoSPosition( ownerId, losPosition, currentSearchTime ) ) )
+		{
+			if( ( currentSearchTime <= 0.0 ) && ( -( currentSearchTime ) > maxNotFoundTime ) )
+			{
+				return true;
+			}
+			return false;
+		}
+		return ( Vector4.DistanceSquared2D( entityPos, Vector4.Vector3To4( losPosition ) ) < ( radiusXY * radiusXY ) ) && ( AbsF( losPosition.Z - entityPos.Z ) < radiusZ );
+	}
+
+	private function CombatQueriesSystemInit() : Bool
+	{
+		var puppet : ScriptedPuppet;
+		var target : weak< GameObject >;
+		var grenadeAbility : GameplayAbility_Record;
+		puppet = ( ( ScriptedPuppet )( GetEntity() ) );
+		target = ( ( weak< weak< GameObject > > )( GetBehaviorArgument( 'CombatTarget' ) ) );
+		grenadeAbility = TweakDBInterface.GetGameplayAbilityRecord( T"Ability.CanUseGrenades" );
+		if( ( !( target ) || !( m_scriptContextInitialized ) ) || !( AICondition.CheckAbility( m_scriptContext, grenadeAbility ) ) )
+		{
+			if( m_grenadeThrowQueryId >= 0 )
+			{
+				GameInstance.GetCombatQueriesSystem( GetGame() ).StopGrenadeThrowQueries( ( ( GameObject )( puppet ) ) );
+				m_grenadeThrowQueryId = -1;
+				m_grenadeThrowQueryTarget = NULL;
+			}
+			return false;
+		}
+		StartGrenadeThrowQuery( target );
+		return m_grenadeThrowQueryId >= 0;
+	}
+
+	protected event OnStartGrenadeThrowQueryEvent( evt : StartGrenadeThrowQueryEvent )
+	{
+		if( m_grenadeThrowQueryId >= 0 )
+		{
+			GameInstance.GetCombatQueriesSystem( GetGame() ).StopGrenadeThrowQuery( ( ( GameObject )( GetEntity() ) ), m_grenadeThrowQueryId );
+			m_grenadeThrowQueryId = -1;
+			m_grenadeThrowQueryTarget = NULL;
+		}
+		if( evt.queryParams.target )
+		{
+			m_grenadeThrowQueryId = GameInstance.GetCombatQueriesSystem( GetGame() ).StartGrenadeThrowQuery( evt.queryParams );
+			m_grenadeThrowQueryTarget = evt.queryParams.target;
+		}
+	}
+
+	private const function StartGrenadeThrowQuery( target : weak< GameObject > )
+	{
+		var targetTrackerComponent : TargetTrackerComponent;
+		var evt : StartGrenadeThrowQueryEvent;
+		if( !( target ) )
+		{
+			return;
+		}
+		evt = new StartGrenadeThrowQueryEvent;
+		evt.queryParams.requester = ( ( GameObject )( GetEntity() ) );
+		evt.queryParams.target = target;
+		evt.queryParams.minRadius = 1.0;
+		evt.queryParams.maxRadius = 2.0;
+		evt.queryParams.friendlyAvoidanceRadius = 9.0;
+		targetTrackerComponent = evt.queryParams.requester.GetTargetTrackerComponent();
+		if( targetTrackerComponent )
+		{
+			evt.queryParams.targetPositionProvider = targetTrackerComponent.GetThreatLastKnownPositionProvider( target );
+		}
+		GetEntity().QueueEvent( evt );
+	}
+
+	public const function CanThrowGrenadeAtTarget( target : weak< GameObject >, out throwPositions : Vector4, out throwAngle : Float, out throwStartType : gameGrenadeThrowStartType ) : Bool
+	{
+		if( !( target ) )
+		{
+			return false;
+		}
+		if( ( m_grenadeThrowQueryId < 0 ) || ( target != m_grenadeThrowQueryTarget ) )
+		{
+			StartGrenadeThrowQuery( target );
+			return false;
+		}
+		if( GameInstance.GetCombatQueriesSystem( target.GetGame() ).CheckGrenadeThrowQuery( ( ( GameObject )( GetEntity() ) ), m_grenadeThrowQueryId, throwPositions, throwAngle, throwStartType ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public function CacheThrowGrenadeAtTargetQuery( target : weak< GameObject > ) : Bool
+	{
+		var throwPositions : Vector4;
+		var throwAngle : Float;
+		var throwStartType : gameGrenadeThrowStartType;
+		throwStartType = gameGrenadeThrowStartType.Invalid;
+		if( !( target ) )
+		{
+			GetCombatGadgetBlackboard().SetFloat( GetAllBlackboardDefs().CombatGadget.lastThrowAngle, throwAngle );
+			GetCombatGadgetBlackboard().SetVector4( GetAllBlackboardDefs().CombatGadget.lastThrowPosition, throwPositions );
+			GetCombatGadgetBlackboard().SetVariant( GetAllBlackboardDefs().CombatGadget.lastThrowStartType, throwStartType );
+			return false;
+		}
+		if( ( m_grenadeThrowQueryId < 0 ) || ( target != m_grenadeThrowQueryTarget ) )
+		{
+			GetCombatGadgetBlackboard().SetFloat( GetAllBlackboardDefs().CombatGadget.lastThrowAngle, throwAngle );
+			GetCombatGadgetBlackboard().SetVector4( GetAllBlackboardDefs().CombatGadget.lastThrowPosition, throwPositions );
+			GetCombatGadgetBlackboard().SetVariant( GetAllBlackboardDefs().CombatGadget.lastThrowStartType, throwStartType );
+			StartGrenadeThrowQuery( target );
+			return false;
+		}
+		if( GameInstance.GetCombatQueriesSystem( target.GetGame() ).CheckGrenadeThrowQuery( ( ( GameObject )( GetEntity() ) ), m_grenadeThrowQueryId, throwPositions, throwAngle, throwStartType ) )
+		{
+			GetCombatGadgetBlackboard().SetFloat( GetAllBlackboardDefs().CombatGadget.lastThrowAngle, throwAngle );
+			GetCombatGadgetBlackboard().SetVector4( GetAllBlackboardDefs().CombatGadget.lastThrowPosition, throwPositions );
+			GetCombatGadgetBlackboard().SetVariant( GetAllBlackboardDefs().CombatGadget.lastThrowStartType, throwStartType );
+			return true;
+		}
+		return false;
+	}
+
+	public function NULLCachedThrowGrenadeAtTargetQuery()
+	{
+		var throwPositions : Vector4;
+		var throwAngle : Float;
+		var throwStartType : gameGrenadeThrowStartType;
+		throwStartType = gameGrenadeThrowStartType.Invalid;
+		GetCombatGadgetBlackboard().SetFloat( GetAllBlackboardDefs().CombatGadget.lastThrowAngle, throwAngle );
+		GetCombatGadgetBlackboard().SetVector4( GetAllBlackboardDefs().CombatGadget.lastThrowPosition, throwPositions );
+		GetCombatGadgetBlackboard().SetVariant( GetAllBlackboardDefs().CombatGadget.lastThrowStartType, throwStartType );
+	}
+
+	protected event OnSetScriptExecutionContext( evt : SetScriptExecutionContextEvent )
+	{
+		m_scriptContext = evt.scriptExecutionContext;
+		m_scriptContextInitialized = true;
+	}
+
+	public static function GetScriptContext( const puppet : weak< ScriptedPuppet >, out context : ScriptExecutionContext ) : Bool
+	{
+		if( !( puppet ) )
+		{
+			return false;
+		}
+		return puppet.GetAIControllerComponent().GetScriptContext( context );
+	}
+
+	public const function GetScriptContext( out context : ScriptExecutionContext ) : Bool
+	{
+		if( !( m_scriptContextInitialized ) )
+		{
+			return false;
+		}
+		context = m_scriptContext;
+		return true;
+	}
+
+	public const function CheckTweakCondition( ActionConditionName : String ) : Bool
+	{
+		var actionStringName : String;
+		var actionRecord : weak< AIAction_Record >;
+		var TDBRecord : TweakDBID;
+		if( !( m_scriptContextInitialized ) )
+		{
+			return false;
+		}
+		TDBRecord = ScriptExecutionContext.CreateActionID( m_scriptContext, ActionConditionName, AIScriptActionDelegate.GetActionPackageType( m_scriptContext ) );
+		if( TweakAIActionRecord.GetActionRecord( m_scriptContext, TDBRecord, actionStringName, actionRecord ) )
+		{
+			return AICondition.ActivationCheck( m_scriptContext, actionRecord );
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public export function TryBulletDodgeOpportunity() : Bool
+	{
+		var owner : ScriptedPuppet;
+		var aiEvent : StimuliEvent;
+		var dodge : Bool;
+		dodge = false;
+		owner = ( ( ScriptedPuppet )( GetEntity() ) );
+		if( owner )
+		{
+			dodge = owner.HasIndividualTimeDilation( TimeDilationHelper.GetSandevistanKey() );
+		}
+		if( ( !( dodge ) && AIActionHelper.CheckAbility( owner, m_kerenzikovAbilityRecord ) ) && CheckTweakCondition( "DodgeBulletSelectorCondition" ) )
+		{
+			aiEvent = new StimuliEvent;
+			aiEvent.name = 'BulletDodgeOpportunity';
+			GetEntity().QueueEvent( aiEvent );
+			dodge = true;
+		}
+		return dodge;
+	}
+
+	protected event OnHitAiEventReceived( hitAIEvent : AIEvent )
+	{
+		if( hitAIEvent.name == 'MyAttackBlocked' )
+		{
+			UpdateMyAttackBlockedCount( false );
+		}
+		else if( hitAIEvent.name == 'MyAttackParried' )
+		{
+			UpdateMyAttackParriedCount( false );
+		}
+		else if( hitAIEvent.name == 'MyAttackDodged' )
+		{
+			UpdateMyAttackDodgedCount( false );
+		}
+		else if( hitAIEvent.name == 'ResetmyAttackBlockedCount' )
+		{
+			UpdateMyAttackBlockedCount( true );
+		}
+		else if( hitAIEvent.name == 'ResetmyAttackParriedCount' )
+		{
+			UpdateMyAttackParriedCount( true );
+		}
+		else if( hitAIEvent.name == 'ResetmyAttackDodgedCount' )
+		{
+			UpdateMyAttackDodgedCount( true );
+		}
+	}
+
+	private function UpdateMyAttackBlockedCount( resetBB : Bool )
+	{
+		var blackBoardVarID : BlackboardID_Int;
+		var request : StimuliEvent;
+		request = new StimuliEvent;
+		blackBoardVarID = GetAllBlackboardDefs().AIAction.ownerMeleeAttackBlockedCount;
+		if( resetBB )
+		{
+			GetActionBlackboard().SetInt( blackBoardVarID, 0 );
+		}
+		else
+		{
+			GetActionBlackboard().SetInt( blackBoardVarID, GetActionBlackboard().GetInt( blackBoardVarID ) + 1 );
+			request.name = 'ResetmyAttackBlockedCount';
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_lastOwnerBlockedAttackEventID );
+			m_lastOwnerBlockedAttackEventID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( GetEntity(), request, 5.0 );
+		}
+	}
+
+	private function UpdateMyAttackParriedCount( resetBB : Bool )
+	{
+		var blackBoardVarID : BlackboardID_Int;
+		var request : StimuliEvent;
+		request = new StimuliEvent;
+		blackBoardVarID = GetAllBlackboardDefs().AIAction.ownerMeleeAttackParriedCount;
+		if( resetBB )
+		{
+			GetActionBlackboard().SetInt( blackBoardVarID, 0 );
+		}
+		else
+		{
+			GetActionBlackboard().SetInt( blackBoardVarID, GetActionBlackboard().GetInt( blackBoardVarID ) + 1 );
+			request.name = 'ResetmyAttackParriedCount';
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_lastOwnerParriedAttackEventID );
+			m_lastOwnerParriedAttackEventID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( GetEntity(), request, 5.0 );
+		}
+	}
+
+	private function UpdateMyAttackDodgedCount( resetBB : Bool )
+	{
+		var blackBoardVarID : BlackboardID_Int;
+		var request : StimuliEvent;
+		request = new StimuliEvent;
+		blackBoardVarID = GetAllBlackboardDefs().AIAction.ownerMeleeAttackDodgedCount;
+		if( resetBB )
+		{
+			GetActionBlackboard().SetInt( blackBoardVarID, 0 );
+		}
+		else
+		{
+			GetActionBlackboard().SetInt( blackBoardVarID, GetActionBlackboard().GetInt( blackBoardVarID ) + 1 );
+			request.name = 'ResetmyAttackDodgedCount';
+			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_lastOwnerDodgedAttackEventID );
+			m_lastOwnerDodgedAttackEventID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( GetEntity(), request, 5.0 );
+		}
+	}
+
+	public export function OnCommandStateChanged( command : AICommand, oldState : AICommandState, newState : AICommandState )
+	{
+		if( ( newState == AICommandState.Executing || newState == AICommandState.Enqueued ) || newState == AICommandState.NotExecuting )
+		{
+			AIActiveCommandList.Add( m_activeCommands, command );
+			if( ( ( AIMoveCommand )( command ) ).ignoreInCombat )
+			{
+				GetActionBlackboard().SetBool( GetAllBlackboardDefs().AIAction.ignoreInCombatMoveCommand, true );
+			}
+		}
+		else
+		{
+			AIActiveCommandList.Remove( m_activeCommands, command.GetClassName() );
+			if( ( ( AIMoveCommand )( command ) ).ignoreInCombat )
+			{
+				GetActionBlackboard().SetBool( GetAllBlackboardDefs().AIAction.ignoreInCombatMoveCommand, false );
+			}
+		}
+		if( ( ( AICombatRelatedCommand )( command ) ) )
+		{
+			InvokeBehaviorCallback( 'OnCombatCommandChanged' );
+		}
+		InvokeBehaviorCallback( 'OnCommandStateChanged' );
+	}
+
+	public function OnSignalCommandSignal( signalId : Uint16, newValue : Bool )
+	{
+		var signalData : CommandSignal;
+		if( newValue )
+		{
+			signalData = ( ( CommandSignal )( GetSignals().GetCurrentData( signalId ) ) );
+			if( signalData )
+			{
+				if( signalData.track )
+				{
+					TrackActionCommandID( signalData.commandClassNames );
+				}
+				else
+				{
+					ClearActionCommandID( signalData.commandClassNames );
+				}
+			}
+		}
+	}
+
+	private function TrackActionCommandID( commandClassNames : ref< array< CName > > )
+	{
+		var i : Int32;
+		for( i = 0; i < commandClassNames.Size(); i += 1 )
+		{
+			AIActiveCommandList.TrackActionCommand( m_activeCommands, commandClassNames[ i ] );
+		}
+	}
+
+	private function ClearActionCommandID( commandClassNames : ref< array< CName > > )
+	{
+		var i : Int32;
+		for( i = 0; i < commandClassNames.Size(); i += 1 )
+		{
+			AIActiveCommandList.ClearActionCommand( m_activeCommands, commandClassNames[ i ] );
+		}
+	}
+
+	public const function IsCommandReceivedOrOverriden( const commandClassName : CName ) : Bool
+	{
+		return AIActiveCommandList.IsActionCommandByName( m_activeCommands, commandClassName );
+	}
+
+	public const function IsCommandReceivedOrOverriden( const commandID : Uint32 ) : Bool
+	{
+		return AIActiveCommandList.IsActionCommandById( m_activeCommands, commandID );
+	}
+
+	public const function IsCommandActive( const commandClassName : CName ) : Bool
+	{
+		return AIActiveCommandList.Contains( m_activeCommands, commandClassName );
+	}
+
+	public const function GetActiveCommandsCount() : Int32
+	{
+		return AIActiveCommandList.Size( m_activeCommands );
+	}
+
+	public const function IsCommandActive( const commandID : Uint32 ) : Bool
+	{
+		return AIActiveCommandList.ContainsById( m_activeCommands, commandID );
+	}
+
+	public const function GetActiveCommandID( const commandClassName : CName ) : Int32
+	{
+		var id : Uint32;
+		if( AIActiveCommandList.GetId( m_activeCommands, commandClassName, id ) )
+		{
+			return ( ( Int32 )( id ) );
+		}
+		return -1;
+	}
+
+	protected event OnStatusEffectApplied( evt : ApplyStatusEffectEvent ) {}
+
+	protected event OnStatusEffectRemoved( evt : ApplyStatusEffectEvent )
+	{
+		InvokeBehaviorCallback( 'OnStatusEffectRemoved' );
+	}
+
+	protected event OnNewThreat( evt : NewThreat )
+	{
+		InvokeBehaviorCallback( 'OnThreatsChanged' );
+	}
+
+	protected event OnHostileThreatDetected( evt : HostileThreatDetected )
+	{
+		InvokeBehaviorCallback( 'OnThreatsChanged' );
+	}
+
+	protected event OnEnemyThreatDetected( evt : EnemyThreatDetected )
+	{
+		InvokeBehaviorCallback( 'OnThreatsChanged' );
+	}
+
+	protected event OnThreatRemoved( evt : ThreatRemoved )
+	{
+		InvokeBehaviorCallback( 'OnThreatsChanged' );
+	}
+
+	protected event OnAnimParamsEvent( evt : AnimParamsEvent )
+	{
+		var status : Bool;
+		var value : Float;
+		if( evt.GetParameterValue( 'rightArmLookAtStatus', value ) )
+		{
+			status = GetLookAtStatus( animLookAtStatus.LimitReached, value );
+			if( status )
+			{
+				GetShootingBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.rightArmLookAtLimitReached, 0 );
+				return true;
+			}
+			status = GetLookAtStatus( animLookAtStatus.TransitionInProgress, value );
+			if( status )
+			{
+				GetShootingBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.rightArmLookAtLimitReached, 1 );
+				return true;
+			}
+			status = GetLookAtStatus( animLookAtStatus.Active, value );
+			if( status )
+			{
+				GetShootingBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.rightArmLookAtLimitReached, 2 );
+				return true;
+			}
+			GetShootingBlackboard().SetInt( GetAllBlackboardDefs().AIShooting.rightArmLookAtLimitReached, 0 );
+		}
+	}
+
+}
+

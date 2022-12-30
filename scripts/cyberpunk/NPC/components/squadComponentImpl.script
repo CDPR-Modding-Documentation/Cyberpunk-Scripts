@@ -1,0 +1,640 @@
+class SquadActionSignal extends TaggedSignalUserData
+{
+	var squadActionName : CName;
+	var squadVerb : EAISquadVerb;
+}
+
+class SquadActionEvent extends Event
+{
+	var squadActionName : CName;
+	var squadVerb : EAISquadVerb;
+}
+
+struct SquadTicketReceipt
+{
+	var acknowledgedTimeStamp : Float;
+	var conditionDeactivationCheckTimeStamp : Float;
+	var conditionDeactivationSuccessfulCheckTimeStamp : Float;
+	var conditionCheckRandomizedInterval : Float;
+	var lastRecipient : EntityID;
+	var acknowledgesInQueue : Int32;
+	var numberOfOrders : Int32;
+	var cooldownID : Int32;
+}
+
+class SquadMemberBaseComponent extends SquadMemberComponent
+{
+	private var m_baseSquadRecord : weak< AISquadParams_Record >;
+
+	private function GetBaseSquadRecord() : weak< AISquadParams_Record >
+	{
+		if( !( m_baseSquadRecord ) )
+		{
+			AIScriptSquad.GetBaseSquadRecord( m_baseSquadRecord );
+		}
+		return m_baseSquadRecord;
+	}
+
+	public function OnSquadActionSignalReceived( signal : SquadActionSignal )
+	{
+		PerformSquadVerb( signal.squadActionName, signal.squadVerb );
+	}
+
+	protected event OnSquadActionEvent( evt : SquadActionEvent )
+	{
+		PerformSquadVerb( evt.squadActionName, evt.squadVerb );
+	}
+
+	[ profile = "" ]
+	public function PerformSquadVerb( squadActionName : CName, squadVerb : EAISquadVerb )
+	{
+		var squadInterface : weak< SquadScriptInterface >;
+		var ticketRecord : AITicket_Record;
+		var ticketTimeout : Float;
+		if( !( GetSquadInterface( squadInterface ) ) )
+		{
+			return;
+		}
+		switch( squadVerb )
+		{
+			case EAISquadVerb.OpenSquadAction:
+				ticketTimeout = -1.0;
+			if( GetTicketType( squadActionName, GetEntity(), ticketRecord ) )
+			{
+				ticketTimeout = ticketRecord.Timeout();
+			}
+			squadInterface.OpenSquadAction( squadActionName, GetEntity(), ticketTimeout );
+			break;
+			case EAISquadVerb.RevokeSquadAction:
+				squadInterface.RevokeSquadAction( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.RevokeOrder:
+				squadInterface.RevokeOrder( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.EvaluateTicketActivation:
+				squadInterface.TriggerActivation( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.EvaluateTicketDeactivation:
+				squadInterface.TriggerDeactivation( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.CommitToSquadAction:
+				squadInterface.Commit( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.AcknowledgeOrder:
+				squadInterface.AckOrder( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.ReportDoneOnSquadAction:
+				squadInterface.ReportDone( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.ReportFailureOnSquadAction:
+				squadInterface.ReportFail( squadActionName, GetEntity() );
+			break;
+			case EAISquadVerb.JoinSquad:
+				squadInterface.Join( GetEntity() );
+			break;
+			case EAISquadVerb.LeaveSquad:
+				squadInterface.Leave( GetEntity() );
+			break;
+		}
+	}
+
+	private function GetSquadInterface( out interface : weak< SquadScriptInterface > ) : Bool
+	{
+		interface = MySquad( AISquadType.Combat );
+		return interface != NULL;
+	}
+
+	private function GetTicketType( actionName : CName, entity : Entity, out ticketRecord : AITicket_Record ) : Bool
+	{
+		var squadRecord : AISquadParams_Record;
+		return AIScriptUtils.GetTicketType( actionName, ( ( gamePuppet )( entity ) ), GetBaseSquadRecord(), ticketRecord, squadRecord );
+	}
+
+}
+
+class PuppetSquadInterface extends CombatSquadScriptInterface
+{
+	private var m_baseSquadRecord : weak< AISquadParams_Record >;
+	private var m_ticketHistory : array< SquadTicketReceipt >;
+	private var m_enumValueToNdx : EnumNameToIndexCache;
+	private var m_sectorsInitialized : Bool;
+
+	protected event OnInitialise()
+	{
+		AIScriptSquad.GetBaseSquadRecord( m_baseSquadRecord );
+		AllocateTicketHistoryArray();
+	}
+
+	protected event OnOpenSquadAction( actionName : CName, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var ticketHistoryID : Int32;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		RefreshSquadAction( actionName, entity, ticketRecord.Timeout() );
+	}
+
+	protected event OnAckOrder( orderId : Uint32, actionName : CName, entity : Entity )
+	{
+		var ticketHistoryID : Int32;
+		ticketHistoryID = GetTicketHistoryID( actionName );
+		m_ticketHistory[ ticketHistoryID ].acknowledgedTimeStamp = GetAITime( entity );
+		m_ticketHistory[ ticketHistoryID ].acknowledgesInQueue -= 1;
+	}
+
+	protected event OnGiveOrder( orderId : Uint32, actionName : CName, entity : Entity ) {}
+
+	protected event OnCommitToOrder( actionName : CName, orderId : Uint32, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var ticketHistoryID : Int32;
+		var acknowledgeDelay : Float;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		GetAcknowledgeDelay( entity, ticketRecord, ticketHistoryID, acknowledgeDelay );
+		AcknowledgeTicket( actionName, entity, ticketRecord, ticketHistoryID, acknowledgeDelay );
+	}
+
+	protected event OnCloseSquadAction( actionName : CName, entity : Entity ) {}
+
+	protected event OnOrderRevoked( orderId : Uint32, actionName : CName, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var ticketHistoryID : Int32;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		if( ticketRecord.ReleaseAll() )
+		{
+			ReleaseSquadMembersTickets( actionName, entity );
+		}
+		UpdateTicketHistory( entity, ticketRecord, ticketHistoryID, EAITicketStatus.OrderRevoked );
+	}
+
+	protected event OnOrderDone( orderId : Uint32, actionName : CName, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var ticketHistoryID : Int32;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		if( ticketRecord.ReleaseAll() )
+		{
+			ReleaseSquadMembersTickets( actionName, entity );
+		}
+		UpdateTicketHistory( entity, ticketRecord, ticketHistoryID, EAITicketStatus.OrderDone );
+	}
+
+	protected event OnOrderFail( orderId : Uint32, actionName : CName, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var ticketHistoryID : Int32;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		if( ticketRecord.ReleaseAll() )
+		{
+			AISquadHelper.SendStimFromSquadTargetToMember( entity, actionName );
+		}
+		UpdateTicketHistory( entity, ticketRecord, ticketHistoryID, EAITicketStatus.OrderFail );
+	}
+
+	protected event OnEvaluationActivation( actionName : CName, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var squadRecord : AISquadParams_Record;
+		var ticketHistoryID : Int32;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID, squadRecord ) ) )
+		{
+			return false;
+		}
+		if( EvaluateTicketActivation( actionName, entity, ticketRecord, ticketHistoryID, squadRecord ) )
+		{
+			GiveOrder( actionName, entity );
+			UpdateTicketHistory( entity, ticketRecord, ticketHistoryID, EAITicketStatus.Evaluate );
+		}
+		else
+		{
+			RefreshSquadAction( actionName, entity, ticketRecord.Timeout() );
+		}
+	}
+
+	protected event OnEvaluationDeActivation( actionName : CName, entity : Entity )
+	{
+		var ticketRecord : AITicket_Record;
+		var squadRecord : AISquadParams_Record;
+		var ticketHistoryID : Int32;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID, squadRecord ) ) )
+		{
+			return false;
+		}
+		if( EvaluateTicketDeactivation( actionName, entity, ticketRecord, ticketHistoryID, squadRecord ) )
+		{
+			ReportDone( actionName, entity );
+		}
+	}
+
+	private function EvaluateTicketActivation( actionName : CName, entity : weak< Entity >, ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32, squadRecord : weak< AISquadParams_Record > ) : Bool
+	{
+		var ticketConditions : array< weak< AITicketCondition_Record > >;
+		var acknowledgeDelay : Float;
+		if( HasOrderBySquadAction( actionName, entity ) )
+		{
+			return false;
+		}
+		if( !( CheckCooldown( entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		if( !( GetAcknowledgeDelay( entity, ticketRecord, ticketHistoryID, acknowledgeDelay ) ) )
+		{
+			return false;
+		}
+		ticketRecord.ActivationCondition( ticketConditions );
+		if( !( AITicketCondition.PerformChecking( entity, this, ticketConditions, ticketRecord, squadRecord ) ) )
+		{
+			return false;
+		}
+		RandomizeDeactivationConditionCheckInterval( ticketRecord, ticketHistoryID );
+		return true;
+	}
+
+	private final function RandomizeDeactivationConditionCheckInterval( ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32 )
+	{
+		var randomCheckIntervalMods : array< Float >;
+		m_ticketHistory[ ticketHistoryID ].conditionCheckRandomizedInterval = 0.0;
+		if( ( ticketRecord.GetDeactivationConditionCount() > 0 ) && ( ticketRecord.DeactivationConditionCheckInterval() > 0.0 ) )
+		{
+			randomCheckIntervalMods.Resize( 3 );
+			randomCheckIntervalMods[ 0 ] = 0.0;
+			randomCheckIntervalMods[ 1 ] = 0.0334;
+			randomCheckIntervalMods[ 2 ] = 0.0667;
+			m_ticketHistory[ ticketHistoryID ].conditionCheckRandomizedInterval = ticketRecord.DeactivationConditionCheckInterval();
+			m_ticketHistory[ ticketHistoryID ].conditionCheckRandomizedInterval += randomCheckIntervalMods[ RandRange( 0, 3 ) ];
+		}
+	}
+
+	private function EvaluateTicketDeactivation( actionName : CName, entity : weak< Entity >, ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32, squadRecord : weak< AISquadParams_Record > ) : Bool
+	{
+		var ticketConditions : array< weak< AITicketCondition_Record > >;
+		var conditionSuccessDuration : Float;
+		if( ticketRecord.GetDeactivationConditionCount() == 0 )
+		{
+			return false;
+		}
+		if( ( m_ticketHistory[ ticketHistoryID ].conditionCheckRandomizedInterval <= 0.0 ) || ( ( m_ticketHistory[ ticketHistoryID ].conditionCheckRandomizedInterval > 0.0 ) && ( GetAITime( entity ) >= ( m_ticketHistory[ ticketHistoryID ].conditionDeactivationCheckTimeStamp + m_ticketHistory[ ticketHistoryID ].conditionCheckRandomizedInterval ) ) ) )
+		{
+			if( HasOrderBySquadAction( actionName, entity ) )
+			{
+				ticketRecord.DeactivationCondition( ticketConditions );
+				if( AITicketCondition.PerformChecking( entity, this, ticketConditions, ticketRecord ) )
+				{
+					conditionSuccessDuration = ticketRecord.ConditionSuccessDuration();
+					if( ( conditionSuccessDuration > 0.0 ) && ( m_ticketHistory[ ticketHistoryID ].conditionDeactivationSuccessfulCheckTimeStamp < 0.0 ) )
+					{
+						m_ticketHistory[ ticketHistoryID ].conditionDeactivationSuccessfulCheckTimeStamp = GetAITime( entity );
+					}
+					if( ( conditionSuccessDuration <= 0.0 ) || ( ( conditionSuccessDuration > 0.0 ) && ( GetAITime( entity ) >= ( m_ticketHistory[ ticketHistoryID ].conditionDeactivationSuccessfulCheckTimeStamp + conditionSuccessDuration ) ) ) )
+					{
+						return true;
+					}
+				}
+				else
+				{
+					m_ticketHistory[ ticketHistoryID ].conditionDeactivationSuccessfulCheckTimeStamp = -1.0;
+				}
+			}
+			m_ticketHistory[ ticketHistoryID ].conditionDeactivationCheckTimeStamp = GetAITime( entity );
+		}
+		return false;
+	}
+
+	private function ReleaseSquadMembersTickets( actionName : CName, entity : weak< Entity > )
+	{
+		var squadMembers : array< weak< Entity > >;
+		var i : Int32;
+		squadMembers = ListMembersWeak();
+		squadMembers.Remove( entity );
+		for( i = 0; i < squadMembers.Size(); i += 1 )
+		{
+			if( HasOrderBySquadAction( actionName, squadMembers[ i ] ) )
+			{
+				ReportDone( actionName, squadMembers[ i ] );
+			}
+		}
+	}
+
+	private function GetAcknowledgeDelay( entity : weak< Entity >, ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32, out acknowledgeDelay : Float ) : Bool
+	{
+		var ticketHistory : SquadTicketReceipt;
+		ticketHistory = m_ticketHistory[ ticketHistoryID ];
+		if( ticketHistory.numberOfOrders == 0 )
+		{
+			return true;
+		}
+		if( ticketRecord.MinTicketDesyncTime() > 0.0 )
+		{
+			if( GetAITime( entity ) > ( ticketRecord.MinTicketDesyncTime() + ticketHistory.acknowledgedTimeStamp ) )
+			{
+				return true;
+			}
+			else
+			{
+				acknowledgeDelay = ( ticketRecord.MinTicketDesyncTime() + ticketHistory.acknowledgedTimeStamp ) - GetAITime( entity );
+				acknowledgeDelay *= ( ( ( Float )( ticketHistory.acknowledgesInQueue ) ) + 1.0 );
+			}
+			return false;
+		}
+		return true;
+	}
+
+	private function AcknowledgeTicket( actionName : CName, entity : weak< Entity >, ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32, delay : Float ) : Bool
+	{
+		var evt : SquadActionEvent;
+		var object : weak< GameObject >;
+		if( delay > 0.0 )
+		{
+			object = ( ( GameObject )( entity ) );
+			if( !( object ) )
+			{
+				return false;
+			}
+			evt = new SquadActionEvent;
+			evt.squadActionName = actionName;
+			evt.squadVerb = EAISquadVerb.AcknowledgeOrder;
+			m_ticketHistory[ ticketHistoryID ].acknowledgesInQueue += 1;
+			GameInstance.GetDelaySystem( object.GetGame() ).DelayEvent( object, evt, delay );
+			return true;
+		}
+		if( AckOrder( actionName, entity ) )
+		{
+			ProcessRingTicket( entity, ticketRecord );
+			m_ticketHistory[ ticketHistoryID ].acknowledgesInQueue += 1;
+			return true;
+		}
+		return false;
+	}
+
+	private function ProcessRingTicket( entity : weak< Entity >, ticketRecord : weak< AITicket_Record > )
+	{
+		var ringTicket : weak< AIRingTicket_Record >;
+		var puppet : weak< ScriptedPuppet >;
+		puppet = ( ( ScriptedPuppet )( entity ) );
+		if( !( puppet ) )
+		{
+			return;
+		}
+		ringTicket = ( ( AIRingTicket_Record )( ticketRecord ) );
+		if( ringTicket )
+		{
+			AICoverHelper.GetCoverBlackboard( puppet ).SetVariant( GetAllBlackboardDefs().AICover.currentRing, ringTicket.RingType().Type() );
+		}
+	}
+
+	private function GetTicketType( actionName : CName, entity : Entity, out ticketRecord : AITicket_Record, out ticketHistoryID : Int32, out squadRecord : AISquadParams_Record ) : Bool
+	{
+		if( !( AIScriptUtils.GetTicketType( actionName, ( ( gamePuppet )( entity ) ), m_baseSquadRecord, ticketRecord, squadRecord ) ) )
+		{
+			return false;
+		}
+		ticketHistoryID = GetTicketHistoryID( actionName );
+		return true;
+	}
+
+	private function GetTicketType( actionName : CName, entity : Entity, out ticketRecord : AITicket_Record, out ticketHistoryID : Int32 ) : Bool
+	{
+		var squadRecord : AISquadParams_Record;
+		return GetTicketType( actionName, entity, ticketRecord, ticketHistoryID, squadRecord );
+	}
+
+	private function GetTicketHistoryID( actionName : CName ) : Int32
+	{
+		var i : Int32;
+		if( EnumNameToIndexCache.GetIndex( m_enumValueToNdx, actionName, i ) )
+		{
+			return i;
+		}
+		return -1;
+	}
+
+	private function GetSquadRecord( entity : weak< Entity >, out squadRecord : weak< AISquadParams_Record > ) : Bool
+	{
+		if( !( entity ) || !( AIScriptSquad.GetSquadRecord( entity, squadRecord ) ) )
+		{
+			LogAIError( "No squadParams record found with for squad template: " + NameToString( GetTemplate() ) );
+			return false;
+		}
+		return true;
+	}
+
+	private function GetAITime( entity : weak< Entity > ) : Float
+	{
+		return EngineTime.ToFloat( GameInstance.GetSimTime( ( ( GameObject )( entity ) ).GetGame() ) );
+	}
+
+	private final function CheckCooldown( entity : weak< Entity >, ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32 ) : Bool
+	{
+		var i, j : Int32;
+		var cooldownsCount, conditionsCount : Int32;
+		var record : weak< AIActionCooldown_Record >;
+		cooldownsCount = ticketRecord.GetCooldownsCount();
+		if( cooldownsCount == 0 )
+		{
+			return true;
+		}
+		for( i = 0; i < cooldownsCount; i += 1 )
+		{
+			record = ticketRecord.GetCooldownsItem( i );
+			conditionsCount = record.GetActivationConditionCount();
+			if( m_ticketHistory[ ticketHistoryID ].numberOfOrders > 0 )
+			{
+				if( conditionsCount > 0 )
+				{
+					for( j = 0; j < conditionsCount; j += 1 )
+					{
+						if( AICondition.CheckActionCondition( ( ( ScriptedPuppet )( entity ) ), record.GetActivationConditionItem( j ) ) )
+						{
+							return false;
+						}
+					}
+				}
+				else
+				{
+					return false;
+				}
+			}
+			if( record && GameObject.IsCooldownActive( ( ( GameObject )( entity ) ), record.Name(), m_ticketHistory[ ticketHistoryID ].cooldownID ) )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private final function UpdateTicketHistory( entity : weak< Entity >, ticketRecord : weak< AITicket_Record >, ticketHistoryID : Int32, ticketStatus : EAITicketStatus )
+	{
+		var i : Int32;
+		var count : Int32;
+		var record : weak< AIActionCooldown_Record >;
+		if( ticketStatus == EAITicketStatus.Evaluate )
+		{
+			m_ticketHistory[ ticketHistoryID ].lastRecipient = entity.GetEntityID();
+			m_ticketHistory[ ticketHistoryID ].numberOfOrders += 1;
+		}
+		else
+		{
+			if( ( ( ( GameObject )( entity ) ) && ticketStatus == EAITicketStatus.OrderDone ) || ( ticketRecord.StartCooldownOnFailure() && ticketStatus == EAITicketStatus.OrderFail ) )
+			{
+				count = ticketRecord.GetCooldownsCount();
+				for( i = 0; i < count; i += 1 )
+				{
+					record = ticketRecord.GetCooldownsItem( i );
+					if( record )
+					{
+						m_ticketHistory[ ticketHistoryID ].cooldownID = AIActionHelper.StartCooldown( ( ( GameObject )( entity ) ), record );
+					}
+				}
+			}
+			m_ticketHistory[ ticketHistoryID ].numberOfOrders -= 1;
+		}
+	}
+
+	private final function AllocateTicketHistoryArray()
+	{
+		var ticketEnumSize : Int32;
+		if( m_ticketHistory.Size() == 0 )
+		{
+			ticketEnumSize = ( ( Int32 )( gamedataAITicketType.Count ) );
+			m_ticketHistory.Resize( ticketEnumSize );
+			EnumNameToIndexCache.Rebuild( m_enumValueToNdx, 'gamedataAITicketType' );
+		}
+	}
+
+	private final function AllocateTacticsSectors()
+	{
+		var ticketRecord : weak< AITicket_Record >;
+		var tacticRecord : weak< AITacticTicket_Record >;
+		var sectorsRecord : array< weak< AISectorType_Record > >;
+		var sectors : array< AICombatSectorType >;
+		var sectorEnumValue : Int32;
+		var ticketEnumSize : Int32;
+		var alley : CombatAlley;
+		var i, j : Int32;
+		if( !( m_baseSquadRecord ) || m_sectorsInitialized )
+		{
+			return;
+		}
+		ticketEnumSize = ( ( Int32 )( gamedataAITicketType.Count ) );
+		for( i = 0; i < ticketEnumSize; i += 1 )
+		{
+			AIScriptSquad.GetTicketRecord( EnumValueToName( 'gamedataAITicketType', i ), m_baseSquadRecord, ticketRecord );
+			tacticRecord = ( ( AITacticTicket_Record )( ticketRecord ) );
+			if( tacticRecord )
+			{
+				if( tacticRecord.OffensiveTactic() )
+				{
+					alley = GetOffensiveCombatAlley();
+				}
+				else
+				{
+					alley = GetDefensiveCombatAlley();
+				}
+				sectorsRecord.Clear();
+				tacticRecord.Sectors( sectorsRecord );
+				if( sectorsRecord.Size() == 0 )
+				{
+					continue;
+				}
+				for( j = 0; j < sectorsRecord.Size(); j += 1 )
+				{
+					sectorEnumValue = ( ( Int32 )( EnumValueFromName( 'AICombatSectorType', sectorsRecord[ j ].EnumName() ) ) );
+					sectors.PushBack( ( ( AICombatSectorType )( sectorEnumValue ) ) );
+				}
+				RegisterTactic( EnumValueToName( 'gamedataAITicketType', i ), sectors, alley, tacticRecord.TacticTimeout() );
+			}
+		}
+		m_sectorsInitialized = true;
+	}
+
+	public function CheckTicketConditions( actionName : CName, entity : weak< Entity > ) : Bool
+	{
+		var ticketRecord : AITicket_Record;
+		var squadRecord : AISquadParams_Record;
+		var ticketHistoryID : Int32;
+		if( HasOrderBySquadAction( actionName, entity ) )
+		{
+			return true;
+		}
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID, squadRecord ) ) )
+		{
+			return false;
+		}
+		return EvaluateTicketActivation( actionName, entity, ticketRecord, ticketHistoryID, squadRecord );
+	}
+
+	public function SimpleTicketConditionsCheck( actionName : CName, entity : weak< Entity > ) : Bool
+	{
+		var ticketRecord : AITicket_Record;
+		var ticketHistoryID : Int32;
+		var ticketConditions : array< weak< AITicketCondition_Record > >;
+		if( !( GetTicketType( actionName, entity, ticketRecord, ticketHistoryID ) ) )
+		{
+			return false;
+		}
+		ticketRecord.ActivationCondition( ticketConditions );
+		return AITicketCondition.PerformChecking( entity, this, ticketConditions, ticketRecord );
+	}
+
+	public function GetLastTicketRecipient( actionName : CName ) : EntityID
+	{
+		var i : Int32;
+		var invalidEntityId : EntityID;
+		if( EnumNameToIndexCache.GetIndex( m_enumValueToNdx, actionName, i ) )
+		{
+			return m_ticketHistory[ i ].lastRecipient;
+		}
+		return invalidEntityId;
+	}
+
+}
+
+class PlayerSquadInterface extends PuppetSquadInterface
+{
+
+	public function BroadcastCommand( command : AICommand )
+	{
+		var members : array< weak< Entity > >;
+		var i : Int32;
+		members = ListMembersWeak();
+		for( i = 0; i < members.Size(); i += 1 )
+		{
+			GiveCommandToSquadMember( members[ i ], command.Copy() );
+		}
+	}
+
+	private function GiveCommandToSquadMember( member : weak< Entity >, command : AICommand )
+	{
+		var aiComponent : AIComponent;
+		var puppet : ScriptedPuppet;
+		var executeCommandEvent : StimuliEvent;
+		puppet = ( ( ScriptedPuppet )( member ) );
+		if( !( puppet ) )
+		{
+			return;
+		}
+		aiComponent = puppet.GetAIControllerComponent();
+		aiComponent.SendCommand( command );
+		executeCommandEvent = new StimuliEvent;
+		executeCommandEvent.name = 'FollowerExecuteCommand';
+		puppet.QueueEvent( executeCommandEvent );
+	}
+
+}
+

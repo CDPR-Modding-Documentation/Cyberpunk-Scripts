@@ -1,0 +1,525 @@
+class NPCRoleChangeEvent extends Event
+{
+	var m_newRole : AIRole;
+}
+
+import class AIRole extends IScriptable
+{
+	public import function GetRoleTweakRecord() : AIRole_Record;
+
+	public const virtual function GetRoleEnum() : EAIRole
+	{
+		return EAIRole.None;
+	}
+
+	public const virtual function GetTweakRecordId() : TweakDBID
+	{
+		return TDBID.None();
+	}
+
+	public virtual function OnRoleSet( owner : weak< GameObject > ) {}
+
+	public virtual function OnRoleCleared( owner : weak< GameObject > ) {}
+
+	public virtual function OnHighLevelStateEnter( owner : weak< GameObject >, newState : gamedataNPCHighLevelState, previousState : gamedataNPCHighLevelState ) {}
+
+	public virtual function OnHighLevelStateExit( owner : weak< GameObject >, leftState : gamedataNPCHighLevelState, nextState : gamedataNPCHighLevelState ) {}
+}
+
+class AINoRole extends AIRole
+{
+}
+
+import class WorkspotList extends IScriptable
+{
+	import var spots : array< NodeRef >;
+}
+
+import class AIPatrolRole extends AIRole
+{
+	protected editable inlined persistent var pathParams : AIPatrolPathParameters;
+	protected editable inlined persistent var alertedPathParams : AIPatrolPathParameters;
+	protected editable inlined persistent var alertedRadius : Float;
+	protected editable inlined persistent var alertedSpots : WorkspotList;
+	protected editable inlined persistent var forceAlerted : Bool;
+
+	public const function GetPathParams() : AIPatrolPathParameters
+	{
+		return pathParams;
+	}
+
+	public const function GetAlertedPathParams() : AIPatrolPathParameters
+	{
+		return alertedPathParams;
+	}
+
+	public const function GetAlertedRadius() : Float
+	{
+		return alertedRadius;
+	}
+
+	public const function IsForceAlerted() : Bool
+	{
+		return forceAlerted;
+	}
+
+	public const function GetAlertedSpots() : WorkspotList
+	{
+		return alertedSpots;
+	}
+
+	public const override function GetRoleEnum() : EAIRole
+	{
+		return EAIRole.Patrol;
+	}
+
+	public export const override function GetTweakRecordId() : TweakDBID
+	{
+		return T"AIRole.Patrol";
+	}
+
+	public override function OnRoleSet( owner : weak< GameObject > )
+	{
+		( ( ScriptedPuppet )( owner ) ).GetAIControllerComponent().GetAIPatrolBlackboard().SetBool( GetAllBlackboardDefs().AIPatrol.forceAlerted, forceAlerted );
+	}
+
+}
+
+class PatrolRoleCommandDelegate extends ScriptBehaviorDelegate
+{
+	var patrolWithWeapon : Bool;
+	var forceAlerted : Bool;
+
+	public function ResetVariables( context : ScriptExecutionContext ) : Bool
+	{
+		patrolWithWeapon = false;
+		forceAlerted = false;
+		return true;
+	}
+
+	public export function IsPatrolWithWeapon( context : ScriptExecutionContext ) : Bool
+	{
+		return ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetAIControllerComponent().GetAIPatrolBlackboard().GetBool( GetAllBlackboardDefs().AIPatrol.patrolWithWeapon );
+	}
+
+	public export function IsForceAlerted( context : ScriptExecutionContext ) : Bool
+	{
+		return ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetAIControllerComponent().GetAIPatrolBlackboard().GetBool( GetAllBlackboardDefs().AIPatrol.forceAlerted );
+	}
+
+}
+
+class FriendlyTargetWeaponChangeCallback extends AttachmentSlotsScriptCallback
+{
+	var m_followerRole : AIFollowerRole;
+
+	public export override function OnItemEquipped( slotIDArg : TweakDBID, itemIDArg : ItemID )
+	{
+		slotID = slotIDArg;
+		m_followerRole.OnFriendlyTargetWeaponChange( itemIDArg );
+	}
+
+}
+
+class OwnerWeaponChangeCallback extends AttachmentSlotsScriptCallback
+{
+	var m_followerRole : AIFollowerRole;
+
+	public export override function OnItemEquipped( slotIDArg : TweakDBID, itemIDArg : ItemID )
+	{
+		slotID = slotIDArg;
+	}
+
+}
+
+class AIFollowerRole extends AIRole
+{
+	[ customEditor = "scnbPerformerSelector" ]
+	protected editable persistent var followerRef : EntityReference;
+	private var m_followTarget : weak< GameObject >;
+	private var m_owner : weak< GameObject >;
+	private persistent var attitudeGroupName : CName;
+	private persistent var m_followTargetSquads : array< CName >;
+	private var m_playerCombatListener : CallbackHandle;
+	private var m_lastStealthLeaveTimeStamp : EngineTime;
+	private var m_friendlyTargetSlotListener : AttachmentSlotsScriptListener;
+	private var m_ownerTargetSlotListener : AttachmentSlotsScriptListener;
+	private var m_isFriendMelee : Bool;
+	private var m_isOwnerSniper : Bool;
+
+	public function OnFriendlyTargetWeaponChange( itemID : ItemID )
+	{
+		var itemRecord : Item_Record;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		m_isFriendMelee = itemRecord.TagsContains( WeaponObject.GetMeleeWeaponTag() );
+		UpdateSpatialsMultiplier();
+	}
+
+	public function OnOwnerWeaponChange( itemID : ItemID )
+	{
+		var itemRecord : Item_Record;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		m_isOwnerSniper = itemRecord.ItemType().Type() == gamedataItemType.Wea_SniperRifle;
+		UpdateSpatialsMultiplier();
+	}
+
+	private function UpdateSpatialsMultiplier()
+	{
+		if( ( ( NPCPuppet )( m_owner ) ).GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat && ( m_isFriendMelee || m_isOwnerSniper ) )
+		{
+			( ( NPCPuppet )( m_owner ) ).GetAIControllerComponent().SetCombatSpaceSizeMultiplier( 2.0 );
+		}
+		else
+		{
+			( ( NPCPuppet )( m_owner ) ).GetAIControllerComponent().SetCombatSpaceSizeMultiplier( 1.0 );
+		}
+	}
+
+	public const function GetFollowerRef() : EntityReference
+	{
+		return followerRef;
+	}
+
+	private const function FindFollowTarget( owner : weak< GameObject >, out followTarget : weak< GameObject > ) : Bool
+	{
+		if( !( GetGameObjectFromEntityReference( GetFollowerRef(), owner.GetGame(), followTarget ) ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public const override function GetRoleEnum() : EAIRole
+	{
+		return EAIRole.Follower;
+	}
+
+	public export const override function GetTweakRecordId() : TweakDBID
+	{
+		return T"AIRole.Follower";
+	}
+
+	public override function OnRoleSet( owner : weak< GameObject > )
+	{
+		var ownAttitudeAgent : AttitudeAgent;
+		var ownerNPC : NPCPuppet;
+		var potentialTarget : weak< GameObject >;
+		var currentHighLevelState : gamedataNPCHighLevelState;
+		var friendlyTargetweaponChangeListener : FriendlyTargetWeaponChangeCallback;
+		var ownerWeaponChangeListener : OwnerWeaponChangeCallback;
+		m_owner = owner;
+		ownerNPC = ( ( NPCPuppet )( owner ) );
+		if( !( ownerNPC ) )
+		{
+			return;
+		}
+		ownAttitudeAgent = owner.GetAttitudeAgent();
+		if( !( ownAttitudeAgent ) )
+		{
+			return;
+		}
+		ownAttitudeAgent = owner.GetAttitudeAgent();
+		attitudeGroupName = ownAttitudeAgent.GetAttitudeGroup();
+		if( ownerNPC.GetHighLevelStateFromBlackboard() != gamedataNPCHighLevelState.Combat )
+		{
+			SenseComponent.RequestMainPresetChange( owner, "Follower" );
+		}
+		FindFollowTarget( owner, potentialTarget );
+		if( !( potentialTarget ) )
+		{
+			return;
+		}
+		m_followTarget = potentialTarget;
+		( ( ScriptedPuppet )( owner ) ).GetAIControllerComponent().SetBehaviorArgument( 'FriendlyTarget', m_followTarget );
+		ChangeAttitude( owner, ownAttitudeAgent, m_followTarget );
+		JoinFollowTargetSquads( ( ( ScriptedPuppet )( owner ) ) );
+		RegisterToPlayerCombat( ( ( ScriptedPuppet )( owner ) ), ( ( PlayerPuppet )( m_followTarget ) ) );
+		( ( ScriptedPuppet )( owner ) ).GetTargetTrackerComponent().SetCurrentPreset( T"TargetTracking.FollowerPreset" );
+		currentHighLevelState = ( ( gamedataNPCHighLevelState )( ( ( ScriptedPuppet )( owner ) ).GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HighLevel ) ) );
+		if( currentHighLevelState == gamedataNPCHighLevelState.Combat )
+		{
+			( ( TargetTrackingExtension )( ( ( ScriptedPuppet )( owner ) ).GetTargetTrackerComponent() ) ).RemoveHostileCamerasFromThreats();
+			( ( ScriptedPuppet )( owner ) ).GetSensesComponent().RemoveForcedSensesTracing( gamedataSenseObjectType.Camera, EAIAttitude.AIA_Hostile );
+		}
+		else
+		{
+			( ( ScriptedPuppet )( owner ) ).GetSensesComponent().SetForcedSensesTracing( gamedataSenseObjectType.Camera, EAIAttitude.AIA_Hostile );
+		}
+		friendlyTargetweaponChangeListener = new FriendlyTargetWeaponChangeCallback;
+		friendlyTargetweaponChangeListener.slotID = T"AttachmentSlots.WeaponRight";
+		friendlyTargetweaponChangeListener.m_followerRole = this;
+		m_friendlyTargetSlotListener = GameInstance.GetTransactionSystem( ( ( ScriptedPuppet )( owner ) ).GetGame() ).RegisterAttachmentSlotListener( m_followTarget, friendlyTargetweaponChangeListener );
+		ownerWeaponChangeListener = new OwnerWeaponChangeCallback;
+		ownerWeaponChangeListener.slotID = T"AttachmentSlots.WeaponRight";
+		ownerWeaponChangeListener.m_followerRole = this;
+		m_ownerTargetSlotListener = GameInstance.GetTransactionSystem( ( ( ScriptedPuppet )( owner ) ).GetGame() ).RegisterAttachmentSlotListener( m_owner, ownerWeaponChangeListener );
+		OnFriendlyTargetWeaponChange( GameInstance.GetTransactionSystem( ( ( ScriptedPuppet )( owner ) ).GetGame() ).GetItemInSlot( m_followTarget, T"AttachmentSlots.WeaponRight" ).GetItemID() );
+		OnOwnerWeaponChange( GameInstance.GetTransactionSystem( ( ( ScriptedPuppet )( owner ) ).GetGame() ).GetItemInSlot( owner, T"AttachmentSlots.WeaponRight" ).GetItemID() );
+	}
+
+	public override function OnRoleCleared( owner : weak< GameObject > )
+	{
+		var ownAttitudeAgent : AttitudeAgent;
+		var characterRecord : weak< Character_Record >;
+		var currentHighLevelState : gamedataNPCHighLevelState;
+		if( !( owner ) )
+		{
+			return;
+		}
+		( ( ScriptedPuppet )( owner ) ).GetAIControllerComponent().SetBehaviorArgument( 'FriendlyTarget', NULL );
+		ownAttitudeAgent = owner.GetAttitudeAgent();
+		if( ownAttitudeAgent && IsNameValid( attitudeGroupName ) )
+		{
+			ownAttitudeAgent.SetAttitudeGroup( attitudeGroupName );
+		}
+		if( !( GetFollowTarget() ) )
+		{
+			if( !( FindFollowTarget( owner, m_followTarget ) ) )
+			{
+				return;
+			}
+		}
+		LeaveFollowTargetSquads( ( ( ScriptedPuppet )( owner ) ) );
+		UnregisterToPlayerCombat( ( ( ScriptedPuppet )( owner ) ), ( ( PlayerPuppet )( m_followTarget ) ) );
+		characterRecord = TweakDBInterface.GetCharacterRecord( ( ( ScriptedPuppet )( owner ) ).GetRecordID() );
+		if( characterRecord )
+		{
+			( ( ScriptedPuppet )( owner ) ).GetTargetTrackerComponent().SetCurrentPreset( characterRecord.ThreatTrackingPreset().GetID() );
+		}
+		if( currentHighLevelState == gamedataNPCHighLevelState.Combat )
+		{
+			( ( ScriptedPuppet )( owner ) ).GetSensesComponent().SetForcedSensesTracing( gamedataSenseObjectType.Camera, EAIAttitude.AIA_Hostile );
+		}
+		else
+		{
+			( ( TargetTrackingExtension )( ( ( ScriptedPuppet )( owner ) ).GetTargetTrackerComponent() ) ).RemoveHostileCamerasFromThreats();
+			( ( ScriptedPuppet )( owner ) ).GetSensesComponent().RemoveForcedSensesTracing( gamedataSenseObjectType.Camera, EAIAttitude.AIA_Hostile );
+		}
+		GameInstance.GetTransactionSystem( ( ( ScriptedPuppet )( owner ) ).GetGame() ).UnregisterAttachmentSlotListener( m_owner, m_ownerTargetSlotListener );
+		GameInstance.GetTransactionSystem( ( ( ScriptedPuppet )( owner ) ).GetGame() ).UnregisterAttachmentSlotListener( m_followTarget, m_friendlyTargetSlotListener );
+		( ( NPCPuppet )( m_owner ) ).GetAIControllerComponent().SetCombatSpaceSizeMultiplier( 1.0 );
+		StatusEffectHelper.RemoveStatusEffect( m_owner, T"BaseStatusEffect.FollowerDefeated" );
+		m_followTarget = NULL;
+		m_owner = NULL;
+	}
+
+	private function ChangeAttitude( owner : weak< GameObject >, ownAttitudeAgent : AttitudeAgent, followTarget : weak< GameObject > ) : Bool
+	{
+		var targetAttitudeAgent : AttitudeAgent;
+		if( ( !( owner ) || !( ownAttitudeAgent ) ) || !( followTarget ) )
+		{
+			return false;
+		}
+		targetAttitudeAgent = followTarget.GetAttitudeAgent();
+		if( !( targetAttitudeAgent ) )
+		{
+			return false;
+		}
+		ownAttitudeAgent.SetAttitudeGroup( targetAttitudeAgent.GetAttitudeGroup() );
+		return true;
+	}
+
+	private function RegisterToPlayerCombat( owner : weak< ScriptedPuppet >, player : weak< PlayerPuppet > )
+	{
+		var bb : IBlackboard;
+		if( ( !( owner ) || !( player ) ) || !( owner.GetAIControllerComponent() ) )
+		{
+			return;
+		}
+		bb = GameInstance.GetBlackboardSystem( owner.GetGame() ).GetLocalInstanced( player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		m_playerCombatListener = bb.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, owner.GetAIControllerComponent(), 'OnPlayerCombatChanged' );
+	}
+
+	private function UnregisterToPlayerCombat( owner : weak< ScriptedPuppet >, player : weak< PlayerPuppet > )
+	{
+		var bb : IBlackboard;
+		if( ( !( owner ) || !( player ) ) || !( m_playerCombatListener ) )
+		{
+			return;
+		}
+		bb = GameInstance.GetBlackboardSystem( owner.GetGame() ).GetLocalInstanced( player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		bb.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, m_playerCombatListener );
+	}
+
+	private function JoinFollowTargetSquads( owner : weak< ScriptedPuppet > )
+	{
+		var squadsToJoin : array< SquadScriptInterface >;
+		var mySquads : array< CName >;
+		var i : Int32;
+		squadsToJoin = AISquadHelper.GetAllSquadMemberInterfaces( ( ( ScriptedPuppet )( m_followTarget ) ) );
+		mySquads = owner.GetSquadMemberComponent().MySquadsNames();
+		for( i = 0; i < squadsToJoin.Size(); i += 1 )
+		{
+			if( !( mySquads.Contains( squadsToJoin[ i ].GetName() ) ) )
+			{
+				m_followTargetSquads.PushBack( squadsToJoin[ i ].GetName() );
+				squadsToJoin[ i ].Join( owner );
+			}
+		}
+	}
+
+	private function LeaveFollowTargetSquads( owner : weak< ScriptedPuppet > )
+	{
+		var i : Int32;
+		for( i = 0; i < m_followTargetSquads.Size(); i += 1 )
+		{
+			owner.GetSquadMemberComponent().FindSquad( m_followTargetSquads[ i ] ).Leave( owner );
+		}
+		m_followTargetSquads.Clear();
+	}
+
+	public function SetFollowTarget( followTarget : weak< GameObject > )
+	{
+		m_followTarget = followTarget;
+	}
+
+	public function GetFollowTarget() : weak< GameObject >
+	{
+		return m_followTarget;
+	}
+
+	public override function OnHighLevelStateEnter( owner : weak< GameObject >, newState : gamedataNPCHighLevelState, previousState : gamedataNPCHighLevelState )
+	{
+		switch( newState )
+		{
+			case gamedataNPCHighLevelState.Relaxed:
+				break;
+			case gamedataNPCHighLevelState.Alerted:
+				break;
+			case gamedataNPCHighLevelState.Combat:
+				GameObject.PlayVoiceOver( owner, 'danger', 'Scripts:OnHighLevelStateEnter' );
+			( ( TargetTrackingExtension )( ( ( ScriptedPuppet )( owner ) ).GetTargetTrackerComponent() ) ).RemoveHostileCamerasFromThreats();
+			( ( ScriptedPuppet )( owner ) ).GetSensesComponent().RemoveForcedSensesTracing( gamedataSenseObjectType.Camera, EAIAttitude.AIA_Hostile );
+			break;
+			case gamedataNPCHighLevelState.Stealth:
+				if( !( TargetTrackingExtension.HasHostileThreat( ( ( ScriptedPuppet )( owner ) ) ) ) )
+				{
+					break;
+				}
+			if( previousState == gamedataNPCHighLevelState.Combat )
+			{
+				GameObject.PlayVoiceOver( owner, 'stealth_restored', 'Scripts:OnHighLevelStateEnter' );
+			}
+			else
+			{
+				if( GameInstance.GetTimeSystem( owner.GetGame() ).GetSimTime() > ( ( ( PlayerPuppet )( m_followTarget ) ).GetCombatExitTimestamp() + 45.0 ) )
+				{
+					GameObject.PlayVoiceOver( owner, 'enemy_warning', 'Scripts:OnHighLevelStateEnter' );
+				}
+			}
+			break;
+			case gamedataNPCHighLevelState.Dead:
+				break;
+			case gamedataNPCHighLevelState.Fear:
+				break;
+			default:
+				break;
+		}
+		if( previousState == gamedataNPCHighLevelState.Stealth )
+		{
+			m_lastStealthLeaveTimeStamp = GameInstance.GetTimeSystem( owner.GetGame() ).GetSimTime();
+		}
+		UpdateSpatialsMultiplier();
+	}
+
+	public override function OnHighLevelStateExit( owner : weak< GameObject >, leftState : gamedataNPCHighLevelState, nextState : gamedataNPCHighLevelState )
+	{
+		var distanceToFriend : Float;
+		var VODelay : Float;
+		var maxDistance : Float;
+		maxDistance = 30.0;
+		switch( leftState )
+		{
+			case gamedataNPCHighLevelState.Relaxed:
+				break;
+			case gamedataNPCHighLevelState.Alerted:
+				break;
+			case gamedataNPCHighLevelState.Combat:
+				distanceToFriend = Vector4.Distance( GetFollowTarget().GetWorldPosition(), owner.GetWorldPosition() );
+			VODelay = 1.0 + ( ClampF( distanceToFriend / maxDistance, 0.0, 1.0 ) * 4.0 );
+			GameObject.PlayVoiceOver( owner, 'combat_ended', 'Scripts:OnHighLevelStateExit', VODelay );
+			( ( ScriptedPuppet )( owner ) ).GetSensesComponent().SetForcedSensesTracing( gamedataSenseObjectType.Camera, EAIAttitude.AIA_Hostile );
+			break;
+			case gamedataNPCHighLevelState.Stealth:
+				break;
+			case gamedataNPCHighLevelState.Dead:
+				break;
+			case gamedataNPCHighLevelState.Fear:
+				break;
+			default:
+				break;
+		}
+	}
+
+}
+
+class AIRoleCondition extends AIbehaviorconditionScript
+{
+	editable var m_role : EAIRole;
+
+	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		var aiComponent : AIHumanComponent;
+		var roleClass : AIRole;
+		var currentRole : EAIRole;
+		aiComponent = GetAIComponent( context );
+		if( !( aiComponent ) )
+		{
+			return false;
+		}
+		roleClass = aiComponent.GetCurrentRole();
+		if( !( roleClass ) )
+		{
+			return false;
+		}
+		currentRole = roleClass.GetRoleEnum();
+		if( currentRole != m_role )
+		{
+			return false;
+		}
+		return true;
+	}
+
+}
+
+class AIAssignRoleTask extends AIbehaviortaskScript
+{
+	editable inlined var m_inCommand : AIArgumentMapping;
+
+	protected export override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var rawCommand : IScriptable;
+		var assignRoleCommand : AIAssignRoleCommand;
+		var aiComponent : AIHumanComponent;
+		if( !( m_inCommand ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		rawCommand = ScriptExecutionContext.GetScriptableMappingValue( context, m_inCommand );
+		assignRoleCommand = ( ( AIAssignRoleCommand )( rawCommand ) );
+		if( !( assignRoleCommand ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( !( assignRoleCommand.role ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		aiComponent = GetAIComponent( context );
+		if( !( aiComponent ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		AIHumanComponent.SetCurrentRole( ScriptExecutionContext.GetOwner( context ), assignRoleCommand.role );
+		return AIbehaviorUpdateOutcome.SUCCESS;
+	}
+
+}
+
+enum EAIRole
+{
+	None = 0,
+	Patrol = 1,
+	Follower = 2,
+}
+

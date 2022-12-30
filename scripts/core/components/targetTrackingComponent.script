@@ -1,0 +1,2150 @@
+importonly struct LocationInformation
+{
+	import var position : Vector4;
+	import var direction : Vector4;
+}
+
+importonly abstract class AIITargetTrackingListener extends IScriptable
+{
+}
+
+import class AIScriptsTargetTrackingListener extends AIITargetTrackingListener
+{
+	public import function SetAccuracyBound( bound : Float );
+	public import function SetSharedAccuracyBound( bound : Float );
+
+	public virtual function OnAccuracyBoundReached( above : Bool ) {}
+
+	public virtual function OnSharedAccuracyBoundReached( above : Bool ) {}
+}
+
+class SecuritySupportListener extends AIScriptsTargetTrackingListener
+{
+	var npc : weak< ScriptedPuppet >;
+
+	public static function Construct( npc : ScriptedPuppet ) : SecuritySupportListener
+	{
+		var listener : SecuritySupportListener;
+		var player : PlayerPuppet;
+		listener = new SecuritySupportListener;
+		listener.npc = npc;
+		listener.SetAccuracyBound( 0.001 );
+		player = GetPlayer( npc.GetGame() );
+		if( player )
+		{
+			npc.GetTargetTrackerComponent().RegisterListener( player, listener );
+		}
+		return listener;
+	}
+
+	public override function OnAccuracyBoundReached( above : Bool )
+	{
+		npc.OnSecuritySupportThreshold( above );
+	}
+
+}
+
+importonly struct TrackedLocation
+{
+	import var location : LocationInformation;
+	import var lastKnown : LocationInformation;
+	import var sharedLocation : LocationInformation;
+	import var sharedLastKnown : LocationInformation;
+	import var entity : weak< Entity >;
+	import var speed : Vector4;
+	import var accuracy : Float;
+	import var sharedAccuracy : Float;
+	import var sharedTimeDelay : Float;
+	import var threat : Float;
+	import var visible : Bool;
+	import var invalidExpectation : Bool;
+	import var status : AITrackedStatusType;
+}
+
+class OnSquadmateDied extends Event
+{
+	var squad : CName;
+	var squadmate : weak< Entity >;
+	var killer : weak< Entity >;
+}
+
+importonly class NewThreat extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var isHostile : Bool;
+	import var isEnemy : Bool;
+}
+
+importonly class StartedBeingTrackedAsHostile extends AIEvent
+{
+}
+
+importonly class StoppedBeingTrackedAsHostile extends AIEvent
+{
+}
+
+importonly class SquadIsTracked extends AIEvent
+{
+	import var isSquadTracked : Bool;
+}
+
+importonly class ThreatRemoved extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var isHostile : Bool;
+	import var isEnemy : Bool;
+}
+
+importonly class ThreatDeath extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var id : Uint32;
+	import var detected : Bool;
+}
+
+importonly class ThreatUnconscious extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var id : Uint32;
+	import var detected : Bool;
+}
+
+importonly class ThreatDefeated extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var id : Uint32;
+	import var detected : Bool;
+}
+
+importonly class ThreatInvalid extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var isHostile : Bool;
+	import var isEnemy : Bool;
+}
+
+importonly class EnemyThreatDetected extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var status : Bool;
+}
+
+importonly class ThreatExpectationInvalid extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var threatId : Uint32;
+}
+
+importonly class HostileThreatDetected extends AIEvent
+{
+	import var owner : weak< Entity >;
+	import var threat : weak< Entity >;
+	import var status : Bool;
+}
+
+importonly class EnemyPushedToSquad extends AIEvent
+{
+	import var threat : weak< Entity >;
+}
+
+importonly class HostJoinedSquad extends AIEvent
+{
+	import var squad : CName;
+}
+
+importonly class HostLeftSquad extends AIEvent
+{
+	import var squadInterface : weak< SquadScriptInterface >;
+}
+
+importonly class EntitySpotted extends AIEvent
+{
+	import var spotter : weak< Entity >;
+	import var spotted : weak< Entity >;
+	import var isHostile : Bool;
+}
+
+importonly class EntityLost extends AIEvent
+{
+	import var spotter : weak< Entity >;
+	import var spotted : weak< Entity >;
+	import var isHostile : Bool;
+}
+
+class SetThreatsPersistenceRequest extends AIEvent
+{
+	var et : weak< Entity >;
+	var isPersistent : Bool;
+}
+
+class PullSquadSyncRequest extends AIEvent
+{
+	var squadType : AISquadType;
+}
+
+struct ThreatPersistanceMemory
+{
+	var threats : array< weak< Entity > >;
+	var isPersistent : array< Bool >;
+}
+
+importonly class TargetTrackerComponent extends GameComponent
+{
+	public import final function RegisterListener( et : Entity, listener : AIScriptsTargetTrackingListener );
+	public import final function GetThreats( onlyVisible : Bool ) : array< TrackedLocation >;
+	public import final function GetHostileThreats( onlyVisible : Bool ) : array< TrackedLocation >;
+	public import final function GetTopHostileThreat( onlyVisible : Bool, out threat : TrackedLocation ) : Bool;
+	public import final function ThreatFromEntity( et : Entity, out threat : TrackedLocation ) : Bool;
+	public import final function HasHostileThreat( onlyVisible : Bool ) : Bool;
+	public import final function AddThreat( et : Entity, isHostile : Bool, pos : Vector4, accuracy : Float, cooldown : Float, isPersistent : Bool ) : Uint32;
+	public import final function AddThreatOnPosition( pos : Vector4, timeToLive : Float ) : Uint32;
+	public import final function SetThreatPersistence( et : Entity, isPersistent : Bool, src : Uint32 );
+	public import final function GetThreatPersistence( et : Entity ) : AIThreatPersistenceStatus;
+	public import final function SetCurrentThreatsPersistence( isPersistent : Bool, src : Uint32 );
+	public import final function SetThreatBaseMul( et : Entity, threatValue : Float );
+	public import final function ClearThreats();
+	public import final function SetThreatAccuracy( et : Entity, accuracy : Float );
+	public import final function SetThreatBeliefAccuracy( et : Entity, accuracy : Float );
+	public import final function RequestThreatBeliefAccuracyMinValue( et : Entity, reason : CName, minAccuracy : Float );
+	public import final function RemoveThreatBeliefAccuracyMinValue( et : Entity, reason : CName );
+	public import final function RemoveThreat( id : Uint32 );
+	public import final function MapThreat( et : Entity ) : Uint32;
+	public import final function ResetDroppingCooldown( et : Entity );
+	public import final function AddDroppingCooldown( et : Entity, value : Float );
+	public import final function GetDroppingCooldown( et : Entity ) : Float;
+	public import final function GetCurrentPreset() : TweakDBID;
+	public import final function SetCurrentPreset( presetId : TweakDBID );
+	public import final function PushSquadSync( sqType : AISquadType );
+	public import final function PullSquadSync( sqType : AISquadType );
+	public import final function SetThreatPriorityDmgCurve( curveName : CName ) : Bool;
+	public import final function SetThreatPriorityDistCurve( curveName : CName ) : Bool;
+	public import final function SetThreatPriorityHisteresisCurve( curveName : CName ) : Bool;
+	public import final function SetThreatPriorityAttackersCurve( curveName : CName ) : Bool;
+	public import final function GetThreatPriorityModFromDmgCurve( timeSinceLastDmg : Float ) : Float;
+	public import final function GetThreatPriorityModFromDistCurve( distanceFromThreat : Float ) : Float;
+	public import final function GetThreatPriorityModFromHisteresisCurve( timeSinceTargetChange : Float ) : Float;
+	public import final function GetThreatPriorityModFromAttackersCurve( attackers : Uint32 ) : Float;
+	public import final function CollectTrackers( onlyHostiles : Bool, onlyInContact : Bool ) : array< Entity >;
+	public import final function IsPositionValid( pos : Vector4 ) : Bool;
+	public import final function GetThreatLastKnownPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
+	public import final function GetThreatBeliefPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
+	public import final function GetThreatSharedLastKnownPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
+	public import final function GetThreatSharedBeliefPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
+}
+
+class PlayerHostileThreatDetected extends HostileThreatDetected
+{
+}
+
+struct DroppedThreatData
+{
+	var threat : weak< Entity >;
+	var position : Vector4;
+	var timeStamp : Float;
+}
+
+class TargetTrackingExtension extends TargetTrackerComponent
+{
+	private var m_droppedThreatData : DroppedThreatData;
+	private var m_trackedCombatSquads : array< CombatSquadScriptInterface >;
+	private var m_trackedCombatSquadsCounters : array< Int32 >;
+	private var m_threatPersistanceMemory : ThreatPersistanceMemory;
+	private var m_hasBeenSeenByPlayer : Bool;
+	private var m_canBeAddedToBossHealthbar : Bool;
+	private var m_playerPuppet : weak< GameObject >;
+
+	private function RegisterTrackedSquadMember( cssi : CombatSquadScriptInterface )
+	{
+		var index : Int32;
+		index = m_trackedCombatSquads.FindFirst( cssi );
+		if( index < 0 )
+		{
+			m_trackedCombatSquads.PushBack( cssi );
+			m_trackedCombatSquadsCounters.PushBack( 1 );
+		}
+		else
+		{
+			m_trackedCombatSquadsCounters[ index ] += 1;
+		}
+	}
+
+	private function RevaluateTrackedSquads()
+	{
+		var trackedLocations : array< TrackedLocation >;
+		var i : Int32;
+		m_trackedCombatSquadsCounters.Clear();
+		m_trackedCombatSquads.Clear();
+		trackedLocations = GetHostileThreats( false );
+		for( i = 0; i < trackedLocations.Size(); i += 1 )
+		{
+			TryToRegisterTrackedSquad( ( ( ScriptedPuppet )( trackedLocations[ i ].entity ) ) );
+		}
+	}
+
+	public function RemoveHostileCamerasFromThreats()
+	{
+		var trackedLocations : array< TrackedLocation >;
+		var i : Int32;
+		trackedLocations = GetHostileThreats( false );
+		for( i = 0; i < trackedLocations.Size(); i += 1 )
+		{
+			if( ( ( SurveillanceCamera )( trackedLocations[ i ].entity ) ) )
+			{
+				RemoveThreat( MapThreat( trackedLocations[ i ].entity ) );
+			}
+		}
+	}
+
+	public function SquadTrackedMembersAmount( cssi : CombatSquadScriptInterface ) : Int32
+	{
+		var index : Int32;
+		index = m_trackedCombatSquads.FindFirst( cssi );
+		if( index < 0 )
+		{
+			return 0;
+		}
+		else
+		{
+			return m_trackedCombatSquadsCounters[ index ];
+		}
+	}
+
+	public function IsSquadTracked( cssi : CombatSquadScriptInterface ) : Bool
+	{
+		return m_trackedCombatSquads.Contains( cssi );
+	}
+
+	protected event OnSeenByPlayerEvent( evt : gameProperlySeenByPlayerEvent )
+	{
+		m_hasBeenSeenByPlayer = true;
+		if( m_canBeAddedToBossHealthbar && m_playerPuppet )
+		{
+			BossHealthBarGameController.ReevaluateBossHealthBar( ( ( NPCPuppet )( GetEntity() ) ), m_playerPuppet );
+		}
+	}
+
+	private function AddPotentialBossTarget( target : weak< GameObject > )
+	{
+		var ownerPuppet : weak< NPCPuppet >;
+		ownerPuppet = ( ( NPCPuppet )( GetEntity() ) );
+		if( !( ownerPuppet ) || !( ownerPuppet.IsBoss() ) )
+		{
+			return;
+		}
+		if( !( target ) || !( target.IsPlayer() ) )
+		{
+			return;
+		}
+		m_playerPuppet = target;
+		m_canBeAddedToBossHealthbar = true;
+		if( m_hasBeenSeenByPlayer && m_playerPuppet )
+		{
+			BossHealthBarGameController.ReevaluateBossHealthBar( ownerPuppet, m_playerPuppet );
+		}
+	}
+
+	public static function HasHostileThreat( puppet : weak< ScriptedPuppet >, optional onlyVisible : Bool ) : Bool
+	{
+		var tt : TargetTrackerComponent;
+		if( !( puppet ) )
+		{
+			return false;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( !( tt ) )
+		{
+			return false;
+		}
+		return tt.HasHostileThreat( onlyVisible );
+	}
+
+	public static function InjectThreat( puppet : weak< ScriptedPuppet >, threat : TrackedLocation )
+	{
+		var tt : TargetTrackerComponent;
+		var pos : Vector4;
+		if( !( puppet ) || !( threat.entity ) )
+		{
+			return;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( !( tt ) )
+		{
+			return;
+		}
+		if( TargetTrackingExtension.IsThreatInThreatList( puppet, threat.entity, false, true ) )
+		{
+			return;
+		}
+		if( SenseComponent.ShouldIgnoreIfPlayerCompanion( puppet, threat.entity ) )
+		{
+			return;
+		}
+		pos = threat.sharedLocation.position;
+		if( Vector4.IsZero( pos ) )
+		{
+			pos = threat.entity.GetWorldPosition();
+		}
+		if( ( ( ScriptedPuppet )( threat.entity ) ) )
+		{
+			tt.AddThreat( threat.entity, true, pos, 1.0, -1.0, false );
+		}
+		else
+		{
+			tt.AddThreatOnPosition( pos, 0.5 );
+		}
+	}
+
+	public static function InjectThreat( puppet : weak< ScriptedPuppet >, threat : weak< Entity > )
+	{
+		InjectThreat( puppet, threat, 1.0 );
+	}
+
+	public static function InjectThreat( puppet : weak< ScriptedPuppet >, threat : weak< Entity >, accuracy : Float, optional cooldown : Float )
+	{
+		var tt : TargetTrackerComponent;
+		var pos : Vector4;
+		var threatLocation : TrackedLocation;
+		if( !( puppet ) || !( threat ) )
+		{
+			return;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( !( tt ) )
+		{
+			return;
+		}
+		if( SenseComponent.ShouldIgnoreIfPlayerCompanion( puppet, threat ) )
+		{
+			return;
+		}
+		if( TargetTrackingExtension.IsThreatInThreatList( puppet, threat, false, true ) )
+		{
+			return;
+		}
+		if( AISquadHelper.GetThreatLocationFromSquad( puppet, threat, threatLocation ) )
+		{
+			pos = threatLocation.sharedLocation.position;
+			if( Vector4.IsZero( pos ) )
+			{
+				pos = threatLocation.entity.GetWorldPosition();
+			}
+		}
+		else
+		{
+			pos = threat.GetWorldPosition();
+		}
+		if( ( ( ScriptedPuppet )( threat ) ) )
+		{
+			if( cooldown > 0.0 )
+			{
+				tt.AddThreat( threat, true, pos, accuracy, cooldown, false );
+			}
+			else
+			{
+				tt.AddThreat( threat, true, pos, accuracy, -1.0, false );
+			}
+		}
+		else if( ( ( SecurityTurret )( threat ) ) )
+		{
+			threat.QueueEvent( new TurnOnVisibilitySenseComponent );
+			if( cooldown > 0.0 )
+			{
+				tt.AddThreat( threat, true, pos, accuracy, cooldown, false );
+			}
+			else
+			{
+				tt.AddThreat( threat, true, pos, accuracy, -1.0, false );
+			}
+		}
+		else
+		{
+			tt.AddThreatOnPosition( pos, 0.5 );
+		}
+	}
+
+	public static function RemoveThreat( puppet : weak< ScriptedPuppet >, threat : weak< Entity > )
+	{
+		var tt : TargetTrackerComponent;
+		if( !( puppet ) || !( threat ) )
+		{
+			return;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( !( tt ) )
+		{
+			return;
+		}
+		if( TargetTrackingExtension.IsThreatInThreatList( puppet, threat, false, true ) )
+		{
+			return;
+		}
+		tt.RemoveThreat( tt.MapThreat( threat ) );
+	}
+
+	public static function SetThreatPersistence( puppet : weak< ScriptedPuppet >, target : weak< Entity >, isPersistent : Bool, persistenceSource : Uint32 )
+	{
+		var tt : TargetTrackerComponent;
+		var evt : SetThreatsPersistenceRequest;
+		var previousPersistenceStatus : AIThreatPersistenceStatus;
+		if( !( puppet ) || !( target ) )
+		{
+			return;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( !( tt ) )
+		{
+			return;
+		}
+		previousPersistenceStatus = tt.GetThreatPersistence( puppet );
+		if( previousPersistenceStatus != AIThreatPersistenceStatus.ThreatNotFound )
+		{
+			evt = new SetThreatsPersistenceRequest;
+			evt.et = puppet;
+			if( previousPersistenceStatus == AIThreatPersistenceStatus.Persistent )
+			{
+				evt.isPersistent = true;
+			}
+			puppet.QueueEvent( evt );
+		}
+		tt.SetThreatPersistence( target, isPersistent, persistenceSource );
+	}
+
+	protected event OnSetThreatsPersistenceRequest( evt : SetThreatsPersistenceRequest )
+	{
+		var index : Int32;
+		if( !( evt.et ) )
+		{
+			return true;
+		}
+		if( !( m_threatPersistanceMemory.threats.Contains( evt.et ) ) )
+		{
+			if( evt.isPersistent )
+			{
+				m_threatPersistanceMemory.threats.PushBack( evt.et );
+				m_threatPersistanceMemory.isPersistent.PushBack( evt.isPersistent );
+			}
+		}
+		else if( !( evt.isPersistent ) )
+		{
+			index = m_threatPersistanceMemory.threats.FindFirst( evt.et );
+			m_threatPersistanceMemory.threats.Erase( index );
+			m_threatPersistanceMemory.isPersistent.Erase( index );
+		}
+		return true;
+	}
+
+	public function WasThreatPersistent( threat : weak< Entity > ) : Bool
+	{
+		var tt : TargetTrackerComponent;
+		var currentPersistenceStatus : AIThreatPersistenceStatus;
+		var index : Int32;
+		if( !( threat ) )
+		{
+			return false;
+		}
+		tt = ( ( ScriptedPuppet )( threat ) ).GetTargetTrackerComponent();
+		if( tt )
+		{
+			currentPersistenceStatus = tt.GetThreatPersistence( threat );
+		}
+		if( m_threatPersistanceMemory.threats.Contains( threat ) )
+		{
+			index = m_threatPersistanceMemory.threats.FindFirst( threat );
+			if( currentPersistenceStatus != AIThreatPersistenceStatus.Persistent )
+			{
+				m_threatPersistanceMemory.threats.Erase( index );
+				m_threatPersistanceMemory.isPersistent.Erase( index );
+				return false;
+			}
+			return m_threatPersistanceMemory.isPersistent[ index ];
+		}
+		return false;
+	}
+
+	public static function OnHit( ownerPuppet : weak< ScriptedPuppet >, evt : gameHitEvent )
+	{
+		var instigator : weak< GameObject >;
+		var targetTracker : weak< TargetTrackingExtension >;
+		var id : TweakDBID;
+		if( ( !( ownerPuppet ) || !( evt ) ) || !( evt.attackData ) )
+		{
+			return;
+		}
+		instigator = evt.attackData.GetInstigator();
+		if( !( instigator ) )
+		{
+			return;
+		}
+		if( ownerPuppet.GetEntityID() == instigator.GetEntityID() )
+		{
+			return;
+		}
+		if( ScriptedPuppet.IsPlayerCompanion( instigator ) )
+		{
+			return;
+		}
+		if( !( ownerPuppet.IsActive() ) )
+		{
+			return;
+		}
+		if( GameObject.GetAttitudeTowards( ownerPuppet, instigator ) == EAIAttitude.AIA_Friendly )
+		{
+			return;
+		}
+		if( !( ownerPuppet.IsAggressive() ) )
+		{
+			return;
+		}
+		if( evt.attackData.HasFlag( hitFlag.WasKillingBlow ) )
+		{
+			return;
+		}
+		if( evt.attackData.HasFlag( hitFlag.QuickHack ) )
+		{
+			return;
+		}
+		if( evt.attackData.HasFlag( hitFlag.DealNoDamage ) )
+		{
+			return;
+		}
+		NPCStatesComponent.AlertPuppet( ownerPuppet );
+		if( ( ( Device )( evt.attackData.GetSource() ) ) && !( evt.attackData.GetWeapon() ) )
+		{
+			return;
+		}
+		if( !( TargetTrackingExtension.Get( ownerPuppet, targetTracker ) ) )
+		{
+			return;
+		}
+		if( SenseComponent.ShouldIgnoreIfPlayerCompanion( ownerPuppet, instigator ) )
+		{
+			return;
+		}
+		if( AIActionHelper.TryChangingAttitudeToHostile( ownerPuppet, instigator ) )
+		{
+			id = targetTracker.GetCurrentPreset();
+			TDBID.Append( id, T".droppingCooldownPerHit" );
+			if( instigator.IsPlayer() && instigator.GetTakeOverControlSystem().IsDeviceControlled() )
+			{
+				instigator = instigator.GetTakeOverControlSystem().GetControlledObject();
+				GameObject.ChangeAttitudeToHostile( ownerPuppet, instigator );
+			}
+			targetTracker.AddDroppingCooldown( instigator, TDB.GetFloat( id, 0.0 ) );
+			targetTracker.AddThreat( instigator, true, instigator.GetWorldPosition(), 1.0, -1.0, false );
+			if( instigator.IsSensor() )
+			{
+				instigator.QueueEvent( new TurnOnVisibilitySenseComponent );
+			}
+		}
+	}
+
+	public static function Get( const puppet : weak< ScriptedPuppet >, out targetTracker : weak< TargetTrackingExtension > ) : Bool
+	{
+		if( puppet )
+		{
+			targetTracker = ( ( TargetTrackingExtension )( puppet.GetTargetTrackerComponent() ) );
+			if( targetTracker )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function Get( const puppet : weak< ScriptedPuppet >, out targetTracker : weak< TargetTrackerComponent > ) : Bool
+	{
+		if( puppet )
+		{
+			targetTracker = puppet.GetTargetTrackerComponent();
+			if( targetTracker )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function Get( const context : ScriptExecutionContext, out targetTracker : weak< TargetTrackerComponent > ) : Bool
+	{
+		var puppet : weak< ScriptedPuppet >;
+		puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( puppet )
+		{
+			targetTracker = puppet.GetTargetTrackerComponent();
+			if( targetTracker )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function GetStrong( const context : ScriptExecutionContext, out targetTracker : TargetTrackerComponent ) : Bool
+	{
+		var puppet : weak< ScriptedPuppet >;
+		puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( puppet )
+		{
+			targetTracker = puppet.GetTargetTrackerComponent();
+			if( targetTracker )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function GetTrackedLocation( puppet : weak< ScriptedPuppet >, target : weak< Entity >, out trackedLocation : TrackedLocation ) : Bool
+	{
+		var targetTracker : weak< TargetTrackerComponent >;
+		if( target && Get( puppet, targetTracker ) )
+		{
+			return targetTracker.ThreatFromEntity( target, trackedLocation );
+		}
+		return false;
+	}
+
+	public static function GetTrackedLocation( const context : ScriptExecutionContext, target : weak< Entity >, out trackedLocation : TrackedLocation ) : Bool
+	{
+		var targetTracker : weak< TargetTrackerComponent >;
+		if( target && Get( context, targetTracker ) )
+		{
+			return targetTracker.ThreatFromEntity( target, trackedLocation );
+		}
+		return false;
+	}
+
+	public static function GetTopThreat( const context : ScriptExecutionContext, visible : Bool, out trackedLocation : TrackedLocation ) : Bool
+	{
+		var targetTracker : weak< TargetTrackerComponent >;
+		if( Get( context, targetTracker ) )
+		{
+			return targetTracker.GetTopHostileThreat( visible, trackedLocation );
+		}
+		return false;
+	}
+
+	public static function GetHostileThreats( const context : ScriptExecutionContext, visible : Bool, out trackedLocations : array< TrackedLocation > ) : Bool
+	{
+		var targetTracker : weak< TargetTrackerComponent >;
+		if( Get( context, targetTracker ) )
+		{
+			trackedLocations = targetTracker.GetHostileThreats( visible );
+			return trackedLocations.Size() > 0;
+		}
+		return false;
+	}
+
+	public static function GetHostileThreats( puppet : weak< ScriptedPuppet >, visible : Bool, out trackedLocations : array< TrackedLocation > ) : Bool
+	{
+		var targetTracker : weak< TargetTrackerComponent >;
+		if( Get( puppet, targetTracker ) )
+		{
+			trackedLocations = targetTracker.GetHostileThreats( visible );
+			return trackedLocations.Size() > 0;
+		}
+		return false;
+	}
+
+	public static function GetPlayerFromThreats( hostileThreats : array< TrackedLocation >, out player : weak< GameObject > ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < hostileThreats.Size(); i += 1 )
+		{
+			player = ( ( GameObject )( hostileThreats[ i ].entity ) );
+			if( player.IsPlayer() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const function GetDroppedThreat( game : GameInstance, out threatData : DroppedThreatData ) : Bool
+	{
+		if( ( !( GameInstance.IsValid( game ) ) || !( m_droppedThreatData.threat ) ) || Vector4.IsZero( m_droppedThreatData.position ) )
+		{
+			return false;
+		}
+		if( ( m_droppedThreatData.timeStamp >= 0.0 ) && ( EngineTime.ToFloat( GameInstance.GetSimTime( game ) ) > m_droppedThreatData.timeStamp ) )
+		{
+			return false;
+		}
+		threatData = m_droppedThreatData;
+		return true;
+	}
+
+	public function SetRecentlyDroppedThreat( game : GameInstance, threat : Entity, position : Vector4, validFor : Float )
+	{
+		if( threat )
+		{
+			m_droppedThreatData.threat = threat;
+			m_droppedThreatData.position = position;
+			if( validFor >= 0.0 )
+			{
+				m_droppedThreatData.timeStamp = EngineTime.ToFloat( GameInstance.GetSimTime( game ) ) + validFor;
+			}
+			else
+			{
+				m_droppedThreatData.timeStamp = -1.0;
+			}
+		}
+	}
+
+	protected event OnEnemyPushedToSquad( evt : EnemyPushedToSquad )
+	{
+		if( ( ( ScriptedPuppet )( GetEntity() ) ).GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat )
+		{
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) )
+			{
+				if( ( ( ScriptedPuppet )( GetEntity() ) ).IsActive() )
+				{
+					PullSquadSync( AISquadType.Combat );
+				}
+			}
+		}
+	}
+
+	public function ResetRecentlyDroppedThreat()
+	{
+		m_droppedThreatData.threat = NULL;
+	}
+
+	protected event OnHostJoinedSquad( th : HostJoinedSquad )
+	{
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) )
+		{
+			PullSquadSync( AISquadType.Combat );
+		}
+	}
+
+	protected event OnHostLeftSquad( th : HostLeftSquad )
+	{
+		var evt : OnSquadmateDied;
+		var squadMembers : array< weak< Entity > >;
+		var i : Int32;
+		var cssi : CombatSquadScriptInterface;
+		if( !( ScriptedPuppet.IsAlive( ( ( GameObject )( GetEntity() ) ) ) ) )
+		{
+			cssi = ( ( CombatSquadScriptInterface )( th.squadInterface ) );
+			if( cssi && cssi.ValidCombatSquad() )
+			{
+				squadMembers = cssi.ListMembersWeak();
+				evt = new OnSquadmateDied;
+				evt.killer = ( ( ScriptedPuppet )( GetEntity() ) ).GetKiller();
+				evt.squad = cssi.GetName();
+				evt.squadmate = GetEntity();
+				for( i = 0; i < squadMembers.Size(); i += 1 )
+				{
+					squadMembers[ i ].QueueEvent( evt );
+				}
+			}
+		}
+	}
+
+	private function RemoveWholeSquadFromThreats( cssi : CombatSquadScriptInterface )
+	{
+		var squadMembers : array< weak< Entity > >;
+		var i : Int32;
+		squadMembers = cssi.ListMembersWeak();
+		for( i = 0; i < squadMembers.Size(); i += 1 )
+		{
+			RemoveThreat( MapThreat( squadMembers[ i ] ) );
+			( ( ScriptedPuppet )( squadMembers[ i ] ) ).GetAIControllerComponent().SetBehaviorArgument( 'CombatTarget', NULL );
+			( ( ScriptedPuppet )( GetEntity() ) ).GetSenses().ReevaluateDetectionOverwrite( ( ( GameObject )( squadMembers[ i ] ) ) );
+		}
+	}
+
+	protected event OnThreatRemoved( th : ThreatRemoved )
+	{
+		var validTimeStamp : Float;
+		var evt : RemoveLinkedStatusEffectsEvent;
+		var owner : GameObject;
+		var threat : GameObject;
+		var playerSquad : CombatSquadScriptInterface;
+		var i : Int32;
+		var shouldPlayVO : Bool;
+		var membersCount : Uint32;
+		var squadMembers : array< weak< Entity > >;
+		owner = ( ( GameObject )( th.owner ) );
+		if( !( owner ) )
+		{
+			return false;
+		}
+		threat = ( ( GameObject )( th.threat ) );
+		if( !( threat ) )
+		{
+			return false;
+		}
+		if( !( ScriptedPuppet.IsActive( ( ( GameObject )( th.threat ) ) ) ) )
+		{
+			if( ScriptedPuppet.IsPlayerCompanion( owner ) )
+			{
+				shouldPlayVO = true;
+				for( i = 0; i < m_trackedCombatSquads.Size(); i += 1 )
+				{
+					membersCount = m_trackedCombatSquads[ i ].GetMembersCount();
+					if( membersCount > ( ( Uint32 )( 1 ) ) )
+					{
+						shouldPlayVO = false;
+						break;
+					}
+					else if( membersCount == ( ( Uint32 )( 1 ) ) )
+					{
+						squadMembers = m_trackedCombatSquads[ i ].ListMembersWeak();
+						if( squadMembers[ 0 ] != th.threat )
+						{
+							shouldPlayVO = false;
+							break;
+						}
+					}
+				}
+				if( shouldPlayVO && ( ( ScriptedPuppet )( owner ) ).GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Stealth )
+				{
+					GameObject.PlayVoiceOver( owner, 'stealth_ended', 'Scripts:OnThreatRemoved' );
+				}
+			}
+		}
+		RevaluateTrackedSquads();
+		if( threat.IsPlayer() )
+		{
+			if( owner.IsPuppet() && ( ( NPCPuppet )( owner ) ).IsBoss() )
+			{
+				BossHealthBarGameController.ReevaluateBossHealthBar( ( ( NPCPuppet )( owner ) ), ( ( GameObject )( threat ) ), true );
+				m_canBeAddedToBossHealthbar = false;
+			}
+			if( ScriptedPuppet.IsActive( owner ) )
+			{
+				if( th.isHostile )
+				{
+					validTimeStamp = EngineTime.ToFloat( GameInstance.GetSimTime( ( ( GameObject )( th.owner ) ).GetGame() ) ) + 10.0;
+					SetRecentlyDroppedThreat( ( ( GameObject )( th.owner ) ).GetGame(), th.threat, th.threat.GetWorldPosition(), validTimeStamp );
+				}
+				else
+				{
+					StatusEffectHelper.ApplyStatusEffect( owner, T"AIQuickHackStatusEffect.HackingInterrupted", th.owner.GetEntityID() );
+					evt = new RemoveLinkedStatusEffectsEvent;
+					th.owner.QueueEvent( evt );
+				}
+				AISquadHelper.GetCombatSquadInterface( threat, playerSquad );
+				RemoveWholeSquadFromThreats( playerSquad );
+			}
+		}
+	}
+
+	private function TryToRegisterTrackedSquad( threat : ScriptedPuppet )
+	{
+		var cssi : CombatSquadScriptInterface;
+		var wasSquadTracked : Bool;
+		var i : Int32;
+		var squadMembers : array< weak< Entity > >;
+		var senseComponent : SenseComponent;
+		if( !( threat ) )
+		{
+			return;
+		}
+		AISquadHelper.GetCombatSquadInterface( threat, cssi );
+		wasSquadTracked = IsSquadTracked( cssi );
+		RegisterTrackedSquadMember( cssi );
+		if( !( wasSquadTracked ) )
+		{
+			if( !( AISquadHelper.GetSquadmates( threat, squadMembers, true ) ) )
+			{
+				return;
+			}
+			senseComponent = ( ( ScriptedPuppet )( GetEntity() ) ).GetSenses();
+			if( senseComponent )
+			{
+				for( i = 0; i < squadMembers.Size(); i += 1 )
+				{
+					senseComponent.RefreshCombatDetectionMultiplier( ( ( ScriptedPuppet )( squadMembers[ i ] ) ) );
+				}
+			}
+		}
+	}
+
+	protected function OnHostileThreatAdded( owner : weak< Entity >, threat : weak< Entity > )
+	{
+		var evt : PlayerHostileThreatDetected;
+		var squadMembers : array< weak< Entity > >;
+		var i : Int32;
+		if( SenseComponent.ShouldIgnoreIfPlayerCompanion( owner, threat ) )
+		{
+			RemoveThreat( MapThreat( threat ) );
+		}
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) )
+		{
+			PushSquadSync( AISquadType.Combat );
+		}
+		if( ScriptedPuppet.IsPlayerCompanion( ( ( ScriptedPuppet )( owner ) ) ) )
+		{
+			TryToPlayVOOnCompanion( ( ( ScriptedPuppet )( owner ) ), ( ( GameObject )( threat ) ), true );
+		}
+		TryToRegisterTrackedSquad( ( ( ScriptedPuppet )( threat ) ) );
+		if( ( ( ScriptedPuppet )( owner ) ).IsPlayer() )
+		{
+			if( !( AISquadHelper.GetSquadmates( ( ( ScriptedPuppet )( owner ) ), squadMembers ) ) )
+			{
+				return;
+			}
+			evt = new PlayerHostileThreatDetected;
+			evt.owner = owner;
+			evt.threat = threat;
+			evt.status = true;
+			for( i = 0; i < squadMembers.Size(); i += 1 )
+			{
+				squadMembers[ i ].QueueEvent( evt );
+			}
+		}
+		else
+		{
+			AddPotentialBossTarget( ( ( GameObject )( threat ) ) );
+		}
+	}
+
+	protected event OnSquadmateDeath( evt : OnSquadmateDied )
+	{
+		if( IsThreatInThreatList( ( ( ScriptedPuppet )( GetEntity() ) ), evt.killer, false, true ) )
+		{
+			SetThreatAccuracy( evt.killer, 1.0 );
+			SetThreatBeliefAccuracy( evt.killer, 1.0 );
+		}
+	}
+
+	protected event OnNewThreat( th : NewThreat )
+	{
+		if( th.isHostile && !( th.isEnemy ) )
+		{
+			OnHostileThreatAdded( th.owner, th.threat );
+		}
+	}
+
+	protected event OnHostileThreatDetected( th : HostileThreatDetected )
+	{
+		if( !( th.status ) )
+		{
+			return false;
+		}
+		OnHostileThreatAdded( th.owner, th.threat );
+	}
+
+	protected event OnPlayerHostileThreatDetected( evt : PlayerHostileThreatDetected )
+	{
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) )
+		{
+			PullSquadSync( AISquadType.Combat );
+		}
+	}
+
+	protected event OnEnemyThreatDetected( th : EnemyThreatDetected )
+	{
+		var owner : ScriptedPuppet;
+		var threat : weak< GameObject >;
+		var broadcaster : StimBroadcasterComponent;
+		owner = ( ( ScriptedPuppet )( th.owner ) );
+		if( owner.IsPlayer() )
+		{
+			return false;
+		}
+		threat = ( ( GameObject )( th.threat ) );
+		if( th.status )
+		{
+			if( ScriptedPuppet.IsPlayerCompanion( owner ) )
+			{
+				TryToPlayVOOnCompanion( owner, threat, false );
+				InjectThreat( owner, th.threat );
+				return false;
+			}
+			if( owner.IsCharacterCivilian() )
+			{
+				broadcaster = threat.GetStimBroadcasterComponent();
+				if( broadcaster )
+				{
+					broadcaster.SendDrirectStimuliToTarget( ( ( GameObject )( GetEntity() ) ), gamedataStimType.Combat, owner );
+				}
+			}
+			else if( AIActionHelper.TryChangingAttitudeToHostile( owner, threat ) )
+			{
+				if( IsSingleplayer() )
+				{
+					InjectThreat( owner, th.threat );
+				}
+			}
+		}
+		else
+		{
+		}
+	}
+
+	public static function IsThreatInThreatList( owner : weak< ScriptedPuppet >, threat : weak< Entity >, visible : Bool, hostile : Bool ) : Bool
+	{
+		var allThreats : array< TrackedLocation >;
+		var targetTracker : weak< TargetTrackerComponent >;
+		var i : Int32;
+		targetTracker = owner.GetTargetTrackerComponent();
+		if( targetTracker )
+		{
+			if( hostile )
+			{
+				allThreats = targetTracker.GetHostileThreats( visible );
+			}
+			else
+			{
+				allThreats = targetTracker.GetThreats( visible );
+			}
+			for( i = 0; i < allThreats.Size(); i += 1 )
+			{
+				if( allThreats[ i ].entity == threat )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private function TryToPlayVOOnCompanion( owner : weak< ScriptedPuppet >, threat : weak< GameObject >, detectedBySelf : Bool )
+	{
+		var npcThreat : NPCPuppet;
+		var npcThreatRarity : gamedataNPCRarity;
+		var hls : gamedataNPCHighLevelState;
+		var cssi : CombatSquadScriptInterface;
+		var friendlyTarget : weak< PlayerPuppet >;
+		if( ( !( owner ) || !( threat ) ) || !( owner.GetAIControllerComponent().GetFriendlyTargetAsPlayer( friendlyTarget ) ) )
+		{
+			return;
+		}
+		if( AISquadHelper.GetCombatSquadInterface( ( ( ScriptedPuppet )( threat ) ), cssi ) )
+		{
+			if( IsSquadTracked( cssi ) || ( ( ( TargetTrackingExtension )( friendlyTarget.GetTargetTrackerComponent() ) ).SquadTrackedMembersAmount( cssi ) > ( ( detectedBySelf ) ? ( 0 ) : ( 1 ) ) ) )
+			{
+				return;
+			}
+		}
+		hls = owner.GetHighLevelStateFromBlackboard();
+		if( hls == gamedataNPCHighLevelState.Combat )
+		{
+			if( threat.IsTurret() )
+			{
+				GameObject.PlayVoiceOver( owner, 'turret_warning', 'Scripts:OnEnemyThreatDetected' );
+			}
+			else if( threat.IsNPC() )
+			{
+				npcThreat = ( ( NPCPuppet )( threat ) );
+				npcThreatRarity = npcThreat.GetPuppetRarityEnum();
+				switch( npcThreat.GetNPCType() )
+				{
+					case gamedataNPCType.Drone:
+						if( ( npcThreatRarity == gamedataNPCRarity.Elite || npcThreatRarity == gamedataNPCRarity.Officer ) || npcThreatRarity == gamedataNPCRarity.Boss )
+						{
+							GameObject.PlayVoiceOver( owner, 'octant_warning', 'Scripts:OnEnemyThreatDetected' );
+						}
+						else
+						{
+							GameObject.PlayVoiceOver( owner, 'drones_warning', 'Scripts:OnEnemyThreatDetected' );
+						}
+					break;
+					case gamedataNPCType.Mech:
+						GameObject.PlayVoiceOver( owner, 'mech_warning', 'Scripts:OnEnemyThreatDetected' );
+					break;
+					default:
+						if( npcThreatRarity == gamedataNPCRarity.Elite )
+						{
+							GameObject.PlayVoiceOver( owner, 'elite_warning', 'Scripts:OnEnemyThreatDetected' );
+						}
+					break;
+				}
+			}
+		}
+		else if( ( hls == gamedataNPCHighLevelState.Stealth || hls == gamedataNPCHighLevelState.Relaxed ) && ( ( EngineTime.ToFloat( GameInstance.GetTimeSystem( friendlyTarget.GetGame() ).GetSimTime() ) - friendlyTarget.GetCombatExitTimestamp() ) > 45.0 ) )
+		{
+			if( ( ( SurveillanceCamera )( threat ) ) )
+			{
+				GameObject.PlayVoiceOver( owner, 'camera_warning', 'Scripts:OnEnemyThreatDetected' );
+			}
+			else
+			{
+				GameObject.PlayVoiceOver( owner, 'enemy_warning', 'Scripts:OnEnemyThreatDetected' );
+			}
+		}
+	}
+
+	protected event OnPullSquadSyncRequest( evt : PullSquadSyncRequest )
+	{
+		var ownerPuppet : ScriptedPuppet;
+		ownerPuppet = ( ( ScriptedPuppet )( GetEntity() ) );
+		if( ownerPuppet && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ownerPuppet, 'ResetSquadSync' ) ) )
+		{
+			AISquadHelper.PullSquadSync( ownerPuppet, evt.squadType );
+		}
+	}
+
+}
+
+abstract class AIActionTarget
+{
+
+	public static function Set( const context : ScriptExecutionContext, record : AIActionTarget_Record, optional entity : weak< Entity >, pos : Vector4, optional coverID : Uint32 ) : Bool
+	{
+		var tmpID : Uint64;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( record.IsObject() )
+		{
+			ScriptExecutionContext.SetArgumentObject( context, record.BehaviorArgumentName(), ( ( GameObject )( entity ) ) );
+			ScriptExecutionContext.GetTweakActionSystem( context ).ForceDirty( context, record.GetID() );
+			return true;
+		}
+		if( record.IsPosition() )
+		{
+			if( entity )
+			{
+				ScriptExecutionContext.SetArgumentVector( context, record.BehaviorArgumentName(), entity.GetWorldPosition() );
+				ScriptExecutionContext.GetTweakActionSystem( context ).ForceDirty( context, record.GetID() );
+				return true;
+			}
+			ScriptExecutionContext.SetArgumentVector( context, record.BehaviorArgumentName(), pos );
+			ScriptExecutionContext.GetTweakActionSystem( context ).ForceDirty( context, record.GetID() );
+			return true;
+		}
+		if( record.IsCoverID() )
+		{
+			tmpID = ( ( Uint64 )( ScriptExecutionContext.GetArgumentInt( context, record.BehaviorArgumentName() ) ) );
+			if( tmpID != coverID )
+			{
+				ScriptExecutionContext.SetArgumentInt( context, record.BehaviorArgumentName(), ( ( Int32 )( coverID ) ) );
+				ScriptExecutionContext.GetTweakActionSystem( context ).ForceDirty( context, record.GetID() );
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public static function Get( const context : ScriptExecutionContext, record : AIActionTarget_Record, getSlotPosition : Bool, out obj : weak< GameObject >, out pos : Vector4, out coverID : Uint64, optional const predictionTime : Float ) : Bool
+	{
+		var strongObj : GameObject;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( record.Type() == gamedataAIActionTarget.NetrunnerProxy )
+		{
+			obj = GetNetrunnerProxy( context );
+			if( obj )
+			{
+				return true;
+			}
+			return false;
+		}
+		else if( record.Type() == gamedataAIActionTarget.CurrentNetrunnerProxy )
+		{
+			obj = ScriptExecutionContext.GetArgumentObject( context, 'NetrunnerProxy' );
+			if( obj )
+			{
+				return true;
+			}
+			return false;
+		}
+		else if( !( ScriptExecutionContext.GetTweakActionSystem( context ).EvaluateActionTargetAll( context, record.GetID(), predictionTime, strongObj, pos, coverID ) ) )
+		{
+			return false;
+		}
+		obj = strongObj;
+		return true;
+	}
+
+	public static function Get( const context : ScriptExecutionContext, record : AIActionTarget_Record, out obj : weak< GameObject >, out pos : Vector4, out coverID : Uint64, optional const predictionTime : Float ) : Bool
+	{
+		return Get( context, record, false, obj, pos, coverID, predictionTime );
+	}
+
+	public static function GetLegacy( const context : ScriptExecutionContext, record : weak< AIActionTarget_Record >, getSlotPosition : Bool, out obj : weak< GameObject >, out pos : Vector4, out coverID : Uint64, optional const predictionTime : Float ) : Bool
+	{
+		var targetTracker : TargetTrackerComponent;
+		var trackedLocation : TrackedLocation;
+		var tmpProvider : IPositionProvider;
+		var slotName : CName;
+		var objVelocity : Vector4;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( GetObjectLegacy( context, record, obj ) )
+		{
+			if( ( ( obj != ScriptExecutionContext.GetOwner( context ) ) && TargetTrackingExtension.GetTrackedLocation( context, obj, trackedLocation ) ) && record.Type() != gamedataAIActionTarget.StimTarget )
+			{
+				if( ( record.TrackingMode() && record.TrackingMode().Type() != gamedataTrackingMode.RealPosition ) && TargetTrackingExtension.GetStrong( context, targetTracker ) )
+				{
+					if( getSlotPosition )
+					{
+						slotName = record.TargetSlot();
+					}
+					switch( record.TrackingMode().Type() )
+					{
+						case gamedataTrackingMode.LastKnownPosition:
+							tmpProvider = targetTracker.GetThreatLastKnownPositionProvider( obj, , false, slotName, IPositionProvider.CreateEntityPositionProvider( ScriptExecutionContext.GetOwner( context ) ) );
+						break;
+						case gamedataTrackingMode.BeliefPosition:
+							tmpProvider = targetTracker.GetThreatBeliefPositionProvider( obj, , false, slotName, IPositionProvider.CreateEntityPositionProvider( ScriptExecutionContext.GetOwner( context ) ) );
+						break;
+						case gamedataTrackingMode.SharedLastKnownPosition:
+							tmpProvider = targetTracker.GetThreatSharedLastKnownPositionProvider( obj, , false, slotName, IPositionProvider.CreateEntityPositionProvider( ScriptExecutionContext.GetOwner( context ) ) );
+						break;
+						case gamedataTrackingMode.SharedBeliefPosition:
+							tmpProvider = targetTracker.GetThreatSharedBeliefPositionProvider( obj, , false, slotName, IPositionProvider.CreateEntityPositionProvider( ScriptExecutionContext.GetOwner( context ) ) );
+						break;
+						default:
+							break;
+					}
+				}
+				if( !( tmpProvider ) || !( tmpProvider.CalculatePosition( pos ) ) )
+				{
+					if( Vector4.IsZero( trackedLocation.location.position ) || !( obj.GetTargetTrackerComponent().IsPositionValid( trackedLocation.location.position ) ) )
+					{
+						pos = obj.GetWorldPosition();
+					}
+					else
+					{
+						pos = trackedLocation.location.position;
+					}
+				}
+				if( predictionTime > 0.0 )
+				{
+					pos += ( trackedLocation.speed * predictionTime );
+				}
+			}
+			else
+			{
+				pos = obj.GetWorldPosition();
+				if( ( predictionTime > 0.0 ) && ( ( gamePuppet )( obj ) ) )
+				{
+					objVelocity = ( ( gamePuppet )( obj ) ).GetVelocity();
+					objVelocity.Z = 0.0;
+					pos += ( objVelocity * predictionTime );
+				}
+			}
+			return true;
+		}
+		if( record.IsPosition() )
+		{
+			return GetPosition( context, record, pos, getSlotPosition );
+		}
+		if( record.IsCoverID() )
+		{
+			if( !( GetCoverID( context, record, coverID ) ) )
+			{
+				return false;
+			}
+			return GetCoverPosition( context, coverID, pos );
+		}
+		return false;
+	}
+
+	public static function Get( const context : ScriptExecutionContext, record : weak< AIActionTarget_Record >, getSlotPosition : Bool, out obj : weak< GameObject >, out position : Vector4, optional const predictionTime : Float ) : Bool
+	{
+		var coverId : Uint64;
+		return Get( context, record, getSlotPosition, obj, position, coverId, predictionTime );
+	}
+
+	public static function GetObject( const context : ScriptExecutionContext, record : AIActionTarget_Record, out object : weak< GameObject > ) : Bool
+	{
+		var strongObject : GameObject;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( record.Type() == gamedataAIActionTarget.NetrunnerProxy )
+		{
+			object = GetNetrunnerProxy( context );
+			if( object )
+			{
+				return true;
+			}
+			return false;
+		}
+		else if( record.Type() == gamedataAIActionTarget.CurrentNetrunnerProxy )
+		{
+			object = ScriptExecutionContext.GetArgumentObject( context, 'NetrunnerProxy' );
+			if( object )
+			{
+				return true;
+			}
+			return false;
+		}
+		else if( !( ScriptExecutionContext.GetTweakActionSystem( context ).EvaluateActionTargetObject( context, record.GetID(), strongObject ) ) )
+		{
+			return false;
+		}
+		object = strongObject;
+		return true;
+	}
+
+	public static function GetNetrunnerProxy( const context : ScriptExecutionContext ) : weak< GameObject >
+	{
+		var target : weak< GameObject >;
+		var squadInterface : weak< SquadScriptInterface >;
+		var squadMembers : array< weak< Entity > >;
+		var trackedLocations : array< TrackedLocation >;
+		var securitySystem : SecuritySystemControllerPS;
+		var sensorDevices : array< SensorDeviceControllerPS >;
+		var sensorDevice : weak< SensorDevice >;
+		var i, j : Int32;
+		target = ScriptExecutionContext.GetArgumentObject( context, 'CombatTarget' );
+		if( !( target ) )
+		{
+			return NULL;
+		}
+		if( ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).IsConnectedToSecuritySystem() )
+		{
+			securitySystem = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetSecuritySystem();
+			if( securitySystem )
+			{
+				sensorDevices = securitySystem.GetSensors();
+				for( i = 0; i < sensorDevices.Size(); i += 1 )
+				{
+					sensorDevice = ( ( weak< weak< SensorDevice > > )( sensorDevices[ i ].GetOwnerEntityWeak() ) );
+					if( sensorDevice && ( sensorDevice.GetCurrentlyFollowedTarget() == target ) )
+					{
+						return sensorDevice;
+					}
+				}
+			}
+		}
+		squadInterface = ScriptExecutionContext.GetOwner( context ).GetSquadMemberComponent().MySquad( AISquadType.Combat );
+		if( !( squadInterface ) )
+		{
+			return NULL;
+		}
+		squadMembers = squadInterface.ListMembersWeak();
+		squadMembers.Remove( ScriptExecutionContext.GetOwner( context ) );
+		for( i = 0; i < squadMembers.Size(); i += 1 )
+		{
+			if( TargetTrackingExtension.GetHostileThreats( ( ( weak< weak< ScriptedPuppet > > )( squadMembers[ i ] ) ), true, trackedLocations ) )
+			{
+				for( j = 0; j < trackedLocations.Size(); j += 1 )
+				{
+					if( trackedLocations[ j ].entity == target )
+					{
+						return ( ( weak< weak< GameObject > > )( squadMembers[ i ] ) );
+					}
+				}
+				trackedLocations.Clear();
+			}
+		}
+		return NULL;
+	}
+
+	public static function GetObjectLegacy( const context : ScriptExecutionContext, record : AIActionTarget_Record, out object : weak< GameObject > ) : Bool
+	{
+		var squadInterface : weak< SquadScriptInterface >;
+		var squadMembers : array< weak< Entity > >;
+		var trackedLocations : array< TrackedLocation >;
+		var trackedLocation : TrackedLocation;
+		var compareDistance : Float;
+		var distance : Float;
+		var i, j : Int32;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( !( record.IsObject() ) )
+		{
+			return false;
+		}
+		switch( record.Type() )
+		{
+			case gamedataAIActionTarget.Owner:
+				object = ScriptExecutionContext.GetOwner( context );
+			break;
+			case gamedataAIActionTarget.CombatTarget:
+				object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+			break;
+			case gamedataAIActionTarget.VisibleTopThreat:
+			case gamedataAIActionTarget.TopThreat:
+				if( TargetTrackingExtension.GetTopThreat( context, record.Type() == gamedataAIActionTarget.VisibleTopThreat, trackedLocation ) )
+				{
+					object = ( ( GameObject )( trackedLocation.entity ) );
+				}
+				else
+				{
+					object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+				}
+			;
+			break;
+			case gamedataAIActionTarget.NearestThreat:
+				if( TargetTrackingExtension.GetHostileThreats( context, true, trackedLocations ) )
+				{
+					for( i = 0; i < trackedLocations.Size(); i += 1 )
+					{
+						distance = Vector4.Distance( ScriptExecutionContext.GetOwner( context ).GetWorldPosition(), trackedLocations[ i ].location.position );
+						if( ( compareDistance == 0.0 ) || ( compareDistance > distance ) )
+						{
+							compareDistance = distance;
+							j = i;
+						}
+					}
+					object = ( ( GameObject )( trackedLocations[ j ].entity ) );
+				}
+				else
+				{
+					object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+				}
+			break;
+			case gamedataAIActionTarget.FurthestThreat:
+				if( TargetTrackingExtension.GetHostileThreats( context, true, trackedLocations ) )
+				{
+					for( i = 0; i < trackedLocations.Size(); i += 1 )
+					{
+						distance = Vector4.Distance( ScriptExecutionContext.GetOwner( context ).GetWorldPosition(), trackedLocations[ i ].location.position );
+						if( ( compareDistance == 0.0 ) || ( compareDistance < distance ) )
+						{
+							compareDistance = distance;
+							j = i;
+						}
+					}
+					object = ( ( GameObject )( trackedLocations[ j ].entity ) );
+				}
+				else
+				{
+					object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+				}
+			break;
+			case gamedataAIActionTarget.NearestSquadmate:
+				squadInterface = ScriptExecutionContext.GetOwner( context ).GetSquadMemberComponent().MySquad( AISquadType.Combat );
+			if( squadInterface )
+			{
+				squadMembers = squadInterface.ListMembersWeak();
+			}
+			if( squadMembers.Size() > 0 )
+			{
+				for( i = 0; i < squadMembers.Size(); i += 1 )
+				{
+					distance = Vector4.Distance( ScriptExecutionContext.GetOwner( context ).GetWorldPosition(), squadMembers[ i ].GetWorldPosition() );
+					if( ( ScriptExecutionContext.GetOwner( context ) != squadMembers[ i ] ) && ( ( compareDistance == 0.0 ) || ( compareDistance > distance ) ) )
+					{
+						compareDistance = distance;
+						j = i;
+					}
+				}
+				object = ( ( GameObject )( squadMembers[ j ] ) );
+			}
+			else
+			{
+				object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+			}
+			break;
+			case gamedataAIActionTarget.FurthestSquadmate:
+				squadInterface = ScriptExecutionContext.GetOwner( context ).GetSquadMemberComponent().MySquad( AISquadType.Combat );
+			if( squadInterface )
+			{
+				squadMembers = squadInterface.ListMembersWeak();
+			}
+			if( squadMembers.Size() > 0 )
+			{
+				for( i = 0; i < squadMembers.Size(); i += 1 )
+				{
+					distance = Vector4.Distance( ScriptExecutionContext.GetOwner( context ).GetWorldPosition(), squadMembers[ i ].GetWorldPosition() );
+					if( ( compareDistance == 0.0 ) || ( compareDistance < distance ) )
+					{
+						compareDistance = distance;
+						j = i;
+					}
+				}
+				object = ( ( GameObject )( squadMembers[ j ] ) );
+			}
+			else
+			{
+				object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+			}
+			break;
+			case gamedataAIActionTarget.HostileOfficer:
+				if( TargetTrackingExtension.GetHostileThreats( context, true, trackedLocations ) )
+				{
+					for( i = 0; i < trackedLocations.Size(); i += 1 )
+					{
+						if( ( ( ScriptedPuppet )( trackedLocations[ i ].entity ) ).IsOfficer() )
+						{
+							break;
+						}
+					}
+					object = ( ( GameObject )( trackedLocations[ i ].entity ) );
+				}
+				else
+				{
+					object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+				}
+			case gamedataAIActionTarget.SquadOfficer:
+				squadInterface = ScriptExecutionContext.GetOwner( context ).GetSquadMemberComponent().MySquad( AISquadType.Community );
+			if( squadInterface )
+			{
+				squadMembers = squadInterface.ListMembersWeak();
+			}
+			if( squadMembers.Size() > 0 )
+			{
+				for( i = 0; i < squadMembers.Size(); i += 1 )
+				{
+					if( ( ( ScriptedPuppet )( squadMembers[ i ] ) ).IsOfficer() )
+					{
+						break;
+					}
+				}
+				object = ( ( GameObject )( squadMembers[ i ] ) );
+			}
+			else
+			{
+				object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+			}
+			break;
+			case gamedataAIActionTarget.AssignedVehicle:
+				AIHumanComponent.GetAssignedVehicle( ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ), object );
+			break;
+			case gamedataAIActionTarget.MountedVehicle:
+				VehicleComponent.GetVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ), object );
+			break;
+			case gamedataAIActionTarget.NearestDefeatedSquadmate:
+				squadInterface = ScriptExecutionContext.GetOwner( context ).GetSquadMemberComponent().MySquad( AISquadType.Combat );
+			j = -1;
+			if( squadInterface )
+			{
+				squadMembers = squadInterface.ListMembersWeak();
+			}
+			for( i = 0; i < squadMembers.Size(); i += 1 )
+			{
+				if( !( ScriptedPuppet.IsDefeated( ( ( GameObject )( squadMembers[ i ] ) ) ) ) )
+				{
+					continue;
+				}
+				distance = Vector4.Distance( ScriptExecutionContext.GetOwner( context ).GetWorldPosition(), squadMembers[ i ].GetWorldPosition() );
+				if( ( compareDistance == 0.0 ) || ( compareDistance > distance ) )
+				{
+					compareDistance = distance;
+					j = i;
+				}
+			}
+			if( j > -1 )
+			{
+				object = ( ( GameObject )( squadMembers[ j ] ) );
+			}
+			else
+			{
+				object = NULL;
+			}
+			break;
+			case gamedataAIActionTarget.Player:
+				object = GameInstance.GetPlayerSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetLocalPlayerMainGameObject();
+			break;
+			default:
+				object = ScriptExecutionContext.GetArgumentObject( context, record.BehaviorArgumentName() );
+			break;
+		}
+		return object != NULL;
+	}
+
+	public static function GetPosition( const context : ScriptExecutionContext, record : weak< AIActionTarget_Record >, out position : Vector4, getSlotPosition : Bool, optional const predictionTime : Float ) : Bool
+	{
+		var target : weak< GameObject >;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( record.IsPosition() )
+		{
+			position = ScriptExecutionContext.GetArgumentVector( context, record.BehaviorArgumentName() );
+		}
+		else if( record.IsCoverID() )
+		{
+			GetCoverPosition( context, ScriptExecutionContext.GetArgumentUint64( context, record.BehaviorArgumentName() ), position );
+		}
+		else if( record.IsObject() )
+		{
+			Get( context, record, getSlotPosition, target, position, predictionTime );
+		}
+		return !( Vector4.IsZero( position ) );
+	}
+
+	public static function GetCurrentCoverID( const context : ScriptExecutionContext, out coverID : Uint64, out position : Vector4 ) : Bool
+	{
+		if( !( GetCurrentCoverID( context, coverID ) ) )
+		{
+			return false;
+		}
+		return GetCoverPosition( context, coverID, position );
+	}
+
+	public static function GetCurrentCoverID( const context : ScriptExecutionContext, out coverID : Uint64 ) : Bool
+	{
+		var cm : CoverManager;
+		var puppet : ScriptedPuppet;
+		puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( !( puppet ) )
+		{
+			return false;
+		}
+		cm = GameInstance.GetCoverManager( puppet.GetGame() );
+		if( !( cm ) )
+		{
+			return false;
+		}
+		coverID = cm.GetCurrentCover( puppet );
+		return coverID > ( ( Uint64 )( 0 ) );
+	}
+
+	public static function GetCoverID( const context : ScriptExecutionContext, record : weak< AIActionTarget_Record >, out coverID : Uint64, out position : Vector4 ) : Bool
+	{
+		if( !( GetCoverID( context, record, coverID ) ) )
+		{
+			return false;
+		}
+		return GetCoverPosition( context, coverID, position );
+	}
+
+	public static function GetCoverID( const context : ScriptExecutionContext, record : weak< AIActionTarget_Record >, out coverID : Uint64 ) : Bool
+	{
+		var cm : CoverManager;
+		var puppet : ScriptedPuppet;
+		if( !( record ) )
+		{
+			return false;
+		}
+		if( !( record.IsCoverID() ) )
+		{
+			return false;
+		}
+		switch( record.Type() )
+		{
+			case gamedataAIActionTarget.CurrentCover:
+				puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+			if( !( puppet ) )
+			{
+				return false;
+			}
+			cm = GameInstance.GetCoverManager( puppet.GetGame() );
+			if( !( cm ) )
+			{
+				return false;
+			}
+			coverID = cm.GetCurrentCover( puppet );
+			break;
+			case gamedataAIActionTarget.DesiredCover:
+				coverID = ScriptExecutionContext.GetArgumentUint64( context, 'DesiredCoverID' );
+			break;
+			case gamedataAIActionTarget.SelectedCover:
+				coverID = ScriptExecutionContext.GetArgumentUint64( context, 'CoverID' );
+			break;
+			case gamedataAIActionTarget.CommandCover:
+				coverID = ScriptExecutionContext.GetArgumentUint64( context, 'CommandCoverID' );
+			break;
+		}
+		return coverID > ( ( Uint64 )( 0 ) );
+	}
+
+	public static function GetCoverPosition( const context : ScriptExecutionContext, coverID : Uint64, out position : Vector4 ) : Bool
+	{
+		if( coverID > ( ( Uint64 )( 0 ) ) )
+		{
+			if( GameInstance.GetCoverManager( ScriptExecutionContext.GetOwner( context ).GetGame() ) )
+			{
+				position = GameInstance.GetCoverManager( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetCoverPosition( coverID );
+			}
+		}
+		return !( Vector4.IsZero( position ) );
+	}
+
+	public static function GetVehicleObject( const context : ScriptExecutionContext, record : weak< AIActionTarget_Record >, out vehicleObject : weak< VehicleObject > ) : Bool
+	{
+		var object : weak< GameObject >;
+		if( !( AIActionTarget.GetObject( context, record, object ) ) )
+		{
+			return false;
+		}
+		vehicleObject = ( ( VehicleObject )( object ) );
+		if( vehicleObject || VehicleComponent.GetVehicle( object.GetGame(), object, vehicleObject ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function UpdateThreatsValue( puppet : NPCPuppet, newTargetObject : GameObject, timeSinceTargetChange : Float )
+	{
+		var targetTrackerComponent : TargetTrackerComponent;
+		var allThreats : array< TrackedLocation >;
+		var ownerPos : Vector4;
+		var threat : GameObject;
+		var i : Int32;
+		var threatBaseVal : Float;
+		var currentTime : Float;
+		if( !( puppet ) )
+		{
+			return;
+		}
+		ownerPos = puppet.GetWorldPosition();
+		if( Vector4.IsZero( ownerPos ) )
+		{
+			return;
+		}
+		targetTrackerComponent = puppet.GetTargetTrackerComponent();
+		allThreats = targetTrackerComponent.GetHostileThreats( false );
+		currentTime = EngineTime.ToFloat( GameInstance.GetSimTime( puppet.GetGame() ) );
+		for( i = 0; i < allThreats.Size(); i += 1 )
+		{
+			threat = ( ( GameObject )( allThreats[ i ].entity ) );
+			threatBaseVal = 0.0;
+			if( ( ( SurveillanceCamera )( threat ) ) )
+			{
+				targetTrackerComponent.SetThreatBaseMul( threat, -1.0 );
+				continue;
+			}
+			switch( puppet.GetThreatCalculationType() )
+			{
+				case EAIThreatCalculationType.Madness:
+					MadnessThreatCalculation( puppet, ownerPos, targetTrackerComponent, newTargetObject, threat, timeSinceTargetChange, currentTime, threatBaseVal );
+				break;
+				case EAIThreatCalculationType.Boss:
+					BossThreatCalculation( puppet, ownerPos, targetTrackerComponent, newTargetObject, threat, timeSinceTargetChange, currentTime, threatBaseVal );
+				break;
+				default:
+					RegularThreatCalculation( puppet, ownerPos, targetTrackerComponent, newTargetObject, threat, timeSinceTargetChange, currentTime, threatBaseVal );
+				break;
+			}
+			targetTrackerComponent.SetThreatBaseMul( threat, threatBaseVal );
+		}
+	}
+
+	private static function RegularThreatCalculation( owner : weak< ScriptedPuppet >, ownerPos : Vector4, targetTrackerComponent : TargetTrackerComponent, newTargetObject : weak< GameObject >, threat : weak< GameObject >, timeSinceTargetChange : Float, currentTime : Float, out threatValue : Float )
+	{
+		var distance : Float;
+		var zDiff : Float;
+		var turret : weak< SecurityTurret >;
+		if( ScriptedPuppet.IsActive( threat ) )
+		{
+			threatValue = 0.01;
+			if( threat.IsPuppet() || turret )
+			{
+				if( threat.IsPlayerControlled() )
+				{
+					threatValue = 1.0;
+				}
+				else if( turret )
+				{
+					threatValue = 1.0;
+				}
+				distance = GetDistanceToThreat( ownerPos, threat, zDiff, true );
+				threatValue += GetThreatZDiffModifier( zDiff );
+				threatValue += GetThreatDistanceModifier( targetTrackerComponent, distance );
+				threatValue += GetThreatHisteresisModifier( targetTrackerComponent, threat, newTargetObject, timeSinceTargetChange );
+				threatValue += GetThreatDamageModifier( targetTrackerComponent, owner, threat, distance, currentTime );
+				threatValue += GetThreatAttackersModifier( targetTrackerComponent, owner, threat );
+				threatValue += GetThreatLastVisibilityModifier( owner, threat );
+				threatValue += GetThreatAccessibilityFromCoverModifier( owner, threat );
+				if( ScriptedPuppet.IsBeingGrappled( threat ) )
+				{
+					threatValue *= 0.1;
+				}
+				else if( !( HasWeaponInInventory( threat ) ) )
+				{
+					threatValue *= 0.5;
+				}
+			}
+		}
+	}
+
+	private static function BossThreatCalculation( owner : weak< ScriptedPuppet >, ownerPos : Vector4, targetTrackerComponent : TargetTrackerComponent, newTargetObject : weak< GameObject >, threat : weak< GameObject >, timeSinceTargetChange : Float, currentTime : Float, out threatValue : Float )
+	{
+		var distance : Float;
+		var zDiff : Float;
+		var turret : weak< SecurityTurret >;
+		var threatPuppet : weak< ScriptedPuppet >;
+		if( ScriptedPuppet.IsActive( threat ) )
+		{
+			threatValue = 0.01;
+			if( threat.IsTurret() )
+			{
+				turret = ( ( SecurityTurret )( threat ) );
+			}
+			else if( threat.IsPuppet() )
+			{
+				threatPuppet = ( ( ScriptedPuppet )( threat ) );
+			}
+			if( threatPuppet || turret )
+			{
+				if( ( ( ( threat == newTargetObject ) && threatPuppet ) && threatPuppet.IsPlayerCompanion() ) && ( timeSinceTargetChange >= 3.0 ) )
+				{
+					threatValue = 0.01;
+					return;
+				}
+				if( threat.IsPlayerControlled() )
+				{
+					threatValue = 2.0;
+				}
+				else if( turret )
+				{
+					if( turret.GetDevicePS().IsControlledByPlayer() )
+					{
+						threatValue = 100.0;
+					}
+					else
+					{
+						threatValue = 2.0;
+					}
+				}
+				distance = GetDistanceToThreat( ownerPos, threat, zDiff );
+				threatValue += GetThreatDistanceModifier( targetTrackerComponent, distance );
+				threatValue += GetThreatHisteresisModifier( targetTrackerComponent, threat, newTargetObject, timeSinceTargetChange );
+				threatValue += GetThreatDamageModifier( targetTrackerComponent, owner, threat, distance, currentTime );
+				threatValue += GetThreatAttackersModifier( targetTrackerComponent, owner, threat );
+			}
+		}
+	}
+
+	private static function MadnessThreatCalculation( owner : weak< ScriptedPuppet >, ownerPos : Vector4, targetTrackerComponent : TargetTrackerComponent, newTargetObject : weak< GameObject >, threat : weak< GameObject >, timeSinceTargetChange : Float, currentTime : Float, out threatValue : Float )
+	{
+		var distance : Float;
+		var zDiff : Float;
+		if( ScriptedPuppet.IsActive( threat ) )
+		{
+			threatValue = 0.01;
+			if( threat.IsPuppet() || threat.IsTurret() )
+			{
+				distance = GetDistanceToThreat( ownerPos, threat, zDiff );
+				threatValue += GetThreatDistanceModifier( targetTrackerComponent, distance );
+			}
+		}
+	}
+
+	private static function HasWeaponInInventory( owner : weak< GameObject > ) : Bool
+	{
+		var puppet : ScriptedPuppet;
+		puppet = ( ( ScriptedPuppet )( owner ) );
+		if( puppet )
+		{
+			return puppet.HasPrimaryOrSecondaryEquipment();
+		}
+		return false;
+	}
+
+	public static function GetDistanceToThreat( ownerPos : Vector4, threat : GameObject, out zDiff : Float, optional positionOfRoot : Bool ) : Float
+	{
+		var targetPos : Vector4;
+		if( positionOfRoot || !( AIActionHelper.GetTargetSlotPosition( threat, 'Head', targetPos ) ) )
+		{
+			targetPos = threat.GetWorldPosition();
+		}
+		zDiff = ownerPos.Z - targetPos.Z;
+		return Vector4.Distance( ownerPos, targetPos );
+	}
+
+	public static function GetThreatDistanceModifier( targetTrackerComponent : TargetTrackerComponent, distance : Float ) : Float
+	{
+		var threatValue : Float;
+		threatValue = targetTrackerComponent.GetThreatPriorityModFromDistCurve( distance );
+		return threatValue;
+	}
+
+	public static function GetThreatZDiffModifier( zDiff : Float ) : Float
+	{
+		var threatValue : Float;
+		var floorDiff : Int32;
+		floorDiff = ( ( Int32 )( AbsF( zDiff ) / 3.70000005 ) );
+		threatValue = 1.5 * ( 1.0 - ( ClampF( ( ( Float )( floorDiff ) ), 0.0, 5.0 ) / 5.0 ) );
+		return threatValue;
+	}
+
+	private static function GetThreatHisteresisModifier( targetTrackerComponent : TargetTrackerComponent, threat : GameObject, currentTarget : GameObject, timeSinceTargetChange : Float ) : Float
+	{
+		var histeresisVal : Float;
+		histeresisVal = 0.0;
+		if( threat == currentTarget )
+		{
+			histeresisVal = targetTrackerComponent.GetThreatPriorityModFromHisteresisCurve( timeSinceTargetChange );
+		}
+		return histeresisVal;
+	}
+
+	private static function GetThreatDamageModifier( targetTrackerComponent : TargetTrackerComponent, puppet : ScriptedPuppet, threat : GameObject, distance : Float, currentTime : Float ) : Float
+	{
+		var timeSinceDamage : Float;
+		var isMelee : Bool;
+		var meleeModifier : Float;
+		var curveModifier : Float;
+		var distanceModifier : Float;
+		var minDistance : Float;
+		var maxDistance : Float;
+		isMelee = false;
+		meleeModifier = 1.0;
+		curveModifier = 1.0;
+		distanceModifier = 1.0;
+		minDistance = 2.0;
+		maxDistance = 20.0;
+		timeSinceDamage = puppet.GetLastDamageTimeFrom( threat, isMelee );
+		if( timeSinceDamage != -1.0 )
+		{
+			if( isMelee )
+			{
+				meleeModifier = 2.0;
+			}
+			curveModifier = targetTrackerComponent.GetThreatPriorityModFromDmgCurve( currentTime - timeSinceDamage ) * meleeModifier;
+			if( distance <= minDistance )
+			{
+				distanceModifier = 1.0;
+			}
+			else if( distance >= maxDistance )
+			{
+				distanceModifier = 0.0;
+			}
+			else
+			{
+				distanceModifier = ( distance - minDistance ) / ( maxDistance - minDistance );
+				distanceModifier *= distanceModifier;
+				distanceModifier = 1.0 - distanceModifier;
+			}
+			return distanceModifier * curveModifier;
+		}
+		return 0.0;
+	}
+
+	private static function GetThreatAttackersModifier( targetTrackerComponent : TargetTrackerComponent, puppet : ScriptedPuppet, threat : GameObject ) : Float
+	{
+		var squadMembersCount : Uint32;
+		var enemiesCount : Uint32;
+		var enemyAttackersCount : Uint32;
+		var priorityAttackersMod : Float;
+		var cssi : CombatSquadScriptInterface;
+		enemiesCount = 0;
+		enemyAttackersCount = 0;
+		AISquadHelper.GetCombatSquadInterface( puppet, cssi );
+		if( !( cssi ) )
+		{
+			return 0.0;
+		}
+		enemiesCount = cssi.GetEnemyAttackersCount( threat );
+		if( ( enemiesCount <= ( ( Uint32 )( 1 ) ) ) || !( cssi.IsEnemy( threat ) ) )
+		{
+			return 0.0;
+		}
+		squadMembersCount = cssi.GetMembersCount();
+		if( squadMembersCount >= enemiesCount )
+		{
+			priorityAttackersMod = targetTrackerComponent.GetThreatPriorityModFromAttackersCurve( enemyAttackersCount );
+			if( ( priorityAttackersMod > 0.0 ) && ( GetClosestMemberId( cssi, threat.GetWorldPosition() ) == puppet.GetEntityID() ) )
+			{
+				return priorityAttackersMod;
+			}
+		}
+		return 0.0;
+	}
+
+	private static function GetThreatLastVisibilityModifier( puppet : ScriptedPuppet, threat : GameObject ) : Float
+	{
+		var senseComponent : SenseComponent;
+		var sensorComponent : SensorObjectComponent;
+		var threatId : EntityID;
+		var minTime : Float;
+		var maxTime : Float;
+		var maxVal : Float;
+		var timeSinceLastVisible : Float;
+		minTime = 3.0;
+		maxTime = 7.0;
+		maxVal = 1.0;
+		timeSinceLastVisible = maxTime;
+		senseComponent = puppet.GetSensesComponent();
+		if( senseComponent )
+		{
+			threatId = threat.GetEntityID();
+			timeSinceLastVisible = senseComponent.GetTimeSinceLastEntityVisible( threatId );
+		}
+		else
+		{
+			sensorComponent = puppet.GetSensorObjectComponent();
+			if( sensorComponent )
+			{
+				threatId = threat.GetEntityID();
+				timeSinceLastVisible = sensorComponent.GetTimeSinceLastEntityVisible( threatId );
+			}
+		}
+		if( timeSinceLastVisible > 100000000.0 )
+		{
+			timeSinceLastVisible = 0.0;
+		}
+		if( timeSinceLastVisible >= maxTime )
+		{
+			return 0.0;
+		}
+		else if( timeSinceLastVisible <= minTime )
+		{
+			return maxVal;
+		}
+		return maxVal * ( 1.0 - ( ( timeSinceLastVisible - minTime ) / ( maxTime - minTime ) ) );
+	}
+
+	private static function GetThreatAccessibilityFromCoverModifier( puppet : ScriptedPuppet, threat : GameObject ) : Float
+	{
+		var coverManager : CoverManager;
+		var maxVal : Float;
+		var coverID : Uint64;
+		var minUsableMethods : Uint32;
+		maxVal = 3.0;
+		minUsableMethods = 1;
+		coverManager = GameInstance.GetCoverManager( puppet.GetGame() );
+		coverID = coverManager.GetCurrentCover( puppet );
+		if( coverID > ( ( Uint64 )( 0 ) ) )
+		{
+			if( coverManager.GetUsableExposureSpotsNumForCoverTolerance( coverID, threat, 3.0, true ) >= minUsableMethods )
+			{
+				return maxVal;
+			}
+		}
+		return 0.0;
+	}
+
+	private static function GetClosestMemberId( smi : SquadScriptInterface, pos : Vector4 ) : EntityID
+	{
+		var members : array< weak< Entity > >;
+		var i : Int32;
+		var closestId : EntityID;
+		var dist : Float;
+		var minDist : Float;
+		members = smi.ListMembersWeak();
+		minDist = 100000000.0;
+		if( smi )
+		{
+			for( i = 0; i < members.Size(); i += 1 )
+			{
+				dist = Vector4.DistanceSquared( pos, members[ i ].GetWorldPosition() );
+				if( dist < minDist )
+				{
+					minDist = dist;
+					closestId = members[ i ].GetEntityID();
+				}
+			}
+		}
+		return closestId;
+	}
+
+}
+
+import enum AITrackedStatusType
+{
+	Unknown,
+	Friendly,
+	Neutral,
+	Hostile,
+}
+
+import enum AIThreatPersistenceStatus
+{
+	ThreatNotFound,
+	Persistent,
+	NotPersistent,
+}
+

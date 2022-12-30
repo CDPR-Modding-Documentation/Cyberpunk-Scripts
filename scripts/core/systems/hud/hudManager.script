@@ -1,0 +1,1861 @@
+class PulseFinishedRequest extends ScriptableSystemRequest
+{
+}
+
+class QuickHackPanelStateEvent extends Event
+{
+	var isOpened : Bool;
+}
+
+class LookedAtEvent extends Event
+{
+	var isLookedAt : Bool;
+}
+
+class NameplateChangedEvent extends ScriptableSystemRequest
+{
+	var entity : EntityID;
+}
+
+class IterateModulesRequest extends ScriptableSystemRequest
+{
+	var remainingJobs : array< HUDJob >;
+}
+
+class SendInstructionRequest extends ScriptableSystemRequest
+{
+	var jobs : array< HUDJob >;
+}
+
+class ScannerTargetChangedRequest extends ScriptableSystemRequest
+{
+	var scannerTarget : EntityID;
+}
+
+class PlayerTargetChangedRequest extends ScriptableSystemRequest
+{
+	var playerTarget : EntityID;
+}
+
+class NemaplateChangedRequest extends ScriptableSystemRequest
+{
+	var playerTarget : EntityID;
+}
+
+class LockQHackInput extends ScriptableSystemRequest
+{
+	var isLocked : Bool;
+}
+
+class QuickHackSetDescriptionVisibilityRequest extends ScriptableSystemRequest
+{
+	var visible : Bool;
+}
+
+struct HUDJob
+{
+	var actor : weak< HUDActor >;
+	var instruction : HUDInstruction;
+}
+
+class CrosshairModule extends HUDModule
+{
+	private var m_activeCrosshairs : array< Crosshair >;
+}
+
+class Crosshair extends ModuleInstance
+{
+}
+
+class AimAssistModule extends HUDModule
+{
+	private var m_activeAssists : array< AimAssist >;
+}
+
+class AimAssist extends ModuleInstance
+{
+}
+
+class HUDInstruction extends Event
+{
+	var scannerInstructions : ScanInstance;
+	var highlightInstructions : HighlightInstance;
+	var braindanceInstructions : BraindanceInstance;
+	var iconsInstruction : IconsInstance;
+	var quickhackInstruction : QuickhackInstance;
+
+	public static function Construct( self : HUDInstruction, id : EntityID )
+	{
+		if( !( EntityID.IsDefined( id ) ) )
+		{
+			return;
+		}
+		self.scannerInstructions = new ScanInstance;
+		self.highlightInstructions = new HighlightInstance;
+		self.iconsInstruction = new IconsInstance;
+		self.braindanceInstructions = new BraindanceInstance;
+		self.quickhackInstruction = new QuickhackInstance;
+		ScanInstance.Construct( self.scannerInstructions, id );
+		HighlightInstance.Construct( self.highlightInstructions, id );
+		IconsInstance.Construct( self.iconsInstruction, id );
+		BraindanceInstance.Construct( self.braindanceInstructions, id );
+		QuickhackInstance.Construct( self.quickhackInstruction, id );
+	}
+
+}
+
+import class NativeHudManager extends ScriptableSystem
+{
+	protected import function RegisterActor( actorId : EntityID ) : HUDActor;
+	protected import function UnregisterActor( actorId : EntityID ) : Bool;
+	protected import const function GetActor( actorId : EntityID ) : HUDActor;
+	protected import const function GetAllActors() : array< HUDActor >;
+	public import const function IsQuickHackPanelOpened() : Bool;
+	public import function SetIsQuickHackPanelOpened( isOpen : Bool );
+}
+
+class HUDManager extends NativeHudManager
+{
+	private var m_state : HUDState;
+	private var m_activeMode : ActiveMode;
+	default m_activeMode = ActiveMode.SEMI;
+	private var m_instructionsDelayID : DelayID;
+	private var m_isBraindanceActive : Bool;
+	private var m_modulesArray : array< HUDModule >;
+	private var m_scanner : ScannerModule;
+	private var m_braindanceModule : BraindanceModule;
+	private var m_highlightsModule : HighlightModule;
+	private var m_iconsModule : IconsModule;
+	private var m_crosshair : CrosshairModule;
+	private var m_aimAssist : AimAssistModule;
+	private var m_quickhackModule : QuickhackModule;
+	private var m_lastTarget : weak< HUDActor >;
+	private var m_currentTarget : weak< HUDActor >;
+	private var m_lookAtTarget : EntityID;
+	private var m_scannerTarget : EntityID;
+	private var m_nameplateTarget : EntityID;
+	private var m_quickHackTarget : EntityID;
+	private var m_lootedTarget : EntityID;
+	private var m_scannningController : weak< ScanningController >;
+	private var m_uiScannerVisible : Bool;
+	default m_uiScannerVisible = false;
+	private var m_uiQuickHackVisible : Bool;
+	default m_uiQuickHackVisible = false;
+	private var m_quickHackDescriptionVisible : Bool;
+	private var m_targetingSystem : weak< TargetingSystem >;
+	private var m_visionModeSystem : weak< VisionModeSystem >;
+	private var m_isHackingMinigameActive : Bool;
+	private var m_stickInputListener : CallbackHandle;
+	private var m_quickHackPanelListener : CallbackHandle;
+	private var m_carriedBodyListener : CallbackHandle;
+	private var m_grappleListener : CallbackHandle;
+	private var m_lookatRequest : AimRequest;
+	private var m_isQHackUIInputLocked : Bool;
+	private var m_playerAttachedCallbackID : Uint32;
+	private var m_playerDetachedCallbackID : Uint32;
+	private var m_playerTargetCallbackID : CallbackHandle;
+	private var m_braindanceToggleCallbackID : CallbackHandle;
+	private var m_nameplateCallbackID : CallbackHandle;
+	private var m_visionModeChangedCallbackID : CallbackHandle;
+	private var m_scannerTargetCallbackID : CallbackHandle;
+	private var m_hackingMinigameCallbackID : CallbackHandle;
+	private var m_uiScannerVisibleCallbackID : CallbackHandle;
+	private var m_uiQuickHackVisibleCallbackID : CallbackHandle;
+	private var m_lootDataCallbackID : CallbackHandle;
+	private var m_pulseDelayID : DelayID;
+	private var m_previousStickInput : Vector4;
+
+	private export override function OnAttach()
+	{
+		InitializeHUD();
+	}
+
+	private export override function OnDetach()
+	{
+		UninitializeHUD();
+	}
+
+	private function InitializeHUD()
+	{
+		m_scannningController = GameInstance.GetVisionModeSystem( GetGameInstance() ).GetScanningController();
+		m_targetingSystem = GameInstance.GetTargetingSystem( GetGameInstance() );
+		m_visionModeSystem = GameInstance.GetVisionModeSystem( GetGameInstance() );
+		m_playerAttachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetAttachedCallback( this, 'PlayerAttachedCallback' );
+		m_playerDetachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetDetachedCallback( this, 'PlayerDetachedCallback' );
+		RegisterPlayerTargetCallback();
+		RegisterScannerTargetCallback();
+		RegisterNameplateShownCallback();
+		RegisterHackingMinigameCallback();
+		RegisterBraindanceToggleCallback();
+		RegisterUICallbacks();
+		InitializeModules();
+		m_state = HUDState.ACTIVATED;
+	}
+
+	private function InitializeModules()
+	{
+		m_scanner = new ScannerModule;
+		m_braindanceModule = new BraindanceModule;
+		m_highlightsModule = new HighlightModule;
+		m_iconsModule = new IconsModule;
+		m_crosshair = new CrosshairModule;
+		m_aimAssist = new AimAssistModule;
+		m_quickhackModule = new QuickhackModule;
+		m_scanner.InitializeModule( this, ModuleState.ON );
+		m_highlightsModule.InitializeModule( this, ModuleState.ON );
+		m_iconsModule.InitializeModule( this, ModuleState.ON );
+		m_crosshair.InitializeModule( this, ModuleState.DISABLED );
+		m_aimAssist.InitializeModule( this, ModuleState.DISABLED );
+		m_braindanceModule.InitializeModule( this, ModuleState.ON );
+		m_quickhackModule.InitializeModule( this, ModuleState.ON );
+		m_modulesArray.PushBack( m_scanner );
+		m_modulesArray.PushBack( m_braindanceModule );
+		m_modulesArray.PushBack( m_highlightsModule );
+		m_modulesArray.PushBack( m_iconsModule );
+		m_modulesArray.PushBack( m_quickhackModule );
+	}
+
+	private function UninitializeHUD()
+	{
+		GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetAttachedCallback( m_playerAttachedCallbackID );
+		GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetDetachedCallback( m_playerDetachedCallbackID );
+		UnregisterUICallbacks();
+		m_playerAttachedCallbackID = ( ( Uint32 )( 0 ) );
+		m_playerDetachedCallbackID = ( ( Uint32 )( 0 ) );
+		m_scannningController = NULL;
+	}
+
+	private export function PlayerAttachedCallback( playerPuppet : GameObject )
+	{
+		RegisterVisionModeCallback( playerPuppet );
+		RegisterToInput();
+		m_quickHackPanelListener = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData ).RegisterListenerBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelOpen, this, 'OnQuickHackPanelOpened' );
+		m_carriedBodyListener = GetPlayerSMBlackboard().RegisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.Carrying, this, 'OnBodyCarryStateChanged' );
+		m_grappleListener = GetPlayerSMBlackboard().RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Takedown, this, 'OnGrappleStateChanged' );
+	}
+
+	private export function PlayerDetachedCallback( playerPuppet : GameObject )
+	{
+		UnregisterVisionModeCallback( playerPuppet );
+		UnregisterToInput();
+		if( m_quickHackPanelListener )
+		{
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData ).UnregisterListenerBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelOpen, m_quickHackPanelListener );
+		}
+		if( m_carriedBodyListener )
+		{
+			GetPlayerSMBlackboard().UnregisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.Carrying, m_carriedBodyListener );
+		}
+		if( m_grappleListener )
+		{
+			GetPlayerSMBlackboard().UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Takedown, m_grappleListener );
+		}
+	}
+
+	public const function GetPlayerSMBlackboard() : IBlackboard
+	{
+		var psmBlackboard : IBlackboard;
+		psmBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( GetPlayer().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return psmBlackboard;
+	}
+
+	protected export function OnRegister( request : HUDManagerRegistrationRequest )
+	{
+		if( IsRequestLegal( request ) )
+		{
+			ProcessRegistration( request );
+		}
+	}
+
+	protected export function OnRefreshSingleActor( request : RefreshActorRequest )
+	{
+		var actor : HUDActor;
+		var updateData : HUDActorUpdateData;
+		var requestedModules : array< weak< HUDModule > >;
+		if( request.IsValid() )
+		{
+			actor = GetActor( request.ownerID );
+			if( !( actor ) )
+			{
+				return;
+			}
+			updateData = request.GetActorUpdateData();
+			if( updateData )
+			{
+				actor.UpdateActorData( updateData );
+			}
+			requestedModules = request.GetRequestedModules();
+			if( requestedModules.Size() > 0 )
+			{
+				RefreshHudForSingleActor( actor, requestedModules );
+			}
+			else
+			{
+				RefreshHudForSingleActor( actor );
+			}
+		}
+	}
+
+	private function OnLockQHackInput( request : LockQHackInput )
+	{
+		m_isQHackUIInputLocked = request.isLocked;
+	}
+
+	public const function IsQHackInputLocked() : Bool
+	{
+		return m_isQHackUIInputLocked;
+	}
+
+	public static function IsQHackInputLocked( context : GameInstance ) : Bool
+	{
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( self )
+		{
+			return self.IsQHackInputLocked();
+		}
+		return false;
+	}
+
+	public static function LockQHackInput( context : GameInstance, isLocked : Bool )
+	{
+		var request : LockQHackInput;
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( self )
+		{
+			request = new LockQHackInput;
+			request.isLocked = isLocked;
+			self.QueueRequest( request );
+		}
+	}
+
+	private function OnRevealQuickhackMenu( request : RevealQuickhackMenu )
+	{
+		if( request.shouldOpenWheel )
+		{
+			GetCurrentTarget().SetShouldRefreshQHack( true );
+			RefreshHudForSingleActor( GetCurrentTarget() );
+		}
+		else
+		{
+			CloseQHackMenu();
+		}
+	}
+
+	private const function CloseQHackMenu()
+	{
+		var evt : QuickHackScreenOpen;
+		evt = new QuickHackScreenOpen;
+		evt.setToOpen = false;
+		GetPlayer().QueueEvent( evt );
+	}
+
+	public static function CanCurrentTargetRevealRemoteActionsWheel( context : GameInstance ) : Bool
+	{
+		var self : HUDManager;
+		var gameObject : GameObject;
+		var canOpen : Bool;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( self )
+		{
+			gameObject = ( ( GameObject )( GameInstance.FindEntityByID( context, self.GetCurrentTargetID() ) ) );
+			if( gameObject )
+			{
+				canOpen = gameObject.CanRevealRemoteActionsWheel();
+			}
+			if( canOpen )
+			{
+				return true;
+			}
+			else
+			{
+				return false;
+			}
+		}
+		return false;
+	}
+
+	protected export function OnRevealActorNotification( request : RevealStatusNotification )
+	{
+		var actor : HUDActor;
+		if( IsRequestLegal( request ) )
+		{
+			actor = GetActor( request.ownerID );
+			if( actor )
+			{
+				actor.SetRevealed( request.isRevealed );
+			}
+		}
+		if( actor )
+		{
+			IterateModules( CreateJob( actor ) );
+		}
+	}
+
+	protected export function OnTagActorNotification( request : TagStatusNotification )
+	{
+		var actor : HUDActor;
+		if( IsRequestLegal( request ) )
+		{
+			actor = GetActor( request.ownerID );
+			if( actor )
+			{
+				actor.SetTagged( request.isTagged );
+			}
+		}
+		if( actor )
+		{
+			IterateModules( CreateJob( actor ) );
+		}
+	}
+
+	protected export function OnClueClueLockNotification( request : ClueLockNotification )
+	{
+		if( IsRequestLegal( request ) )
+		{
+			IterateModules( CreateJobsForClueActors( GetAllActors() ) );
+		}
+	}
+
+	protected export function OnClueActorNotification( request : ClueStatusNotification )
+	{
+		var actor : HUDActor;
+		if( IsRequestLegal( request ) )
+		{
+			actor = GetActor( request.ownerID );
+			if( actor )
+			{
+				actor.SetClue( request.isClue );
+				actor.SetClueGroup( request.clueGroupID );
+				IterateModules( CreateJob( actor ) );
+			}
+		}
+	}
+
+	protected event OnVisionModeChanged( value : Int32 )
+	{
+		var newActiveMode : ActiveMode;
+		var visionType : gameVisionModeType;
+		ResolveCurrentTarget();
+		if( GetHUDState() != HUDState.ACTIVATED )
+		{
+			return false;
+		}
+		visionType = ( ( gameVisionModeType )( value ) );
+		if( visionType == gameVisionModeType.Focus )
+		{
+			newActiveMode = ActiveMode.FOCUS;
+		}
+		else
+		{
+			newActiveMode = ActiveMode.SEMI;
+		}
+		if( newActiveMode != m_activeMode )
+		{
+			m_activeMode = newActiveMode;
+			GetCurrentTarget().SetShouldRefreshQHack( true );
+			RefreshHUD();
+		}
+	}
+
+	protected event OnPlayerTargetChanged( value : EntityID )
+	{
+		var request : PlayerTargetChangedRequest;
+		request = new PlayerTargetChangedRequest;
+		request.playerTarget = value;
+		QueueRequest( request );
+	}
+
+	protected event OnBraindanceToggle( value : Bool )
+	{
+		if( m_isBraindanceActive != value )
+		{
+			m_isBraindanceActive = value;
+			RefreshHUD();
+			if( !( value ) )
+			{
+				OnVisionModeChanged( GetPlayerStateMachineBlackboard( GetPlayer() ).GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vision ) );
+			}
+		}
+	}
+
+	protected export function OnPlayerTargetChangedRequest( evt : PlayerTargetChangedRequest )
+	{
+		ResolveLookAtTarget( evt.playerTarget );
+		if( m_activeMode == ActiveMode.FOCUS && EntityID.IsDefined( m_scannerTarget ) )
+		{
+			return;
+		}
+		if( !( ResolveCurrentTarget() ) )
+		{
+			return;
+		}
+		ReactToTargetChanged();
+	}
+
+	private function ResolveLookAtTarget( newTarget : EntityID )
+	{
+		var lookAtStarted : LookedAtEvent;
+		var lookAtStopped : LookedAtEvent;
+		var lastTarget : EntityID;
+		if( newTarget != m_lookAtTarget )
+		{
+			lastTarget = m_lookAtTarget;
+			m_lookAtTarget = newTarget;
+			lookAtStarted = new LookedAtEvent;
+			lookAtStopped = new LookedAtEvent;
+			lookAtStarted.isLookedAt = true;
+			lookAtStopped.isLookedAt = false;
+			if( EntityID.IsDefined( m_lookAtTarget ) )
+			{
+				QueueEntityEvent( m_lookAtTarget, lookAtStarted );
+			}
+			if( EntityID.IsDefined( lastTarget ) )
+			{
+				QueueEntityEvent( lastTarget, lookAtStopped );
+			}
+		}
+	}
+
+	protected function RegisterToInput()
+	{
+		var player : GameObject;
+		player = GetPlayer();
+		player.RegisterInputListener( this, 'QH_MoveLeft' );
+		player.RegisterInputListener( this, 'QH_MoveRight' );
+		player.RegisterInputListener( this, 'Ping' );
+		player.RegisterInputListener( this, 'OpenQuickHackPanel' );
+		player.RegisterInputListener( this, 'DescriptionChange' );
+		m_stickInputListener = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData ).RegisterListenerVector4( GetAllBlackboardDefs().UI_QuickSlotsData.leftStick, this, 'OnStickInputChanged' );
+	}
+
+	protected function UnregisterToInput()
+	{
+		GetPlayer().UnregisterInputListener( this );
+		if( m_stickInputListener )
+		{
+			GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData ).UnregisterListenerVector4( GetAllBlackboardDefs().UI_QuickSlotsData.leftStick, m_stickInputListener );
+		}
+	}
+
+	public const function IsBraindanceActive() : Bool
+	{
+		return m_isBraindanceActive;
+	}
+
+	protected event OnQuickHackPanelOpened( value : Bool )
+	{
+		var invalidID : EntityID;
+		if( value != IsQuickHackPanelOpened() )
+		{
+			SetIsQuickHackPanelOpened( value );
+			SendQuickHackPanelStateEvent( value );
+		}
+		if( value )
+		{
+			m_previousStickInput = Vector4.EmptyVector();
+		}
+		else
+		{
+			Vector4.Zero( m_lookatRequest.lookAtTarget );
+			m_quickHackTarget = invalidID;
+			ResolveCurrentTarget();
+		}
+		RefreshDebug();
+	}
+
+	protected event OnBodyCarryStateChanged( value : Bool )
+	{
+		RefreshHUD();
+	}
+
+	protected event OnGrappleStateChanged( value : Int32 )
+	{
+		RefreshHUD();
+	}
+
+	protected event OnBreachingNetwork( value : String )
+	{
+		if( IsStringValid( value ) )
+		{
+			m_isHackingMinigameActive = true;
+		}
+		else
+		{
+			m_isHackingMinigameActive = false;
+		}
+	}
+
+	public const function IsHackingMinigameActive() : Bool
+	{
+		return m_isHackingMinigameActive;
+	}
+
+	private function SendQuickHackPanelStateEvent( isOpened : Bool )
+	{
+		var evt : QuickHackPanelStateEvent;
+		var targetID : EntityID;
+		targetID = m_currentTarget.GetEntityID();
+		if( EntityID.IsDefined( targetID ) )
+		{
+			evt = new QuickHackPanelStateEvent;
+			evt.isOpened = isOpened;
+			QueueEntityEvent( targetID, evt );
+		}
+	}
+
+	public static function IsQuickHackPanelOpen( context : GameInstance ) : Bool
+	{
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( self )
+		{
+			return self.IsQuickHackPanelOpened();
+		}
+		return false;
+	}
+
+	public static function SetQHDescriptionVisibility( context : GameInstance, visible : Bool )
+	{
+		var request : QuickHackSetDescriptionVisibilityRequest;
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( self )
+		{
+			request = new QuickHackSetDescriptionVisibilityRequest;
+			request.visible = visible;
+			self.QueueRequest( request );
+		}
+	}
+
+	private export function OnQuickHackSetDescriptionVisibility( evt : QuickHackSetDescriptionVisibilityRequest )
+	{
+		SetQhuickHackDescriptionVisibility( evt.visible );
+	}
+
+	private function SetQhuickHackDescriptionVisibility( value : Bool )
+	{
+		m_quickHackDescriptionVisible = value;
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData ).SetBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickHackDescritpionVisible, m_quickHackDescriptionVisible, true );
+	}
+
+	public const function IsQHDescriptionVisible() : Bool
+	{
+		return m_quickHackDescriptionVisible;
+	}
+
+	public static function IsQuickHackDescriptionVisible( context : GameInstance ) : Bool
+	{
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( self )
+		{
+			return self.IsQHDescriptionVisible();
+		}
+		return false;
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : CName;
+		var isReleased : Bool;
+		if( IsHackingMinigameActive() )
+		{
+			return false;
+		}
+		isReleased = ListenerAction.GetType( action ) == gameinputActionType.BUTTON_PRESSED;
+		actionName = ListenerAction.GetName( action );
+		if( IsQuickHackPanelOpened() && !( m_isQHackUIInputLocked ) )
+		{
+			if( isReleased && !( GameObject.IsCooldownActive( GetPlayer(), 'Qhack_targetChange_lock' ) ) )
+			{
+				switch( actionName )
+				{
+					case 'QH_MoveLeft':
+					{
+						if( isReleased )
+						{
+							JumpToNextTarget( false );
+						}
+						GameObject.StartCooldown( GetPlayer(), 'Qhack_targetChange_lock', 0.001 );
+						break;
+					}
+					case 'QH_MoveRight':
+					{
+						if( isReleased )
+						{
+							JumpToNextTarget( true );
+						}
+						GameObject.StartCooldown( GetPlayer(), 'Qhack_targetChange_lock', 0.001 );
+						break;
+					}
+					default:
+						break;
+				}
+			}
+		}
+		if( ListenerAction.IsButtonJustPressed( action ) )
+		{
+			switch( actionName )
+			{
+				case 'Ping':
+					StartPulse();
+				break;
+				case 'DescriptionChange':
+					if( IsQuickHackPanelOpened() )
+					{
+						SetQhuickHackDescriptionVisibility( !( m_quickHackDescriptionVisible ) );
+					}
+				break;
+				default:
+					break;
+			}
+		}
+	}
+
+	protected event OnStickInputChanged( value : Vector4 ) {}
+
+	protected function JumpToNextTarget( right : Bool )
+	{
+		var inputVector : Vector4;
+		if( right )
+		{
+			inputVector.X = 1.0;
+		}
+		else
+		{
+			inputVector.X = -1.0;
+		}
+		JumpToTarget( inputVector );
+	}
+
+	protected function JumpToTarget( inputVector : Vector4, optional dotThreshold : Float )
+	{
+		var searchQuery : TargetSearchQuery;
+		var targetParts : array< TS_TargetPartInfo >;
+		var i : Int32;
+		var angleDistance : EulerAngles;
+		var dot : Float;
+		var normalizedDot : Float;
+		var smallestDot : Float;
+		var gameObj : weak< GameObject >;
+		var selectedTarget : Int32;
+		var vecToNextObject : Vector4;
+		if( Vector4.IsZero( inputVector ) )
+		{
+			return;
+		}
+		if( LiftDevice.IsPlayerInsideElevator( GetGameInstance() ) )
+		{
+			return;
+		}
+		selectedTarget = -1;
+		smallestDot = 100000000.0;
+		TargetSearchQuery.SetComponentFilter( searchQuery, TargetComponentFilterType.QuickHack );
+		searchQuery.searchFilter = TSF_Quickhackable();
+		searchQuery.maxDistance = SNameplateRangesData.GetMaxDisplayRange();
+		GameInstance.GetTargetingSystem( GetGameInstance() ).GetTargetParts( GetPlayer(), searchQuery, targetParts );
+		for( i = 0; i < targetParts.Size(); i += 1 )
+		{
+			gameObj = ( ( GameObject )( TS_TargetPartInfo.GetComponent( targetParts[ i ] ).GetEntity() ) );
+			if( ( !( gameObj ) || ( gameObj.GetEntityID() == m_currentTarget.GetEntityID() ) ) || !( gameObj.CanRevealRemoteActionsWheel() ) )
+			{
+				continue;
+			}
+			angleDistance = TS_TargetPartInfo.GetPlayerAngleDistance( targetParts[ i ] );
+			vecToNextObject.X = angleDistance.Yaw * -1.0;
+			vecToNextObject.Y = angleDistance.Pitch * -1.0;
+			dot = Vector4.Dot2D( inputVector, vecToNextObject );
+			normalizedDot = Vector4.Dot2D( inputVector, Vector4.Normalize2D( vecToNextObject ) );
+			if( normalizedDot < dotThreshold )
+			{
+				continue;
+			}
+			if( dot < smallestDot )
+			{
+				smallestDot = dot;
+				selectedTarget = i;
+			}
+		}
+		if( selectedTarget >= 0 )
+		{
+			angleDistance = TS_TargetPartInfo.GetPlayerAngleDistance( targetParts[ selectedTarget ] );
+			vecToNextObject.X = angleDistance.Yaw * -1.0;
+			vecToNextObject.Y = angleDistance.Pitch * -1.0;
+			LookAtNewTarget( TS_TargetPartInfo.GetComponent( targetParts[ selectedTarget ] ), vecToNextObject );
+		}
+	}
+
+	private function ClearQuickHackTargetData( targetID : EntityID )
+	{
+		var evt : QHackWheelItemChangedEvent;
+		evt = new QHackWheelItemChangedEvent;
+		evt.currentEmpty = true;
+		if( EntityID.IsDefined( targetID ) )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( targetID, evt );
+		}
+	}
+
+	private function LookAtNearestCroshairTarget( optional targetEntityID : EntityID )
+	{
+		var searchQuery : TargetSearchQuery;
+		var angleDistance : EulerAngles;
+		var vecToNextObject : Vector4;
+		var component : weak< TargetingComponent >;
+		TargetSearchQuery.SetComponentFilter( searchQuery, TargetComponentFilterType.QuickHack );
+		searchQuery.searchFilter = TSF_Quickhackable();
+		searchQuery.maxDistance = SNameplateRangesData.GetMaxDisplayRange();
+		if( EntityID.IsDefined( targetEntityID ) )
+		{
+			searchQuery.queryTarget = targetEntityID;
+			searchQuery.testedSet = TargetingSet.Complete;
+		}
+		component = ( ( TargetingComponent )( GameInstance.GetTargetingSystem( GetGameInstance() ).GetComponentClosestToCrosshair( GetPlayer(), angleDistance, searchQuery ) ) );
+		if( component )
+		{
+			vecToNextObject.X = angleDistance.Yaw * -1.0;
+			vecToNextObject.Y = angleDistance.Pitch * -1.0;
+			LookAtNewTarget( component, vecToNextObject );
+		}
+	}
+
+	private function LookAtNewTarget( lookAtComponent : weak< TargetingComponent >, vecToNextObject : Vector4 )
+	{
+		var aimRequest : AimRequest;
+		GameInstance.GetTargetingSystem( GetGameInstance() ).BreakAimSnap( GetPlayer() );
+		aimRequest = FillLookAtRequestData( lookAtComponent );
+		if( m_lookatRequest.lookAtTarget != aimRequest.lookAtTarget )
+		{
+			m_lookatRequest = aimRequest;
+			m_quickHackTarget = lookAtComponent.GetEntity().GetEntityID();
+			if( ResolveCurrentTarget() )
+			{
+				ReactToTargetChanged();
+			}
+			GameInstance.GetTargetingSystem( GetGameInstance() ).LookAt( GetPlayer(), m_lookatRequest );
+			RequestTimeDilation( 'quickHackChangeTarget', true );
+		}
+	}
+
+	protected function FillLookAtRequestData( lookAtComponent : weak< TargetingComponent > ) : AimRequest
+	{
+		var localAimRequest : AimRequest;
+		var localToWorldMatrix : Matrix;
+		localToWorldMatrix = lookAtComponent.GetLocalToWorld();
+		localAimRequest.lookAtTarget = Matrix.GetTranslation( localToWorldMatrix );
+		localAimRequest.duration = 0.1;
+		localAimRequest.easeIn = false;
+		localAimRequest.easeOut = false;
+		localAimRequest.precision = 0.01;
+		localAimRequest.adjustPitch = true;
+		localAimRequest.adjustYaw = true;
+		localAimRequest.checkRange = false;
+		localAimRequest.endOnCameraInputApplied = true;
+		localAimRequest.endOnTargetReached = false;
+		localAimRequest.processAsInput = true;
+		return localAimRequest;
+	}
+
+	protected event OnNameplateChanged( value : Variant )
+	{
+		var request : NemaplateChangedRequest;
+		request = new NemaplateChangedRequest;
+		request.playerTarget = ( ( EntityID )value );
+		QueueRequest( request );
+	}
+
+	protected export function OnNemaplateChangedRequest( evt : NemaplateChangedRequest )
+	{
+		m_nameplateTarget = evt.playerTarget;
+		if( ResolveCurrentTarget() )
+		{
+			ReactToTargetChanged();
+		}
+	}
+
+	protected event OnScannerTargetChanged( value : EntityID )
+	{
+		var request : ScannerTargetChangedRequest;
+		request = new ScannerTargetChangedRequest;
+		request.scannerTarget = value;
+		QueueRequest( request );
+	}
+
+	private function RequestTimeDilation( eventId : CName, val : Bool )
+	{
+		var psmEvent : PSMPostponedParameterBool;
+		psmEvent = new PSMPostponedParameterBool;
+		psmEvent.id = eventId;
+		psmEvent.value = val;
+		GetPlayer().QueueEvent( psmEvent );
+	}
+
+	protected export function OnScannerTargetChangedRequest( request : ScannerTargetChangedRequest )
+	{
+		m_scannerTarget = request.scannerTarget;
+		if( ResolveCurrentTarget() )
+		{
+			ReactToTargetChanged();
+		}
+		RequestTimeDilation( 'quickHackChangeTarget', false );
+	}
+
+	protected export function OnResolveRadial( request : ResolveQuickHackRadialRequest ) {}
+
+	public const function IsRegistered( id : EntityID ) : Bool
+	{
+		return GetActor( id ) != NULL;
+	}
+
+	private function ProcessRegistration( request : HUDManagerRegistrationRequest )
+	{
+		if( request.isRegistering )
+		{
+			if( GetActor( request.ownerID ) )
+			{
+				HUDLog( EntityID.ToDebugString( request.ownerID ) + " already exists. RegistryRequest rejected" );
+			}
+			else
+			{
+				RegisterActor_Script( request );
+			}
+		}
+		else
+		{
+			UnregisterActor_Script( request );
+		}
+	}
+
+	private function RegisterActor_Script( request : HUDManagerRegistrationRequest )
+	{
+		var freshActor : HUDActor;
+		var type : HUDActorType;
+		freshActor = RegisterActor( request.ownerID );
+		type = request.type;
+		if( type == HUDActorType.UNINITIALIZED )
+		{
+			HUDLog( "REGISTRATION FAILED. UNKNOWN TYPE" );
+			return;
+		}
+		HUDActor.Construct( freshActor, request.ownerID, type, HUDActorStatus.REGISTERED, DetermineActorVisibilityState( request.ownerID ) );
+		if( m_state == HUDState.ACTIVATED && freshActor )
+		{
+			IterateModules( CreateJob( freshActor ) );
+		}
+	}
+
+	private function UnregisterActor_Script( request : HUDManagerRegistrationRequest )
+	{
+		var i : Int32;
+		var hudActor : HUDActor;
+		hudActor = GetActor( request.ownerID );
+		SuppressActor( hudActor );
+		if( hudActor )
+		{
+			for( i = 0; i < m_modulesArray.Size(); i += 1 )
+			{
+				m_modulesArray[ i ].UnregisterActor( hudActor );
+			}
+			UnregisterActor( request.ownerID );
+		}
+	}
+
+	private function ResolveCurrentTarget() : Bool
+	{
+		var potentialTarget : EntityID;
+		var actor : HUDActor;
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+		if( EntityID.IsDefined( m_scannerTarget ) )
+		{
+			potentialTarget = m_scannerTarget;
+		}
+		else if( EntityID.IsDefined( m_lookAtTarget ) )
+		{
+			potentialTarget = m_lookAtTarget;
+		}
+		else
+		{
+			if( SetNewTarget( NULL ) )
+			{
+				return true;
+			}
+			return false;
+		}
+		if( EntityID.IsDefined( potentialTarget ) )
+		{
+			actor = GetActor( potentialTarget );
+			if( SetNewTarget( actor ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function SetNewTarget( newTarget : HUDActor ) : Bool
+	{
+		if( m_currentTarget == newTarget )
+		{
+			return false;
+		}
+		m_lastTarget = m_currentTarget;
+		m_currentTarget = newTarget;
+		m_currentTarget.SetShouldRefreshQHack( true );
+		return true;
+	}
+
+	private function ReactToTargetChanged()
+	{
+		var actors : array< HUDActor >;
+		if( m_state != HUDState.ACTIVATED )
+		{
+			return;
+		}
+		if( m_currentTarget )
+		{
+			actors.PushBack( m_currentTarget );
+		}
+		if( m_lastTarget != m_currentTarget )
+		{
+			actors.PushBack( m_lastTarget );
+			if( IsQuickHackPanelOpened() )
+			{
+				ClearQuickHackTargetData( m_lastTarget.GetEntityID() );
+				RefreshHudForSingleActor( GetCurrentTarget() );
+			}
+		}
+		IterateModules( CreateJobs( actors ) );
+		if( !( IsFinal() ) )
+		{
+			RefreshDebug();
+		}
+	}
+
+	private function CanShowHintMessage() : Bool
+	{
+		var attitudeCheck : Bool;
+		var currentTargetObj : weak< GameObject >;
+		if( ( m_currentTarget.GetType() == HUDActorType.PUPPET || m_currentTarget.GetType() == HUDActorType.DEVICE ) || m_currentTarget.GetType() == HUDActorType.BODY_DISPOSAL_DEVICE )
+		{
+			currentTargetObj = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), m_currentTarget.GetEntityID() ) ) );
+			attitudeCheck = GameObject.GetAttitudeTowards( GetPlayer(), currentTargetObj ) != EAIAttitude.AIA_Friendly;
+			return IsCyberdeckEquipped() && attitudeCheck;
+		}
+		if( m_currentTarget.GetType() == HUDActorType.ITEM || m_currentTarget.GetType() == HUDActorType.VEHICLE )
+		{
+			return false;
+		}
+		return IsCyberdeckEquipped();
+	}
+
+	public const function IsCyberdeckEquipped() : Bool
+	{
+		var player : GameObject;
+		player = ( ( GameObject )( GetPlayer( GetGameInstance() ) ) );
+		return EquipmentSystem.IsCyberdeckEquipped( player );
+	}
+
+	private function RefreshHUD()
+	{
+		var jobs : array< HUDJob >;
+		var invalidDealy : DelayID;
+		if( m_state != HUDState.ACTIVATED )
+		{
+			return;
+		}
+		if( m_instructionsDelayID != invalidDealy )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_instructionsDelayID );
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_instructionsDelayID );
+			m_instructionsDelayID = invalidDealy;
+		}
+		jobs = CreateJobs( GetAllActors() );
+		IterateModules( jobs );
+	}
+
+	private function RefreshHudForSingleActor( actor : HUDActor, optional targetModules : array< weak< HUDModule > > )
+	{
+		var i : Int32;
+		var jobs : array< HUDJob >;
+		var actors : array< HUDActor >;
+		if( m_state != HUDState.ACTIVATED || ( actor == NULL ) )
+		{
+			return;
+		}
+		actors.PushBack( actor );
+		jobs = CreateJobs( actors );
+		if( targetModules.Size() > 0 )
+		{
+			for( i = 0; i < targetModules.Size(); i += 1 )
+			{
+				targetModules[ i ].Iterate( jobs );
+			}
+		}
+		else
+		{
+			for( i = 0; i < m_modulesArray.Size(); i += 1 )
+			{
+				m_modulesArray[ i ].Iterate( jobs );
+			}
+		}
+		SendInstructions( jobs );
+	}
+
+	private function CreateJob( actor : HUDActor ) : HUDJob
+	{
+		var job : HUDJob;
+		job.actor = actor;
+		job.instruction = new HUDInstruction;
+		HUDInstruction.Construct( job.instruction, actor.GetEntityID() );
+		return job;
+	}
+
+	private function CreateJobsForClueActors( actors : array< HUDActor > ) : array< HUDJob >
+	{
+		var i : Int32;
+		var jobs : array< HUDJob >;
+		for( i = 0; i < actors.Size(); i += 1 )
+		{
+			if( actors[ i ] && actors[ i ].IsClue() )
+			{
+				jobs.PushBack( CreateJob( actors[ i ] ) );
+			}
+		}
+		return jobs;
+	}
+
+	private function CreateJobsByActorType( actors : array< HUDActor >, type : HUDActorType ) : array< HUDJob >
+	{
+		var i : Int32;
+		var jobs : array< HUDJob >;
+		for( i = 0; i < actors.Size(); i += 1 )
+		{
+			if( actors[ i ] && actors[ i ].GetType() == type )
+			{
+				jobs.PushBack( CreateJob( actors[ i ] ) );
+			}
+		}
+		return jobs;
+	}
+
+	private function CreateJobs( actors : array< HUDActor > ) : array< HUDJob >
+	{
+		var i : Int32;
+		var jobs : array< HUDJob >;
+		for( i = 0; i < actors.Size(); i += 1 )
+		{
+			if( actors[ i ] )
+			{
+				jobs.PushBack( CreateJob( actors[ i ] ) );
+			}
+		}
+		return jobs;
+	}
+
+	private function IterateModules( job : HUDJob )
+	{
+		var i : Int32;
+		for( i = 0; i < m_modulesArray.Size(); i += 1 )
+		{
+			m_modulesArray[ i ].Iterate( job );
+		}
+		SendSingleInstruction( job.actor.GetEntityID(), job.instruction );
+	}
+
+	private function IterateModules( jobs : array< HUDJob > )
+	{
+		var i : Int32;
+		for( i = 0; i < m_modulesArray.Size(); i += 1 )
+		{
+			m_modulesArray[ i ].Iterate( jobs );
+		}
+		SendInstructions( jobs );
+	}
+
+	private function SendInstructions( jobs : array< HUDJob > )
+	{
+		var i : Int32;
+		var totalInstructions : Int32;
+		var excessJobsPackage : array< HUDJob >;
+		for( i = 0; i < jobs.Size(); i += 1 )
+		{
+			if( totalInstructions >= GetMaxInstructionsPerFrame() )
+			{
+				excessJobsPackage.PushBack( jobs[ i ] );
+			}
+			else
+			{
+				SendSingleInstruction( jobs[ i ].actor.GetEntityID(), jobs[ i ].instruction );
+			}
+			totalInstructions += 1;
+		}
+		if( excessJobsPackage.Size() > 0 )
+		{
+			SendInstructionsByRequest( excessJobsPackage );
+		}
+	}
+
+	private function SuppressActor( actor : HUDActor )
+	{
+		var suppressJobs : array< HUDJob >;
+		var i : Int32;
+		if( actor )
+		{
+			suppressJobs.PushBack( CreateJob( actor ) );
+		}
+		for( i = 0; i < m_modulesArray.Size(); i += 1 )
+		{
+			m_modulesArray[ i ].Suppress( suppressJobs );
+		}
+		SendInstructions( suppressJobs );
+	}
+
+	private function SendSingleInstruction( entityID : EntityID, evt : Event )
+	{
+		if( ( evt != NULL ) && EntityID.IsDefined( entityID ) )
+		{
+			QueueEntityEvent( entityID, evt );
+		}
+	}
+
+	private function PostponeModuleIteration( remainingJobs : array< HUDJob > )
+	{
+		var request : IterateModulesRequest;
+		request = new IterateModulesRequest;
+		request.remainingJobs = remainingJobs;
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( GetClassName(), request, 0.03, false );
+	}
+
+	private function OnIterateModulesRequest( request : IterateModulesRequest )
+	{
+		IterateModules( request.remainingJobs );
+	}
+
+	private function SendInstructionsByRequest( jobs : array< HUDJob > )
+	{
+		var request : SendInstructionRequest;
+		request = new SendInstructionRequest;
+		request.jobs = jobs;
+		m_instructionsDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( GetClassName(), request, 0.03, false );
+	}
+
+	protected export function OnInstructionRequest( request : SendInstructionRequest )
+	{
+		var invalidID : DelayID;
+		m_instructionsDelayID = invalidID;
+		SendInstructions( request.jobs );
+	}
+
+	private constexpr static function GetMaxInstructionsPerFrame() : Int32
+	{
+		return 50;
+	}
+
+	private constexpr const function DetermineActorVisibilityState( id : EntityID ) : ActorVisibilityStatus
+	{
+		return ActorVisibilityStatus.OUTSIDE_CAMERA;
+	}
+
+	private function ForceScannerModule( actor : weak< HUDActor >, shouldForce : Bool )
+	{
+		var mode : gameScanningMode;
+		var scanningController : ScanningController;
+		if( m_state != HUDState.ACTIVATED )
+		{
+			return;
+		}
+		scanningController = m_visionModeSystem.GetScanningController();
+		if( !( scanningController ) )
+		{
+			HUDLog( "NO SCANNING CONTROLLER!" );
+			return;
+		}
+		if( shouldForce )
+		{
+			mode = gameScanningMode.Light;
+			scanningController.EnterMode( GetPlayer(), mode );
+			scanningController.SetIsScanned_Event( ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), actor.GetEntityID() ) ) ), shouldForce );
+			NetworkSystem.SendEvaluateVisionModeRequest( GetGameInstance(), gameVisionModeType.Focus );
+		}
+		if( !( shouldForce ) && !( GetActiveMode() == ActiveMode.FOCUS ) )
+		{
+			mode = gameScanningMode.Inactive;
+			scanningController.EnterMode( GetPlayer(), mode );
+			NetworkSystem.SendEvaluateVisionModeRequest( GetGameInstance(), gameVisionModeType.Default );
+		}
+	}
+
+	protected function RegisterScannerTargetCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		if( blackboard && !( m_scannerTargetCallbackID ) )
+		{
+			m_scannerTargetCallbackID = blackboard.RegisterListenerEntityID( GetAllBlackboardDefs().UI_Scanner.ScannedObject, this, 'OnScannerTargetChanged' );
+		}
+	}
+
+	protected function RegisterPlayerTargetCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_TargetingInfo );
+		if( blackboard && !( m_playerTargetCallbackID ) )
+		{
+			m_playerTargetCallbackID = blackboard.RegisterListenerEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget, this, 'OnPlayerTargetChanged' );
+		}
+	}
+
+	protected function RegisterBraindanceToggleCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().Braindance );
+		if( blackboard && !( m_braindanceToggleCallbackID ) )
+		{
+			m_braindanceToggleCallbackID = blackboard.RegisterListenerBool( GetAllBlackboardDefs().Braindance.IsActive, this, 'OnBraindanceToggle' );
+		}
+	}
+
+	protected function RegisterNameplateShownCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_NameplateData );
+		if( blackboard && !( m_nameplateCallbackID ) )
+		{
+			m_nameplateCallbackID = blackboard.RegisterListenerVariant( GetAllBlackboardDefs().UI_NameplateData.EntityID, this, 'OnNameplateChanged' );
+		}
+	}
+
+	protected function UnRegisterPlayerTargetCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_TargetingInfo );
+		if( m_playerTargetCallbackID )
+		{
+			blackboard.UnregisterListenerEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget, m_playerTargetCallbackID );
+		}
+	}
+
+	private function RegisterVisionModeCallback( player : GameObject )
+	{
+		var blackboard : IBlackboard;
+		if( player != NULL )
+		{
+			blackboard = GetPlayerStateMachineBlackboard( player );
+			if( blackboard && !( m_visionModeChangedCallbackID ) )
+			{
+				m_visionModeChangedCallbackID = blackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vision, this, 'OnVisionModeChanged' );
+			}
+		}
+	}
+
+	private function UnregisterVisionModeCallback( player : GameObject )
+	{
+		var blackboard : IBlackboard;
+		if( player != NULL )
+		{
+			blackboard = GetPlayerStateMachineBlackboard( player );
+			if( blackboard )
+			{
+				if( m_visionModeChangedCallbackID )
+				{
+					blackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vision, m_visionModeChangedCallbackID );
+				}
+			}
+			m_visionModeChangedCallbackID = NULL;
+		}
+	}
+
+	private function RegisterHackingMinigameCallback()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().NetworkBlackboard );
+		if( blackboard && !( m_hackingMinigameCallbackID ) )
+		{
+			m_hackingMinigameCallbackID = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().NetworkBlackboard ).RegisterListenerString( GetAllBlackboardDefs().NetworkBlackboard.NetworkName, this, 'OnBreachingNetwork' );
+		}
+	}
+
+	private function UnregisterHackingMinigameCallback( player : GameObject )
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().NetworkBlackboard );
+		if( blackboard && m_hackingMinigameCallbackID )
+		{
+			blackboard.UnregisterListenerString( GetAllBlackboardDefs().NetworkBlackboard.NetworkName, m_hackingMinigameCallbackID );
+		}
+		m_hackingMinigameCallbackID = NULL;
+	}
+
+	protected function RegisterUICallbacks()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		if( blackboard && !( m_uiScannerVisibleCallbackID ) )
+		{
+			m_uiScannerVisibleCallbackID = blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_Scanner.UIVisible, this, 'OnScannerUIVisibleChanged' );
+		}
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData );
+		if( blackboard && !( m_uiQuickHackVisibleCallbackID ) )
+		{
+			m_uiQuickHackVisibleCallbackID = blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelOpen, this, 'OnQuickHackUIVisibleChanged' );
+		}
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UIInteractions );
+		if( blackboard && !( m_lootDataCallbackID ) )
+		{
+			m_lootDataCallbackID = blackboard.RegisterListenerVariant( GetAllBlackboardDefs().UIInteractions.LootData, this, 'OnLootDataChanged' );
+		}
+	}
+
+	protected function UnregisterUICallbacks()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		if( ( blackboard != NULL ) && m_uiScannerVisibleCallbackID )
+		{
+			blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_Scanner.UIVisible, m_uiScannerVisibleCallbackID );
+		}
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData );
+		if( ( blackboard != NULL ) && m_uiQuickHackVisibleCallbackID )
+		{
+			blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelOpen, m_uiQuickHackVisibleCallbackID );
+		}
+		blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UIInteractions );
+		if( ( blackboard != NULL ) && m_lootDataCallbackID )
+		{
+			blackboard.UnregisterListenerVariant( GetAllBlackboardDefs().UIInteractions.LootData, m_lootDataCallbackID );
+		}
+	}
+
+	protected event OnScannerUIVisibleChanged( visible : Bool )
+	{
+		var uiSystem : UISystem;
+		uiSystem = GameInstance.GetUISystem( GetGameInstance() );
+		if( ( uiSystem == NULL ) || m_uiScannerVisible == visible )
+		{
+			return true;
+		}
+		m_uiScannerVisible = visible;
+		if( m_uiQuickHackVisible )
+		{
+			return true;
+		}
+		if( visible )
+		{
+			uiSystem.PushGameContext( UIGameContext.Scanning );
+		}
+		else
+		{
+			uiSystem.PopGameContext( UIGameContext.Scanning );
+		}
+		RefreshDebug();
+	}
+
+	protected event OnQuickHackUIVisibleChanged( visible : Bool )
+	{
+		var uiSystem : UISystem;
+		uiSystem = GameInstance.GetUISystem( GetGameInstance() );
+		if( ( uiSystem == NULL ) || m_uiQuickHackVisible == visible )
+		{
+			return true;
+		}
+		m_uiQuickHackVisible = visible;
+		if( visible )
+		{
+			if( m_uiScannerVisible )
+			{
+				uiSystem.SwapGameContext( UIGameContext.Scanning, UIGameContext.QuickHack );
+			}
+			else
+			{
+				uiSystem.PushGameContext( UIGameContext.QuickHack );
+			}
+		}
+		else
+		{
+			if( m_uiScannerVisible )
+			{
+				uiSystem.SwapGameContext( UIGameContext.QuickHack, UIGameContext.Scanning );
+			}
+			else
+			{
+				uiSystem.PopGameContext( UIGameContext.QuickHack );
+			}
+		}
+	}
+
+	protected event OnLootDataChanged( value : Variant )
+	{
+		var data : LootData;
+		var invalidID : EntityID;
+		var newTarget : EntityID;
+		var newActor : HUDActor;
+		var oldActor : HUDActor;
+		data = ( ( LootData )value );
+		if( data.isActive )
+		{
+			newTarget = data.ownerId;
+		}
+		else
+		{
+			newTarget = invalidID;
+		}
+		if( newTarget != m_lootedTarget )
+		{
+			if( EntityID.IsDefined( newTarget ) )
+			{
+				newActor = GetActor( newTarget );
+			}
+			if( EntityID.IsDefined( m_lootedTarget ) )
+			{
+				oldActor = GetActor( m_lootedTarget );
+			}
+			m_lootedTarget = newTarget;
+			if( oldActor )
+			{
+				RefreshHudForSingleActor( oldActor );
+			}
+			if( newActor )
+			{
+				RefreshHudForSingleActor( newActor );
+			}
+		}
+	}
+
+	public const function GetHUDState() : HUDState
+	{
+		return m_state;
+	}
+
+	public const function GetActiveMode() : ActiveMode
+	{
+		return m_activeMode;
+	}
+
+	public static function GetActiveMode( context : GameInstance ) : ActiveMode
+	{
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( !( self ) )
+		{
+			return ActiveMode.UNINITIALIZED;
+		}
+		return self.GetActiveMode();
+	}
+
+	public const function GetLastTarget() : HUDActor
+	{
+		return m_lastTarget;
+	}
+
+	public const function GetUiScannerVisible() : Bool
+	{
+		return m_uiScannerVisible;
+	}
+
+	public const function GetIconsModule() : IconsModule
+	{
+		return ( ( m_iconsModule.IsModuleOperational() ) ? ( m_iconsModule ) : ( ( ( IconsModule )( NULL ) ) ) );
+	}
+
+	public const function GetLockedClueID() : EntityID
+	{
+		var id : EntityID;
+		if( m_scannningController )
+		{
+			id = m_scannningController.GetExclusiveFocusClueEntity();
+		}
+		return id;
+	}
+
+	public const function GetLastTargetID() : EntityID
+	{
+		var entityID : EntityID;
+		if( m_lastTarget )
+		{
+			entityID = m_lastTarget.GetEntityID();
+		}
+		return entityID;
+	}
+
+	public const function GetQuickHackTargetID() : EntityID
+	{
+		return m_quickHackTarget;
+	}
+
+	public const function GetLootedTargetID() : EntityID
+	{
+		return m_lootedTarget;
+	}
+
+	public const function GetCurrentTarget() : HUDActor
+	{
+		return m_currentTarget;
+	}
+
+	public static function GetCurrentTarget( context : GameInstance ) : HUDActor
+	{
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( !( self ) )
+		{
+			return NULL;
+		}
+		return self.GetCurrentTarget();
+	}
+
+	public const function GetCurrentTargetObject() : GameObject
+	{
+		return ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), GetCurrentTarget().GetEntityID() ) ) );
+	}
+
+	public const function GetCurrentTargetID() : EntityID
+	{
+		var entityID : EntityID;
+		if( m_currentTarget )
+		{
+			entityID = m_currentTarget.GetEntityID();
+		}
+		return entityID;
+	}
+
+	public const function HasCurrentTarget() : Bool
+	{
+		if( m_currentTarget )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function HasCurrentTarget( context : GameInstance ) : Bool
+	{
+		var self : HUDManager;
+		self = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'HUDManager' ) ) );
+		if( !( self ) )
+		{
+			return false;
+		}
+		return self.HasCurrentTarget();
+	}
+
+	public const function CanActivateRemoteActionWheel() : Bool
+	{
+		var object : GameObject;
+		if( HasCurrentTarget() )
+		{
+			object = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), m_currentTarget.GetEntityID() ) ) );
+			if( object )
+			{
+				return object.ShouldShowScanner() && object.CanRevealRemoteActionsWheel();
+			}
+			return false;
+		}
+		return false;
+	}
+
+	public const function GetPlayerStateMachineBlackboard( playerPuppet : weak< GameObject > ) : IBlackboard
+	{
+		var blackboard : IBlackboard;
+		if( playerPuppet != NULL )
+		{
+			blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		}
+		return blackboard;
+	}
+
+	protected const function IsRequestLegal( requestToValidate : HUDManagerRequest ) : Bool
+	{
+		if( requestToValidate.IsValid() )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function QueueEntityEvent( entityID : EntityID, evt : Event )
+	{
+		if( EntityID.IsDefined( entityID ) && ( evt != NULL ) )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( entityID, evt );
+		}
+	}
+
+	public const function GetPlayer() : GameObject
+	{
+		return GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject();
+	}
+
+	private function HUDLog( message : String ) {}
+
+	public static function ShowScannerHint( game : GameInstance )
+	{
+		var blackboard : IBlackboard;
+		if( GameInstance.IsValid( game ) )
+		{
+			blackboard = GameInstance.GetBlackboardSystem( game ).Get( GetAllBlackboardDefs().HUD_Manager );
+			blackboard.SetBool( GetAllBlackboardDefs().HUD_Manager.ShowHudHintMessege, true );
+		}
+	}
+
+	public static function HideScannerHint( game : GameInstance )
+	{
+		var blackboard : IBlackboard;
+		if( GameInstance.IsValid( game ) )
+		{
+			blackboard = GameInstance.GetBlackboardSystem( game ).Get( GetAllBlackboardDefs().HUD_Manager );
+			blackboard.SetBool( GetAllBlackboardDefs().HUD_Manager.ShowHudHintMessege, false );
+		}
+	}
+
+	public static function SetScannerHintMessege( game : GameInstance, text : String )
+	{
+		var blackboard : IBlackboard;
+		if( GameInstance.IsValid( game ) )
+		{
+			blackboard = GameInstance.GetBlackboardSystem( game ).Get( GetAllBlackboardDefs().HUD_Manager );
+			blackboard.SetString( GetAllBlackboardDefs().HUD_Manager.HudHintMessegeContent, text );
+		}
+	}
+
+	private function GetPulseDuration() : Float
+	{
+		return TDB.GetFloat( T"scanning.pulse.duration" );
+	}
+
+	public const function IsPulseActive() : Bool
+	{
+		var invalidDelay : DelayID;
+		return m_pulseDelayID != invalidDelay;
+	}
+
+	public const function CanPulse() : Bool
+	{
+		var statValue : Float;
+		var canScan : Bool;
+		var player : GameObject;
+		player = GetPlayer();
+		statValue = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( player.GetEntityID(), gamedataStatType.HasCybereye );
+		canScan = !( StatusEffectSystem.ObjectHasStatusEffect( player, T"GameplayRestriction.NoScanning" ) );
+		return ( statValue > 0.0 ) && canScan;
+	}
+
+	private function StartPulse()
+	{
+		var request : PulseFinishedRequest;
+		var shouldRefresh : Bool;
+		if( !( CanPulse() ) )
+		{
+			return;
+		}
+		if( IsPulseActive() )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_pulseDelayID );
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_pulseDelayID );
+			shouldRefresh = false;
+		}
+		else
+		{
+			shouldRefresh = true;
+		}
+		request = new PulseFinishedRequest;
+		m_pulseDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( GetClassName(), request, GetPulseDuration(), false );
+		if( shouldRefresh )
+		{
+			RefreshHUD();
+		}
+	}
+
+	private function StopPulse()
+	{
+		var invalidDelay : DelayID;
+		m_pulseDelayID = invalidDelay;
+		RefreshHUD();
+	}
+
+	protected export function OnPingFinishedRequest( request : PulseFinishedRequest )
+	{
+		StopPulse();
+	}
+
+	protected const function GetNetworkSystem() : NetworkSystem
+	{
+		return ( ( NetworkSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'NetworkSystem' ) ) );
+	}
+
+	private function RefreshDebug()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "HUDManager" );
+		SDOSink.PushString( sink, "Current target", EntityID.ToDebugString( m_currentTarget.GetEntityID() ) );
+		SDOSink.PushString( sink, "Last target", EntityID.ToDebugString( m_lastTarget.GetEntityID() ) );
+		SDOSink.PushString( sink, "LookAt target", EntityID.ToDebugString( m_lookAtTarget ) );
+		SDOSink.PushString( sink, "Scanner target", EntityID.ToDebugString( m_scannerTarget ) );
+		SDOSink.PushString( sink, "Nameplate target", EntityID.ToDebugString( m_nameplateTarget ) );
+		SDOSink.PushBool( sink, "Scanner opened", m_uiScannerVisible );
+		SDOSink.PushBool( sink, "QHMenu opened", IsQuickHackPanelOpened() );
+	}
+
+}
+
+enum ActiveMode
+{
+	UNINITIALIZED = 0,
+	CLEAR = 1,
+	SEMI = 2,
+	COMBAT = 3,
+	FOCUS = 4,
+}
+
+enum InstanceState
+{
+	DISABLED = 0,
+	HIDDEN = 1,
+	RUNNING = 2,
+	MALFUNCTIONING = 3,
+	ON = 4,
+}
+
+enum ModuleState
+{
+	DISABLED = 0,
+	HIDDEN = 1,
+	ASLEEP = 2,
+	MALFUNCTIONING = 3,
+	ON = 4,
+}
+
+enum VisualState
+{
+	OFF = 0,
+	RUNNING = 1,
+	MALFUNCTIONING = 2,
+	ON = 3,
+}
+
+enum SignalType
+{
+	DEFAULT = 0,
+	REGISTRATION = 1,
+	UNREGISTRATION = 2,
+}
+
+enum HUDState
+{
+	UNINITIALIZED = 0,
+	DEACTIVATED = 1,
+	ACTIVATED = 2,
+}
+
+enum HUDContext
+{
+	DEFAULT = 0,
+	FOCUS = 1,
+	LOOKEDAT = 2,
+}
+

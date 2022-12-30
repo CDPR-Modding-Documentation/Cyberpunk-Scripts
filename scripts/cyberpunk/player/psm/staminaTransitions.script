@@ -1,0 +1,215 @@
+abstract class PlayerStaminaHelpers
+{
+
+	public static function GetSprintStaminaCost() : Float
+	{
+		return TDB.GetFloat( T"player.staminaCosts.sprint", 0.0 );
+	}
+
+	public static function GetSlideStaminaCost() : Float
+	{
+		return TDB.GetFloat( T"player.staminaCosts.slide", 0.0 );
+	}
+
+	public static function GetJumpStaminaCost() : Float
+	{
+		return TDB.GetFloat( T"player.staminaCosts.jump", 0.0 );
+	}
+
+	public static function GetDodgeStaminaCost() : Float
+	{
+		return TDB.GetFloat( T"player.staminaCosts.dodge", 0.0 );
+	}
+
+	public static function GetAirDodgeStaminaCost() : Float
+	{
+		return TDB.GetFloat( T"player.staminaCosts.airDodge", 0.0 );
+	}
+
+	public constexpr static function GetExhaustedStatusEffectID() : TweakDBID
+	{
+		return T"BaseStatusEffect.PlayerExhausted";
+	}
+
+	public static function GetBlockStaminaDelay() : Float
+	{
+		return TDB.GetFloat( T"player.staminaCosts.blockStaminaDelay", 0.0 );
+	}
+
+	public static function OnPlayerBlock( player : PlayerPuppet )
+	{
+		GameObject.StartCooldown( player, 'OnBlockStaminaCooldown', GetBlockStaminaDelay() );
+	}
+
+	public static function ModifyStamina( player : PlayerPuppet, delta : Float, optional perc : Bool )
+	{
+		var isExhausted : Bool;
+		var canIgnoreStamina : Bool;
+		if( player )
+		{
+			isExhausted = StatusEffectSystem.ObjectHasStatusEffect( player, PlayerStaminaHelpers.GetExhaustedStatusEffectID() );
+			canIgnoreStamina = RPGManager.HasStatFlag( player, gamedataStatType.CanIgnoreStamina );
+			if( ( delta > 0.0 ) || ( ( ( delta < 0.0 ) && !( isExhausted ) ) && !( canIgnoreStamina ) ) )
+			{
+				GameInstance.GetStatPoolsSystem( player.GetGame() ).RequestChangingStatPoolValue( player.GetEntityID(), gamedataStatPoolType.Stamina, delta, NULL, false, perc );
+			}
+		}
+	}
+
+}
+
+abstract class StaminaTransition extends DefaultTransition
+{
+	var staminaChangeToggle : Bool;
+
+	protected const function ShouldRegenStamina( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var meleeState : Int32;
+		var meleeWeaponState : Int32;
+		var locomotionState : Int32;
+		var staminaState : Int32;
+		meleeState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Melee );
+		meleeWeaponState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon );
+		locomotionState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.LocomotionDetailed );
+		staminaState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Stamina );
+		if( staminaState == ( ( Int32 )( gamePSMStamina.Exhausted ) ) )
+		{
+			return true;
+		}
+		if( scriptInterface.HasStatFlag( gamedataStatType.CanIgnoreStamina ) )
+		{
+			return true;
+		}
+		if( meleeState == ( ( Int32 )( gamePSMMelee.Attack ) ) )
+		{
+			return false;
+		}
+		if( meleeWeaponState == ( ( Int32 )( gamePSMMeleeWeapon.ChargedHold ) ) )
+		{
+			return false;
+		}
+		if( ( ( ( locomotionState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Dodge ) ) ) || ( locomotionState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Slide ) ) ) ) || ( locomotionState == ( ( Int32 )( gamePSMDetailedLocomotionStates.DodgeAir ) ) ) ) || ( locomotionState == ( ( Int32 )( gamePSMDetailedLocomotionStates.VeryHardLand ) ) ) )
+		{
+			return false;
+		}
+		if( GameObject.IsCooldownActive( scriptInterface.owner, 'OnBlockStaminaCooldown' ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	protected function EnableStaminaPoolRegen( stateContext : StateContext, scriptInterface : StateGameScriptInterface, enable : Bool )
+	{
+		var staminaCost : Float;
+		staminaCost = 0.1;
+		if( !( enable ) )
+		{
+			if( staminaChangeToggle )
+			{
+				staminaCost = staminaCost * -1.0;
+			}
+			staminaChangeToggle = !( staminaChangeToggle );
+			PlayerStaminaHelpers.ModifyStamina( ( ( PlayerPuppet )( scriptInterface.executionOwner ) ), staminaCost, true );
+		}
+	}
+
+	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var shouldRegenStamina : Bool;
+		shouldRegenStamina = true;
+		shouldRegenStamina = ShouldRegenStamina( stateContext, scriptInterface );
+		EnableStaminaPoolRegen( stateContext, scriptInterface, shouldRegenStamina );
+	}
+
+}
+
+abstract class StaminaEventsTransition extends StaminaTransition
+{
+}
+
+class RestedEvents extends StaminaEventsTransition
+{
+
+	protected export function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Stamina, ( ( Int32 )( gamePSMStamina.Rested ) ) );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, PlayerStaminaHelpers.GetExhaustedStatusEffectID() );
+	}
+
+}
+
+class ExhaustedDecisions extends StaminaTransition
+{
+
+	protected export const function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentStamina : Float;
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( scriptInterface.executionOwner ) );
+		currentStamina = player.GetStaminaValueUnsafe();
+		if( currentStamina <= 1.0 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected export const function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentStaminaPerc : Float;
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( scriptInterface.executionOwner ) );
+		currentStaminaPerc = player.GetStaminaPercUnsafe();
+		if( ( currentStaminaPerc >= 100.0 ) || scriptInterface.GetStatusEffectSystem().HasStatusEffectOfType( scriptInterface.executionOwnerEntityID, gamedataStatusEffectType.Berserk ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class ExhaustedEvents extends StaminaEventsTransition
+{
+	var m_staminaVfxBlackboard : worldEffectBlackboard;
+
+	protected export function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var animFeature : AnimFeature_Stamina;
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Stamina, ( ( Int32 )( gamePSMStamina.Exhausted ) ) );
+		StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, PlayerStaminaHelpers.GetExhaustedStatusEffectID() );
+		GameInstance.GetAudioSystem( scriptInterface.executionOwner.GetGame() ).ReplaceTriggerEffect( 'te_wea_melee_swing_exhausted', 'PSM_MeleeAttackGeneric', false );
+		m_staminaVfxBlackboard = new worldEffectBlackboard;
+		if( m_staminaVfxBlackboard )
+		{
+			m_staminaVfxBlackboard.SetValue( 'alpha', 1.0 );
+			GameObjectEffectHelper.StartEffectEvent( scriptInterface.executionOwner, 'status_tired', false, m_staminaVfxBlackboard );
+		}
+		animFeature = new AnimFeature_Stamina;
+		animFeature.staminaValue = 0.0;
+		animFeature.tiredness = 1.0;
+		AnimationControllerComponent.ApplyFeature( scriptInterface.executionOwner, 'StaminaData', animFeature );
+	}
+
+	protected function HandleExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		GameObjectEffectHelper.StopEffectEvent( scriptInterface.executionOwner, 'status_tired' );
+		m_staminaVfxBlackboard = NULL;
+		AnimationControllerComponent.ApplyFeature( scriptInterface.executionOwner, 'StaminaData', new AnimFeature_Stamina );
+		StatusEffectHelper.RemoveStatusEffect( scriptInterface.executionOwner, PlayerStaminaHelpers.GetExhaustedStatusEffectID() );
+		GameInstance.GetAudioSystem( scriptInterface.executionOwner.GetGame() ).RevertTriggerEffect( 'PSM_MeleeAttackGeneric' );
+	}
+
+	protected function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		HandleExit( stateContext, scriptInterface );
+	}
+
+	protected export function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		HandleExit( stateContext, scriptInterface );
+	}
+
+}
+

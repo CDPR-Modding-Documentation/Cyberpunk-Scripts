@@ -1,0 +1,2002 @@
+class DoorController extends ScriptableDeviceComponent
+{
+
+	public const override function GetPS() : DoorControllerPS
+	{
+		return ( ( DoorControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class SetDoorType extends Event
+{
+	editable var doorTypeSideOne : EDoorType;
+	editable var doorTypeSideTwo : EDoorType;
+
+	public constexpr export function GetFriendlyDescription() : String
+	{
+		return "Set Door Type";
+	}
+
+}
+
+class SetCloseItself extends Event
+{
+	editable var automaticallyClosesItself : Bool;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Automatically Closes Itself";
+	}
+
+}
+
+class ResetDoorState extends Event
+{
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Reset Door To Default";
+	}
+
+}
+
+struct DoorSetup
+{
+	instanceeditable persistent var m_doorType : EDoorType;
+	default m_doorType = EDoorType.INTERACTIVE;
+	persistent var m_doorTypeSideOne : EDoorType;
+	instanceeditable persistent var m_doorTypeSideTwo : EDoorType;
+	default m_doorTypeSideTwo = EDoorType.NONE;
+	instanceeditable var m_skillCheckSide : EDoorSkillcheckSide;
+	instanceeditable var m_authorizationSide : EDoorSkillcheckSide;
+	var m_doorTriggerSide : EDoorTriggerSide;
+	editable persistent var m_isShutter : Bool;
+	instanceeditable persistent var m_initialDoorState : EDoorStatus;
+	[ unsavable = "true" ]
+	instanceeditable persistent var m_canPlayerToggleLockState : Bool;
+	[ unsavable = "true" ]
+	editable persistent var m_canPlayerToggleSealState : Bool;
+	[ unsavable = "true" ]
+	editable persistent var m_canPlayerRemotelyAuthorize : Bool;
+	instanceeditable persistent var m_automaticallyClosesItself : Bool;
+	default m_automaticallyClosesItself = true;
+	hint m_automaticallyClosesItself = "If this is true then door will try to close themself after someone passed through them";
+	instanceeditable var m_openingSpeed : Float;
+	default m_openingSpeed = 1.0f;
+	instanceeditable var m_doorOpeningTime : Float;
+	default m_doorOpeningTime = 1.0f;
+	instanceeditable var m_doorOpeningStimRange : Float;
+	default m_doorOpeningStimRange = 5.0f;
+	[ category = "Payment" ]
+	instanceeditable persistent var m_canPayToUnlock : Bool;
+	[ category = "Payment" ][ customEditor = "TweakDBGroupInheritance;ActionPayment" ]
+	instanceeditable persistent var m_paymentRecordID : TweakDBID;
+	[ category = "Quest" ]
+	instanceeditable var m_exposeQuickHacksIfNotConnectedToAP : Bool;
+}
+
+class DoorControllerPS extends ScriptableDeviceComponentPS
+{
+	default m_deviceName = "LocKey#69";
+	default m_tweakDBRecord = T"Devices.Door";
+	default m_tweakDBDescriptionRecord = T"device_descriptions.Door";
+	protected instanceeditable persistent var m_doorProperties : DoorSetup;
+	private instanceeditable inlined var m_doorSkillChecks : EngDemoContainer;
+	private persistent var m_isOpened : Bool;
+	private persistent var m_isLocked : Bool;
+	private persistent var m_isSealed : Bool;
+	protected var m_alarmRaised : Bool;
+	protected var m_isBusy : Bool;
+	protected instanceeditable var m_isLiftDoor : Bool;
+	protected persistent var m_isPlayerAuthorised : Bool;
+	protected persistent var m_openingTokens : array< EntityID >;
+
+	protected event OnInstantiated()
+	{
+		super.OnInstantiated();
+		if( !( IsStringValid( m_deviceName ) ) )
+		{
+			m_deviceName = "Gameplay-Devices-DisplayNames-Door";
+		}
+	}
+
+	protected override function Initialize()
+	{
+		super.Initialize();
+		SetDefaultDoorState();
+		InitializeDoorTypes();
+		GetPersistencySystem().EntityProxy_DisablePhysics( PersistentID.ExtractEntityID( GetID() ), IsOpen() );
+	}
+
+	protected override function GameAttached()
+	{
+		m_isLiftDoor = CheckIfLiftDoors();
+	}
+
+	protected override function LogicReady()
+	{
+		super.LogicReady();
+		InitializeSkillChecks( m_doorSkillChecks, false );
+	}
+
+	public const override function IsStatic() : Bool
+	{
+		if( IsSealed() && !( canPlayerToggleSealState() ) )
+		{
+			return true;
+		}
+		else if( ( ( ( IsLocked() && !( IsAuthorizationValid() ) ) && !( canPlayerToggleLockState() ) ) && !( HasAnySkillCheckActive() ) ) && !( CanCreateAnyQuickHackActions() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function IsClosingAutomatically() : Bool
+	{
+		return m_doorProperties.m_automaticallyClosesItself;
+	}
+
+	public const function GetOpeningTokensList() : array< EntityID >
+	{
+		return m_openingTokens;
+	}
+
+	public export quest const function IsOpen() : Bool
+	{
+		return m_isOpened;
+	}
+
+	public const function IsLogicallyClosed() : Bool
+	{
+		return ( !( IsOpen() ) && !( IsLocked() ) ) && !( IsSealed() );
+	}
+
+	public export quest const function IsClosed() : Bool
+	{
+		return !( IsOpen() );
+	}
+
+	public quest const function IsLocked() : Bool
+	{
+		return m_isLocked;
+	}
+
+	public export quest const function IsUnlocked() : Bool
+	{
+		return !( IsLocked() );
+	}
+
+	public export quest const function IsSealed() : Bool
+	{
+		return m_isSealed;
+	}
+
+	public const function canPlayerToggleLockState() : Bool
+	{
+		return m_doorProperties.m_canPlayerToggleLockState;
+	}
+
+	public const function canPlayerToggleSealState() : Bool
+	{
+		return m_doorProperties.m_canPlayerToggleSealState;
+	}
+
+	public const function canPlayerRemotelyAuthorize() : Bool
+	{
+		return m_doorProperties.m_canPlayerRemotelyAuthorize;
+	}
+
+	public const function GetDoorType() : EDoorType
+	{
+		return m_doorProperties.m_doorType;
+	}
+
+	public const function GetDoorTypeSideTwo() : EDoorType
+	{
+		return m_doorProperties.m_doorTypeSideTwo;
+	}
+
+	public const function GetDoorTypeSideOne() : EDoorType
+	{
+		return m_doorProperties.m_doorTypeSideOne;
+	}
+
+	public const function GetDoorSkillcheckSide() : EDoorSkillcheckSide
+	{
+		return m_doorProperties.m_skillCheckSide;
+	}
+
+	public const function GetDoorAuthorizationSide() : EDoorSkillcheckSide
+	{
+		return m_doorProperties.m_authorizationSide;
+	}
+
+	public const function GetDoorTriggerSide() : EDoorTriggerSide
+	{
+		return m_doorProperties.m_doorTriggerSide;
+	}
+
+	public const function GetOpeningSpeed() : Float
+	{
+		return m_doorProperties.m_openingSpeed;
+	}
+
+	public const function GetOpeningTime() : Float
+	{
+		return m_doorProperties.m_doorOpeningTime;
+	}
+
+	public const function GetStimRange() : Float
+	{
+		return m_doorProperties.m_doorOpeningStimRange;
+	}
+
+	public const function IsShutter() : Bool
+	{
+		return m_doorProperties.m_isShutter;
+	}
+
+	public const function IsLiftDoor() : Bool
+	{
+		return m_isLiftDoor;
+	}
+
+	public const function IsBusy() : Bool
+	{
+		return m_isBusy;
+	}
+
+	public const function GetPaymentRecordID() : TweakDBID
+	{
+		return m_doorProperties.m_paymentRecordID;
+	}
+
+	public const function GetPaymentRecord() : ActionPayment_Record
+	{
+		return TweakDBInterface.GetActionPaymentRecord( GetPaymentRecordID() );
+	}
+
+	public const function CanPayToUnlock() : Bool
+	{
+		return m_doorProperties.m_canPayToUnlock;
+	}
+
+	public const function ExposeQuickHakcsIfNotConnnectedToAP() : Bool
+	{
+		return m_doorProperties.m_exposeQuickHacksIfNotConnectedToAP;
+	}
+
+	public const function GetDoorState() : EDoorStatus
+	{
+		if( IsOpen() )
+		{
+			return EDoorStatus.OPENED;
+		}
+		if( IsLocked() )
+		{
+			return EDoorStatus.LOCKED;
+		}
+		if( IsSealed() )
+		{
+			return EDoorStatus.SEALED;
+		}
+		return EDoorStatus.CLOSED;
+	}
+
+	public const function IsSideOneActive() : Bool
+	{
+		if( GetDoorSkillcheckSide() != EDoorSkillcheckSide.TWO )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public const function IsSideTwoActive() : Bool
+	{
+		if( GetDoorSkillcheckSide() != EDoorSkillcheckSide.ONE )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public const override function GetDeviceStatusAction() : DoorStatus
+	{
+		return ActionDoorStatus();
+	}
+
+	public function SetNewDoorType( type : EDoorType )
+	{
+		m_doorProperties.m_doorType = type;
+	}
+
+	public function SetTriggerSide( side : EDoorTriggerSide )
+	{
+		m_doorProperties.m_doorTriggerSide = side;
+	}
+
+	public function SetIsOpened( isOpened : Bool )
+	{
+		m_isOpened = isOpened;
+		OnSetIsOpened();
+	}
+
+	public function SetIsLocked( isLocked : Bool )
+	{
+		m_isLocked = isLocked;
+	}
+
+	public function SetIsSealed( isSealed : Bool )
+	{
+		m_isSealed = isSealed;
+	}
+
+	public function SetIsBusy( isBusy : Bool )
+	{
+		m_isBusy = isBusy;
+	}
+
+	private function InitializeDoorTypes()
+	{
+		m_doorProperties.m_doorTypeSideOne = m_doorProperties.m_doorType;
+		if( m_doorProperties.m_doorTypeSideTwo == EDoorType.NONE )
+		{
+			m_doorProperties.m_doorTypeSideTwo = m_doorProperties.m_doorTypeSideOne;
+		}
+	}
+
+	protected function SetDefaultDoorState()
+	{
+		switch( m_doorProperties.m_initialDoorState )
+		{
+			case EDoorStatus.OPENED:
+				SetIsOpened( true );
+			break;
+			case EDoorStatus.CLOSED:
+				SetIsOpened( false );
+			break;
+			case EDoorStatus.LOCKED:
+				SetIsOpened( false );
+			SetIsLocked( true );
+			break;
+			case EDoorStatus.SEALED:
+				SetIsOpened( false );
+			SetIsSealed( true );
+			break;
+			default:
+				Log( "DoorController / Unknown EDoorStatus - Debug " );
+		}
+	}
+
+	protected function CheckIfLiftDoors() : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( ElevatorFloorTerminalControllerPS )( parents[ i ] ) ) )
+			{
+				if( IsLocked() && IsOpen() )
+				{
+					SetIsOpened( false );
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected function IsLiftFloorAuthorized() : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( ElevatorFloorTerminalControllerPS )( parents[ i ] ) ) )
+			{
+				return ( ( ElevatorFloorTerminalControllerPS )( parents[ i ] ) ).IsPlayerAuthorized();
+			}
+		}
+		return false;
+	}
+
+	protected function IsLiftAvailable() : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		GetAncestors( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( LiftControllerPS )( parents[ i ] ) ) )
+			{
+				return ( ( LiftControllerPS )( parents[ i ] ) ).IsPlayerAuthorized() && ( ( LiftControllerPS )( parents[ i ] ) ).IsON();
+			}
+		}
+		return false;
+	}
+
+	protected function IsLiftUnauthorized() : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		var result : Bool;
+		GetAncestors( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( LiftControllerPS )( parents[ i ] ) ) && ( ( LiftControllerPS )( parents[ i ] ) ).IsON() )
+			{
+				result = ( ( LiftControllerPS )( parents[ i ] ) ).IsPlayerAuthorized();
+				return !( result );
+			}
+		}
+		return false;
+	}
+
+	protected const function IsLiftMoving() : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( ElevatorFloorTerminalControllerPS )( parents[ i ] ) ) )
+			{
+				return ( ( ElevatorFloorTerminalControllerPS )( parents[ i ] ) ).IsLiftMoving();
+			}
+		}
+		return false;
+	}
+
+	public export function PushResaveData( data : DoorResaveData ) {}
+
+	protected override function DetermineGameplayViability( context : GetActionsContext, hasActiveActions : Bool ) : Bool
+	{
+		return DoorViabilityInterpreter.Evaluate( this, hasActiveActions );
+	}
+
+	protected override function GetInkWidgetTweakDBID( context : GetActionsContext ) : TweakDBID
+	{
+		if( ( !( IsUserAuthorized( context.processInitiatorObject.GetEntityID() ) ) && !( context.ignoresAuthorization ) ) && !( CanPayToUnlock() ) )
+		{
+			if( canPlayerRemotelyAuthorize() || context.allowsRemoteAuthorization )
+			{
+				return T"DevicesUIDefinitions.DoorDeviceWidget";
+			}
+			else
+			{
+				return T"DevicesUIDefinitions.DoorKeypadWidget";
+			}
+		}
+		return T"DevicesUIDefinitions.DoorDeviceWidget";
+	}
+
+	public override function GetWidgetTypeName() : CName
+	{
+		return 'GenericDeviceWidget';
+	}
+
+	public override function GetDeviceIconPath() : String
+	{
+		return "base/gameplay/gui/brushes/devices/icon_door.widgetbrush";
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.DoorDeviceIcon";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.DoorDeviceBackground";
+	}
+
+	protected override function GetWidgetVisualState() : EWidgetState
+	{
+		var widgetState : EWidgetState;
+		if( GetDoorState() == EDoorStatus.OPENED )
+		{
+			widgetState = EWidgetState.ALLOWED;
+		}
+		else if( GetDoorState() == EDoorStatus.LOCKED )
+		{
+			widgetState = EWidgetState.LOCKED;
+		}
+		else if( GetDoorState() == EDoorStatus.SEALED )
+		{
+			widgetState = EWidgetState.SEALED;
+		}
+		else if( GetDoorState() == EDoorStatus.OPENED )
+		{
+			widgetState = EWidgetState.ALLOWED;
+		}
+		else if( GetDoorState() == EDoorStatus.CLOSED && !( IsPlayerAuthorized() ) )
+		{
+			widgetState = EWidgetState.LOCKED;
+		}
+		else
+		{
+			widgetState = EWidgetState.ALLOWED;
+		}
+		return widgetState;
+	}
+
+	public override function GetActions( out actions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		var actionCallElevator : CallElevator;
+		var basedTestsPassed : Bool;
+		basedTestsPassed = super.GetActions( actions, context );
+		if( m_isLiftDoor )
+		{
+			if( IsON() )
+			{
+				if( IsOpen() )
+				{
+					return false;
+				}
+				if( ( ( IsLocked() && !( IsLiftMoving() ) ) && IsLiftFloorAuthorized() ) && IsLiftAvailable() )
+				{
+					actionCallElevator = ActionCallElevator();
+					actions.PushBack( actionCallElevator );
+				}
+				else if( IsLiftUnauthorized() )
+				{
+					actions.PushBack( ActionUnauthorized() );
+				}
+				else
+				{
+					actionCallElevator = ActionCallElevator();
+					actionCallElevator.SetInactiveWithReason( false, "LocKey#17796" );
+					actions.PushBack( actionCallElevator );
+				}
+			}
+			return false;
+		}
+		if( !( basedTestsPassed ) )
+		{
+			return false;
+		}
+		if( IsBusy() )
+		{
+			return false;
+		}
+		if( context.requestType == gamedeviceRequestType.Remote )
+		{
+			return false;
+		}
+		if( m_doorProperties.m_doorType == EDoorType.PHYSICAL )
+		{
+			return false;
+		}
+		if( m_doorProperties.m_doorType == EDoorType.REMOTELY_CONTROLLED && context.requestType == gamedeviceRequestType.Direct )
+		{
+			return false;
+		}
+		if( m_doorProperties.m_doorType == EDoorType.AUTOMATIC && context.requestType != gamedeviceRequestType.Internal )
+		{
+			return false;
+		}
+		if( ( IsOFF() || IsUnpowered() ) || IsDisabled() )
+		{
+			return false;
+		}
+		if( DoorStatus.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionDoorStatus() );
+		}
+		if( TogglePower.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionTogglePower() );
+		}
+		if( GetDoorType() == EDoorType.AUTOMATIC && context.requestType == gamedeviceRequestType.Internal )
+		{
+			if( ToggleOpen.IsDefaultConditionMet( this, context ) )
+			{
+				actions.PushBack( ActionToggleOpen() );
+			}
+		}
+		if( GetDoorType() != EDoorType.AUTOMATIC )
+		{
+			if( ToggleOpen.IsDefaultConditionMet( this, context ) )
+			{
+				actions.PushBack( ActionToggleOpen() );
+			}
+		}
+		if( ToggleLock.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionToggleLock() );
+		}
+		if( ToggleSeal.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionToggleSeal() );
+		}
+		if( ForceOpen.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionForceOpen() );
+		}
+		if( SetOpened.IsDefaultConditionMet( this, context ) )
+		{
+			actions.PushBack( ActionSetOpened() );
+		}
+		SetActionIllegality( actions, m_illegalActions.regularActions );
+		return true;
+	}
+
+	protected override function SetInactiveActionsWithExceptions( out outActions : array< DeviceAction > )
+	{
+		var i : Int32;
+		var inactiveReason : String;
+		var actionAllowedClassNames : array< String >;
+		var actionDisallowedClassNames : array< String >;
+		var sAction : ScriptableDeviceAction;
+		super.SetInactiveActionsWithExceptions( outActions );
+		if( GetActionsRestrictionData( actionAllowedClassNames, actionDisallowedClassNames, inactiveReason ) )
+		{
+			if( actionAllowedClassNames.Contains( "ToggleOpen" ) )
+			{
+				for( i = 0; i < outActions.Size(); i += 1 )
+				{
+					sAction = ( ( ActionSkillCheck )( outActions[ i ] ) );
+					if( sAction )
+					{
+						sAction.SetActive();
+					}
+				}
+			}
+		}
+	}
+
+	protected override function PushReturnActions( out outActions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		var shouldReturn : Bool;
+		shouldReturn = super.PushReturnActions( outActions, context );
+		if( ( ( ( shouldReturn && !( m_isLiftDoor ) ) && IsDeviceSecured() ) && !( IsUserAuthorized( context.processInitiatorObject.GetEntityID() ) ) ) && PlayerUnauthorized.IsDefaultConditionMet( this, context ) )
+		{
+			outActions.PushBack( ActionUnauthorized() );
+		}
+		if( ( !( shouldReturn ) && CanPayToAuthorize() ) && Pay.IsDefaultConditionMet( this, context ) )
+		{
+			shouldReturn = true;
+			outActions.PushBack( ActionPay( context ) );
+		}
+		return shouldReturn;
+	}
+
+	protected const override function CanCreateAnyQuickHackActions() : Bool
+	{
+		return ExposeQuickHakcsIfNotConnnectedToAP() || IsConnectedToBackdoorDevice();
+	}
+
+	protected override function GetQuickHackActions( out actions : array< DeviceAction >, context : GetActionsContext )
+	{
+		var currentAction : ScriptableDeviceAction;
+		if( ExposeQuickHakcsIfNotConnnectedToAP() || IsConnectedToBackdoorDevice() )
+		{
+			currentAction = ActionQuickHackToggleOpen();
+			currentAction.SetObjectActionID( T"DeviceAction.ToggleStateClassHack" );
+			if( IsBusy() )
+			{
+				currentAction.SetInactiveWithReason( !( IsBusy() ), "LocKey#42758" );
+			}
+			else
+			{
+				currentAction.SetInactiveWithReason( QuickHackToggleOpen.IsDefaultConditionMet( ( ( DoorControllerPS )( this ) ), context ), "LocKey#7003" );
+			}
+			actions.PushBack( currentAction );
+			FinalizeGetQuickHackActions( actions, context );
+		}
+	}
+
+	protected override function GetMinigameActions( out actions : array< DeviceAction >, context : GetActionsContext )
+	{
+		var action : ScriptableDeviceAction;
+		action = ActionSetAuthorizationModuleOFF();
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( this );
+		action.AddDeviceName( m_deviceName );
+		actions.PushBack( action );
+	}
+
+	public override function GetQuestActionByName( actionName : CName ) : DeviceAction
+	{
+		var action : DeviceAction;
+		action = super.GetQuestActionByName( actionName );
+		if( action == NULL )
+		{
+			switch( actionName )
+			{
+				case 'ForceOpen':
+					action = ActionQuestForceOpen();
+				break;
+				case 'ForceClose':
+					action = ActionQuestForceClose();
+				break;
+				case 'ForceCloseImmediate':
+					action = ActionQuestForceCloseImmediate();
+				break;
+				case 'ForceOpenScene':
+					action = ActionQuestForceOpenScene();
+				break;
+				case 'ForceCloseScene':
+					action = ActionQuestForceCloseScene();
+				break;
+				case 'ForceLock':
+					action = ActionQuestForceLock();
+				break;
+				case 'ForceUnlock':
+					action = ActionQuestForceUnlock();
+				break;
+				case 'ForceSeal':
+					action = ActionQuestForceSeal();
+				break;
+				case 'ForceUnseal':
+					action = ActionQuestForceUnseal();
+				break;
+			}
+		}
+		return action;
+	}
+
+	public override function GetQuestActions( out actions : array< DeviceAction >, context : GetActionsContext )
+	{
+		super.GetQuestActions( actions, context );
+		actions.PushBack( ActionQuestForceOpen() );
+		actions.PushBack( ActionQuestForceClose() );
+		actions.PushBack( ActionQuestForceCloseImmediate() );
+		actions.PushBack( ActionQuestForceOpenScene() );
+		actions.PushBack( ActionQuestForceCloseScene() );
+		actions.PushBack( ActionQuestForceLock() );
+		actions.PushBack( ActionQuestForceUnlock() );
+		actions.PushBack( ActionQuestForceSeal() );
+		actions.PushBack( ActionQuestForceUnseal() );
+	}
+
+	protected override function PushSkillCheckActions( out outActions : array< DeviceAction >, context : GetActionsContext ) : Bool
+	{
+		var skillCheckAdded : Bool;
+		if( ( IsClosed() && !( IsSealed() ) ) && IsTriggerValid( GetDoorSkillcheckSide() ) )
+		{
+			if( m_skillCheckContainer.GetDemolitionSlot().IsActive() && ActionDemolition.IsDefaultConditionMet( this, context, false ) )
+			{
+				outActions.PushBack( ActionDemolition( context ) );
+				skillCheckAdded = true;
+			}
+			if( m_skillCheckContainer.GetEngineeringSlot().IsActive() && ActionEngineering.IsDefaultConditionMet( this, context, false ) )
+			{
+				outActions.PushBack( ActionEngineering( context ) );
+				skillCheckAdded = true;
+			}
+		}
+		return skillCheckAdded;
+	}
+
+	public const function IsTriggerValid( side : EDoorSkillcheckSide ) : Bool
+	{
+		if( side == EDoorSkillcheckSide.BOTH )
+		{
+			return true;
+		}
+		else if( side == EDoorSkillcheckSide.ONE && GetDoorTriggerSide() == EDoorTriggerSide.ONE )
+		{
+			return true;
+		}
+		else if( side == EDoorSkillcheckSide.TWO && GetDoorTriggerSide() == EDoorTriggerSide.TWO )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	protected const function ActionDoorStatus() : DoorStatus
+	{
+		var action : DoorStatus;
+		action = new DoorStatus;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetStatusClearance();
+		action.SetUp( this );
+		action.SetProperties( this );
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	protected virtual function ActionDoorOpeningToken() : DoorOpeningToken
+	{
+		var action : DoorOpeningToken;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOpenClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public function OnDoorOpeningToken( evt : DoorOpeningToken ) : EntityNotificationType
+	{
+		AddToken( evt.GetExecutor().GetEntityID() );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public virtual function ActionToggleOpen() : ToggleOpen
+	{
+		var action : ToggleOpen;
+		action = new ToggleOpen;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOpenClearance();
+		action.SetUp( this );
+		action.SetProperties( IsOpen() );
+		action.AddDeviceName( GetDeviceName() );
+		action.CreateInteraction();
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public override function OnSecuritySystemOutput( evt : SecuritySystemOutput ) : EntityNotificationType
+	{
+		super.OnSecuritySystemOutput( evt );
+		if( IsOpen() && evt.GetCachedSecurityState() == ESecuritySystemState.COMBAT )
+		{
+			m_alarmRaised = true;
+			if( IsClosingAutomatically() )
+			{
+				ExecutePSAction( ActionQuestForceLock(), this );
+				ExecutePSAction( ActionToggleOpen(), this );
+			}
+		}
+		else if( evt.GetCachedSecurityState() == ESecuritySystemState.SAFE && m_alarmRaised )
+		{
+			m_alarmRaised = false;
+			ExecutePSAction( ActionQuestForceUnlock(), this );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public export function OnToggleOpen( evt : ToggleOpen ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Unpowered or Disabled" );
+		}
+		if( m_isKeyloggerInstalled && IsAuthorizationModuleOn() )
+		{
+			TurnAuthorizationModuleOFF();
+		}
+		if( IsOpen() )
+		{
+			SetIsOpened( false );
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus );
+			}
+			UseNotifier( evt );
+			return EntityNotificationType.SendThisEventToEntity;
+		}
+		if( !( ToggleOpenOnDoor() ) )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Failed Toggle" );
+		}
+		if( HasAnySkillCheckActive() && evt.GetExecutor().IsPlayer() )
+		{
+			ResolveOtherSkillchecks();
+		}
+		DepleteToken( evt.GetExecutor().GetEntityID() );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		UseNotifier( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function OnSetIsOpened()
+	{
+		GetPersistencySystem().EntityProxy_DisablePhysics( PersistentID.ExtractEntityID( GetID() ), IsOpen() );
+	}
+
+	public function OnDoorCollision()
+	{
+		if( !( IsOpen() ) )
+		{
+			ExecutePSAction( ActionToggleOpen(), this );
+		}
+	}
+
+	public function ActionSetOpened() : SetOpened
+	{
+		var action : SetOpened;
+		action = new SetOpened;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOpenClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnSetOpened( evt : SetOpened ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetAll();
+		if( IsDisabled() || IsSealed() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Sealed or Disabled" );
+		}
+		SetIsOpened( true );
+		Notify( notifier, evt );
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	public function ActionSetClosed() : SetClosed
+	{
+		var action : SetClosed;
+		action = new SetClosed;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOpenClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnSetClosed( evt : SetClosed ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetAll();
+		if( IsDisabled() || IsSealed() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Sealed or Disabled" );
+		}
+		SetIsOpened( false );
+		Notify( notifier, evt );
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	protected override function ActionPay( context : GetActionsContext ) : Pay
+	{
+		var action : Pay;
+		action = new Pay;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleLockClearance();
+		action.SetUp( this );
+		if( TDBID.IsValid( GetPaymentRecordID() ) )
+		{
+			action.SetObjectActionID( GetPaymentRecordID() );
+		}
+		action.SetExecutor( GetPlayer( GetGameInstance() ) );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		action.SetDurationValue( 1.5 );
+		return action;
+	}
+
+	public function OnPay( evt : Pay ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		if( IsDisabled() || IsSealed() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Sealed or Disabled" );
+		}
+		if( evt.IsStarted() && evt.CanPayCost() )
+		{
+			ExecutePSActionWithDelay( evt, this, evt.GetDurationValue() );
+		}
+		else
+		{
+			notifier = new ActionNotifier;
+			notifier.SetAll();
+			SetIsOpened( true );
+			SetIsLocked( false );
+			Notify( notifier, evt );
+		}
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected virtual function ActionQuickHackToggleOpen() : QuickHackToggleOpen
+	{
+		var action : QuickHackToggleOpen;
+		action = new QuickHackToggleOpen;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOpenClearance();
+		action.SetUp( this );
+		action.SetProperties( IsOpen() );
+		action.AddDeviceName( m_deviceName );
+		if( IsOpen() )
+		{
+			action.CreateInteraction( , , T"Interactions.Close" );
+		}
+		else
+		{
+			action.CreateInteraction( , , T"Interactions.Open" );
+		}
+		return action;
+	}
+
+	public function ActionToggleLock() : ToggleLock
+	{
+		var action : ToggleLock;
+		action = new ToggleLock;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleLockClearance();
+		action.SetUp( this );
+		action.SetProperties( IsLocked() );
+		action.AddDeviceName( m_deviceName );
+		action.CreateInteraction();
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public function OnToggleLock( evt : ToggleLock ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		cachedStatus = GetDeviceStatusAction();
+		notifier.SetAll();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Disabled or Unpowered" );
+		}
+		if( IsLocked() )
+		{
+			ResolveOtherSkillchecks();
+		}
+		if( !( ToggleLockOnDoor() ) )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Failed Toggle Lock" );
+		}
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public export function OnForceLockElevator( evt : ForceLockElevator ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		cachedStatus = GetDeviceStatusAction();
+		notifier.SetAll();
+		if( ( IsUnpowered() || IsDisabled() ) || IsSealed() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Disabled or Unpowered" );
+		}
+		SetIsLocked( true );
+		SetIsOpened( false );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	public export function OnForceUnlockAndOpenElevator( evt : ForceUnlockAndOpenElevator ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		cachedStatus = GetDeviceStatusAction();
+		notifier.SetAll();
+		if( ( IsUnpowered() || IsDisabled() ) || IsSealed() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Disabled or Unpowered" );
+		}
+		SetIsLocked( false );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected function ActionToggleSeal() : ToggleSeal
+	{
+		var action : ToggleSeal;
+		action = new ToggleSeal;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleSealClearance();
+		action.SetUp( this );
+		action.SetProperties( IsSealed() );
+		action.AddDeviceName( m_deviceName );
+		action.CreateActionWidgetPackage();
+		return action;
+	}
+
+	public function OnToggleSeal( evt : ToggleSeal ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Disabled or Unpowered" );
+		}
+		if( IsOpen() && !( ( ( Bool )evt.prop.first ) ) )
+		{
+			OnToggleOpen( ActionToggleOpen() );
+		}
+		if( !( ToggleSealOnDoor() ) )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Failed Toggle" );
+		}
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	protected override function ActionDemolition( context : GetActionsContext ) : ActionDemolition
+	{
+		var action : ActionDemolition;
+		action = super.ActionDemolition( context );
+		action.SetDurationValue( 3.0 );
+		return action;
+	}
+
+	private function ActionCallElevator() : CallElevator
+	{
+		var action : CallElevator;
+		action = new CallElevator;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( this );
+		action.SetProperties( 0 );
+		action.AddDeviceName( m_deviceName );
+		action.CreateInteraction();
+		return action;
+	}
+
+	public function OnCallElevator( evt : CallElevator ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		var notifier : ActionNotifier;
+		var i : Int32;
+		var callElevator : CallElevator;
+		var devices : array< DeviceComponentPS >;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		GetParents( devices );
+		for( i = 0; i < devices.Size(); i += 1 )
+		{
+			if( ( ( ElevatorFloorTerminalControllerPS )( devices[ i ] ) ) )
+			{
+				callElevator = ActionCallElevator();
+				if( callElevator )
+				{
+					GetPersistencySystem().QueuePSEvent( devices[ i ].GetID(), 'ElevatorFloorTerminalControllerPS', callElevator );
+				}
+			}
+		}
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus );
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	public const function IsPlayerCarrying() : Bool
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( GetPlayerMainObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		return playerStateMachineBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.Carrying );
+	}
+
+	protected override function OnActionDemolition( evt : ActionDemolition ) : EntityNotificationType
+	{
+		if( !( evt.WasPassed() ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		super.OnActionDemolition( evt );
+		if( evt.IsCompleted() )
+		{
+			ResolveOtherSkillchecks();
+			ForceDisableDevice();
+		}
+		else
+		{
+			ExecuteForceOpen( evt.GetExecutor() );
+			if( IsPlayerCarrying() )
+			{
+				RequestForceBodyDrop( evt.GetExecutor() );
+			}
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function OnActionEngineering( evt : ActionEngineering ) : EntityNotificationType
+	{
+		if( !( evt.WasPassed() ) )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		super.OnActionEngineering( evt );
+		if( evt.IsCompleted() )
+		{
+			RPGManager.GiveReward( evt.GetExecutor().GetGame(), T"RPGActionRewards.ExtractPartsDoor" );
+			ResolveOtherSkillchecks();
+			OnForceOpen( ActionForceOpen() );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function OnActionForceResetDevice( evt : ActionForceResetDevice ) : EntityNotificationType
+	{
+		if( IsOpen() )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		ExecuteForceOpen( evt.GetExecutor() );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected function ExecuteForceOpen( executor : weak< GameObject > )
+	{
+		var actionForceOpen : ForceOpen;
+		actionForceOpen = ActionForceOpen();
+		actionForceOpen.SetExecutor( executor );
+		actionForceOpen.RegisterAsRequester( PersistentID.ExtractEntityID( GetID() ) );
+		GetPersistencySystem().QueuePSDeviceEvent( actionForceOpen );
+	}
+
+	protected function RequestForceBodyDrop( executor : weak< GameObject > )
+	{
+		var psmEvent : PSMPostponedParameterBool;
+		psmEvent = new PSMPostponedParameterBool;
+		psmEvent.id = 'forceDropBody';
+		psmEvent.value = true;
+		executor.QueueEvent( psmEvent );
+	}
+
+	protected function OnActionInstallKeylogger( evt : InstallKeylogger ) : EntityNotificationType
+	{
+		m_isKeyloggerInstalled = true;
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	protected override function ResolveOtherSkillchecks()
+	{
+		if( m_skillCheckContainer )
+		{
+			if( m_skillCheckContainer.GetDemolitionSlot() && m_skillCheckContainer.GetDemolitionSlot().IsActive() )
+			{
+				m_skillCheckContainer.GetDemolitionSlot().SetIsActive( false );
+				m_skillCheckContainer.GetDemolitionSlot().SetIsPassed( true );
+			}
+			if( m_skillCheckContainer.GetEngineeringSlot() && m_skillCheckContainer.GetEngineeringSlot().IsActive() )
+			{
+				m_skillCheckContainer.GetEngineeringSlot().SetIsActive( false );
+				m_skillCheckContainer.GetEngineeringSlot().SetIsPassed( true );
+			}
+		}
+		ResolveTerminalSkillchecks( GetMyEntityID() );
+	}
+
+	public function ResolveSkillchecks()
+	{
+		ResolveOtherSkillchecks();
+	}
+
+	public const function CanPassAnySkillCheckOnParentTerminal( requester : GameObject ) : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		var parent : TerminalControllerPS;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			parent = ( ( TerminalControllerPS )( parents[ i ] ) );
+			if( parent == NULL )
+			{
+				continue;
+			}
+			if( parent.IsSkillCheckActive() && parent.CanPassAnySkillCheck( requester ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected function ActionForceOpen() : ForceOpen
+	{
+		var action : ForceOpen;
+		action = new ForceOpen;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetForceOpenClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public function OnForceOpen( evt : ForceOpen ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetInternalOnly();
+		if( IsDisabled() || IsSealed() )
+		{
+			return SendActionFailedEvent( evt, evt.GetRequesterID(), "Sealed or Disabled" );
+		}
+		SetIsLocked( false );
+		SetIsOpened( true );
+		m_doorProperties.m_automaticallyClosesItself = false;
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function ActionQuestForceOpen() : QuestForceOpen
+	{
+		var action : QuestForceOpen;
+		action = new QuestForceOpen;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceOpen( evt : QuestForceOpen ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR OPENED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsOpened( true );
+		SetIsLocked( false );
+		SetIsSealed( false );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		UseNotifier( evt );
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	private function ActionQuestForceClose() : QuestForceClose
+	{
+		var action : QuestForceClose;
+		action = new QuestForceClose;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceClose( evt : QuestForceClose ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR CLOSED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsOpened( false );
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	private function ActionQuestForceCloseImmediate() : QuestForceCloseImmediate
+	{
+		var action : QuestForceCloseImmediate;
+		action = new QuestForceCloseImmediate;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceCloseImmediate( evt : QuestForceCloseImmediate ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR CLOSED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsOpened( false );
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function ActionQuestForceOpenScene() : QuestForceOpenScene
+	{
+		var action : QuestForceOpenScene;
+		action = new QuestForceOpenScene;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public function OnQuestForceOpenScene( evt : QuestForceOpenScene ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR CLOSED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsOpened( true );
+		SetIsLocked( false );
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function ActionQuestForceCloseScene() : QuestForceCloseScene
+	{
+		var action : QuestForceCloseScene;
+		action = new QuestForceCloseScene;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public function OnQuestForceCloseScene( evt : QuestForceCloseScene ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR CLOSED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsOpened( false );
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function ActionQuestForceLock() : QuestForceLock
+	{
+		var action : QuestForceLock;
+		action = new QuestForceLock;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceLock( evt : QuestForceLock ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR LOCKED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsLocked( true );
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	private function ActionQuestForceUnlock() : QuestForceUnlock
+	{
+		var action : QuestForceUnlock;
+		action = new QuestForceUnlock;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceUnlock( evt : QuestForceUnlock ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR UNLOCKED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsLocked( false );
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	private function ActionQuestForceSeal() : QuestForceSeal
+	{
+		var action : QuestForceSeal;
+		action = new QuestForceSeal;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceSeal( evt : QuestForceSeal ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( ( IsUnpowered() || IsDisabled() ) || !( m_doorProperties.m_canPlayerToggleSealState ) )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR SEALED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsOpened( false );
+		SetIsSealed( true );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	private function ActionQuestForceUnseal() : QuestForceUnseal
+	{
+		var action : QuestForceUnseal;
+		action = new QuestForceUnseal;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetQuestClearance();
+		action.SetUp( this );
+		action.SetProperties();
+		action.AddDeviceName( m_deviceName );
+		return action;
+	}
+
+	public export function OnQuestForceUnseal( evt : QuestForceUnseal ) : EntityNotificationType
+	{
+		var cachedStatus : DoorStatus;
+		cachedStatus = GetDeviceStatusAction();
+		if( IsUnpowered() || IsDisabled() )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogActionDetails( evt, cachedStatus, "POTENTIAL ERROR: DOOR SEALED DESPITE WRONG STATE" );
+			}
+		}
+		SetIsSealed( false );
+		UseNotifier( evt );
+		if( !( IsFinal() ) )
+		{
+			LogActionDetails( evt, cachedStatus, "QUEST" );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public function SetNewDoorType( evt : SetDoorType )
+	{
+		m_doorProperties.m_doorType = evt.doorTypeSideOne;
+		m_doorProperties.m_doorTypeSideTwo = evt.doorTypeSideTwo;
+		InitializeDoorTypes();
+	}
+
+	public function SetCloseItself( val : Bool )
+	{
+		m_doorProperties.m_automaticallyClosesItself = val;
+	}
+
+	public function ResetToDefault()
+	{
+		SetDefaultDoorState();
+		ErasePassedSkillchecks();
+		InitializeSkillChecks( m_doorSkillChecks, false );
+		if( IsDisabled() )
+		{
+			ForceDeviceON();
+		}
+	}
+
+	public override function OnSetAuthorizationModuleOFF( evt : SetAuthorizationModuleOFF ) : EntityNotificationType
+	{
+		super.OnSetAuthorizationModuleOFF( evt );
+		ResolveOtherSkillchecks();
+		if( !( IsSealed() ) )
+		{
+			SetIsLocked( false );
+			SetIsOpened( true );
+		}
+		UseNotifier( evt );
+		return EntityNotificationType.SendPSChangedEventToEntity;
+	}
+
+	public function ActionUnauthorized() : PlayerUnauthorized
+	{
+		var action : PlayerUnauthorized;
+		action = new PlayerUnauthorized;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetToggleOpenClearance();
+		action.SetUp( this );
+		action.SetProperties( m_isLiftDoor );
+		action.AddDeviceName( m_deviceName );
+		action.CreateInteraction( this );
+		return action;
+	}
+
+	protected function ResolveTerminalSkillchecks( id : EntityID )
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		var evt : ResolveSkillchecksEvent;
+		evt = new ResolveSkillchecksEvent;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( TerminalControllerPS )( parents[ i ] ) ) && ( parents[ i ].GetMyEntityID() != id ) )
+			{
+				GetPersistencySystem().QueuePSEvent( parents[ i ].GetID(), parents[ i ].GetClassName(), evt );
+			}
+		}
+	}
+
+	public function OnQuickHackToggleOpen( evt : QuickHackToggleOpen ) : EntityNotificationType
+	{
+		var actionClose : ToggleOpen;
+		var notifier : ActionNotifier;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		TurnAuthorizationModuleOFF();
+		if( IsOpen() )
+		{
+			actionClose = ActionToggleOpen();
+			actionClose.SetExecutor( evt.GetExecutor() );
+			actionClose.RegisterAsRequester( PersistentID.ExtractEntityID( GetID() ) );
+			GetPersistencySystem().QueuePSDeviceEvent( actionClose );
+		}
+		else
+		{
+			ExecuteForceOpen( evt.GetExecutor() );
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	protected override function OnActivateDevice( evt : ActivateDevice ) : EntityNotificationType
+	{
+		super.OnActivateDevice( evt );
+		if( IsUnpowered() )
+		{
+			SetDeviceState( EDeviceStatus.ON );
+		}
+		UseNotifier( evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public override function OnAuthorizeUser( evt : AuthorizeUser ) : EntityNotificationType
+	{
+		var notifier : ActionNotifier;
+		var actionLock : ToggleLock;
+		var actionOpen : ToggleOpen;
+		var wasAuthorized : Bool;
+		notifier = new ActionNotifier;
+		notifier.SetNone();
+		if( evt.IsForced() )
+		{
+			GiveKeycardsToExecutor( evt.GetExecutor() );
+		}
+		if( ( evt.GetRequesterID() == GetMyEntityID() ) && MasterUserAuthorizationAttempt( evt.GetExecutor().GetEntityID(), evt.GetEnteredPassword() ) )
+		{
+			wasAuthorized = true;
+		}
+		else if( UserAuthorizationAttempt( evt.GetExecutor().GetEntityID(), evt.GetEnteredPassword(), evt.GetExecutor() ) )
+		{
+			wasAuthorized = true;
+		}
+		if( wasAuthorized )
+		{
+			if( !( evt.IsForced() ) )
+			{
+				GiveKeycardsToExecutor( evt.GetExecutor() );
+			}
+			if( IsLocked() )
+			{
+				actionLock = ActionToggleLock();
+				actionLock.SetExecutor( evt.GetExecutor() );
+				actionLock.RegisterAsRequester( GetMyEntityID() );
+				GetPersistencySystem().QueuePSDeviceEvent( actionLock );
+			}
+			else
+			{
+				actionOpen = ActionToggleOpen();
+				actionOpen.SetExecutor( evt.GetExecutor() );
+				actionOpen.RegisterAsRequester( GetMyEntityID() );
+				GetPersistencySystem().QueuePSDeviceEvent( actionOpen );
+				ResolveOtherSkillchecks();
+			}
+		}
+		Notify( notifier, evt );
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public const override function CanPayToAuthorize() : Bool
+	{
+		return CanPayToUnlock();
+	}
+
+	public const override function IsUserAuthorized( user : EntityID ) : Bool
+	{
+		if( IsLocked() )
+		{
+			if( IsDeviceSecured() && IsTriggerValid( GetDoorAuthorizationSide() ) )
+			{
+				return super.IsUserAuthorized( user );
+			}
+			else
+			{
+				if( m_doorProperties.m_canPlayerToggleLockState )
+				{
+					return true;
+				}
+				else
+				{
+					return false;
+				}
+			}
+		}
+		else
+		{
+			if( IsTriggerValid( GetDoorAuthorizationSide() ) )
+			{
+				return super.IsUserAuthorized( user );
+			}
+			else
+			{
+				return true;
+			}
+		}
+	}
+
+	public function RequiresAuthorization() : Bool
+	{
+		if( ( IsDeviceSecured() && IsTriggerValid( GetDoorAuthorizationSide() ) ) && super.IsUserAuthorized( GetPlayerObject( GetGameInstance() ).GetEntityID() ) )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public function UpdatePlayerAuthorization()
+	{
+		m_isPlayerAuthorised = IsUserAuthorized( GetPlayerEntityID() );
+	}
+
+	public function WasPlayerAuthorized() : Bool
+	{
+		return m_isPlayerAuthorised;
+	}
+
+	private function ToggleOpenOnDoor() : Bool
+	{
+		if( IsSealed() || IsLocked() )
+		{
+			return false;
+		}
+		if( IsLogicallyClosed() )
+		{
+			SetIsOpened( true );
+			return true;
+		}
+		else
+		{
+			SetIsOpened( false );
+			return true;
+		}
+	}
+
+	private function ToggleLockOnDoor() : Bool
+	{
+		if( IsSealed() )
+		{
+			return false;
+		}
+		if( IsLocked() )
+		{
+			SetIsLocked( false );
+			return true;
+		}
+		else
+		{
+			SetIsLocked( true );
+			return true;
+		}
+	}
+
+	private function ToggleSealOnDoor() : Bool
+	{
+		if( IsSealed() )
+		{
+			SetIsSealed( false );
+			return true;
+		}
+		else
+		{
+			SetIsSealed( true );
+			return true;
+		}
+	}
+
+	protected override function ShouldForceAuthorizeUser( context : GetActionsContext ) : Bool
+	{
+		return super.ShouldForceAuthorizeUser( context ) || ( context.requestType == gamedeviceRequestType.External && canPlayerRemotelyAuthorize() );
+	}
+
+	private function GiveKeycardsToExecutor( executor : GameObject )
+	{
+		var i : Int32;
+		var transaction : TransactionSystem;
+		var item : ItemID;
+		var keycards : array< TweakDBID >;
+		transaction = GameInstance.GetTransactionSystem( GetGameInstance() );
+		if( ( transaction != NULL ) && ( executor != NULL ) )
+		{
+			keycards = GetKeycards();
+			for( i = 0; i < keycards.Size(); i += 1 )
+			{
+				item = ItemID.FromTDBID( keycards[ i ] );
+				if( !( transaction.HasItem( executor, item ) ) )
+				{
+					transaction.GiveItem( executor, item, 1 );
+				}
+			}
+		}
+	}
+
+	protected function AddToken( id : EntityID ) : Bool
+	{
+		if( !( EntityID.IsDefined( id ) ) )
+		{
+			return false;
+		}
+		if( m_openingTokens.Contains( id ) )
+		{
+			return false;
+		}
+		m_openingTokens.PushBack( id );
+		return true;
+	}
+
+	public function DepleteToken( id : EntityID ) : Bool
+	{
+		if( !( EntityID.IsDefined( id ) ) )
+		{
+			return false;
+		}
+		return m_openingTokens.Remove( id );
+	}
+
+	protected override function LogActionDetails( action : ScriptableDeviceAction, cachedStatus : BaseDeviceStatus, optional context : String, optional status : String, optional overrideStatus : Bool )
+	{
+		var doorType : String;
+		if( IsLogInExclusiveMode() && !( m_debugDevice ) )
+		{
+			return;
+		}
+		overrideStatus = true;
+		switch( m_doorProperties.m_doorType )
+		{
+			case EDoorType.AUTOMATIC:
+				doorType = "AUTOMATIC";
+			break;
+			case EDoorType.INTERACTIVE:
+				doorType = "INTERACTIVE";
+			break;
+			case EDoorType.PHYSICAL:
+				doorType = "PHYSICAL";
+			break;
+			case EDoorType.REMOTELY_CONTROLLED:
+				doorType = "REMOTELYCONTROLLED";
+			break;
+			default:
+				Log( "LogActionDetails ( Door ) / Wrong door type" );
+		}
+		status = ActionDoorStatus().GetCurrentDisplayString();
+		super.LogActionDetails( action, cachedStatus, context, status, overrideStatus );
+		Log( "door type............. " + doorType );
+	}
+
+	public function PushPersistentData( data : DoorPersistentData )
+	{
+		if( IsInitialized() )
+		{
+			return;
+		}
+		m_doorProperties.m_doorType = data.m_doorType;
+		m_doorProperties.m_canPlayerToggleLockState = data.m_canPlayerToggleLockState;
+		m_doorProperties.m_canPlayerToggleSealState = data.m_canPlayerToggleSealState;
+		if( !( AuthorizationData.IsAuthorizationValid( m_authorizationProperties ) ) )
+		{
+			m_authorizationProperties.m_authorizationDataEntry.m_keycard = data.m_keycardName;
+			m_authorizationProperties.m_authorizationDataEntry.m_password = data.m_passcode;
+		}
+		switch( data.m_initialStatus )
+		{
+			case EDoorStatus.OPENED:
+				SetIsOpened( true );
+			break;
+			case EDoorStatus.CLOSED:
+				SetIsOpened( false );
+			break;
+			case EDoorStatus.LOCKED:
+				SetIsOpened( false );
+			SetIsLocked( true );
+			break;
+			case EDoorStatus.SEALED:
+				SetIsOpened( false );
+			SetIsSealed( true );
+			break;
+			default:
+				Log( "DoorController / Unknown EDoorStatus - Debug " );
+		}
+	}
+
+}
+

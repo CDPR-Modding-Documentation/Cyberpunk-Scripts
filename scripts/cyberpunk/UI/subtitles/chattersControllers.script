@@ -1,0 +1,628 @@
+struct ChatterKeyValuePair
+{
+	var Key : CRUID;
+	var Value : weak< ChatterLineLogicController >;
+	var Owner : weak< GameObject >;
+}
+
+class ChattersGameController extends BaseSubtitlesGameController
+{
+	private var c_DisplayRange : Float;
+	default c_DisplayRange = 150;
+	private var c_CloseDisplayRange : Float;
+	default c_CloseDisplayRange = 20;
+	private var c_TimeToUnblockSec : Float;
+	default c_TimeToUnblockSec = 5.f;
+	private var m_rootWidget : weak< inkCompoundWidget >;
+	private var m_AllControllers : array< ChatterKeyValuePair >;
+	private var m_targetingSystem : TargetingSystem;
+	private var m_broadcastBlockingLines : array< CRUID >;
+	private var m_playerInDialogChoice : Bool;
+	default m_playerInDialogChoice = false;
+	private var m_lastBroadcastBlockingLineTime : EngineTime;
+	private var m_lastChoiceTime : EngineTime;
+	private var m_bbPSceneTierEventId : CallbackHandle;
+	private var m_sceneTier : Int32;
+	private var m_OnNameplateEntityChangedCallback : CallbackHandle;
+	private var m_OnNameplateOffsetChangedCallback : CallbackHandle;
+	private var m_OnNameplateVisibilityChangedCallback : CallbackHandle;
+	private var m_OnScannerModeChangedCallback : CallbackHandle;
+	private var m_OnOnDialogsDataCallback : CallbackHandle;
+
+	protected event OnInitialize()
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		var blackboardUI : IBlackboard;
+		var blackboardUIInteractions : IBlackboard;
+		super.OnInitialize();
+		m_rootWidget = ( ( inkCompoundWidget )( GetRootWidget() ) );
+		blackboardSystem = GetBlackboardSystem();
+		blackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_NameplateData );
+		m_OnNameplateEntityChangedCallback = blackboard.RegisterListenerVariant( GetAllBlackboardDefs().UI_NameplateData.EntityID, this, 'OnNameplateEntityChanged' );
+		m_OnNameplateOffsetChangedCallback = blackboard.RegisterListenerFloat( GetAllBlackboardDefs().UI_NameplateData.HeightOffset, this, 'OnNameplateOffsetChanged' );
+		m_OnNameplateVisibilityChangedCallback = blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_NameplateData.IsVisible, this, 'OnNameplateVisibilityChanged' );
+		m_targetingSystem = GameInstance.GetTargetingSystem( GetPlayerControlledObject().GetGame() );
+		blackboardUI = blackboardSystem.Get( GetAllBlackboardDefs().UI_Scanner );
+		m_OnScannerModeChangedCallback = blackboardUI.RegisterListenerVariant( GetAllBlackboardDefs().UI_Scanner.ScannerMode, this, 'OnScannerModeChanged' );
+		m_lastBroadcastBlockingLineTime = EngineTime.FromFloat( -( c_TimeToUnblockSec ) );
+		m_lastChoiceTime = EngineTime.FromFloat( -( c_TimeToUnblockSec ) );
+		blackboardUIInteractions = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UIInteractions );
+		m_OnOnDialogsDataCallback = blackboardUIInteractions.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UIInteractions.DialogChoiceHubs, this, 'OnDialogsData' );
+	}
+
+	protected event OnPlayerAttach( playerGameObject : GameObject )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			playerStateMachineBlackboard = GetPSMBlackboard( playerGameObject );
+			if( playerStateMachineBlackboard )
+			{
+				m_bbPSceneTierEventId = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.SceneTier, this, 'OnSceneTierChange' );
+				m_sceneTier = playerStateMachineBlackboard.GetInt( playerSMDef.SceneTier );
+			}
+		}
+	}
+
+	protected event OnPlayerDetach( playerGameObject : GameObject )
+	{
+		var playerStateMachineBlackboard : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			playerStateMachineBlackboard = GetPSMBlackboard( playerGameObject );
+			if( playerStateMachineBlackboard )
+			{
+				playerStateMachineBlackboard.UnregisterListenerInt( playerSMDef.SceneTier, m_bbPSceneTierEventId );
+			}
+		}
+	}
+
+	protected event OnSceneTierChange( argTier : Int32 )
+	{
+		m_sceneTier = argTier;
+	}
+
+	protected override function GetTextSizeSettigId() : CName
+	{
+		return 'ChattersTextSize';
+	}
+
+	protected override function SetChattersVisibilitySetting( value : Bool )
+	{
+		DisableBySettings( !( value ) );
+	}
+
+	protected override function SetChattersForeignLinesVisibilitySetting( value : Bool )
+	{
+		ForceForeignLinesBySettings( value );
+	}
+
+	protected override function ShowKiroshiSettings( value : Bool )
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'OverheadsForceKiroshiTexts' ) ) );
+		configVar.SetVisible( value );
+	}
+
+	protected override function OnSubCreated( controller : weak< BaseSubtitleLineLogicController > )
+	{
+		var nameplateEntityId : EntityID;
+		var isNameplateVisible : Bool;
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		var tmpVariant : Variant;
+		blackboardSystem = GetBlackboardSystem();
+		blackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_NameplateData );
+		tmpVariant = blackboard.GetVariant( GetAllBlackboardDefs().UI_NameplateData.EntityID );
+		if( tmpVariant.IsValid() )
+		{
+			nameplateEntityId = ( ( EntityID )tmpVariant );
+		}
+		isNameplateVisible = blackboard.GetBool( GetAllBlackboardDefs().UI_NameplateData.IsVisible );
+		( ( ChatterLineLogicController )( controller ) ).SetNameplateData( isNameplateVisible, nameplateEntityId );
+		super.OnSubCreated( controller );
+	}
+
+	private function OnNameplateOffsetChanged( vrt : Float )
+	{
+		var i : Int32;
+		for( i = 0; i < m_AllControllers.Size(); i = i + 1 )
+		{
+			( ( ChatterLineLogicController )( m_AllControllers[ i ].Value ) ).SetNameplateOffsetValue( vrt );
+		}
+	}
+
+	private function OnNameplateEntityChanged( vrt : Variant )
+	{
+		var i : Int32;
+		for( i = 0; i < m_AllControllers.Size(); i = i + 1 )
+		{
+			( ( ChatterLineLogicController )( m_AllControllers[ i ].Value ) ).SetNameplateEntity( vrt );
+		}
+	}
+
+	private function OnNameplateVisibilityChanged( visibility : Bool )
+	{
+		var i : Int32;
+		for( i = 0; i < m_AllControllers.Size(); i = i + 1 )
+		{
+			( ( ChatterLineLogicController )( m_AllControllers[ i ].Value ) ).SetNameplateVisibility( visibility );
+		}
+	}
+
+	private function OnNameplateChanged()
+	{
+		var nameplateEntityId : EntityID;
+		var isNameplateVisible : Bool;
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : IBlackboard;
+		blackboardSystem = GetBlackboardSystem();
+		blackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_NameplateData );
+		nameplateEntityId = ( ( EntityID )( blackboard.GetVariant( GetAllBlackboardDefs().UI_NameplateData.EntityID ) ) );
+		isNameplateVisible = blackboard.GetBool( GetAllBlackboardDefs().UI_NameplateData.IsVisible );
+		UpdateChattersNameplateData( nameplateEntityId, isNameplateVisible );
+	}
+
+	protected event OnDialogsData( value : Variant )
+	{
+		var data : DialogChoiceHubs;
+		var inDialogChoice : Bool;
+		data = ( ( DialogChoiceHubs )value );
+		inDialogChoice = data.choiceHubs.Size() > 0;
+		if( !( inDialogChoice ) && m_playerInDialogChoice )
+		{
+			m_lastChoiceTime = GameInstance.GetSimTime( GetGame() );
+		}
+		m_playerInDialogChoice = inDialogChoice;
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+	}
+
+	private function AddBroadcastBlockingLine( lineData : scnDialogLineData )
+	{
+		if( !( m_broadcastBlockingLines.Contains( lineData.id ) ) )
+		{
+			m_broadcastBlockingLines.PushBack( lineData.id );
+		}
+	}
+
+	private function IsBroadcastBlockedByMainDialogue() : Bool
+	{
+		return ( ( m_playerInDialogChoice || ( m_broadcastBlockingLines.Size() > 0 ) ) || ( EngineTime.ToFloat( GameInstance.GetSimTime( GetGame() ) - m_lastBroadcastBlockingLineTime ) < c_TimeToUnblockSec ) ) || ( EngineTime.ToFloat( GameInstance.GetSimTime( GetGame() ) - m_lastChoiceTime ) < c_TimeToUnblockSec );
+	}
+
+	private function IsLineTypeConditionFulfilled( lineData : scnDialogLineData ) : Bool
+	{
+		var speakerVehicle : weak< VehicleObject >;
+		var player : weak< PlayerPuppet >;
+		if( lineData.type == scnDialogLineType.OverHead || lineData.type == scnDialogLineType.OverHeadAlwaysVisible )
+		{
+			return true;
+		}
+		else if( lineData.type == scnDialogLineType.Radio )
+		{
+			player = ( ( PlayerPuppet )( GetPlayerControlledObject() ) );
+			speakerVehicle = ( ( VehicleObject )( lineData.speaker ) );
+			return ( ( speakerVehicle == NULL ) && ( lineData.speaker != player ) ) && !( IsBroadcastBlockedByMainDialogue() );
+		}
+		else if( lineData.type == scnDialogLineType.GlobalTV )
+		{
+			return !( IsBroadcastBlockedByMainDialogue() );
+		}
+		return false;
+	}
+
+	private function IsDistanceConditionFulfilled( lineData : scnDialogLineData ) : Bool
+	{
+		var range : Float;
+		range = ( ( m_sceneTier < ( ( Int32 )( GameplayTier.Tier2_StagedGameplay ) ) ) ? ( c_DisplayRange ) : ( c_CloseDisplayRange ) );
+		return Vector4.DistanceSquared( GetPlayerControlledObject().GetWorldPosition(), lineData.speaker.GetWorldPosition() ) < ( range * range );
+	}
+
+	protected override function ShouldDisplayLine( lineData : scnDialogLineData ) : Bool
+	{
+		if( IsMainDialogLine( lineData ) )
+		{
+			AddBroadcastBlockingLine( lineData );
+			return false;
+		}
+		if( lineData.type == scnDialogLineType.OverHeadAlwaysVisible )
+		{
+			return true;
+		}
+		return ( ( ( lineData.speaker != NULL ) && ( m_sceneTier < ( ( Int32 )( GameplayTier.Tier3_LimitedGameplay ) ) ) ) && IsLineTypeConditionFulfilled( lineData ) ) && IsDistanceConditionFulfilled( lineData );
+	}
+
+	private override function OnRemovalFailure( lineId : CRUID )
+	{
+		if( m_broadcastBlockingLines.Remove( lineId ) && ( m_broadcastBlockingLines.Size() == 0 ) )
+		{
+			m_lastBroadcastBlockingLineTime = GameInstance.GetSimTime( GetGame() );
+		}
+	}
+
+	protected override function CreateLine( lineSpawnData : LineSpawnData )
+	{
+		AsyncSpawnFromLocal( m_rootWidget, 'Line', this, 'OnLineSpawned', lineSpawnData );
+	}
+
+	protected override function SetupLine( lineWidget : inkWidget, lineSpawnData : LineSpawnData )
+	{
+		var currKeyValuePair : ChatterKeyValuePair;
+		var gameObject : weak< GameObject >;
+		var isDevice : Bool;
+		gameObject = ( ( GameObject )( lineSpawnData.m_lineData.speaker ) );
+		isDevice = gameObject && gameObject.IsDevice();
+		StartScreenProjection( lineWidget, isDevice );
+		currKeyValuePair.Key = lineSpawnData.m_lineData.id;
+		currKeyValuePair.Value = ( ( ChatterLineLogicController )( lineWidget.GetController() ) );
+		currKeyValuePair.Owner = lineSpawnData.m_lineData.speaker;
+		m_AllControllers.PushBack( currKeyValuePair );
+	}
+
+	protected override function OnHideLineByData( lineData : subtitleLineMapEntry )
+	{
+		var i : Int32;
+		super.OnHideLineByData( lineData );
+		StopScreenProjection( lineData.widget );
+		m_rootWidget.RemoveChild( lineData.widget );
+		for( i = 0; i < m_AllControllers.Size(); i = i + 1 )
+		{
+			if( !( m_AllControllers[ i ].Owner ) || ( lineData.owner && m_AllControllers[ i ].Owner.GetPersistentID() == lineData.owner.GetPersistentID() ) )
+			{
+				m_AllControllers.Erase( i );
+				i -= 1;
+			}
+		}
+	}
+
+	protected override function OnHideLine( lineData : subtitleLineMapEntry )
+	{
+		var i : Int32;
+		super.OnHideLine( lineData );
+		StopScreenProjection( lineData.widget );
+		m_rootWidget.RemoveChild( lineData.widget );
+		for( i = 0; i < m_AllControllers.Size(); i = i + 1 )
+		{
+			if( m_AllControllers[ i ].Key == lineData.id )
+			{
+				m_AllControllers.Erase( i );
+			}
+		}
+	}
+
+	private function StartScreenProjection( lineWidget : weak< inkWidget >, isDevice : Bool )
+	{
+		var projection : inkScreenProjection;
+		var controller : weak< ChatterLineLogicController >;
+		controller = ( ( ChatterLineLogicController )( lineWidget.GetController() ) );
+		projection = RegisterScreenProjection( controller.CreateProjectionData( isDevice ) );
+		controller.SetProjection( projection );
+	}
+
+	private function StopScreenProjection( lineWidget : weak< inkWidget > )
+	{
+		var controller : weak< ChatterLineLogicController >;
+		controller = ( ( ChatterLineLogicController )( lineWidget.GetController() ) );
+		UnregisterScreenProjection( controller.GetProjection() );
+	}
+
+	protected event OnScreenProjectionUpdate( projections : gameuiScreenProjectionsData )
+	{
+		var i, count : Int32;
+		var controller : weak< ChatterLineLogicController >;
+		var projection : inkScreenProjection;
+		var target : EntityID;
+		var screenSize : Vector2;
+		var X : Float;
+		var Y : Float;
+		var distance : Float;
+		var closestDistance : Float;
+		closestDistance = 100000.0;
+		count = projections.data.Size();
+		for( i = 0; i < count; i += 1 )
+		{
+			projection = projections.data[ i ];
+			controller = ( ( ChatterLineLogicController )( projection.GetUserData() ) );
+			screenSize = m_rootWidget.GetSize();
+			X = projection.currentPosition.X;
+			Y = projection.currentPosition.Y;
+			X -= ( screenSize.X / 2.0 );
+			Y -= ( screenSize.Y / 2.0 );
+			distance = SqrtF( ( X * X ) + ( Y * Y ) );
+			if( ( distance < closestDistance ) && projection.IsInScreen() )
+			{
+				closestDistance = distance;
+				target = controller.GetOwnerID();
+			}
+		}
+		for( i = 0; i < count; i += 1 )
+		{
+			projection = projections.data[ i ];
+			controller = ( ( ChatterLineLogicController )( projection.GetUserData() ) );
+			controller.UpdateProjection( target, this );
+		}
+	}
+
+	protected event OnNameplateVisibleEvent( evt : NameplateVisibleEvent )
+	{
+		UpdateChattersNameplateData( evt.entityID, evt.isNameplateVisible );
+	}
+
+	private function UpdateChattersNameplateData( entID : EntityID, isVisible : Bool )
+	{
+		var i : Int32;
+		for( i = 0; i < m_AllControllers.Size(); i = i + 1 )
+		{
+			( ( ChatterLineLogicController )( m_AllControllers[ i ].Value ) ).SetNameplateData( isVisible, entID );
+		}
+	}
+
+	protected event OnScannerModeChanged( val : Variant )
+	{
+		var evt : ScanningModeEvent;
+		evt = ( ( ScanningModeEvent )val );
+		m_rootWidget.SetVisible( evt.mode == gameScanningMode.Inactive );
+	}
+
+}
+
+class ChatterLineLogicController extends BaseSubtitleLineLogicController
+{
+	private editable var m_TextContainer : inkWidgetRef;
+	private editable var m_speachBubble : inkWidgetRef;
+	private editable var m_background : inkRectangleRef;
+	private editable var m_container_normal : inkWidgetRef;
+	private editable var m_container_wide : inkWidgetRef;
+	private editable var m_text_normal : inkTextRef;
+	private editable var m_text_wide : inkTextRef;
+	private var m_kiroshiAnimationCtrl_Normal : weak< inkTextKiroshiAnimController >;
+	private var m_kiroshiAnimationCtrl_Wide : weak< inkTextKiroshiAnimController >;
+	private var m_motherTongueCtrl_Normal : weak< inkTextMotherTongueController >;
+	private var m_motherTongueCtrl_Wide : weak< inkTextMotherTongueController >;
+	private var m_isNameplateVisible : Bool;
+	private var m_nameplateEntityId : EntityID;
+	private var m_nameplatHeightOffset : Float;
+	private var m_ownerId : EntityID;
+	private var c_ExtraWideTextWidth : Int32;
+	default c_ExtraWideTextWidth = 110;
+	private var m_rootWidget : weak< inkWidget >;
+	private var m_projection : inkScreenProjection;
+	private var m_subtitlesMaxDistance : Float;
+	private var m_bubbleMinDistance : Float;
+	private var m_limitSubtitlesDistance : Bool;
+	private var m_isOverHead : Bool;
+
+	protected event OnInitialize()
+	{
+		m_rootWidget = GetRootWidget();
+		m_kiroshiAnimationCtrl_Normal = ( ( inkTextKiroshiAnimController )( inkWidgetRef.GetController( m_container_normal ) ) );
+		m_kiroshiAnimationCtrl_Wide = ( ( inkTextKiroshiAnimController )( inkWidgetRef.GetController( m_container_wide ) ) );
+		m_motherTongueCtrl_Normal = ( ( inkTextMotherTongueController )( inkWidgetRef.GetControllerByType( m_container_normal, 'inkTextMotherTongueController' ) ) );
+		m_motherTongueCtrl_Wide = ( ( inkTextMotherTongueController )( inkWidgetRef.GetControllerByType( m_container_wide, 'inkTextMotherTongueController' ) ) );
+		inkWidgetRef.SetVisible( m_speachBubble, false );
+	}
+
+	public function GetOwnerID() : EntityID
+	{
+		return m_ownerId;
+	}
+
+	public override function SetupSettings( textSize : Int32, backgroundOpacity : Float )
+	{
+		inkTextRef.SetFontSize( m_text_normal, textSize );
+		inkTextRef.SetFontSize( m_text_wide, textSize );
+		m_kiroshiAnimationCtrl_Normal.SetupFontSettings( textSize );
+		m_kiroshiAnimationCtrl_Wide.SetupFontSettings( textSize );
+		inkRectangleRef.SetOpacity( m_background, backgroundOpacity / 100.0 );
+	}
+
+	public override function ShowBackground( value : Bool )
+	{
+		inkRectangleRef.SetVisible( m_background, value );
+	}
+
+	public override function SetLineData( lineData : scnDialogLineData )
+	{
+		var displayData : scnDialogDisplayString;
+		var animCtrl : weak< inkTextKiroshiAnimController >;
+		var motherTongueCtrl : weak< inkTextMotherTongueController >;
+		var isWide : Bool;
+		var gameObject : weak< GameObject >;
+		gameObject = ( ( GameObject )( lineData.speaker ) );
+		m_isOverHead = lineData.type == scnDialogLineType.OverHead;
+		if( gameObject && gameObject.IsDevice() )
+		{
+			m_rootWidget.SetAnchorPoint( Vector2( 0.5, 0.0 ) );
+			m_limitSubtitlesDistance = true;
+			m_subtitlesMaxDistance = 10.0;
+			m_bubbleMinDistance = 10.0;
+		}
+		else if( gameObject && m_isOverHead )
+		{
+			m_rootWidget.SetAnchorPoint( Vector2( 0.5, 1.0 ) );
+			m_limitSubtitlesDistance = true;
+			m_subtitlesMaxDistance = 30.0;
+			m_bubbleMinDistance = 25.0;
+		}
+		else
+		{
+			m_rootWidget.SetAnchorPoint( Vector2( 0.5, 1.0 ) );
+			m_limitSubtitlesDistance = false;
+			m_subtitlesMaxDistance = 0.0;
+			m_bubbleMinDistance = 0.0;
+		}
+		m_projection.SetEntity( lineData.speaker );
+		displayData = scnDialogLineData.GetDisplayText( lineData );
+		isWide = StrLen( displayData.translation ) >= c_ExtraWideTextWidth;
+		m_ownerId = lineData.speaker.GetEntityID();
+		if( isWide )
+		{
+			animCtrl = m_kiroshiAnimationCtrl_Wide;
+			motherTongueCtrl = m_motherTongueCtrl_Wide;
+		}
+		else
+		{
+			animCtrl = m_kiroshiAnimationCtrl_Normal;
+			motherTongueCtrl = m_motherTongueCtrl_Normal;
+		}
+		inkTextRef.SetVisible( m_text_normal, !( isWide ) );
+		inkTextRef.SetVisible( m_text_wide, isWide );
+		inkWidgetRef.SetVisible( m_container_normal, !( isWide ) );
+		inkWidgetRef.SetVisible( m_container_wide, isWide );
+		inkWidgetRef.SetVisible( m_TextContainer, false );
+		inkWidgetRef.SetVisible( m_speachBubble, true );
+		if( scnDialogLineData.HasKiroshiTag( lineData ) )
+		{
+			displayData = scnDialogLineData.GetDisplayText( lineData );
+			if( IsKiroshiEnabled() )
+			{
+				animCtrl.SetPreTranslatedText( displayData.preTranslatedText );
+				animCtrl.SetNativeText( displayData.text, displayData.language );
+				animCtrl.SetTargetText( displayData.translation );
+				animCtrl.SetPostTranslatedText( displayData.postTranslatedText );
+				SetupAnimation( lineData.duration, animCtrl );
+				animCtrl.PlaySetAnimation();
+			}
+			else
+			{
+				motherTongueCtrl.SetPreTranslatedText( "" );
+				motherTongueCtrl.SetNativeText( displayData.text, displayData.language );
+				motherTongueCtrl.SetTranslatedText( "" );
+				motherTongueCtrl.SetPostTranslatedText( "" );
+				motherTongueCtrl.ApplyTexts();
+			}
+		}
+		else if( scnDialogLineData.HasMothertongueTag( lineData ) )
+		{
+			displayData = scnDialogLineData.GetDisplayText( lineData );
+			motherTongueCtrl.SetPreTranslatedText( displayData.preTranslatedText );
+			motherTongueCtrl.SetNativeText( displayData.text, displayData.language );
+			motherTongueCtrl.SetTranslatedText( displayData.translation );
+			motherTongueCtrl.SetPostTranslatedText( displayData.postTranslatedText );
+			motherTongueCtrl.ApplyTexts();
+		}
+		else
+		{
+			inkTextRef.SetText( m_text_normal, lineData.text );
+			inkTextRef.SetText( m_text_wide, lineData.text );
+		}
+	}
+
+	public function CreateProjectionData( isDevice : Bool ) : inkScreenProjectionData
+	{
+		var projectionData : inkScreenProjectionData;
+		projectionData.userData = this;
+		projectionData.slotComponentName = 'UI_Slots';
+		if( isDevice )
+		{
+			projectionData.fixedWorldOffset = Vector4( 0.0, 0.0, 0.0, 0.0 );
+			projectionData.slotName = 'UI_Subtitles';
+			projectionData.slotFallbackName = 'UI_Interaction';
+		}
+		else
+		{
+			projectionData.fixedWorldOffset = Vector4( 0.0, 0.0, 0.30000001, 0.0 );
+			projectionData.slotName = 'UI_Interaction';
+			projectionData.slotFallbackName = 'UI_Subtitles';
+		}
+		return projectionData;
+	}
+
+	public function GetProjection() : inkScreenProjection
+	{
+		return m_projection;
+	}
+
+	public function SetProjection( projection : inkScreenProjection )
+	{
+		m_projection = projection;
+	}
+
+	public function IsVisible( targetedObject : EntityID ) : Bool
+	{
+		var isVisible : Bool;
+		if( !( m_limitSubtitlesDistance ) )
+		{
+			isVisible = true;
+		}
+		else if( m_isOverHead )
+		{
+			isVisible = m_projection.distanceToCamera <= m_subtitlesMaxDistance;
+		}
+		else
+		{
+			isVisible = m_projection.VoIsPerceptible( targetedObject );
+		}
+		return isVisible;
+	}
+
+	public function IsBubble( targetedObject : EntityID ) : Bool
+	{
+		var isBubble : Bool;
+		if( !( m_limitSubtitlesDistance ) )
+		{
+			isBubble = targetedObject != m_ownerId;
+		}
+		else
+		{
+			isBubble = ( targetedObject != m_ownerId ) || ( ( m_projection.distanceToCamera > m_bubbleMinDistance ) && ( m_projection.distanceToCamera <= m_subtitlesMaxDistance ) );
+		}
+		return isBubble;
+	}
+
+	public function UpdateProjection( targetedObject : EntityID, owner : weak< ChattersGameController > )
+	{
+		var margin : inkMargin;
+		var isVisible : Bool;
+		var isBubble : Bool;
+		if( m_projection )
+		{
+			isVisible = IsVisible( targetedObject );
+			isBubble = IsBubble( targetedObject );
+			margin.left = m_projection.currentPosition.X;
+			margin.top = m_projection.currentPosition.Y;
+			if( m_isNameplateVisible && ( m_projection.GetEntity().GetEntityID() == m_nameplateEntityId ) )
+			{
+				margin.top -= 30.0;
+			}
+			owner.ApplyProjectionMarginOnWidget( m_rootWidget, margin );
+			if( m_projection.IsInScreen() )
+			{
+				inkWidgetRef.SetVisible( m_TextContainer, isVisible && !( isBubble ) );
+				inkWidgetRef.SetVisible( m_speachBubble, isVisible && isBubble );
+			}
+		}
+	}
+
+	public function SetNameplateData( argNameplateVisible : Bool, argEntityId : EntityID )
+	{
+		m_isNameplateVisible = argNameplateVisible;
+		m_nameplateEntityId = argEntityId;
+	}
+
+	public function SetNameplateOffsetValue( value : Float )
+	{
+		m_nameplatHeightOffset = value;
+	}
+
+	public function SetNameplateEntity( blackboardVariant : Variant )
+	{
+		m_nameplateEntityId = ( ( EntityID )blackboardVariant );
+	}
+
+	public function SetNameplateVisibility( isVisible : Bool )
+	{
+		m_isNameplateVisible = isVisible;
+	}
+
+}
+

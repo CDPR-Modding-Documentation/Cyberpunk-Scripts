@@ -1,0 +1,191 @@
+import class inkCooldownGameController extends inkGameController
+{
+	private editable var m_maxCooldowns : Int32;
+	private editable var m_cooldownContainer : inkCompoundRef;
+	private editable var m_poolHolder : inkCompoundRef;
+	private editable var m_mode : ECooldownGameControllerMode;
+	default m_mode = ECooldownGameControllerMode.COOLDOWNS;
+	private var m_effectTypes : array< gamedataStatusEffectType >;
+	private var m_cooldownPool : array< weak< SingleCooldownManager > >;
+	private var m_matchBuffer : array< weak< SingleCooldownManager > >;
+	private var m_buffsCallback : CallbackHandle;
+	private var m_debuffsCallback : CallbackHandle;
+	private var m_blackboardDef : UI_PlayerBioMonitorDef;
+	private var m_blackboard : weak< IBlackboard >;
+
+	protected event OnInitialize()
+	{
+		var tempSingleCooldownManagerRef : weak< SingleCooldownManager >;
+		var i : Int32;
+		inkCompoundRef.SetVAlign( m_poolHolder, inkEVerticalAlign.Top );
+		inkCompoundRef.SetHAlign( m_poolHolder, inkEHorizontalAlign.Left );
+		for( i = 0; i < m_maxCooldowns; i += 1 )
+		{
+			tempSingleCooldownManagerRef = ( ( SingleCooldownManager )( SpawnFromLocal( inkCompoundRef.Get( m_poolHolder ), 'SingleCooldownBar' ).GetController() ) );
+			tempSingleCooldownManagerRef.GetRootWidget().SetVAlign( inkEVerticalAlign.Top );
+			tempSingleCooldownManagerRef.GetRootWidget().SetHAlign( inkEHorizontalAlign.Left );
+			tempSingleCooldownManagerRef.Init( m_poolHolder, m_cooldownContainer );
+			m_cooldownPool.PushBack( tempSingleCooldownManagerRef );
+		}
+		m_blackboardDef = GetAllBlackboardDefs().UI_PlayerBioMonitor;
+		m_blackboard = GetBlackboardSystem().Get( m_blackboardDef );
+		if( m_mode == ECooldownGameControllerMode.COOLDOWNS )
+		{
+			m_buffsCallback = m_blackboard.RegisterDelayedListenerVariant( m_blackboardDef.BuffsList, this, 'OnEffectUpdate' );
+		}
+		else if( m_mode == ECooldownGameControllerMode.BUFFS_AND_DEBUFFS )
+		{
+			m_buffsCallback = m_blackboard.RegisterDelayedListenerVariant( m_blackboardDef.BuffsList, this, 'OnEffectUpdate' );
+			m_debuffsCallback = m_blackboard.RegisterDelayedListenerVariant( m_blackboardDef.DebuffsList, this, 'OnEffectUpdate' );
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_buffsCallback )
+		{
+			m_blackboard.UnregisterDelayedListener( m_blackboardDef.BuffsList, m_buffsCallback );
+		}
+		if( m_debuffsCallback )
+		{
+			m_blackboard.UnregisterDelayedListener( m_blackboardDef.DebuffsList, m_debuffsCallback );
+		}
+	}
+
+	private function ParseBuffList( buffList : array< UIBuffInfo > )
+	{
+		var i : Int32;
+		var j : Int32;
+		var foundIndex : Int32;
+		m_matchBuffer.Grow( m_maxCooldowns );
+		j = 0;
+		for( i = 0; i < m_maxCooldowns; i += 1 )
+		{
+			if( m_cooldownPool[ i ].GetState() != ECooldownIndicatorState.Pooled )
+			{
+				m_matchBuffer[ j ] = m_cooldownPool[ i ];
+				j += 1;
+			}
+		}
+		for( j = 0; j < buffList.Size(); j += 1 )
+		{
+			foundIndex = -1;
+			for( i = 0; i < m_matchBuffer.Size(); i += 1 )
+			{
+				if( m_matchBuffer[ i ] && m_matchBuffer[ i ].IsIDMatch( buffList[ j ].buffID ) )
+				{
+					foundIndex = i;
+					m_matchBuffer[ foundIndex ].Update( buffList[ j ].timeRemaining, buffList[ j ].stackCount );
+					m_matchBuffer.EraseFast( foundIndex );
+					break;
+				}
+			}
+			if( foundIndex < 0 )
+			{
+				RequestCooldownVisualization( buffList[ j ] );
+			}
+		}
+		for( i = 0; i < m_matchBuffer.Size(); i += 1 )
+		{
+			if( m_matchBuffer[ i ] && m_matchBuffer[ i ].GetState() != ECooldownIndicatorState.Pooled )
+			{
+				m_matchBuffer[ i ].RemoveCooldown();
+			}
+		}
+		m_matchBuffer.Clear();
+	}
+
+	private function GetInstance() : GameInstance
+	{
+		return ( ( GameObject )( GetOwnerEntity() ) ).GetGame();
+	}
+
+	protected event OnEffectUpdate( v : Variant )
+	{
+		var effects : array< UIBuffInfo >;
+		var effect : UIBuffInfo;
+		var buffs : array< BuffInfo >;
+		var debuffs : array< BuffInfo >;
+		var i : Int32;
+		if( !( GetRootWidget().IsVisible() ) )
+		{
+			return false;
+		}
+		if( m_mode == ECooldownGameControllerMode.COOLDOWNS )
+		{
+			GetBuffs( buffs );
+			for( i = 0; i < buffs.Size(); i += 1 )
+			{
+				if( TweakDBInterface.GetStatusEffectRecord( buffs[ i ].buffID ).StatusEffectType().Type() == gamedataStatusEffectType.PlayerCooldown )
+				{
+					effect.buffID = buffs[ i ].buffID;
+					effect.timeRemaining = buffs[ i ].timeRemaining;
+					effect.isBuff = true;
+					effects.PushBack( effect );
+				}
+			}
+		}
+		else
+		{
+			GetBuffs( buffs );
+			GetDebuffs( debuffs );
+			for( i = 0; i < buffs.Size(); i += 1 )
+			{
+				effect.buffID = buffs[ i ].buffID;
+				effect.timeRemaining = buffs[ i ].timeRemaining;
+				effect.isBuff = true;
+				effect.stackCount = StatusEffectHelper.GetStatusEffectByID( GetPlayerControlledObject(), effect.buffID ).GetStackCount();
+				effects.PushBack( effect );
+			}
+			for( i = 0; i < debuffs.Size(); i += 1 )
+			{
+				effect.buffID = debuffs[ i ].buffID;
+				effect.timeRemaining = debuffs[ i ].timeRemaining;
+				effect.isBuff = false;
+				effect.stackCount = StatusEffectHelper.GetStatusEffectByID( GetPlayerControlledObject(), effect.buffID ).GetStackCount();
+				effects.PushBack( effect );
+			}
+		}
+		if( effects.Size() > 0 )
+		{
+			ParseBuffList( effects );
+		}
+	}
+
+	private const function GetBuffs( buffs : ref< array< BuffInfo > > )
+	{
+		buffs = ( ( array< BuffInfo > )( m_blackboard.GetVariant( m_blackboardDef.BuffsList ) ) );
+	}
+
+	private const function GetDebuffs( debuffs : ref< array< BuffInfo > > )
+	{
+		debuffs = ( ( array< BuffInfo > )( m_blackboard.GetVariant( m_blackboardDef.DebuffsList ) ) );
+	}
+
+	protected event OnCooldownUpdate( buffList : array< BuffInfo > ) {}
+
+	public function RequestCooldownVisualization( buffData : UIBuffInfo )
+	{
+		var i : Int32;
+		if( buffData.timeRemaining <= 0.0 )
+		{
+			return;
+		}
+		for( i = 0; i < m_maxCooldowns; i += 1 )
+		{
+			if( m_cooldownPool[ i ].GetState() == ECooldownIndicatorState.Pooled )
+			{
+				m_cooldownPool[ i ].ActivateCooldown( buffData );
+				return;
+			}
+		}
+	}
+
+}
+
+enum ECooldownGameControllerMode
+{
+	COOLDOWNS = 0,
+	BUFFS_AND_DEBUFFS = 1,
+}
+

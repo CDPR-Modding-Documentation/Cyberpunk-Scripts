@@ -1,0 +1,176 @@
+class CentaurShieldStateChangeEvent extends Event
+{
+	var newState : ECentaurShieldState;
+}
+
+class HitShieldEvent extends Event
+{
+}
+
+class CentaurShieldController extends AICustomComponents
+{
+	private editable var m_startWithShieldActive : Bool;
+	default m_startWithShieldActive = true;
+	private const var m_animFeatureName : CName;
+	default m_animFeatureName = 'ShieldState';
+	private const var m_shieldDestroyedModifierName : CName;
+	default m_shieldDestroyedModifierName = 'Shield_ControllerDestroyed';
+	private var m_shieldState : ECentaurShieldState;
+	private var m_centaurBlackboard : IBlackboard;
+
+	private function OnGameAttach()
+	{
+		m_centaurBlackboard = IBlackboard.Create( GetAllBlackboardDefs().CustomCentaurBlackboard );
+		ScriptedPuppet.CreateCustomBlackboard( GetOwner(), m_centaurBlackboard );
+		m_centaurBlackboard.SetFloat( GetAllBlackboardDefs().CustomCentaurBlackboard.WoundedStateHPThreshold, -1.0 );
+		if( m_startWithShieldActive )
+		{
+			ChangeShieldState( ECentaurShieldState.Active );
+		}
+	}
+
+	public static function ChangeShieldState( obj : GameObject, newState : ECentaurShieldState )
+	{
+		var changeStateEvent : CentaurShieldStateChangeEvent;
+		changeStateEvent = new CentaurShieldStateChangeEvent;
+		changeStateEvent.newState = newState;
+		obj.QueueEvent( changeStateEvent );
+	}
+
+	protected event OnShieldStateChange( stateChangeEvent : CentaurShieldStateChangeEvent )
+	{
+		ChangeShieldState( stateChangeEvent.newState );
+	}
+
+	private final function ChangeShieldState( newState : ECentaurShieldState )
+	{
+		if( m_shieldState == newState )
+		{
+			return;
+		}
+		m_shieldState = newState;
+		UpdateAnimFeature();
+		UpdateBlackbaord();
+		switch( m_shieldState )
+		{
+			case ECentaurShieldState.Destroyed:
+				TriggerShieldControllerExplosion();
+			ApplyShieldDestroyedStats();
+			PlayShieldDestroyedVoiceOver();
+			break;
+			default:
+				break;
+		}
+	}
+
+	private final function UpdateAnimFeature()
+	{
+		var shieldAnimFeature : AnimFeatureShieldState;
+		shieldAnimFeature = new AnimFeatureShieldState;
+		shieldAnimFeature.state = ( ( Int32 )( m_shieldState ) );
+		AnimationControllerComponent.ApplyFeature( GetOwner(), m_animFeatureName, shieldAnimFeature );
+	}
+
+	private final function UpdateBlackbaord()
+	{
+		m_centaurBlackboard.SetInt( GetAllBlackboardDefs().CustomCentaurBlackboard.ShieldState, ( ( Int32 )( m_shieldState ) ) );
+	}
+
+	private function ApplyShieldDestroyedStats()
+	{
+		var desiredStaggerThreshold : Float;
+		var currentStaggerThreshold : Float;
+		var statFlag : gameStatModifierData;
+		var ownerID : StatsObjectID;
+		ownerID = GetOwner().GetEntityID();
+		desiredStaggerThreshold = GetFloatFromCharacterTweak( "shieldControllerDestroyed_staggerThreshold" );
+		currentStaggerThreshold = GameInstance.GetStatsSystem( GetOwner().GetGame() ).GetStatValue( ownerID, gamedataStatType.StaggerDamageThreshold );
+		statFlag = RPGManager.CreateStatModifier( gamedataStatType.StaggerDamageThreshold, gameStatModifierType.Additive, desiredStaggerThreshold - currentStaggerThreshold );
+		GameInstance.GetStatsSystem( GetOwner().GetGame() ).AddModifier( ownerID, statFlag );
+	}
+
+	private function PlayShieldDestroyedVoiceOver()
+	{
+		var voName : CName;
+		voName = StringToName( GetStringFromCharacterTweak( "shieldControllerDestroyed_voiceOver" ) );
+		GameObject.PlayVoiceOver( GetOwner(), voName, 'Scripts:PlayShieldDestroyedVoiceOver' );
+	}
+
+	private function GetFloatFromCharacterTweak( varName : String, optional defaultValue : Float ) : Float
+	{
+		return ( ( ScriptedPuppet )( GetOwner() ) ).GetFloatFromCharacterTweak( varName, defaultValue );
+	}
+
+	private function GetStringFromCharacterTweak( varName : String, optional defaultValue : String ) : String
+	{
+		return ( ( ScriptedPuppet )( GetOwner() ) ).GetStringFromCharacterTweak( varName, defaultValue );
+	}
+
+	private function TriggerShieldControllerExplosion()
+	{
+		var explosionAttack : Attack_GameEffect;
+		var explosionEffect : EffectInstance;
+		var attackContext : AttackInitContext;
+		var hitFlags : array< hitFlag >;
+		var statMods : array< gameStatModifierData >;
+		GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_explode' );
+		GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_overload' );
+		attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.Explosion" );
+		attackContext.instigator = attackContext.source;
+		attackContext.source = GetOwner();
+		explosionAttack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		explosionEffect = explosionAttack.PrepareAttack( GetOwner() );
+		explosionAttack.GetStatModList( statMods );
+		hitFlags.PushBack( hitFlag.FriendlyFire );
+		EffectData.SetFloat( explosionEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, 3.5 );
+		EffectData.SetVector( explosionEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, GetOwner().GetWorldPosition() );
+		EffectData.SetVariant( explosionEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.flags, hitFlags );
+		EffectData.SetVariant( explosionEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( explosionAttack ) ) );
+		EffectData.SetVariant( explosionEffect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attackStatModList, statMods );
+		explosionAttack.StartAttack();
+	}
+
+	protected event OnStatusEffectApplied( evt : ApplyStatusEffectEvent )
+	{
+		var i : Int32;
+		var tags : array< CName >;
+		tags = evt.staticData.GameplayTags();
+		for( i = 0; i < tags.Size(); i += 1 )
+		{
+			if( tags[ i ] == 'E3_BossWeakSpotDestroyed' )
+			{
+				ChangeShieldState( ECentaurShieldState.Destroyed );
+				break;
+			}
+		}
+	}
+
+	protected event OnEventReceived( stimEvent : StimuliEvent )
+	{
+		var shieldTarget : weak< GameObject >;
+		if( m_shieldState == ECentaurShieldState.Active && stimEvent.GetStimType() == gamedataStimType.GrenadeLanded )
+		{
+			shieldTarget = stimEvent.sourceObject;
+			if( shieldTarget != NULL )
+			{
+				m_centaurBlackboard.SetEntityID( GetAllBlackboardDefs().CustomCentaurBlackboard.ShieldTarget, shieldTarget.GetEntityID() );
+			}
+		}
+	}
+
+	protected event OnHitShield( evt : HitShieldEvent )
+	{
+		GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_compensating' );
+	}
+
+}
+
+enum ECentaurShieldState
+{
+	Inactive = 0,
+	Activating = 1,
+	Active = 2,
+	Destroyed = 3,
+	Hacked = 4,
+}
+

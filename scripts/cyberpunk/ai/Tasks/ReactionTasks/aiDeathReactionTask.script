@@ -1,0 +1,641 @@
+abstract class AIDeathReactionsTask extends AIbehaviortaskScript
+{
+	editable inlined var m_fastForwardAnimation : AIArgumentMapping;
+	protected var m_hitData : AnimFeature_HitReactionsData;
+	private var m_hitReactionAction : ActionHitReactionScriptProxy;
+	private var m_previousRagdollTimeStamp : Float;
+	private var m_deathHasBeenPlayed : Bool;
+	private var m_updateFrame : Int32;
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		var puppet : NPCPuppet;
+		var victimYaw : Float;
+		var instigatorYaw : Float;
+		var npcType : gamedataNPCType;
+		puppet = ( ( NPCPuppet )( GetPuppet( context ) ) );
+		npcType = puppet.GetNPCType();
+		m_updateFrame = 0;
+		puppet.GetHitReactionComponent().UpdateDeathHasBeenPlayed();
+		NPCPuppet.ChangeHighLevelState( ScriptExecutionContext.GetOwner( context ), gamedataNPCHighLevelState.Dead );
+		m_hitData = new AnimFeature_HitReactionsData;
+		m_hitData = GetHitData( context );
+		m_hitData.hitType = GetDeathReactionType( context );
+		if( CanSkipDeathAnimation() && ( m_hitData.hitType == ( ( Int32 )( animHitReactionType.Ragdoll ) ) ) )
+		{
+			if( !( StatusEffectSystem.ObjectHasStatusEffect( puppet, T"BaseStatusEffect.ForceKillFromRagdoll" ) ) )
+			{
+				ScriptExecutionContext.GetOwner( context ).QueueEvent( CreateForceRagdollEvent( 'AIDeathReactionTask - forced ragdoll' ) );
+			}
+		}
+		else
+		{
+			if( m_hitData.hitSource != 0 )
+			{
+				instigatorYaw = Vector4.Heading( puppet.GetHitReactionComponent().GetHitInstigator().GetWorldForward() );
+				victimYaw = Vector4.Heading( puppet.GetWorldForward() );
+				m_hitData.hitDirectionWs = Vector4.RotByAngleXY( puppet.GetWorldForward(), victimYaw - instigatorYaw );
+			}
+			else
+			{
+				m_hitData.hitDirectionWs = puppet.GetLastHitAttackDirection();
+			}
+			m_hitData.angleToAttack = AngleToAttackSource( context, m_hitData );
+			m_hitData.initialRotationDuration = 0.1;
+			if( ( puppet.GetStanceStateFromBlackboard() == gamedataNPCStanceState.Cover && ( m_hitData.hitIntensity != 3 ) ) && ( m_hitData.hitIntensity != 2 ) )
+			{
+				m_hitData.hitIntensity = 4;
+			}
+			if( !( ScriptExecutionContext.GetArgumentBool( context, 'WasDeadOnInit' ) ) )
+			{
+				PlayHitReactionAction( context );
+				if( ( npcType == gamedataNPCType.Human || npcType == gamedataNPCType.Android ) && IsFloorSteepEnoughToRagdoll( context ) )
+				{
+					GameInstance.GetDelaySystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).DelayEvent( ScriptExecutionContext.GetOwner( context ), CreateForceRagdollEvent( 'NPC died on sloped terrain' ), TDB.GetFloat( T"AIGeneralSettings.ragdollFloorAngleActivationDelay" ), true );
+				}
+			}
+			AnimationControllerComponent.ApplyFeatureToReplicate( puppet, 'hit', m_hitData );
+			AnimationControllerComponent.PushEventToReplicate( puppet, 'hit' );
+		}
+		if( npcType == gamedataNPCType.Human && puppet.ShouldSpawnBloodPuddle() )
+		{
+			SpawnBloodPuddle( puppet );
+		}
+		StopMotionExtraction( context );
+	}
+
+	protected function IsFloorSteepEnoughToRagdoll( context : ScriptExecutionContext ) : Bool
+	{
+		var floorAngle : Float;
+		if( SpatialQueriesHelper.GetFloorAngle( ScriptExecutionContext.GetOwner( context ), floorAngle ) && ( floorAngle >= TDB.GetFloat( T"AIGeneralSettings.maxAllowedIncapacitatedFloorAngle" ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected function TurnOnRagdoll( context : ScriptExecutionContext, activationReason : CName )
+	{
+		var hitPosition : Vector4;
+		var hitImpulse : Vector4;
+		var ragdollImpulse : Float;
+		var hitInfluenceRadius : Float;
+		var owner : ScriptedPuppet;
+		var hrc : HitReactionComponent;
+		if( m_previousRagdollTimeStamp == EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) )
+		{
+			return;
+		}
+		m_previousRagdollTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		owner = GetPuppet( context );
+		if( !( ( ( NPCPuppet )( owner ) ).IsRagdolling() ) && !( StatusEffectSystem.ObjectHasStatusEffect( owner, T"BaseStatusEffect.ForceKillFromRagdoll" ) ) )
+		{
+			hrc = owner.GetHitReactionComponent();
+			if( hrc )
+			{
+				hitPosition = hrc.GetHitPosition();
+				hitImpulse = hrc.GetOverridenHitDirection();
+				ragdollImpulse = hrc.GetRagdollImpulse();
+			}
+			if( ragdollImpulse <= 0.0 )
+			{
+				ragdollImpulse = 1.0;
+			}
+			hitInfluenceRadius = 10000.0;
+			owner.QueueEvent( CreateForceRagdollEvent( activationReason ) );
+			GameInstance.GetDelaySystem( owner.GetGame() ).DelayEvent( owner, CreateRagdollApplyImpulseEvent( hitPosition, hitImpulse * ragdollImpulse, hitInfluenceRadius ), 0.1, false );
+		}
+		owner.GetHitReactionComponent().UpdateDeathHasBeenPlayed();
+		ChangeHighLevelState( context );
+	}
+
+	protected virtual function CanSkipDeathAnimation() : Bool
+	{
+		return true;
+	}
+
+	protected virtual function PlayHitReactionAction( context : ScriptExecutionContext ) : Bool
+	{
+		m_hitReactionAction = GetPuppet( context ).GetHitReactionComponent().GetHitReactionProxyAction();
+		m_hitReactionAction.Stop();
+		if( !( m_hitReactionAction.Setup( m_hitData, ShouldFastForward( context ) ) ) )
+		{
+			m_hitReactionAction.Launch();
+			return false;
+		}
+		m_hitReactionAction.Launch();
+		return true;
+	}
+
+	protected virtual function StopMotionExtraction( context : ScriptExecutionContext )
+	{
+		var stopMotionExtractionDelay : Float;
+		var evt : HitReactionStopMotionExtraction;
+		stopMotionExtractionDelay = GetPuppet( context ).GetFloatFromCharacterTweak( "deathReaction_motionDuration", -1.0 );
+		if( stopMotionExtractionDelay > 0.0 )
+		{
+			evt = new HitReactionStopMotionExtraction;
+			GameInstance.GetDelaySystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).DelayEvent( ScriptExecutionContext.GetOwner( context ), evt, stopMotionExtractionDelay );
+		}
+	}
+
+	protected export override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		m_updateFrame += 1;
+		if( m_updateFrame >= 2 )
+		{
+			if( ( ( !( ScriptExecutionContext.GetArgumentBool( context, 'WasDeadOnInit' ) ) && !( m_deathHasBeenPlayed ) ) && !( GetPuppet( context ).GetHitReactionComponent().GetDefeatedHasBeenPlayed() ) ) && !( PlayHitReactionAction( context ) ) )
+			{
+				TurnOnRagdoll( context, 'Death animation likely isnt streamed in!' );
+			}
+			SetUpdateInterval( context, 999999.0 );
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+	protected export override function Deactivate( context : ScriptExecutionContext )
+	{
+		super.Deactivate( context );
+		m_deathHasBeenPlayed = true;
+		if( m_hitReactionAction )
+		{
+			m_hitReactionAction.Stop();
+		}
+		m_hitReactionAction = NULL;
+	}
+
+	public static function ShouldUseRagdoll( owner : ScriptedPuppet ) : Bool
+	{
+		if( !( owner ) )
+		{
+			return false;
+		}
+		if( owner.GetMovePolicesComponent().IsOnOffMeshLink() && owner.GetNPCType() != gamedataNPCType.Drone )
+		{
+			return true;
+		}
+		if( owner.ShouldSkipDeathAnimation() )
+		{
+			return true;
+		}
+		if( GameInstance.GetWorkspotSystem( owner.GetGame() ).IsActorInWorkspot( owner ) && owner.GetNPCType() != gamedataNPCType.Drone )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected virtual function GetDeathReactionType( context : ScriptExecutionContext ) : Int32
+	{
+		var owner : ScriptedPuppet;
+		owner = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( AIDeathReactionsTask.ShouldUseRagdoll( owner ) )
+		{
+			return ( ( Int32 )( animHitReactionType.Ragdoll ) );
+		}
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Human ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'BrainMeltDeathAnimation' ) )
+		{
+			return 10;
+		}
+		if( owner && ( ( NPCPuppet )( owner ) ).ShouldSkipDeathAnimation() == true )
+		{
+			return ( ( Int32 )( animHitReactionType.None ) );
+		}
+		return ( ( Int32 )( animHitReactionType.Death ) );
+	}
+
+	protected function ChangeHighLevelState( context : ScriptExecutionContext )
+	{
+		NPCPuppet.ChangeHighLevelState( ScriptExecutionContext.GetOwner( context ), gamedataNPCHighLevelState.Dead );
+	}
+
+	protected function SpawnBloodPuddle( puppet : weak< ScriptedPuppet > )
+	{
+		var evt : BloodPuddleEvent;
+		evt = new BloodPuddleEvent;
+		if( !( puppet ) || VehicleComponent.IsMountedToVehicle( puppet.GetGame(), puppet ) )
+		{
+			return;
+		}
+		evt = new BloodPuddleEvent;
+		evt.m_slotName = 'Chest';
+		evt.cyberBlood = NPCManager.HasVisualTag( puppet, 'CyberTorso' );
+		GameInstance.GetDelaySystem( puppet.GetGame() ).DelayEvent( puppet, evt, 3.0 );
+	}
+
+	protected virtual function AngleToAttackSource( context : ScriptExecutionContext, hitData : AnimFeature_HitReactionsData ) : Float
+	{
+		var newLocalHitDirection : Vector4;
+		var finalAngleToAttackSource : Float;
+		var newForwardLocalToWorldAngle : Float;
+		var finalHitDirection : Int32;
+		if( hitData.hitSource == 0 )
+		{
+			switch( ( ( NPCPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetHitReactionComponent().GetHitReactionData().hitDirection )
+			{
+				case 4:
+					finalAngleToAttackSource = 180.0;
+				break;
+				case 1:
+					finalAngleToAttackSource = 270.0;
+				break;
+				case 2:
+					finalAngleToAttackSource = 0.0;
+				break;
+				case 3:
+					finalAngleToAttackSource = 90.0;
+				break;
+				default:
+					break;
+			}
+		}
+		else
+		{
+			newForwardLocalToWorldAngle = Vector4.Heading( GetPuppet( context ).GetWorldForward() );
+			newLocalHitDirection = Vector4.RotByAngleXY( GetPuppet( context ).GetHitReactionComponent().GetHitSource().GetWorldForward(), newForwardLocalToWorldAngle );
+			finalHitDirection = RoundMath( ( Vector4.Heading( newLocalHitDirection ) + 180.0 ) / 90.0 );
+			if( finalHitDirection == 0 )
+			{
+				finalHitDirection = 4;
+			}
+			switch( finalHitDirection )
+			{
+				case 4:
+					finalAngleToAttackSource = 180.0;
+				break;
+				case 1:
+					finalAngleToAttackSource = 270.0;
+				break;
+				case 2:
+					finalAngleToAttackSource = 0.0;
+				break;
+				case 3:
+					finalAngleToAttackSource = 90.0;
+				break;
+				default:
+					break;
+			}
+		}
+		return finalAngleToAttackSource;
+	}
+
+	protected virtual function GetHitData( context : ScriptExecutionContext ) : AnimFeature_HitReactionsData
+	{
+		var animFeature : AnimFeature_HitReactionsData;
+		var owner : ScriptedPuppet;
+		owner = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		animFeature = owner.GetHitReactionComponent().GetHitReactionData();
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Drone ) && !( GameInstance.GetNavigationSystem( owner.GetGame() ).IsOnGround( owner ) ) )
+		{
+			animFeature.animVariation = 10;
+		}
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Human ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'BrainMeltDeathAnimation' ) )
+		{
+			return BrainMeltDeathData( context );
+		}
+		return animFeature;
+	}
+
+	protected virtual function ShouldFastForward( context : ref< ScriptExecutionContext > ) : Bool
+	{
+		var rawValue : Variant;
+		if( !( m_fastForwardAnimation ) )
+		{
+			return false;
+		}
+		rawValue = ScriptExecutionContext.GetMappingValue( context, m_fastForwardAnimation );
+		return ( ( Bool )rawValue );
+	}
+
+	protected function BrainMeltDeathData( context : ScriptExecutionContext ) : AnimFeature_HitReactionsData
+	{
+		var animFeature : AnimFeature_HitReactionsData;
+		animFeature = new AnimFeature_HitReactionsData;
+		animFeature.hitIntensity = 1;
+		animFeature.hitSource = 1;
+		animFeature.hitType = 10;
+		animFeature.npcMovementSpeed = 1;
+		animFeature.hitDirection = 0;
+		animFeature.npcMovementDirection = 0;
+		animFeature.stance = 0;
+		animFeature.animVariation = RandRange( 0, AITweakParams.GetIntFromTweak( T"AIGeneralSettings", "numberOfBrainMeltAnimations" ) );
+		return animFeature;
+	}
+
+}
+
+class DeadOnInitTask extends AIbehaviortaskScript
+{
+	editable var m_preventSkippingDeathAnimation : Bool;
+	default m_preventSkippingDeathAnimation = true;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var puppet : NPCPuppet;
+		NPCPuppet.ChangeHighLevelState( ScriptExecutionContext.GetOwner( context ), gamedataNPCHighLevelState.Dead );
+		puppet = GetNPCPuppet( context );
+		if( puppet )
+		{
+			if( m_preventSkippingDeathAnimation )
+			{
+				puppet.SetSkipDeathAnimation( false );
+			}
+		}
+		puppet.DisableCollision();
+	}
+
+}
+
+class NormalDeathTask extends AIDeathReactionsTask
+{
+}
+
+class DeathIsRagdollCondition extends AIbehaviorconditionScript
+{
+
+	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		var owner : ScriptedPuppet;
+		owner = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		return AIDeathReactionsTask.ShouldUseRagdoll( owner );
+	}
+
+}
+
+class WithoutHitDataDeathTask extends AIDeathReactionsTask
+{
+
+	protected override function GetHitData( context : ScriptExecutionContext ) : AnimFeature_HitReactionsData
+	{
+		var owner : ScriptedPuppet;
+		owner = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'Crippled' ) )
+		{
+			return BleedingDeathData( context );
+		}
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Human ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'BrainMeltDeathAnimation' ) )
+		{
+			return BrainMeltDeathData( context );
+		}
+		return DebugDeathData( context );
+	}
+
+	protected override function GetDeathReactionType( context : ScriptExecutionContext ) : Int32
+	{
+		var owner : ScriptedPuppet;
+		owner = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Drone ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'Crippled' ) )
+		{
+			return ( ( Int32 )( animHitReactionType.Death ) );
+		}
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Human ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'BrainMeltDeathAnimation' ) )
+		{
+			return 10;
+		}
+		if( ( owner && owner.GetNPCType() == gamedataNPCType.Human ) && ScriptExecutionContext.GetArgumentBool( context, 'WasDeadOnInit' ) )
+		{
+			return 0;
+		}
+		return ( ( Int32 )( animHitReactionType.Ragdoll ) );
+	}
+
+	private virtual function BleedingDeathData( context : ScriptExecutionContext ) : AnimFeature_HitReactionsData
+	{
+		var animFeature : AnimFeature_HitReactionsData;
+		animFeature = new AnimFeature_HitReactionsData;
+		animFeature.hitIntensity = 1;
+		animFeature.hitSource = 0;
+		animFeature.hitType = 7;
+		animFeature.npcMovementSpeed = 0;
+		animFeature.hitDirection = 1;
+		animFeature.npcMovementDirection = 0;
+		animFeature.stance = 1;
+		if( StatusEffectSystem.ObjectHasStatusEffectOfType( ScriptExecutionContext.GetOwner( context ), gamedataStatusEffectType.Wounded ) )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffectWithTag( ScriptExecutionContext.GetOwner( context ), 'LeftArm' ) )
+			{
+				animFeature.hitBodyPart = 2;
+			}
+			if( StatusEffectSystem.ObjectHasStatusEffectWithTag( ScriptExecutionContext.GetOwner( context ), 'RightArm' ) )
+			{
+				animFeature.hitBodyPart = 3;
+			}
+			if( StatusEffectSystem.ObjectHasStatusEffectWithTag( ScriptExecutionContext.GetOwner( context ), 'LeftLeg' ) )
+			{
+				animFeature.hitBodyPart = 5;
+			}
+			if( StatusEffectSystem.ObjectHasStatusEffectWithTag( ScriptExecutionContext.GetOwner( context ), 'RightLeg' ) )
+			{
+				animFeature.hitBodyPart = 6;
+			}
+		}
+		return animFeature;
+	}
+
+	private virtual function DebugDeathData( context : ScriptExecutionContext ) : AnimFeature_HitReactionsData
+	{
+		var animFeature : AnimFeature_HitReactionsData;
+		var puppet : ScriptedPuppet;
+		puppet = GetPuppet( context );
+		animFeature = new AnimFeature_HitReactionsData;
+		animFeature.hitIntensity = 1;
+		animFeature.hitSource = 0;
+		animFeature.hitType = ( ( Int32 )( animHitReactionType.Ragdoll ) );
+		animFeature.hitBodyPart = 4;
+		animFeature.npcMovementSpeed = 0;
+		animFeature.hitDirection = 4;
+		animFeature.npcMovementDirection = 0;
+		animFeature.stance = 2;
+		if( puppet.GetNPCType() == gamedataNPCType.Drone )
+		{
+			animFeature.hitType = ( ( Int32 )( animHitReactionType.Death ) );
+			animFeature.animVariation = 10;
+			GameInstance.GetDelaySystem( puppet.GetGame() ).DelayEvent( puppet, CreateForceRagdollEvent( 'Drone aerial death fallback event' ), TweakDBInterface.GetFloat( puppet.GetRecordID() + T".airDeathRagdollDelay", 1.0 ), true );
+		}
+		if( ( puppet && puppet.GetNPCType() == gamedataNPCType.Human ) && ScriptExecutionContext.GetArgumentBool( context, 'WasDeadOnInit' ) )
+		{
+			animFeature = new AnimFeature_HitReactionsData;
+		}
+		return animFeature;
+	}
+
+}
+
+class SyncAnimDeathTask extends WithoutHitDataDeathTask
+{
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		GetPuppet( context ).GetHitReactionComponent().UpdateDeathHasBeenPlayed();
+		NPCPuppet.ChangeHighLevelState( ScriptExecutionContext.GetOwner( context ), gamedataNPCHighLevelState.Dead );
+	}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		SetUpdateInterval( context, 999999.0 );
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+}
+
+class ForcedRagdollDeathTask extends AIDeathReactionsTask
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		TurnOnRagdoll( context, 'The ragdoll was forced on the NPC by the behavior tree' );
+	}
+
+}
+
+class VehicleDeathTask extends AIDeathReactionsTask
+{
+	var m_vehNPCDeathData : AnimFeature_VehicleNPCDeathData;
+	var m_previousState : gamedataNPCHighLevelState;
+	var m_timeToRagdoll : Float;
+	default m_timeToRagdoll = 0.44f;
+	var m_hasRagdolled : Bool;
+	var m_activationTimeStamp : Float;
+	private var m_readyToUnmount : Bool;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		m_readyToUnmount = false;
+		m_vehNPCDeathData = new AnimFeature_VehicleNPCDeathData;
+		m_previousState = ( ( gamedataNPCHighLevelState )( GetPuppet( context ).GetPuppetStateBlackboard().GetInt( GetAllBlackboardDefs().PuppetState.HighLevel ) ) );
+		if( VehicleComponent.IsMountedToVehicle( GetPuppet( context ).GetGame(), GetPuppet( context ) ) )
+		{
+			GameInstance.GetWorkspotSystem( GetPuppet( context ).GetGame() ).HardResetPlaybackToStart( GetPuppet( context ) );
+		}
+		super.Activate( context );
+		m_vehNPCDeathData.deathType = GetVehicleDeathType( context );
+		m_vehNPCDeathData.side = m_hitData.hitDirection;
+		SendVehNPCDeathData( context );
+		m_activationTimeStamp = EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) );
+		if( m_vehNPCDeathData.deathType != ( ( Int32 )( animNPCVehicleDeathType.Ragdoll ) ) )
+		{
+			GetNPCPuppet( context ).SetDisableRagdoll( true );
+		}
+	}
+
+	protected override function CanSkipDeathAnimation() : Bool
+	{
+		return false;
+	}
+
+	protected override function PlayHitReactionAction( context : ScriptExecutionContext ) : Bool
+	{
+		return true;
+	}
+
+	protected override function Deactivate( context : ScriptExecutionContext )
+	{
+		GetNPCPuppet( context ).SetDisableRagdoll( false );
+		ScriptExecutionContext.GetOwner( context ).QueueEvent( CreateForceRagdollEvent( 'VehicleDeathTask_Deactivate' ) );
+		super.Deactivate( context );
+	}
+
+	protected function GetVehicleDeathType( context : ScriptExecutionContext ) : Int32
+	{
+		var mountInfo : MountingInfo;
+		var slotName : CName;
+		var vehType : String;
+		var slotNames : array< CName >;
+		VehicleComponent.GetVehicleType( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ), vehType );
+		mountInfo = GameInstance.GetMountingFacility( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetMountingInfoSingleWithObjects( ScriptExecutionContext.GetOwner( context ) );
+		slotName = mountInfo.slotId.id;
+		if( vehType == "Bike" )
+		{
+			return ( ( Int32 )( animNPCVehicleDeathType.Ragdoll ) );
+		}
+		VehicleComponent.GetPassengersSlotNames( slotNames );
+		if( !( slotNames.Contains( slotName ) ) )
+		{
+			return ( ( Int32 )( animNPCVehicleDeathType.Ragdoll ) );
+		}
+		if( m_previousState == gamedataNPCHighLevelState.Combat )
+		{
+			if( slotName == VehicleComponent.GetDriverSlotName() )
+			{
+				return ( ( Int32 )( animNPCVehicleDeathType.Combat ) );
+			}
+			return ( ( Int32 )( animNPCVehicleDeathType.Ragdoll ) );
+		}
+		return ( ( Int32 )( animNPCVehicleDeathType.Relaxed ) );
+	}
+
+	protected override function GetDeathReactionType( context : ScriptExecutionContext ) : Int32
+	{
+		return ( ( Int32 )( animHitReactionType.Death ) );
+	}
+
+	protected function SendVehNPCDeathData( context : ScriptExecutionContext )
+	{
+		AnimationControllerComponent.ApplyFeatureToReplicate( ScriptExecutionContext.GetOwner( context ), 'VehicleNPCDeathData', m_vehNPCDeathData );
+		AnimationControllerComponent.PushEventToReplicate( ScriptExecutionContext.GetOwner( context ), 'VehicleNPCDeathData' );
+		if( VehicleComponent.IsDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ) ) )
+		{
+			SendAIEventToMountedVehicle( context, 'DriverDead' );
+		}
+	}
+
+	protected function SendAIEventToMountedVehicle( context : ScriptExecutionContext, eventName : CName ) : Bool
+	{
+		var vehicle : weak< GameObject >;
+		var evt : AIEvent;
+		if( !( IsNameValid( eventName ) ) || !( GetAIComponent( context ).GetAssignedVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicle ) ) )
+		{
+			return false;
+		}
+		evt = new AIEvent;
+		evt.name = eventName;
+		vehicle.QueueEvent( evt );
+		return true;
+	}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var workspotSystem : WorkspotGameSystem;
+		var knockOverBike : KnockOverBikeEvent;
+		var mountInfo : MountingInfo;
+		if( m_readyToUnmount )
+		{
+			workspotSystem = GameInstance.GetWorkspotSystem( GetPuppet( context ).GetGame() );
+			workspotSystem.UnmountFromVehicle( NULL, ScriptExecutionContext.GetOwner( context ), true );
+			AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		if( m_vehNPCDeathData.deathType == ( ( Int32 )( animNPCVehicleDeathType.Ragdoll ) ) )
+		{
+			if( !( m_hasRagdolled ) && ( ( EngineTime.ToFloat( ScriptExecutionContext.GetAITime( context ) ) - m_activationTimeStamp ) >= m_timeToRagdoll ) )
+			{
+				mountInfo = GameInstance.GetMountingFacility( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetMountingInfoSingleWithObjects( ScriptExecutionContext.GetOwner( context ),  );
+				ScriptExecutionContext.GetOwner( context ).QueueEvent( CreateForceRagdollWithCustomFilterDataEvent( 'RagdollVehicle', 'VehicleDeathTask_Update' ) );
+				m_readyToUnmount = true;
+				m_hasRagdolled = true;
+				knockOverBike = new KnockOverBikeEvent;
+				knockOverBike.forceKnockdown = true;
+				knockOverBike.applyDirectionalForce = true;
+				GameInstance.FindEntityByID( ScriptExecutionContext.GetOwner( context ).GetGame(), mountInfo.parentId ).QueueEvent( knockOverBike );
+			}
+		}
+		return AIbehaviorUpdateOutcome.IN_PROGRESS;
+	}
+
+}
+
+class SetSkipDeathAnimationTask extends AIbehaviortaskScript
+{
+	editable var m_value : Bool;
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		var puppet : NPCPuppet;
+		puppet = ( ( NPCPuppet )( GetPuppet( context ) ) );
+		if( puppet )
+		{
+			puppet.SetSkipDeathAnimation( m_value );
+		}
+	}
+
+}
+

@@ -1,0 +1,949 @@
+struct ForcedStateData
+{
+	persistent var state : ECLSForcedState;
+	persistent var sourceName : CName;
+	persistent var priority : EPriority;
+	persistent var savable : Bool;
+	default savable = true;
+}
+
+struct RecipientData
+{
+	persistent var fuseID : Int32;
+	persistent var entryID : Int32;
+}
+
+struct FuseData
+{
+	persistent var psOwnerData : PSOwnerData;
+	persistent var timeTable : array< SDeviceTimetableEntry >;
+	persistent var lights : Int32;
+}
+
+class TimetableCallbackData extends IScriptable
+{
+	private persistent var m_time : SSimpleGameTime;
+	private persistent var m_recipients : array< RecipientData >;
+	private persistent var m_callbackID : Uint32;
+
+	public function Initialize( timetableEntry : SSimpleGameTime, recipient : RecipientData )
+	{
+		m_time = timetableEntry;
+		AddRecipient( recipient );
+	}
+
+	public const function GetTime() : SSimpleGameTime
+	{
+		return m_time;
+	}
+
+	public const function GetGameTime() : GameTime
+	{
+		return GameTime.MakeGameTime( 0, m_time.hours, m_time.minutes, m_time.seconds );
+	}
+
+	public const function GetRecipients() : array< RecipientData >
+	{
+		return m_recipients;
+	}
+
+	public const function GetCallbackID() : Uint32
+	{
+		return m_callbackID;
+	}
+
+	public function AddRecipient( recipient : RecipientData )
+	{
+		if( !( HasReciepient( recipient ) ) )
+		{
+			m_recipients.PushBack( recipient );
+		}
+	}
+
+	public function SetCallbackID( id : Uint32 )
+	{
+		m_callbackID = id;
+	}
+
+	private function HasReciepient( recipient : RecipientData ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_recipients.Size(); i += 1 )
+		{
+			if( recipient.fuseID == m_recipients[ i ].fuseID )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+}
+
+class CityLightSystemUpdateEvent extends Event
+{
+}
+
+class NotifyRecipientsRequest extends ScriptableSystemRequest
+{
+	var recipients : array< RecipientData >;
+	var time : GameTime;
+}
+
+class ForceCLSStateRequest extends ScriptableSystemRequest
+{
+	editable var state : ECLSForcedState;
+	editable var sourceName : CName;
+	editable var priority : EPriority;
+	default priority = EPriority.Medium;
+	editable var removePreviousRequests : Bool;
+	default removePreviousRequests = true;
+	var savable : Bool;
+	default savable = true;
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Force CLS State";
+	}
+
+}
+
+class TimeTableCallbackRequest extends ScriptableSystemRequest
+{
+	var m_callBackID : Uint32;
+}
+
+class RegisterTimetableRequest extends ScriptableSystemRequest
+{
+	var requesterData : PSOwnerData;
+	var timeTable : array< SDeviceTimetableEntry >;
+	var lights : Int32;
+}
+
+class UnregisterTimetableRequest extends ScriptableSystemRequest
+{
+	var requesterData : PSOwnerData;
+}
+
+class CLSWeatherListener extends WeatherScriptListener
+{
+	private var m_owner : weak< CityLightSystem >;
+
+	public function Initialize( owner : CityLightSystem )
+	{
+		m_owner = owner;
+	}
+
+	public export override function OnRainIntensityChanged( rainIntensity : Float ) {}
+
+	public export override function OnRainIntensityTypeChanged( rainIntensityType : worldRainIntensity )
+	{
+		if( rainIntensityType == worldRainIntensity.HeavyRain )
+		{
+			TurnOnLights( 'RAIN' );
+		}
+		else if( rainIntensityType == worldRainIntensity.NoRain )
+		{
+			TurnOffLights( 'RAIN' );
+		}
+	}
+
+	private function TurnOnLights( reason : CName )
+	{
+		var request : ForceCLSStateRequest;
+		if( m_owner )
+		{
+			request = new ForceCLSStateRequest;
+			request.state = ECLSForcedState.ForcedON;
+			request.sourceName = reason;
+			request.priority = EPriority.VeryLow;
+			request.removePreviousRequests = true;
+			request.savable = false;
+			m_owner.QueueRequest( request );
+		}
+	}
+
+	private function TurnOffLights( reason : CName )
+	{
+		var request : ForceCLSStateRequest;
+		if( m_owner )
+		{
+			request = new ForceCLSStateRequest;
+			request.state = ECLSForcedState.DEFAULT;
+			request.sourceName = reason;
+			request.priority = EPriority.VeryLow;
+			request.removePreviousRequests = true;
+			request.savable = false;
+			m_owner.QueueRequest( request );
+		}
+	}
+
+}
+
+class CityLightSystem extends ScriptableSystem
+{
+	private persistent var m_timeSystemCallbacks : array< TimetableCallbackData >;
+	private persistent var m_fuses : array< FuseData >;
+	private persistent var m_state : ECLSForcedState;
+	default m_state = ECLSForcedState.DEFAULT;
+	private persistent var m_forcedStateSource : CName;
+	private persistent var m_forcedStatesStack : array< ForcedStateData >;
+	private var m_weatherListener : CLSWeatherListener;
+	private var m_turnOffLisenerID : CName;
+	private var m_turnOnLisenerID : CName;
+	private var m_resetLisenerID : CName;
+	private var m_weatherCallbackId : Uint32;
+
+	private export override function OnAttach()
+	{
+		if( !( IsFinal() ) )
+		{
+			InitializeDebugButtons();
+			ShowDebug_state();
+		}
+		m_weatherListener = new CLSWeatherListener;
+		m_weatherListener.Initialize( this );
+		m_weatherCallbackId = GameInstance.GetWeatherSystem( GetGameInstance() ).RegisterWeatherListener( m_weatherListener );
+	}
+
+	private export override function OnDetach()
+	{
+		GameInstance.GetWeatherSystem( GetGameInstance() ).UnregisterWeatherListener( m_weatherCallbackId );
+		m_weatherListener = NULL;
+		if( !( IsFinal() ) )
+		{
+			UninitializeDebugButtons();
+		}
+	}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		var i : Int32;
+		ResolveForcedStatesStackOnLoad();
+		for( i = 0; i < m_timeSystemCallbacks.Size(); i += 1 )
+		{
+			RegisterTimetableCallback( m_timeSystemCallbacks[ i ] );
+		}
+		if( !( IsFinal() ) )
+		{
+			ShowDebug_fuses( m_fuses );
+		}
+	}
+
+	private export function OnTimeTableCallbackRequest( request : TimeTableCallbackRequest )
+	{
+		var i : Int32;
+		for( i = 0; i < m_timeSystemCallbacks.Size(); i += 1 )
+		{
+			if( request.m_callBackID == m_timeSystemCallbacks[ i ].GetCallbackID() )
+			{
+				NotifyRecipients( m_timeSystemCallbacks[ i ] );
+				if( !( IsFinal() ) )
+				{
+					ShowDebug_fuses( m_fuses );
+				}
+			}
+		}
+	}
+
+	private export function OnRegisterTimetableRequest( request : RegisterTimetableRequest )
+	{
+		AddTimeTableCallbacks( request.requesterData, request.timeTable, request.lights );
+	}
+
+	private export function OnForceCLSStateRequest( request : ForceCLSStateRequest )
+	{
+		var shoulEvaluate : Bool;
+		if( request.state == ECLSForcedState.DEFAULT )
+		{
+			shoulEvaluate = RemoveForcedStateRequestForSource( request.sourceName );
+		}
+		else
+		{
+			if( request.removePreviousRequests )
+			{
+				RemoveForcedStateRequestForSource( request.sourceName );
+			}
+			shoulEvaluate = AddForcedStateRequest( request.state, request.sourceName, request.priority, request.savable );
+		}
+		if( shoulEvaluate )
+		{
+			EvaluateForcedStatesStack();
+		}
+	}
+
+	private function UpdateCLSForcedState()
+	{
+		var i : Int32;
+		for( i = 0; i < m_fuses.Size(); i += 1 )
+		{
+			SendForceStateDeviceTimetableEvent( m_fuses[ i ], m_state );
+		}
+	}
+
+	private function AddForcedStateRequest( state : ECLSForcedState, sourceName : CName, priority : EPriority, savable : Bool ) : Bool
+	{
+		var i : Int32;
+		var data : ForcedStateData;
+		if( state == ECLSForcedState.DEFAULT || !( IsNameValid( sourceName ) ) )
+		{
+			return false;
+		}
+		for( i = 0; i < m_forcedStatesStack.Size(); i += 1 )
+		{
+			if( ( m_forcedStatesStack[ i ].state == state && m_forcedStatesStack[ i ].sourceName == sourceName ) && m_forcedStatesStack[ i ].priority == priority )
+			{
+				return false;
+			}
+		}
+		data.state = state;
+		data.sourceName = sourceName;
+		data.priority = priority;
+		data.savable = savable;
+		m_forcedStatesStack.PushBack( data );
+		return true;
+	}
+
+	private function RemoveForcedStateRequestForSource( sourceName : CName ) : Bool
+	{
+		var i : Int32;
+		var wasRemoved : Bool;
+		if( !( IsNameValid( sourceName ) ) )
+		{
+			return false;
+		}
+		for( i = m_forcedStatesStack.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_forcedStatesStack[ i ].sourceName == sourceName )
+			{
+				m_forcedStatesStack.Erase( i );
+				wasRemoved = true;
+			}
+		}
+		return wasRemoved;
+	}
+
+	private function ResolveForcedStatesStackOnLoad()
+	{
+		var wasRemoved : Bool;
+		var i : Int32;
+		for( i = m_forcedStatesStack.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( !( IsNameValid( m_forcedStatesStack[ i ].sourceName ) ) || !( IsForcedRequestSavable( m_forcedStatesStack[ i ] ) ) )
+			{
+				m_forcedStatesStack.Erase( i );
+				wasRemoved = true;
+			}
+		}
+		if( wasRemoved )
+		{
+			EvaluateForcedStatesStack();
+		}
+	}
+
+	private function EvaluateForcedStatesStack()
+	{
+		var i : Int32;
+		var newPriority : EPriority;
+		var newState : ECLSForcedState;
+		var newSource : CName;
+		var shouldUpdate : Bool;
+		shouldUpdate = false;
+		newPriority = EPriority.VeryLow;
+		newState = ECLSForcedState.DEFAULT;
+		for( i = 0; i < m_forcedStatesStack.Size(); i += 1 )
+		{
+			if( !( IsNameValid( m_forcedStatesStack[ i ].sourceName ) ) )
+			{
+				continue;
+			}
+			if( ( ( Int32 )( m_forcedStatesStack[ i ].priority ) ) >= ( ( Int32 )( newPriority ) ) )
+			{
+				newPriority = m_forcedStatesStack[ i ].priority;
+				newState = m_forcedStatesStack[ i ].state;
+				newSource = m_forcedStatesStack[ i ].sourceName;
+			}
+		}
+		if( m_state != newState )
+		{
+			shouldUpdate = true;
+		}
+		m_state = newState;
+		m_forcedStateSource = newSource;
+		if( shouldUpdate )
+		{
+			UpdateCLSForcedState();
+			if( !( IsFinal() ) )
+			{
+				ShowDebug_state();
+			}
+		}
+	}
+
+	private function IsForcedRequestSavable( data : ForcedStateData ) : Bool
+	{
+		if( data.sourceName == 'RAIN' )
+		{
+			return false;
+		}
+		else
+		{
+			return data.savable;
+		}
+	}
+
+	private function RegisterTimetableCallback( callbackData : TimetableCallbackData )
+	{
+		var request : TimeTableCallbackRequest;
+		var timeout : GameTime;
+		var entryTime : GameTime;
+		var timeSystem : TimeSystem;
+		timeSystem = GameInstance.GetTimeSystem( GetGameInstance() );
+		timeout = GameTime.MakeGameTime( 0, 24, 0, 0 );
+		request = new TimeTableCallbackRequest;
+		entryTime = callbackData.GetGameTime();
+		timeout += entryTime;
+		request.m_callBackID = timeSystem.RegisterScriptableSystemIntervalListener( 'CityLightSystem', request, entryTime, timeout, -1 );
+		callbackData.SetCallbackID( request.m_callBackID );
+		NotifyRecipientsOnRegistration( callbackData );
+	}
+
+	private function NotifyRecipientsOnRegistration( callbackData : TimetableCallbackData )
+	{
+		var recipients : array< RecipientData >;
+		var i : Int32;
+		recipients = callbackData.GetRecipients();
+		for( i = 0; i < recipients.Size(); i += 1 )
+		{
+			if( ShouldNotifyRecipient( recipients[ i ], callbackData.GetGameTime() ) )
+			{
+				SendDeviceTimetableEvent( recipients[ i ] );
+			}
+		}
+	}
+
+	private function NotifyRecipients( callbackData : TimetableCallbackData )
+	{
+		var recipients : array< RecipientData >;
+		recipients = callbackData.GetRecipients();
+		SendNotificationToRecipients( recipients, callbackData.GetGameTime() );
+	}
+
+	private function SendNotificationToRecipients( recipients : array< RecipientData >, time : GameTime )
+	{
+		var i : Int32;
+		var totalNotifications : Int32;
+		var excessRecipients : array< RecipientData >;
+		for( i = 0; i < recipients.Size(); i += 1 )
+		{
+			if( totalNotifications >= GetMaxNotificationsPerFrame() )
+			{
+				excessRecipients.PushBack( recipients[ i ] );
+			}
+			else if( ShouldNotifyRecipient( recipients[ i ], time ) )
+			{
+				SendDeviceTimetableEvent( recipients[ i ] );
+				totalNotifications += 1;
+			}
+		}
+		if( excessRecipients.Size() > 0 )
+		{
+			SendNotificationByRequest( excessRecipients, time );
+		}
+	}
+
+	private function SendNotificationByRequest( recipients : array< RecipientData >, time : GameTime )
+	{
+		var request : NotifyRecipientsRequest;
+		request = new NotifyRecipientsRequest;
+		request.recipients = recipients;
+		request.time = time;
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequestNextFrame( GetClassName(), request );
+	}
+
+	private function OnNotifyRecipientsrequest( request : NotifyRecipientsRequest )
+	{
+		SendNotificationToRecipients( request.recipients, request.time );
+	}
+
+	private constexpr static function GetMaxNotificationsPerFrame() : Int32
+	{
+		return 50;
+	}
+
+	private function SendDeviceTimetableEvent( data : RecipientData )
+	{
+		var evt : DeviceTimetableEvent;
+		var fuse : FuseData;
+		evt = new DeviceTimetableEvent;
+		if( GetFuse( data.fuseID, fuse ) )
+		{
+			if( m_state == ECLSForcedState.DEFAULT )
+			{
+				evt.state = fuse.timeTable[ data.entryID ].state;
+			}
+			else if( m_state == ECLSForcedState.ForcedON )
+			{
+				evt.state = EDeviceStatus.ON;
+			}
+			else if( m_state == ECLSForcedState.ForcedOFF )
+			{
+				evt.state = EDeviceStatus.OFF;
+			}
+			evt.requesterID = PersistentID.ExtractEntityID( fuse.psOwnerData.id );
+			if( EntityID.IsDefined( evt.requesterID ) )
+			{
+				GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( fuse.psOwnerData.id, fuse.psOwnerData.className, evt );
+			}
+		}
+	}
+
+	private function SendForceStateDeviceTimetableEvent( fuse : FuseData, state : ECLSForcedState )
+	{
+		var evt : DeviceTimetableEvent;
+		var entry : SDeviceTimetableEntry;
+		evt = new DeviceTimetableEvent;
+		if( m_state == ECLSForcedState.DEFAULT )
+		{
+			GetActiveTimeTableEntry( fuse, entry );
+			evt.state = entry.state;
+		}
+		else if( m_state == ECLSForcedState.ForcedON )
+		{
+			evt.state = EDeviceStatus.ON;
+		}
+		else if( m_state == ECLSForcedState.ForcedOFF )
+		{
+			evt.state = EDeviceStatus.OFF;
+		}
+		evt.requesterID = PersistentID.ExtractEntityID( fuse.psOwnerData.id );
+		if( EntityID.IsDefined( evt.requesterID ) )
+		{
+			GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( fuse.psOwnerData.id, fuse.psOwnerData.className, evt );
+		}
+	}
+
+	private function AddTimeTableCallbacks( requesterData : PSOwnerData, timeTable : array< SDeviceTimetableEntry >, optional lights : Int32 )
+	{
+		var i : Int32;
+		var callbackData : TimetableCallbackData;
+		var recipientData : RecipientData;
+		var fuseID : Int32;
+		fuseID = AddFuse( requesterData, timeTable, lights );
+		for( i = 0; i < timeTable.Size(); i += 1 )
+		{
+			callbackData = GetTimeTableCallback( timeTable[ i ].time );
+			recipientData.fuseID = fuseID;
+			recipientData.entryID = i;
+			if( callbackData == NULL )
+			{
+				callbackData = new TimetableCallbackData;
+				callbackData.Initialize( timeTable[ i ].time, recipientData );
+				m_timeSystemCallbacks.PushBack( callbackData );
+				RegisterTimetableCallback( callbackData );
+			}
+			else
+			{
+				callbackData.AddRecipient( recipientData );
+			}
+		}
+	}
+
+	private function GetTimeTableCallback( time : SSimpleGameTime ) : TimetableCallbackData
+	{
+		var i : Int32;
+		for( i = 0; i < m_timeSystemCallbacks.Size(); i += 1 )
+		{
+			if( IsTimeTheSame( m_timeSystemCallbacks[ i ].GetTime(), time ) )
+			{
+				return m_timeSystemCallbacks[ i ];
+			}
+		}
+		return NULL;
+	}
+
+	private function AddFuse( requesterData : PSOwnerData, timeTable : array< SDeviceTimetableEntry >, optional lights : Int32 ) : Int32
+	{
+		var fuse : FuseData;
+		var id : Int32;
+		if( !( HasFuse( requesterData, id ) ) )
+		{
+			fuse.psOwnerData = requesterData;
+			fuse.timeTable = timeTable;
+			fuse.lights = lights;
+			m_fuses.PushBack( fuse );
+			if( !( IsFinal() ) )
+			{
+				ShowDebug_fuses( m_fuses );
+			}
+			id = m_fuses.Size() - 1;
+			return id;
+		}
+		return id;
+	}
+
+	private const function HasFuse( requesterData : PSOwnerData, out id : Int32 ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_fuses.Size(); i += 1 )
+		{
+			if( m_fuses[ i ].psOwnerData.id == requesterData.id )
+			{
+				id = i;
+				return true;
+			}
+		}
+		id = -1;
+		return false;
+	}
+
+	private const function GetFuseID( requesterData : PSOwnerData ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_fuses.Size(); i += 1 )
+		{
+			if( m_fuses[ i ].psOwnerData.id == requesterData.id )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function GetFuseID( id : PersistentID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_fuses.Size(); i += 1 )
+		{
+			if( m_fuses[ i ].psOwnerData.id == id )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private const function GetFuse( fuseID : Int32, out fuseData : FuseData ) : Bool
+	{
+		if( ( fuseID >= 0 ) && ( fuseID < m_fuses.Size() ) )
+		{
+			fuseData = m_fuses[ fuseID ];
+			return true;
+		}
+		return false;
+	}
+
+	private function IsTimeTheSame( time1 : SSimpleGameTime, time2 : SSimpleGameTime ) : Bool
+	{
+		return ( ( time1.hours == time2.hours ) && ( time1.minutes == time2.minutes ) ) && ( time1.seconds == time2.seconds );
+	}
+
+	private const function GetCurrentTime() : GameTime
+	{
+		var currentTime : GameTime;
+		var time : GameTime;
+		currentTime = GameInstance.GetTimeSystem( GetGameInstance() ).GetGameTime();
+		time = GameTime.MakeGameTime( 0, GameTime.Hours( currentTime ), GameTime.Minutes( currentTime ), GameTime.Seconds( currentTime ) );
+		return time;
+	}
+
+	private const function ShouldNotifyRecipient( recipient : RecipientData, callbackTime : GameTime ) : Bool
+	{
+		var entryTime : GameTime;
+		var entry : SDeviceTimetableEntry;
+		var fuse : FuseData;
+		if( !( GetFuse( recipient.fuseID, fuse ) ) )
+		{
+			return false;
+		}
+		if( GetActiveTimeTableEntry( fuse, entry ) )
+		{
+			entryTime = GameTime.MakeGameTime( 0, entry.time.hours, entry.time.minutes, entry.time.seconds );
+			return entryTime == callbackTime;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	private const function GetActiveTimeTableEntry( fuse : FuseData, out entry : SDeviceTimetableEntry ) : Bool
+	{
+		var currentTime : GameTime;
+		var entryTime : GameTime;
+		var time : GameTime;
+		var storedtime : GameTime;
+		var i : Int32;
+		var id : Int32;
+		var wasTimeStored : Bool;
+		currentTime = GetCurrentTime();
+		id = -1;
+		for( i = 0; i < fuse.timeTable.Size(); i += 1 )
+		{
+			entryTime = GameTime.MakeGameTime( 0, fuse.timeTable[ i ].time.hours, fuse.timeTable[ i ].time.minutes, fuse.timeTable[ i ].time.seconds );
+			if( currentTime < entryTime )
+			{
+				time = ( GameTime.MakeGameTime( 0, 24, 0, 0 ) - entryTime ) + currentTime;
+			}
+			else
+			{
+				time = currentTime - entryTime;
+			}
+			if( ( time < storedtime ) || !( wasTimeStored ) )
+			{
+				wasTimeStored = true;
+				storedtime = time;
+				id = i;
+				entry = fuse.timeTable[ i ];
+			}
+		}
+		return id >= 0;
+	}
+
+	private const function GetActiveTimeTableEntryID( fuse : FuseData ) : Int32
+	{
+		var currentTime : GameTime;
+		var entryTime : GameTime;
+		var time : GameTime;
+		var storedtime : GameTime;
+		var i : Int32;
+		var id : Int32;
+		var wasTimeStored : Bool;
+		currentTime = GetCurrentTime();
+		id = -1;
+		for( i = 0; i < fuse.timeTable.Size(); i += 1 )
+		{
+			entryTime = GameTime.MakeGameTime( 0, fuse.timeTable[ i ].time.hours, fuse.timeTable[ i ].time.minutes, fuse.timeTable[ i ].time.seconds );
+			if( currentTime < entryTime )
+			{
+				time = ( GameTime.MakeGameTime( 0, 24, 0, 0 ) - entryTime ) + currentTime;
+			}
+			else
+			{
+				time = currentTime - entryTime;
+			}
+			if( ( time < storedtime ) || !( wasTimeStored ) )
+			{
+				wasTimeStored = true;
+				storedtime = time;
+				id = i;
+			}
+		}
+		return id;
+	}
+
+	public const function GetFuseStateByID( id : PersistentID ) : EDeviceStatus
+	{
+		var fuse : FuseData;
+		var returnValue : EDeviceStatus;
+		var entry : SDeviceTimetableEntry;
+		returnValue = EDeviceStatus.DISABLED;
+		if( m_state == ECLSForcedState.DEFAULT )
+		{
+			if( GetFuse( GetFuseID( id ), fuse ) )
+			{
+				if( GetActiveTimeTableEntry( fuse, entry ) )
+				{
+					returnValue = entry.state;
+				}
+			}
+		}
+		else
+		{
+			if( m_state == ECLSForcedState.ForcedON )
+			{
+				returnValue = EDeviceStatus.ON;
+			}
+			else if( m_state == ECLSForcedState.ForcedOFF )
+			{
+				returnValue = EDeviceStatus.OFF;
+			}
+		}
+		return returnValue;
+	}
+
+	public const function GetState() : ECLSForcedState
+	{
+		return m_state;
+	}
+
+	public const function GetFusesCount() : Int32
+	{
+		return m_fuses.Size();
+	}
+
+	public const function GetLightsCount() : Int32
+	{
+		var i : Int32;
+		var counter : Int32;
+		for( i = 0; i < m_fuses.Size(); i += 1 )
+		{
+			counter += m_fuses[ i ].lights;
+		}
+		return counter;
+	}
+
+	public const function GetCallbacks() : array< TimetableCallbackData >
+	{
+		return m_timeSystemCallbacks;
+	}
+
+	private function OnDebugButtonClicked( request : SDOClickedRequest )
+	{
+		var stateRequest : ForceCLSStateRequest;
+		stateRequest = new ForceCLSStateRequest;
+		if( request.key == 'Turn On' )
+		{
+			stateRequest.state = ECLSForcedState.ForcedON;
+			stateRequest.sourceName = 'DEBUG';
+			stateRequest.priority = EPriority.Absolute;
+			stateRequest.removePreviousRequests = true;
+			QueueRequest( stateRequest );
+		}
+		else if( request.key == 'Turn Off' )
+		{
+			stateRequest.state = ECLSForcedState.ForcedOFF;
+			stateRequest.sourceName = 'DEBUG';
+			stateRequest.priority = EPriority.Absolute;
+			stateRequest.removePreviousRequests = true;
+			QueueRequest( stateRequest );
+		}
+		else if( request.key == 'Reset' )
+		{
+			stateRequest.state = ECLSForcedState.DEFAULT;
+			stateRequest.sourceName = 'DEBUG';
+			stateRequest.priority = EPriority.Absolute;
+			stateRequest.removePreviousRequests = true;
+			QueueRequest( stateRequest );
+		}
+	}
+
+	private function UninitializeDebugButtons()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "CLS" );
+		SDOSink.UnregisterListener_OnClicked( sink, this, m_turnOffLisenerID );
+		SDOSink.UnregisterListener_OnClicked( sink, this, m_turnOnLisenerID );
+		SDOSink.UnregisterListener_OnClicked( sink, this, m_resetLisenerID );
+	}
+
+	private function InitializeDebugButtons()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "CLS" );
+		SDOSink.PushString( sink, "Turn On", "EXECUTE" );
+		SDOSink.PushString( sink, "Turn Off", "EXECUTE" );
+		SDOSink.PushString( sink, "Reset", "EXECUTE" );
+		m_turnOnLisenerID = SDOSink.RegisterListener_OnClicked( sink, this, "Turn On" );
+		m_turnOffLisenerID = SDOSink.RegisterListener_OnClicked( sink, this, "Turn Off" );
+		m_resetLisenerID = SDOSink.RegisterListener_OnClicked( sink, this, "Reset" );
+	}
+
+	private function ShowDebug_state()
+	{
+		var sink : SDOSink;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "CLS" );
+		SDOSink.PushString( sink, "STATE", ( ( String )( GetState() ) ) );
+		SDOSink.SetRoot( sink, "CLS/STATE" );
+		SDOSink.PushName( sink, "SOURCE", m_forcedStateSource );
+	}
+
+	private function ShowDebug_fuses( fuses : array< FuseData > )
+	{
+		var sink : SDOSink;
+		var entryString : String;
+		var stateString : String;
+		var globalIDString : String;
+		var activeEntry : SDeviceTimetableEntry;
+		var i : Int32;
+		var k : Int32;
+		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
+		SDOSink.SetRoot( sink, "CLS" );
+		SDOSink.PushString( sink, "FUSES", ( ( String )( GetFusesCount() ) ) );
+		SDOSink.PushString( sink, "LIGHTS", ( ( String )( GetLightsCount() ) ) );
+		for( i = 0; i < fuses.Size(); i += 1 )
+		{
+			globalIDString = PersistentID.ToDebugString( fuses[ i ].psOwnerData.id );
+			if( !( PersistentID.IsDefined( fuses[ i ].psOwnerData.id ) ) )
+			{
+				globalIDString += " [WARNING: INVALID GLOBAL ID!]";
+			}
+			SDOSink.SetRoot( sink, "CLS/FUSES/fuse" + ( ( String )( i ) ) );
+			SDOSink.PushString( sink, "", globalIDString );
+			SDOSink.PushString( sink, "globalID", globalIDString );
+			SDOSink.PushString( sink, "connectedLights", ( ( String )( fuses[ i ].lights ) ) );
+			for( k = 0; k < fuses[ i ].timeTable.Size(); k += 1 )
+			{
+				activeEntry = fuses[ i ].timeTable[ k ];
+				entryString = ( ( ( ( ( String )( activeEntry.time.hours ) ) + " : " ) + ( ( String )( activeEntry.time.minutes ) ) ) + " : " ) + ( ( String )( activeEntry.time.seconds ) );
+				stateString = ( " [" + ( ( String )( activeEntry.state ) ) ) + "]";
+				entryString += stateString;
+				if( GetActiveTimeTableEntryID( fuses[ i ] ) == k )
+				{
+					entryString += " [ACTIVE]";
+				}
+				SDOSink.PushString( sink, "entry" + ( ( String )( k ) ), entryString );
+			}
+		}
+	}
+
+}
+
+enum ECLSForcedState
+{
+	DEFAULT = 0,
+	ForcedON = 1,
+	ForcedOFF = 2,
+}
+
+exec function CLS_on( gameInstance : GameInstance )
+{
+	var request : ForceCLSStateRequest;
+	var system : CityLightSystem;
+	system = ( ( CityLightSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'CityLightSystem' ) ) );
+	if( system )
+	{
+		request = new ForceCLSStateRequest;
+		request.state = ECLSForcedState.ForcedON;
+		request.sourceName = 'DEBUG';
+		request.priority = EPriority.Absolute;
+		request.removePreviousRequests = true;
+		system.QueueRequest( request );
+	}
+}
+
+exec function CLS_off( gameInstance : GameInstance )
+{
+	var request : ForceCLSStateRequest;
+	var system : CityLightSystem;
+	system = ( ( CityLightSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'CityLightSystem' ) ) );
+	if( system )
+	{
+		request = new ForceCLSStateRequest;
+		request.state = ECLSForcedState.ForcedOFF;
+		request.sourceName = 'DEBUG';
+		request.priority = EPriority.Absolute;
+		request.removePreviousRequests = true;
+		system.QueueRequest( request );
+	}
+}
+
+exec function CLS_reset( gameInstance : GameInstance )
+{
+	var request : ForceCLSStateRequest;
+	var system : CityLightSystem;
+	system = ( ( CityLightSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'CityLightSystem' ) ) );
+	if( system )
+	{
+		request = new ForceCLSStateRequest;
+		request.state = ECLSForcedState.DEFAULT;
+		request.sourceName = 'DEBUG';
+		request.priority = EPriority.Absolute;
+		request.removePreviousRequests = true;
+		system.QueueRequest( request );
+	}
+}
+

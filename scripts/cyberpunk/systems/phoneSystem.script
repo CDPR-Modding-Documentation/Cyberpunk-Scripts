@@ -1,0 +1,293 @@
+import class questSetPhoneStatusRequest extends ScriptableSystemRequest
+{
+	import var status : CName;
+}
+
+import class questTriggerCallRequest extends ScriptableSystemRequest
+{
+	import var caller : CName;
+	import var addressee : CName;
+	import var callPhase : questPhoneCallPhase;
+	import var callMode : questPhoneCallMode;
+	import var isPlayerTriggered : Bool;
+	import var isRejectable : Bool;
+}
+
+import class questMinimizeCallRequest extends ScriptableSystemRequest
+{
+	import var minimized : Bool;
+}
+
+class UsePhoneRequest extends ScriptableSystemRequest
+{
+}
+
+class PhoneTimeoutRequest extends ScriptableSystemRequest
+{
+}
+
+class PickupPhoneRequest extends ScriptableSystemRequest
+{
+	var CallInformation : PhoneCallInformation;
+	var shouldBeRejected : Bool;
+}
+
+class TalkingTriggerRequest extends ScriptableSystemRequest
+{
+	var isPlayerCalling : Bool;
+	var contact : CName;
+	var state : questPhoneTalkingState;
+}
+
+class PhoneSystem extends ScriptableSystem
+{
+	private var m_BlackboardSystem : BlackboardSystem;
+	private var m_Blackboard : weak< IBlackboard >;
+	private var m_LastCallInformation : PhoneCallInformation;
+	private var m_ContactsOpen : Bool;
+	default m_ContactsOpen = false;
+	private var ContactsOpenBBId : CallbackHandle;
+
+	private function IsShowingMessage() : Bool
+	{
+		return m_Blackboard.GetBool( GetAllBlackboardDefs().UI_ComDevice.isDisplayingMessage );
+	}
+
+	private export function OnSetPhoneStatus( request : questSetPhoneStatusRequest )
+	{
+		m_Blackboard.SetName( GetAllBlackboardDefs().UI_ComDevice.comDeviceSetStatusText, request.status, true );
+	}
+
+	private export function OnTriggerCall( request : questTriggerCallRequest )
+	{
+		var contactName : CName;
+		var shouldPlayIncomingCallSound : Bool;
+		shouldPlayIncomingCallSound = request.callPhase == questPhoneCallPhase.IncomingCall;
+		if( request.callPhase == questPhoneCallPhase.IncomingCall || request.callPhase == questPhoneCallPhase.StartCall )
+		{
+			ToggleContacts( false );
+		}
+		if( ( IsNameValid( request.caller ) && request.caller != 'player' ) && request.caller != 'Player' )
+		{
+			if( shouldPlayIncomingCallSound )
+			{
+				GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call' );
+			}
+			contactName = request.caller;
+		}
+		else if( ( IsNameValid( request.addressee ) && request.addressee != 'player' ) && request.addressee != 'Player' )
+		{
+			if( shouldPlayIncomingCallSound )
+			{
+				GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_initiation_call' );
+			}
+			contactName = request.addressee;
+		}
+		if( IsNameValid( contactName ) )
+		{
+			TriggerCall( request.callMode, request.callMode == questPhoneCallMode.Audio, contactName, request.caller == 'Player' || request.caller == 'player', request.callPhase, request.isPlayerTriggered, request.isRejectable );
+		}
+	}
+
+	private function TriggerCall( callMode : questPhoneCallMode, isAudio : Bool, contactName : CName, isPlayerCalling : Bool, callPhase : questPhoneCallPhase, isPlayerTriggered : Bool, optional isRejectable : Bool )
+	{
+		var state : questPhoneTalkingState;
+		m_LastCallInformation = PhoneCallInformation( callMode, isAudio, contactName, isPlayerCalling, isPlayerTriggered, callPhase, isRejectable );
+		m_Blackboard.SetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation, m_LastCallInformation, true );
+		if( callPhase == questPhoneCallPhase.EndCall )
+		{
+			state = questPhoneTalkingState.Ended;
+			if( isPlayerTriggered )
+			{
+				GameInstance.GetPhoneManager( GetGameInstance() ).ApplyPhoneCallRestriction( false );
+			}
+		}
+		else
+		{
+			state = questPhoneTalkingState.Initializing;
+			if( isPlayerTriggered )
+			{
+				GameInstance.GetPhoneManager( GetGameInstance() ).ApplyPhoneCallRestriction( true );
+			}
+		}
+		SetPhoneFact( isPlayerCalling, contactName, state );
+	}
+
+	private function OnPickupPhone( request : PickupPhoneRequest )
+	{
+		if( m_LastCallInformation.callPhase == questPhoneCallPhase.IncomingCall && request.CallInformation.contactName == m_LastCallInformation.contactName )
+		{
+			GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_initiation_call_stop' );
+			GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call_stop' );
+			if( request.shouldBeRejected )
+			{
+				SetPhoneFact( request.CallInformation.isPlayerCalling, request.CallInformation.contactName, questPhoneTalkingState.Rejected );
+			}
+			else
+			{
+				SetPhoneFact( request.CallInformation.isPlayerCalling, request.CallInformation.contactName, questPhoneTalkingState.Talking );
+			}
+		}
+	}
+
+	private function OnPhoneTimeoutRequest( request : PhoneTimeoutRequest )
+	{
+		if( m_LastCallInformation.callPhase == questPhoneCallPhase.IncomingCall )
+		{
+			TriggerCall( questPhoneCallMode.Undefined, m_LastCallInformation.isAudioCall, m_LastCallInformation.contactName, m_LastCallInformation.isPlayerCalling, questPhoneCallPhase.EndCall, m_LastCallInformation.isPlayerTriggered, m_LastCallInformation.isRejectable );
+		}
+	}
+
+	private function OnUsePhone( request : UsePhoneRequest )
+	{
+		var psmBlackboard : IBlackboard;
+		var localPlayer : weak< GameObject >;
+		var notificationEvent : UIInGameNotificationEvent;
+		var tier : Int32;
+		tier = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel );
+		if( IsShowingMessage() )
+		{
+			return;
+		}
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		psmBlackboard = GameInstance.GetBlackboardSystem( localPlayer.GetGame() ).GetLocalInstanced( localPlayer.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( m_LastCallInformation.callPhase == questPhoneCallPhase.IncomingCall )
+		{
+			if( m_LastCallInformation.isPlayerCalling )
+			{
+				GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_stop' );
+				TriggerCall( questPhoneCallMode.Undefined, m_LastCallInformation.isAudioCall, m_LastCallInformation.contactName, m_LastCallInformation.isPlayerCalling, questPhoneCallPhase.EndCall, m_LastCallInformation.isPlayerTriggered, m_LastCallInformation.isRejectable );
+			}
+			else
+			{
+				GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_positive' );
+				GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_stop' );
+				SetPhoneFact( m_LastCallInformation.isPlayerCalling, m_LastCallInformation.contactName, questPhoneTalkingState.Talking );
+			}
+		}
+		else if( ( ( tier >= ( ( Int32 )( gamePSMHighLevel.SceneTier3 ) ) ) && ( tier <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'NoPhone' ) )
+		{
+			GameInstance.GetUISystem( localPlayer.GetGame() ).QueueEvent( new UIInGameNotificationRemoveEvent );
+			notificationEvent = new UIInGameNotificationEvent;
+			notificationEvent.m_notificationType = UIInGameNotificationType.ActionRestriction;
+			GameInstance.GetUISystem( localPlayer.GetGame() ).QueueEvent( notificationEvent );
+			return;
+		}
+		else if( m_LastCallInformation.callPhase == questPhoneCallPhase.Undefined || m_LastCallInformation.callPhase == questPhoneCallPhase.EndCall )
+		{
+			if( !( m_ContactsOpen ) )
+			{
+				ToggleContacts( true );
+			}
+		}
+	}
+
+	private function ToggleContacts( open : Bool )
+	{
+		m_Blackboard.SetBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, open, true );
+	}
+
+	private function OnContactsStateChanged( newState : Bool )
+	{
+		m_ContactsOpen = newState;
+	}
+
+	private export function OnTalkingTriggerRequest( request : TalkingTriggerRequest )
+	{
+		GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_initiation_call_stop' );
+		GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call_stop' );
+		GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call_positive' );
+		SetPhoneFact( request.isPlayerCalling, request.contact, request.state );
+	}
+
+	private function OnMinimizeCallRequest( request : questMinimizeCallRequest )
+	{
+		m_LastCallInformation.isAudioCall = request.minimized;
+		m_LastCallInformation.callMode = ( ( request.minimized ) ? ( questPhoneCallMode.Audio ) : ( questPhoneCallMode.Video ) );
+		m_Blackboard.SetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation, m_LastCallInformation, false );
+		m_Blackboard.SetBool( GetAllBlackboardDefs().UI_ComDevice.PhoneStyle_Minimized, request.minimized, true );
+	}
+
+	private function SetPhoneFact( isPlayerCalling : Bool, contactName : CName, state : questPhoneTalkingState )
+	{
+		var factName : String;
+		if( isPlayerCalling )
+		{
+			factName = GetPhoneCallFactName( 'player', contactName );
+		}
+		else
+		{
+			factName = GetPhoneCallFactName( contactName, 'player' );
+		}
+		GameInstance.GetQuestsSystem( GetGameInstance() ).SetFactStr( factName, ( ( Int32 )( state ) ) );
+	}
+
+	private export override function OnAttach()
+	{
+		m_BlackboardSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
+		m_Blackboard = m_BlackboardSystem.Get( GetAllBlackboardDefs().UI_ComDevice );
+		ContactsOpenBBId = m_Blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, this, 'OnContactsStateChanged' );
+	}
+
+	private export override function OnDetach()
+	{
+		if( m_Blackboard )
+		{
+			m_Blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, ContactsOpenBBId );
+		}
+	}
+
+	public const function IsPhoneAvailable() : Bool
+	{
+		return ( m_LastCallInformation.callPhase == questPhoneCallPhase.Undefined || m_LastCallInformation.callPhase == questPhoneCallPhase.EndCall ) || m_LastCallInformation.callPhase == questPhoneCallPhase.IncomingCall;
+	}
+
+	public const function GetPhoneCallFactName( contactName1 : CName, contactName2 : CName ) : String
+	{
+		return ( ( "phonecall_" + StrLower( NameToString( contactName1 ) ) ) + "_with_" ) + StrLower( NameToString( contactName2 ) );
+	}
+
+}
+
+importonly struct PhoneCallInformation
+{
+	import var callMode : questPhoneCallMode;
+	import var isAudioCall : Bool;
+	import var contactName : CName;
+	import var isPlayerCalling : Bool;
+	import var isPlayerTriggered : Bool;
+	import var callPhase : questPhoneCallPhase;
+	import var isRejectable : Bool;
+}
+
+import enum questPhoneStatus
+{
+	Available,
+	NotAvailable,
+	Busy,
+	Minimized,
+}
+
+import enum questPhoneCallPhase
+{
+	Undefined,
+	IncomingCall,
+	StartCall,
+	EndCall,
+}
+
+import enum questPhoneCallMode
+{
+	Undefined,
+	Audio,
+	Video,
+}
+
+import enum questPhoneTalkingState
+{
+	Ended,
+	Initializing,
+	Talking,
+	Rejected,
+}
+

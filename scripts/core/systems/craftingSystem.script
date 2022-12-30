@@ -1,0 +1,1641 @@
+struct ItemAttachments
+{
+	var itemID : ItemID;
+	var attachmentSlotID : TweakDBID;
+
+	public static function Create( itemID : ItemID, attachmentSlotID : TweakDBID ) : ItemAttachments
+	{
+		var itemAttachment : ItemAttachments;
+		itemAttachment.itemID = itemID;
+		itemAttachment.attachmentSlotID = attachmentSlotID;
+		return itemAttachment;
+	}
+
+}
+
+class CraftingSystem extends ScriptableSystem
+{
+	private var m_lastActionStatus : Bool;
+	private persistent var m_playerCraftBook : CraftBook;
+	private var m_callback : CraftingSystemInventoryCallback;
+	private var m_inventoryListener : InventoryScriptListener;
+	private var m_itemIconGender : ItemIconGender;
+
+	private export override function OnAttach()
+	{
+		if( !( m_playerCraftBook ) )
+		{
+			m_playerCraftBook = new CraftBook;
+		}
+	}
+
+	private export function OnPlayerAttach( request : PlayerAttachRequest )
+	{
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( request.owner.GetGame() ).GetLocalPlayerMainGameObject() ) );
+		m_itemIconGender = UIGenderHelper.GetIconGender( player );
+		m_callback = new CraftingSystemInventoryCallback;
+		m_callback.player = player;
+		m_inventoryListener = GameInstance.GetTransactionSystem( player.GetGame() ).RegisterInventoryListener( player, m_callback );
+		if( m_playerCraftBook )
+		{
+			m_playerCraftBook.InitializeCraftBookOwner( player );
+		}
+	}
+
+	private function OnPlayerDetach( request : PlayerDetachRequest )
+	{
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( request.owner ) );
+		GameInstance.GetTransactionSystem( player.GetGame() ).UnregisterInventoryListener( player, m_inventoryListener );
+		m_inventoryListener = NULL;
+	}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		var factVal : Int32;
+		var warningMsg : SimpleScreenMessage;
+		warningMsg.isShown = true;
+		warningMsg.duration = 20.0;
+		warningMsg.message = IntToString( saveVersion );
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, warningMsg, true );
+		factVal = GetFact( GetGameInstance(), 'IconicItemsRevampCompleted' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2 ) )
+		{
+			ProcessIconicRevampRestoration();
+			SetFactValue( GetGameInstance(), 'IconicItemsRevampCompleted', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'AmmoRecipesAdded' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2 ) )
+		{
+			AddAmmoRecipes();
+			SetFactValue( GetGameInstance(), 'AmmoRecipesAdded', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'RecipesCraftedAmountRestored' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2 ) )
+		{
+			m_playerCraftBook.ResetRecipeCraftedAmount();
+			SetFactValue( GetGameInstance(), 'RecipesCraftedAmountRestored', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'LegendaryLizzieFixed' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2 ) )
+		{
+			if( GameInstance.GetTransactionSystem( GetGameInstance() ).HasItem( m_playerCraftBook.GetOwner(), ItemID.CreateQuery( T"Items.Preset_Omaha_Suzie_Epic" ) ) )
+			{
+				m_playerCraftBook.AddRecipe( T"Items.Preset_Omaha_Suzie_Legendary",  );
+				SetFactValue( GetGameInstance(), 'LegendaryLizzieFixed', 1 );
+			}
+		}
+		factVal = GetFact( GetGameInstance(), 'UncommonKnifeAdded' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1300 ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Craftable_Uncommon_Knife",  );
+			SetFactValue( GetGameInstance(), 'UncommonKnifeAdded', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'CraftedItemsDynamicBonus' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1500 ) )
+		{
+			ProcessCraftedItemsPowerBoost();
+			SetFactValue( GetGameInstance(), 'CraftedItemsDynamicBonus', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'DLCStashItemsRevamp' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1500 ) ) && ( saveVersion <= 212 ) )
+		{
+			HideDLCRecipes();
+			AddDLCBaseRecipes();
+			InstallModsToRedesignedItems();
+			SetFactValue( GetGameInstance(), 'DLCStashItemsRevamp', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'ButchersKnifeRemoved' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1600 ) )
+		{
+			HideButchersKnifeRecipes();
+			CompensateForOwnedButchersKnifeRecipes();
+			SetFactValue( GetGameInstance(), 'ButchersKnifeRemoved', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'BuckGradScopeFix' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1600 ) )
+		{
+			InstallModsToRedesignedItems();
+			SetFactValue( GetGameInstance(), 'BuckGradScopeFix', 1 );
+		}
+	}
+
+	public static function GetInstance( gameInstance : GameInstance ) : CraftingSystem
+	{
+		var cs : CraftingSystem;
+		cs = ( ( CraftingSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'CraftingSystem' ) ) );
+		return cs;
+	}
+
+	public const function GetPlayerCraftBook() : CraftBook
+	{
+		return m_playerCraftBook;
+	}
+
+	public const function GetPlayerCraftableItems() : array< weak< Item_Record > >
+	{
+		return m_playerCraftBook.GetCraftableItems();
+	}
+
+	public const function GetItemFinalUpgradeCost( itemData : weak< gameItemData > ) : array< IngredientData >
+	{
+		var i : Int32;
+		var tempStat : Float;
+		var statsSystem : StatsSystem;
+		var ingredients : array< IngredientData >;
+		var upgradeNumber : Float;
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		upgradeNumber = itemData.GetStatValueByType( gamedataStatType.WasItemUpgraded );
+		upgradeNumber += 1.0;
+		ingredients = GetItemBaseUpgradeCost( itemData.GetItemType(), RPGManager.GetItemQuality( itemData ) );
+		for( i = 0; i < ingredients.Size(); i += 1 )
+		{
+			ingredients[ i ].quantity = ingredients[ i ].quantity * ( ( Int32 )( upgradeNumber ) );
+			ingredients[ i ].baseQuantity = ingredients[ i ].quantity;
+		}
+		tempStat = statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.UpgradingCostReduction );
+		if( tempStat > 0.0 )
+		{
+			for( i = 0; i < ingredients.Size(); i += 1 )
+			{
+				ingredients[ i ].quantity = ( ( Int32 )( ( ( Float )( ingredients[ i ].quantity ) ) * ( 1.0 - tempStat ) ) );
+			}
+		}
+		return ingredients;
+	}
+
+	public const function GetItemBaseUpgradeCost( itemType : gamedataItemType, quality : gamedataQuality ) : array< IngredientData >
+	{
+		var i : Int32;
+		var record : UpgradingData_Record;
+		var upgradeData : array< weak< RecipeElement_Record > >;
+		var baseIngredients : array< IngredientData >;
+		record = TweakDBInterface.GetUpgradingDataRecord( T"Upgrading." + TDBID.Create( EnumValueToString( "gamedataItemType", ( ( Int32 )( itemType ) ) ) ) );
+		record.Ingredients( upgradeData );
+		for( i = 0; i < upgradeData.Size(); i += 1 )
+		{
+			baseIngredients.PushBack( CreateIngredientData( upgradeData[ i ] ) );
+		}
+		upgradeData.Clear();
+		record = TweakDBInterface.GetUpgradingDataRecord( T"Upgrading." + TDBID.Create( EnumValueToString( "gamedataQuality", ( ( Int32 )( quality ) ) ) ) );
+		record.Ingredients( upgradeData );
+		for( i = 0; i < upgradeData.Size(); i += 1 )
+		{
+			baseIngredients.PushBack( CreateIngredientData( upgradeData[ i ] ) );
+		}
+		return baseIngredients;
+	}
+
+	public const function GetItemCraftingCost( itemData : weak< gameItemData > ) : array< IngredientData >
+	{
+		var itemRecord : weak< Item_Record >;
+		var baseIngredients : array< IngredientData >;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemData.GetID() ) );
+		baseIngredients = GetItemCraftingCost( itemRecord );
+		return baseIngredients;
+	}
+
+	public const function GetItemCraftingCost( itemRecord : weak< Item_Record > ) : array< IngredientData >
+	{
+		var record : weak< CraftingPackage_Record >;
+		var craftingData : array< weak< RecipeElement_Record > >;
+		var baseIngredients : array< IngredientData >;
+		record = itemRecord.CraftingData();
+		record.CraftingRecipe( craftingData );
+		baseIngredients = GetItemCraftingCost( itemRecord, craftingData );
+		return baseIngredients;
+	}
+
+	public const function GetItemCraftingCost( record : weak< Item_Record >, craftingData : array< weak< RecipeElement_Record > > ) : array< IngredientData >
+	{
+		var i : Int32;
+		var modifiedQuantity : Int32;
+		var tempStat : Float;
+		var statsSystem : StatsSystem;
+		var baseIngredients : array< IngredientData >;
+		var expectedQuality : gamedataQuality;
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		for( i = 0; i < craftingData.Size(); i += 1 )
+		{
+			baseIngredients.PushBack( CreateIngredientData( craftingData[ i ] ) );
+		}
+		tempStat = statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CraftingCostReduction );
+		if( tempStat > 0.0 )
+		{
+			for( i = 0; i < baseIngredients.Size(); i += 1 )
+			{
+				if( baseIngredients[ i ].quantity > 1 )
+				{
+					modifiedQuantity = ( ( Int32 )( CeilF( ( ( Float )( baseIngredients[ i ].quantity ) ) * ( 1.0 - tempStat ) ) ) );
+					baseIngredients[ i ].quantity = modifiedQuantity;
+				}
+			}
+		}
+		if( record.Quality().Type() == gamedataQuality.Random )
+		{
+			expectedQuality = ( ( gamedataQuality )( ( ( Int32 )( EnumValueFromName( 'gamedataQuality', RPGManager.SetQualityBasedOnCraftingSkill( m_playerCraftBook.GetOwner() ) ) ) ) ) );
+			if( expectedQuality >= gamedataQuality.Uncommon )
+			{
+				baseIngredients.PushBack( CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Uncommon, true ), 8 ) );
+			}
+			if( expectedQuality >= gamedataQuality.Rare )
+			{
+				baseIngredients.PushBack( CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Rare, true ), 5 ) );
+			}
+			if( expectedQuality >= gamedataQuality.Epic )
+			{
+				baseIngredients.PushBack( CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Epic, true ), 3 ) );
+			}
+			if( expectedQuality >= gamedataQuality.Legendary )
+			{
+				baseIngredients.PushBack( CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Legendary, true ), 2 ) );
+			}
+		}
+		return baseIngredients;
+	}
+
+	public const function CanItemBeDisassembled( owner : weak< GameObject >, itemID : ItemID ) : Bool
+	{
+		var itemData : weak< gameItemData >;
+		itemData = GameInstance.GetTransactionSystem( GetGameInstance() ).GetItemData( owner, itemID );
+		if( RPGManager.IsItemEquipped( owner, itemID ) )
+		{
+			return false;
+		}
+		return CanItemBeDisassembled( itemData );
+	}
+
+	public const function CanItemBeDisassembled( itemData : weak< gameItemData > ) : Bool
+	{
+		if( itemData )
+		{
+			return ( !( itemData.HasTag( 'Quest' ) ) && !( itemData.HasTag( 'UnequipBlocked' ) ) ) && ItemActionsHelper.GetDisassembleAction( itemData.GetID() );
+		}
+		return false;
+	}
+
+	public const function CanItemBeCrafted( itemData : weak< gameItemData > ) : Bool
+	{
+		var result : Bool;
+		var requiredIngredients : array< IngredientData >;
+		var quality : gamedataQuality;
+		var ammoCap, currentQuantity, resultQuantity : Int32;
+		var transactionSystem : TransactionSystem;
+		var itemRecord : Item_Record;
+		var itemTweakDBID : TweakDBID;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		requiredIngredients = GetItemCraftingCost( itemData );
+		if( itemData.GetItemType() == gamedataItemType.Prt_Program )
+		{
+			result = HasIngredients( requiredIngredients );
+		}
+		else
+		{
+			result = HasIngredients( requiredIngredients ) && CanCraftGivenQuality( itemData, quality );
+		}
+		if( result )
+		{
+			itemTweakDBID = ItemID.GetTDBID( itemData.GetID() );
+			itemRecord = TweakDBInterface.GetItemRecord( itemTweakDBID );
+			if( itemRecord.TagsContains( 'Ammo' ) )
+			{
+				ammoCap = ( ( Int32 )( itemData.GetStatValueByType( gamedataStatType.Quantity ) ) );
+				currentQuantity = transactionSystem.GetItemQuantity( m_playerCraftBook.GetOwner(), itemData.GetID() );
+				resultQuantity = ( ammoCap - currentQuantity ) / GetAmmoBulletAmount( itemTweakDBID );
+				result = resultQuantity > 0;
+			}
+		}
+		return result;
+	}
+
+	public const function CanItemBeCrafted( itemRecord : weak< Item_Record > ) : Bool
+	{
+		var result : Bool;
+		var requiredIngredients : array< IngredientData >;
+		var quality : gamedataQuality;
+		requiredIngredients = GetItemCraftingCost( itemRecord );
+		if( itemRecord.ItemType().Type() == gamedataItemType.Prt_Program )
+		{
+			result = HasIngredients( requiredIngredients );
+		}
+		else
+		{
+			result = HasIngredients( requiredIngredients ) && CanCraftGivenQuality( itemRecord, quality );
+		}
+		return result;
+	}
+
+	public const function EnoughIngredientsForCrafting( itemData : weak< gameItemData > ) : Bool
+	{
+		var result : Bool;
+		var requiredIngredients : array< IngredientData >;
+		requiredIngredients = GetItemCraftingCost( itemData );
+		result = HasIngredients( requiredIngredients );
+		return result;
+	}
+
+	public const function GetMaxCraftingAmount( itemData : weak< gameItemData > ) : Int32
+	{
+		var result, i, currentQuantity : Int32;
+		var requiredIngredients : array< IngredientData >;
+		var transactionSystem : TransactionSystem;
+		var ammoCap : Int32;
+		var itemRecord : Item_Record;
+		var itemTweakDBID : TweakDBID;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		requiredIngredients = GetItemCraftingCost( itemData );
+		result = 10000000;
+		for( i = 0; i < requiredIngredients.Size(); i += 1 )
+		{
+			currentQuantity = transactionSystem.GetItemQuantity( m_playerCraftBook.GetOwner(), ItemID.CreateQuery( requiredIngredients[ i ].id.GetID() ) );
+			if( currentQuantity > requiredIngredients[ i ].quantity )
+			{
+				result = Min( result, currentQuantity / requiredIngredients[ i ].quantity );
+			}
+			else
+			{
+				return 0;
+			}
+		}
+		itemTweakDBID = ItemID.GetTDBID( itemData.GetID() );
+		itemRecord = TweakDBInterface.GetItemRecord( itemTweakDBID );
+		if( itemRecord.TagsContains( 'Ammo' ) )
+		{
+			currentQuantity = transactionSystem.GetItemQuantity( m_playerCraftBook.GetOwner(), itemData.GetID() );
+			ammoCap = ( ( ( Int32 )( itemData.GetStatValueByType( gamedataStatType.Quantity ) ) ) - currentQuantity ) / GetAmmoBulletAmount( itemTweakDBID );
+			result = Min( ammoCap, result );
+		}
+		return Max( result, 0 );
+	}
+
+	public const function EnoughIngredientsForUpgrading( itemData : weak< gameItemData > ) : Bool
+	{
+		var result : Bool;
+		var requiredIngredients : array< IngredientData >;
+		requiredIngredients = GetItemFinalUpgradeCost( itemData );
+		result = HasIngredients( requiredIngredients );
+		return result;
+	}
+
+	public const function CanItemBeUpgraded( itemData : weak< gameItemData > ) : Bool
+	{
+		var result : Bool;
+		var requiredIngredients : array< IngredientData >;
+		if( RPGManager.IsItemMaxLevel( itemData ) )
+		{
+			return false;
+		}
+		requiredIngredients = GetItemFinalUpgradeCost( itemData );
+		result = HasIngredients( requiredIngredients );
+		return result;
+	}
+
+	public const function HasIngredients( required : array< IngredientData > ) : Bool
+	{
+		var i : Int32;
+		var currentQuantity : Int32;
+		var transactionSystem : TransactionSystem;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		for( i = 0; i < required.Size(); i += 1 )
+		{
+			currentQuantity = transactionSystem.GetItemQuantity( m_playerCraftBook.GetOwner(), ItemID.CreateQuery( required[ i ].id.GetID() ) );
+			if( currentQuantity < required[ i ].quantity )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public const function CanCraftGivenQuality( itemData : weak< gameItemData >, out quality : gamedataQuality ) : Bool
+	{
+		var ss : StatsSystem;
+		var canCraft : Bool;
+		ss = GameInstance.GetStatsSystem( GetGameInstance() );
+		quality = RPGManager.GetItemQuality( itemData.GetStatValueByType( gamedataStatType.Quality ) );
+		switch( quality )
+		{
+			case gamedataQuality.Rare:
+				canCraft = ss.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanCraftRareItems ) > 0.0;
+			break;
+			case gamedataQuality.Epic:
+				canCraft = ss.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanCraftEpicItems ) > 0.0;
+			break;
+			case gamedataQuality.Legendary:
+				canCraft = ss.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanCraftLegendaryItems ) > 0.0;
+			break;
+			default:
+				canCraft = true;
+			break;
+		}
+		return canCraft;
+	}
+
+	public const function CanCraftGivenQuality( itemRecord : weak< Item_Record >, out quality : gamedataQuality ) : Bool
+	{
+		var ss : StatsSystem;
+		var canCraft : Bool;
+		ss = GameInstance.GetStatsSystem( GetGameInstance() );
+		quality = itemRecord.Quality().Type();
+		if( quality == gamedataQuality.Random )
+		{
+			quality = UIItemsHelper.QualityNameToEnum( RPGManager.SetQualityBasedOnCraftingSkill( GetPlayer( GetGameInstance() ) ) );
+		}
+		switch( quality )
+		{
+			case gamedataQuality.Rare:
+				canCraft = ss.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanCraftRareItems ) > 0.0;
+			break;
+			case gamedataQuality.Epic:
+				canCraft = ss.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanCraftEpicItems ) > 0.0;
+			break;
+			case gamedataQuality.Legendary:
+				canCraft = ss.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanCraftLegendaryItems ) > 0.0;
+			break;
+			default:
+				canCraft = true;
+			break;
+		}
+		return canCraft;
+	}
+
+	public const function IsRecipeKnown( recipe : TweakDBID, playerCraftBook : CraftBook ) : Bool
+	{
+		var recipeRecord : weak< ItemRecipe_Record >;
+		var itemToAdd : weak< CraftingResult_Record >;
+		recipeRecord = TweakDBInterface.GetItemRecipeRecord( recipe );
+		itemToAdd = recipeRecord.CraftingResult();
+		if( playerCraftBook.GetRecipeIndex( itemToAdd.Item().GetID() ) >= 0 )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private export function OnCraftItemRequest( request : CraftItemRequest )
+	{
+		var craftedItem : weak< gameItemData >;
+		craftedItem = CraftItem( request.target, request.itemRecord, request.amount, request.bulletAmount );
+		UpdateBlackboard( CraftingCommands.CraftingFinished, craftedItem.GetID() );
+	}
+
+	private function OnDisassembleItemRequest( request : DisassembleItemRequest )
+	{
+		if( CanItemBeDisassembled( GetPlayer( GetGameInstance() ), request.itemID ) )
+		{
+			DisassembleItem( request.target, request.itemID, request.amount );
+		}
+	}
+
+	private function OnUpgradeItemRequest( request : UpgradeItemRequest )
+	{
+		UpgradeItem( request.owner, request.itemID );
+		UpdateBlackboard( CraftingCommands.UpgradingFinished, request.itemID );
+	}
+
+	private export function OnAddRecipeRequest( request : AddRecipeRequest )
+	{
+		GetPlayerCraftBook().AddRecipe( request.recipe, request.hideOnItemsAdded, request.amount );
+	}
+
+	private function OnHideRecipeRequest( request : HideRecipeRequest )
+	{
+		GetPlayerCraftBook().HideRecipe( request.recipe, true );
+	}
+
+	private function OnShowRecipeRequest( request : ShowRecipeRequest )
+	{
+		GetPlayerCraftBook().HideRecipe( request.recipe, false );
+	}
+
+	public const function GetLastActionStatus() : Bool
+	{
+		return m_lastActionStatus;
+	}
+
+	private function CraftItem( target : weak< GameObject >, itemRecord : Item_Record, amount : Int32, optional ammoBulletAmount : Int32 ) : weak< gameItemData >
+	{
+		var ingredientRecords : array< weak< RecipeElement_Record > >;
+		var requiredIngredients : array< IngredientData >;
+		var tempStat : Float;
+		var ingredient : ItemID;
+		var transactionSystem : TransactionSystem;
+		var statsSystem : StatsSystem;
+		var j : Int32;
+		var i, recipeXP : Int32;
+		var craftedItemID : ItemID;
+		var itemData : weak< gameItemData >;
+		var randF : Float;
+		var xpID : TweakDBID;
+		var ingredientQuality : gamedataQuality;
+		var isAmmo : Bool;
+		var savedAmount : Int32;
+		var savedAmountLocked : Bool;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		randF = RandF();
+		itemRecord.CraftingData().CraftingRecipe( ingredientRecords );
+		requiredIngredients = GetItemCraftingCost( itemRecord );
+		isAmmo = itemRecord.TagsContains( 'Ammo' );
+		for( i = 0; i < requiredIngredients.Size(); i += 1 )
+		{
+			ingredient = ItemID.CreateQuery( requiredIngredients[ i ].id.GetID() );
+			if( RPGManager.IsItemWeapon( ingredient ) || RPGManager.IsItemClothing( ingredient ) )
+			{
+				itemData = transactionSystem.GetItemData( target, ingredient );
+				if( itemData && itemData.HasTag( 'Quest' ) )
+				{
+					itemData.RemoveDynamicTag( 'Quest' );
+				}
+				ClearNonIconicSlots( itemData );
+				break;
+			}
+		}
+		tempStat = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.CraftingMaterialRetrieveChance );
+		savedAmount = 0;
+		for( i = 0; i < requiredIngredients.Size(); i += 1 )
+		{
+			ingredient = ItemID.CreateQuery( requiredIngredients[ i ].id.GetID() );
+			if( ( ( RPGManager.IsItemWeapon( ingredient ) || RPGManager.IsItemClothing( ingredient ) ) || RPGManager.IsItemProgram( ingredient ) ) || RPGManager.IsItemGadget( ingredient ) )
+			{
+				randF = 100.0;
+			}
+			else if( ( tempStat > 0.0 ) && !( savedAmountLocked ) )
+			{
+				for( j = 0; j < amount; j += 1 )
+				{
+					if( RandF() < tempStat )
+					{
+						savedAmount += 1;
+					}
+				}
+				savedAmountLocked = true;
+			}
+			transactionSystem.RemoveItem( target, ingredient, requiredIngredients[ i ].quantity * ( amount - savedAmount ) );
+			if( ( randF >= tempStat ) && ( ( RPGManager.IsItemWeapon( ingredient ) || RPGManager.IsItemClothing( ingredient ) ) || RPGManager.IsItemProgram( ingredient ) ) )
+			{
+				transactionSystem.RemoveItem( target, ingredient, requiredIngredients[ i ].quantity * amount );
+			}
+			ingredientQuality = RPGManager.GetItemQualityFromRecord( TweakDBInterface.GetItemRecord( requiredIngredients[ i ].id.GetID() ) );
+			switch( ingredientQuality )
+			{
+				case gamedataQuality.Common:
+					xpID = T"Constants.CraftingSystem.commonIngredientXP";
+				break;
+				case gamedataQuality.Uncommon:
+					xpID = T"Constants.CraftingSystem.uncommonIngredientXP";
+				break;
+				case gamedataQuality.Rare:
+					xpID = T"Constants.CraftingSystem.rareIngredientXP";
+				break;
+				case gamedataQuality.Epic:
+					xpID = T"Constants.CraftingSystem.epicIngredientXP";
+				break;
+				case gamedataQuality.Legendary:
+					xpID = T"Constants.CraftingSystem.legendaryIngredientXP";
+				break;
+				default:
+					break;
+			}
+			recipeXP += ( ( TweakDBInterface.GetInt( xpID, 0 ) * requiredIngredients[ i ].baseQuantity ) * amount );
+		}
+		craftedItemID = ItemID.FromTDBID( itemRecord.GetID() );
+		transactionSystem.GiveItem( target, craftedItemID, ( ( isAmmo ) ? ( amount * ammoBulletAmount ) : ( amount ) ) );
+		itemData = transactionSystem.GetItemData( target, craftedItemID );
+		SetItemLevel( itemData );
+		SetItemQualityBasedOnPlayerSkill( itemData );
+		MarkItemAsCrafted( itemData );
+		SendItemCraftedDataTrackingRequest( craftedItemID );
+		ProcessCraftSkill( ( ( Float )( recipeXP ) ) );
+		return itemData;
+	}
+
+	private function MarkItemAsCrafted( itemData : weak< gameItemData > )
+	{
+		var statMod : gameStatModifierData;
+		statMod = RPGManager.CreateStatModifier( gamedataStatType.IsItemCrafted, gameStatModifierType.Additive, 1.0 );
+		GameInstance.GetStatsSystem( GetGameInstance() ).AddSavedModifier( itemData.GetStatsObjectID(), statMod );
+	}
+
+	private function ClearNonIconicSlots( itemData : weak< gameItemData > )
+	{
+		var i : Int32;
+		var slots : array< TweakDBID >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		var removedMod : ItemID;
+		TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+		player = ( ( PlayerPuppet )( m_playerCraftBook.GetOwner() ) );
+		slots.Clear();
+		slots = RPGManager.GetModsSlotIDs( itemData.GetItemType() );
+		for( i = 0; i < slots.Size(); i += 1 )
+		{
+			removedMod = TS.RemovePart( player, itemData.GetID(), slots[ i ] );
+			if( ItemID.IsValid( removedMod ) && !( TS.HasTag( player, 'DummyPart', removedMod ) ) )
+			{
+				TS.GiveItem( player, removedMod, 1 );
+			}
+		}
+		slots.Clear();
+		slots = RPGManager.GetAttachmentSlotIDs();
+		for( i = 0; i < slots.Size(); i += 1 )
+		{
+			removedMod = TS.RemovePart( player, itemData.GetID(), slots[ i ] );
+			if( ItemID.IsValid( removedMod ) )
+			{
+				TS.GiveItem( player, removedMod, 1 );
+			}
+		}
+	}
+
+	public static function MarkItemAsCrafted( target : weak< GameObject >, itemData : weak< gameItemData > )
+	{
+		var statMod : gameStatModifierData;
+		if( itemData.HasStatData( gamedataStatType.IsItemCrafted ) == false )
+		{
+			statMod = RPGManager.CreateStatModifier( gamedataStatType.IsItemCrafted, gameStatModifierType.Additive, 1.0 );
+			GameInstance.GetStatsSystem( target.GetGame() ).AddSavedModifier( itemData.GetStatsObjectID(), statMod );
+		}
+	}
+
+	private function SetItemLevel( itemData : weak< gameItemData > )
+	{
+		var playerPLValue : Float;
+		var craftingLevelBoost : Float;
+		var modifier : gameConstantStatModifierData;
+		var statMod : gameStatModifierData;
+		var statsSystem : StatsSystem;
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		if( ItemID.GetStructure( itemData.GetID() ) == gamedataItemStructure.Unique )
+		{
+			if( !( RPGManager.IsItemSingleInstance( itemData ) ) )
+			{
+				playerPLValue = statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.PowerLevel );
+				craftingLevelBoost = CalculateCraftingLevelBoost();
+				statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.PowerLevel, true );
+				modifier = new gameConstantStatModifierData;
+				modifier.modifierType = gameStatModifierType.Additive;
+				modifier.statType = gamedataStatType.PowerLevel;
+				modifier.value = playerPLValue;
+				statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), modifier );
+				statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.ItemLevel, true );
+				modifier = new gameConstantStatModifierData;
+				modifier.modifierType = gameStatModifierType.Additive;
+				modifier.statType = gamedataStatType.ItemLevel;
+				modifier.value = ( playerPLValue * 10.0 ) - craftingLevelBoost;
+				statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), modifier );
+				statMod = RPGManager.CreateCombinedStatModifier( gamedataStatType.ItemLevel, gameStatModifierType.Additive, gamedataStatType.WasItemUpgraded, gameCombinedStatOperation.Multiplication, 10.0, gameStatObjectsRelation.Self );
+				statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), statMod );
+			}
+		}
+	}
+
+	private function SetItemQualityBasedOnPlayerSkill( itemData : weak< gameItemData > )
+	{
+		var quality : CName;
+		var modifier : gameConstantStatModifierData;
+		var statsSystem : StatsSystem;
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		if( RPGManager.GetItemRecord( itemData.GetID() ).Quality().Type() == gamedataQuality.Random )
+		{
+			statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.Quality, true );
+			modifier = new gameConstantStatModifierData;
+			modifier.modifierType = gameStatModifierType.Additive;
+			modifier.statType = gamedataStatType.Quality;
+			quality = RPGManager.SetQualityBasedOnCraftingSkill( m_playerCraftBook.GetOwner() );
+			modifier.value = RPGManager.ItemQualityNameToValue( quality );
+			statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), modifier );
+		}
+	}
+
+	public static function SetItemLevel( target : weak< GameObject >, itemData : weak< gameItemData > )
+	{
+		var playerPLValue : Float;
+		var craftingLevelBoost : Float;
+		var modifier : gameConstantStatModifierData;
+		var statsSystem : StatsSystem;
+		statsSystem = GameInstance.GetStatsSystem( target.GetGame() );
+		if( ItemID.GetStructure( itemData.GetID() ) == gamedataItemStructure.Unique )
+		{
+			if( !( RPGManager.IsItemSingleInstance( itemData ) ) )
+			{
+				playerPLValue = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.PowerLevel );
+				craftingLevelBoost = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.CraftingItemLevelBoost );
+				statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.PowerLevel, true );
+				modifier = new gameConstantStatModifierData;
+				modifier.modifierType = gameStatModifierType.Additive;
+				modifier.statType = gamedataStatType.PowerLevel;
+				modifier.value = playerPLValue;
+				statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), modifier );
+				statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.ItemLevel, true );
+				modifier = new gameConstantStatModifierData;
+				modifier.modifierType = gameStatModifierType.Additive;
+				modifier.statType = gamedataStatType.ItemLevel;
+				modifier.value = ( playerPLValue * 10.0 ) - ( 5.0 - craftingLevelBoost );
+				statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), modifier );
+			}
+		}
+	}
+
+	private function CalculateCraftingLevelBoost() : Float
+	{
+		var reductionValue : Float;
+		reductionValue = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CraftingItemLevelBoost );
+		reductionValue = 5.0 - reductionValue;
+		return reductionValue;
+	}
+
+	private function ProcessProgramCrafting( itemTDBID : TweakDBID )
+	{
+		GetPlayerCraftBook().HideRecipe( itemTDBID, true );
+	}
+
+	public const function GetDisassemblyResultItems( target : weak< GameObject >, itemID : ItemID, amount : Int32, out restoredAttachments : array< ItemAttachments >, optional calledFromUI : Bool ) : array< IngredientData >
+	{
+		var i, j : Int32;
+		var itemData : weak< gameItemData >;
+		var newIngrData : IngredientData;
+		var itemType : gamedataItemType;
+		var itemQual : gamedataQuality;
+		var dissResult : weak< DisassemblingResult_Record >;
+		var ingredients : array< weak< RecipeElement_Record > >;
+		var outResult : array< IngredientData >;
+		var finalResult : array< IngredientData >;
+		itemType = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ).ItemType().Type();
+		dissResult = TweakDBInterface.GetDisassemblingResultRecord( T"Crafting." + TDBID.Create( EnumValueToString( "gamedataItemType", ( ( Int32 )( itemType ) ) ) ) );
+		if( !( dissResult ) )
+		{
+			dissResult = TweakDBInterface.GetDisassemblingResultRecord( T"Crafting.DisassemblingResult_Default" );
+		}
+		dissResult.Ingredients( ingredients );
+		itemData = GameInstance.GetTransactionSystem( GetGameInstance() ).GetItemData( target, itemID );
+		itemQual = RPGManager.GetItemQuality( itemData );
+		for( i = 0; i < amount; i += 1 )
+		{
+			outResult.Clear();
+			for( j = 0; j < ingredients.Size(); j += 1 )
+			{
+				newIngrData = CreateIngredientData( ingredients[ j ] );
+				AddIngredientToResult( newIngrData, outResult );
+			}
+			itemQual = RPGManager.GetItemQuality( itemData );
+			if( itemQual >= gamedataQuality.Uncommon )
+			{
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Uncommon ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+			}
+			if( itemQual >= gamedataQuality.Rare )
+			{
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Rare ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Rare, true ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+			}
+			if( itemQual >= gamedataQuality.Epic )
+			{
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Epic ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Epic, true ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+			}
+			if( itemQual >= gamedataQuality.Legendary )
+			{
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Legendary ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+				newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( gamedataQuality.Legendary, true ), 1 );
+				AddIngredientToResult( newIngrData, outResult );
+			}
+			ProcessDisassemblingPerks( outResult, itemData, restoredAttachments, calledFromUI );
+			MergeIngredients( outResult, finalResult );
+		}
+		return finalResult;
+	}
+
+	private const function AddIngredientToResult( ingredient : IngredientData, out outputResult : array< IngredientData > )
+	{
+		var i : Int32;
+		var quantityIncreased : Bool;
+		for( i = 0; i < outputResult.Size(); i += 1 )
+		{
+			if( outputResult[ i ].id == ingredient.id )
+			{
+				outputResult[ i ].quantity += ingredient.quantity;
+				quantityIncreased = true;
+			}
+		}
+		if( !( quantityIncreased ) )
+		{
+			outputResult.PushBack( ingredient );
+		}
+	}
+
+	private const function MergeIngredients( input : array< IngredientData >, out output : array< IngredientData > )
+	{
+		var i, j : Int32;
+		var quantityIncreased : Bool;
+		for( i = 0; i < input.Size(); i += 1 )
+		{
+			quantityIncreased = false;
+			for( j = 0; j < output.Size(); j += 1 )
+			{
+				if( output[ i ].id == input[ j ].id )
+				{
+					output[ i ].quantity += input[ j ].quantity;
+					quantityIncreased = true;
+				}
+			}
+			if( !( quantityIncreased ) )
+			{
+				output.PushBack( input[ j ] );
+			}
+		}
+	}
+
+	private const function DisassembleItem( target : weak< GameObject >, itemID : ItemID, amount : Int32 )
+	{
+		var transactionSystem : TransactionSystem;
+		var i : Int32;
+		var listOfIngredients : array< IngredientData >;
+		var restoredAttachments : array< ItemAttachments >;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		listOfIngredients = GetDisassemblyResultItems( target, itemID, amount, restoredAttachments );
+		for( i = 0; i < restoredAttachments.Size(); i += 1 )
+		{
+			transactionSystem.RemovePart( m_playerCraftBook.GetOwner(), itemID, restoredAttachments[ i ].attachmentSlotID );
+			transactionSystem.GiveItem( m_playerCraftBook.GetOwner(), restoredAttachments[ i ].itemID, 1 );
+		}
+		GameInstance.GetTelemetrySystem( GetGameInstance() ).LogItemDisassembled( target, itemID );
+		transactionSystem.RemoveItem( target, itemID, amount );
+		for( i = 0; i < listOfIngredients.Size(); i += 1 )
+		{
+			transactionSystem.GiveItem( target, ItemID.FromTDBID( listOfIngredients[ i ].id.GetID() ), listOfIngredients[ i ].quantity );
+		}
+		UpdateBlackboard( CraftingCommands.DisassemblingFinished, itemID, listOfIngredients );
+	}
+
+	private function UpgradeItem( owner : weak< GameObject >, itemID : ItemID )
+	{
+		var i : Int32;
+		var newVal, oldVal : Float;
+		var tempStat : Float;
+		var randF : Float;
+		var statsSystem : StatsSystem;
+		var TS : TransactionSystem;
+		var itemData : weak< gameItemData >;
+		var mod : gameStatModifierData;
+		var ingredients : array< IngredientData >;
+		var ingredientQuality : gamedataQuality;
+		var xpID : TweakDBID;
+		var recipeXP : Int32;
+		randF = RandF();
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+		itemData = TS.GetItemData( owner, itemID );
+		oldVal = itemData.GetStatValueByType( gamedataStatType.WasItemUpgraded );
+		newVal = oldVal + 1.0;
+		tempStat = statsSystem.GetStatValue( owner.GetEntityID(), gamedataStatType.UpgradingMaterialRetrieveChance );
+		ingredients = GetItemFinalUpgradeCost( itemData );
+		for( i = 0; i < ingredients.Size(); i += 1 )
+		{
+			if( randF >= tempStat )
+			{
+				TS.RemoveItem( owner, ItemID.CreateQuery( ingredients[ i ].id.GetID() ), ingredients[ i ].quantity );
+			}
+			ingredientQuality = RPGManager.GetItemQualityFromRecord( TweakDBInterface.GetItemRecord( ingredients[ i ].id.GetID() ) );
+			switch( ingredientQuality )
+			{
+				case gamedataQuality.Common:
+					xpID = T"Constants.CraftingSystem.commonIngredientXP";
+				break;
+				case gamedataQuality.Uncommon:
+					xpID = T"Constants.CraftingSystem.uncommonIngredientXP";
+				break;
+				case gamedataQuality.Rare:
+					xpID = T"Constants.CraftingSystem.rareIngredientXP";
+				break;
+				case gamedataQuality.Epic:
+					xpID = T"Constants.CraftingSystem.epicIngredientXP";
+				break;
+				case gamedataQuality.Legendary:
+					xpID = T"Constants.CraftingSystem.legendaryIngredientXP";
+				break;
+				default:
+					break;
+			}
+			recipeXP += ( TweakDBInterface.GetInt( xpID, 0 ) * ingredients[ i ].quantity );
+		}
+		statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.WasItemUpgraded, true );
+		mod = RPGManager.CreateStatModifier( gamedataStatType.WasItemUpgraded, gameStatModifierType.Additive, newVal );
+		statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), mod );
+		ProcessCraftSkill( ( ( Float )( recipeXP ) ) );
+	}
+
+	private function ProcessUpgradingPerksData( target : weak< GameObject >, itemRecord : Item_Record )
+	{
+		var statsSystem : StatsSystem;
+		var transactionSystem : TransactionSystem;
+		var tempStat : Float;
+		var randF : Float;
+		var randI : Int32;
+		var recipe : array< weak< RecipeElement_Record > >;
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		randF = RandF();
+		tempStat = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.UpgradingMaterialRandomGrantChance );
+		if( randF <= tempStat )
+		{
+			randI = RandRange( 0, recipe.Size() - 1 );
+			transactionSystem.GiveItemByTDBID( target, recipe[ randI ].Ingredient().GetID(), 1 );
+		}
+	}
+
+	private const function ProcessDisassemblingPerks( out disassembleResult : array< IngredientData >, itemData : weak< gameItemData >, out restoredAttachments : array< ItemAttachments >, optional calledFromUI : Bool )
+	{
+		var i : Int32;
+		var tempStat : Float;
+		var matQuality : gamedataQuality;
+		var innerPart : InnerItemData;
+		var itemCategory : gamedataItemCategory;
+		var innerPartID : ItemID;
+		var newIngrData : IngredientData;
+		var rand : Float;
+		var slotsToCheck : array< TweakDBID >;
+		var tempArr : array< TweakDBID >;
+		var statsSystem : StatsSystem;
+		var partTags : array< CName >;
+		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+		tempStat = statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.DisassemblingIngredientsDoubleBonus );
+		if( tempStat > 0.0 )
+		{
+			for( i = 0; i < disassembleResult.Size(); i += 1 )
+			{
+				disassembleResult[ i ].quantity = ( ( Int32 )( ( ( Float )( disassembleResult[ i ].quantity ) ) * 1.5 ) );
+			}
+		}
+		if( !( calledFromUI ) )
+		{
+			tempStat = statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.DisassemblingMaterialQualityObtainChance );
+			rand = RandF();
+			if( rand < tempStat )
+			{
+				matQuality = RPGManager.GetItemDataQuality( itemData );
+				if( matQuality != gamedataQuality.Invalid )
+				{
+					for( i = 0; i < disassembleResult.Size(); i += 1 )
+					{
+						if( matQuality == RPGManager.GetItemQualityFromRecord( disassembleResult[ i ].id ) )
+						{
+							rand = RandF();
+							if( rand < 0.5 )
+							{
+								newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( matQuality ), 1 );
+								AddIngredientToResult( newIngrData, disassembleResult );
+							}
+							else
+							{
+								newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( matQuality, true ), 1 );
+								AddIngredientToResult( newIngrData, disassembleResult );
+							}
+						}
+					}
+				}
+			}
+			tempStat = statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.DisassemblingMaterialQualityObtainChance );
+			rand = RandF();
+			tempStat /= 4.0;
+			if( rand < tempStat )
+			{
+				matQuality = RPGManager.GetItemDataQuality( itemData );
+				if( matQuality != gamedataQuality.Invalid && ( matQuality <= gamedataQuality.Epic ) )
+				{
+					matQuality = RPGManager.GetBumpedQuality( matQuality );
+					rand = RandF();
+					if( rand < 0.5 )
+					{
+						newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( matQuality ), 1 );
+						AddIngredientToResult( newIngrData, disassembleResult );
+					}
+					else
+					{
+						newIngrData = CreateIngredientData( RPGManager.GetCraftingMaterialRecord( matQuality, true ), 1 );
+						AddIngredientToResult( newIngrData, disassembleResult );
+					}
+				}
+			}
+		}
+		itemCategory = RPGManager.GetItemCategory( itemData.GetID() );
+		if( itemCategory == gamedataItemCategory.Weapon || itemCategory == gamedataItemCategory.Clothing )
+		{
+			slotsToCheck = RPGManager.GetAttachmentSlotIDs();
+			if( statsSystem.GetStatValue( m_playerCraftBook.GetOwner().GetEntityID(), gamedataStatType.CanRetrieveModsFromDisassemble ) > 0.0 )
+			{
+				tempArr = RPGManager.GetModsSlotIDs( itemData.GetItemType() );
+				for( i = 0; i < tempArr.Size(); i += 1 )
+				{
+					slotsToCheck.PushBack( tempArr[ i ] );
+				}
+			}
+			for( i = 0; i < slotsToCheck.Size(); i += 1 )
+			{
+				itemData.GetItemPart( innerPart, slotsToCheck[ i ] );
+				innerPartID = InnerItemData.GetItemID( innerPart );
+				partTags = InnerItemData.GetStaticData( innerPart ).Tags();
+				if( ( ItemID.IsValid( innerPartID ) && !( partTags.Contains( 'DummyPart' ) ) ) && !( partTags.Contains( 'IntrinsicMod' ) ) )
+				{
+					restoredAttachments.PushBack( ItemAttachments.Create( innerPartID, slotsToCheck[ i ] ) );
+				}
+			}
+		}
+	}
+
+	private function ProcessCraftSkill( xpAmount : Float )
+	{
+		RPGManager.AwardXP( GetGameInstance(), xpAmount, gamedataProficiencyType.Crafting );
+	}
+
+	public const function GetRecipeData( itemRecord : Item_Record ) : RecipeData
+	{
+		var newRecipeData : RecipeData;
+		var tempRecipeData : ItemRecipe;
+		var tempItemCategory : ItemCategory_Record;
+		var tempListOfIngredients : array< weak< RecipeElement_Record > >;
+		var listOfIngredients : array< IngredientData >;
+		var i : Int32;
+		tempRecipeData = m_playerCraftBook.GetRecipeData( itemRecord.GetID() );
+		tempItemCategory = itemRecord.ItemCategory();
+		newRecipeData = new RecipeData;
+		newRecipeData.label = GetLocalizedItemNameByCName( itemRecord.DisplayName() );
+		newRecipeData.icon = itemRecord.IconPath();
+		newRecipeData.iconGender = m_itemIconGender;
+		newRecipeData.description = GetLocalizedItemNameByCName( itemRecord.LocalizedDescription() );
+		newRecipeData.type = LocKeyToString( tempItemCategory.LocalizedCategory() );
+		newRecipeData.id = itemRecord;
+		newRecipeData.amount = tempRecipeData.amount;
+		itemRecord.CraftingData().CraftingRecipe( tempListOfIngredients );
+		for( i = 0; i < tempListOfIngredients.Size(); i += 1 )
+		{
+			listOfIngredients.PushBack( CreateIngredientData( tempListOfIngredients[ i ] ) );
+		}
+		newRecipeData.ingredients = listOfIngredients;
+		return newRecipeData;
+	}
+
+	public const function GetUpgradeRecipeData( itemID : ItemID ) : RecipeData
+	{
+		var newRecipeData : RecipeData;
+		var tempItemCategory : ItemCategory_Record;
+		var itemRecord : Item_Record;
+		var itemdata : weak< gameItemData >;
+		itemdata = GameInstance.GetTransactionSystem( GetGameInstance() ).GetItemData( GetPlayer( GetGameInstance() ), itemID );
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		tempItemCategory = itemRecord.ItemCategory();
+		newRecipeData = new RecipeData;
+		newRecipeData.label = GetLocalizedItemNameByCName( itemRecord.DisplayName() );
+		newRecipeData.icon = itemRecord.IconPath();
+		newRecipeData.iconGender = m_itemIconGender;
+		newRecipeData.description = GetLocalizedItemNameByCName( itemRecord.LocalizedDescription() );
+		newRecipeData.type = LocKeyToString( tempItemCategory.LocalizedCategory() );
+		newRecipeData.id = itemRecord;
+		newRecipeData.ingredients = GetItemFinalUpgradeCost( itemdata );
+		return newRecipeData;
+	}
+
+	private const function GetIngredientQuality( data : IngredientData ) : gamedataQuality
+	{
+		var quality : gamedataQuality;
+		quality = RPGManager.GetItemQualityFromRecord( data.id );
+		return quality;
+	}
+
+	private const function CreateIngredientData( ingredientData : RecipeElement_Record ) : IngredientData
+	{
+		var newIngredientData : IngredientData;
+		var itemRecord : weak< Item_Record >;
+		var transactionSystem : TransactionSystem;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		itemRecord = ingredientData.Ingredient();
+		newIngredientData.quantity = ingredientData.Amount();
+		newIngredientData.baseQuantity = ingredientData.Amount();
+		newIngredientData.label = itemRecord.FriendlyName();
+		newIngredientData.inventoryQuantity = transactionSystem.GetItemQuantity( m_playerCraftBook.GetOwner(), ItemID.CreateQuery( itemRecord.GetID() ) );
+		newIngredientData.id = itemRecord;
+		newIngredientData.icon = itemRecord.IconPath();
+		newIngredientData.iconGender = m_itemIconGender;
+		return newIngredientData;
+	}
+
+	private const function CreateIngredientData( item : Item_Record, amount : Int32 ) : IngredientData
+	{
+		var newIngredientData : IngredientData;
+		var transactionSystem : TransactionSystem;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		newIngredientData.quantity = amount;
+		newIngredientData.label = item.FriendlyName();
+		newIngredientData.inventoryQuantity = transactionSystem.GetItemQuantity( m_playerCraftBook.GetOwner(), ItemID.CreateQuery( item.GetID() ) );
+		newIngredientData.id = item;
+		newIngredientData.icon = item.IconPath();
+		newIngredientData.iconGender = m_itemIconGender;
+		return newIngredientData;
+	}
+
+	private const function UpdateBlackboard( lastCommand : CraftingCommands, optional lastItem : ItemID, optional lastIngredients : array< IngredientData > )
+	{
+		var Blackboard : IBlackboard;
+		Blackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Crafting );
+		if( Blackboard )
+		{
+			Blackboard.SetVariant( GetAllBlackboardDefs().UI_Crafting.lastCommand, lastCommand, true );
+			Blackboard.SetVariant( GetAllBlackboardDefs().UI_Crafting.lastItem, lastItem, true );
+			if( lastIngredients.Size() > 0 )
+			{
+				Blackboard.SetVariant( GetAllBlackboardDefs().UI_Crafting.lastIngredients, lastIngredients );
+			}
+		}
+	}
+
+	private function SendItemCraftedDataTrackingRequest( targetItem : ItemID )
+	{
+		var request : ItemCraftedDataTrackingRequest;
+		var dataTrackingSystem : DataTrackingSystem;
+		request = new ItemCraftedDataTrackingRequest;
+		request.targetItem = targetItem;
+		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'DataTrackingSystem' ) ) );
+		dataTrackingSystem.QueueRequest( request );
+	}
+
+	private function ProcessIconicRevampRestoration()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+			TS.GetItemList( player, itemList );
+		}
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( RPGManager.IsItemIconic( itemList[ i ] ) && RPGManager.IsItemWeapon( itemList[ i ].GetID() ) )
+			{
+				ClearNonIconicSlots( itemList[ i ] );
+				RPGManager.ProcessOnLootedPackages( player, itemList[ i ].GetID() );
+			}
+		}
+	}
+
+	private function ProcessCraftedItemsPowerBoost()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var transactionSystem : TransactionSystem;
+		var statsSystem : StatsSystem;
+		var player : weak< PlayerPuppet >;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+			statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
+			transactionSystem.GetItemList( player, itemList );
+		}
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( RPGManager.IsItemCrafted( itemList[ i ] ) )
+			{
+				if( RPGManager.IsItemWeapon( itemList[ i ].GetID() ) )
+				{
+					statsSystem.RemoveSavedModifiers( itemList[ i ].GetStatsObjectID(), gamedataStatType.CraftingBonusWeaponDamage );
+					statsSystem.RemoveSavedModifiers( itemList[ i ].GetStatsObjectID(), gamedataStatType.CanLegendaryCraftedWeaponsBeBoosted );
+				}
+				else if( RPGManager.IsItemClothing( itemList[ i ].GetID() ) )
+				{
+					statsSystem.RemoveSavedModifiers( itemList[ i ].GetStatsObjectID(), gamedataStatType.CraftingBonusArmorValue );
+				}
+			}
+		}
+	}
+
+	private function AddAmmoRecipes()
+	{
+		m_playerCraftBook.AddRecipe( T"Ammo.HandgunAmmo", , GetAmmoBulletAmount( T"Ammo.HandgunAmmo" ) );
+		m_playerCraftBook.AddRecipe( T"Ammo.ShotgunAmmo", , GetAmmoBulletAmount( T"Ammo.ShotgunAmmo" ) );
+		m_playerCraftBook.AddRecipe( T"Ammo.RifleAmmo", , GetAmmoBulletAmount( T"Ammo.RifleAmmo" ) );
+		m_playerCraftBook.AddRecipe( T"Ammo.SniperRifleAmmo", , GetAmmoBulletAmount( T"Ammo.SniperRifleAmmo" ) );
+	}
+
+	private function HideDLCRecipes()
+	{
+		m_playerCraftBook.HideRecipe( T"Items.Jacket_19_basic_04", true );
+		m_playerCraftBook.HideRecipe( T"Items.Jacket_19_basic_04_DLC_Epic", true );
+		m_playerCraftBook.HideRecipe( T"Items.Jacket_19_basic_04_DLC_Legendary", true );
+		m_playerCraftBook.HideRecipe( T"Items.Jacket_20_basic_01", true );
+		m_playerCraftBook.HideRecipe( T"Items.Jacket_20_basic_01_DLC_Epic", true );
+		m_playerCraftBook.HideRecipe( T"Items.Jacket_20_basic_01_DLC_Legendary", true );
+		m_playerCraftBook.HideRecipe( T"Items.GOG_DLC_TShirt_Epic", true );
+		m_playerCraftBook.HideRecipe( T"Items.GOG_DLC_TShirt_Legendary", true );
+		m_playerCraftBook.HideRecipe( T"Items.GOG_DLC_Jacket_Epic", true );
+		m_playerCraftBook.HideRecipe( T"Items.GOG_DLC_Jacket_Legendary", true );
+		m_playerCraftBook.HideRecipe( T"Items.GOG_Galaxy_TShirt_Epic", true );
+		m_playerCraftBook.HideRecipe( T"Items.GOG_Galaxy_TShirt_Legendary", true );
+		m_playerCraftBook.HideRecipe( T"Items.Preset_Katana_GoG_Epic", true );
+		m_playerCraftBook.HideRecipe( T"Items.Preset_Katana_GoG_Legendary", true );
+	}
+
+	private function AddDLCBaseRecipes()
+	{
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Preset_Katana_GoG_Epic" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Preset_Katana_GoG_Crafted",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.GOG_DLC_TShirt_Epic" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.GOG_DLC_TShirt_Crafted",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.GOG_DLC_Jacket_Epic" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.GOG_DLC_Jacket_Crafted",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.GOG_Galaxy_TShirt_Epic" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.GOG_Galaxy_TShirt_Crafted",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Jacket_19_basic_04" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Jacket_19_basic_04_Crafted",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Jacket_20_basic_01" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Jacket_20_basic_01_Crafted",  );
+		}
+	}
+
+	private function InstallModsToRedesignedItems()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var transactionSystem : TransactionSystem;
+		var itemModificationSystem : weak< ItemModificationSystem >;
+		var player : weak< PlayerPuppet >;
+		var partItemID : ItemID;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+			transactionSystem.GetItemList( player, itemList );
+		}
+		itemModificationSystem = ( ( ItemModificationSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'ItemModificationSystem' ) ) );
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( itemList[ i ].HasTag( 'DLCStashItem' ) )
+			{
+				partItemID = ItemID.FromTDBID( T"Items.DLCItemsQualityUpgradeMod" );
+				transactionSystem.GiveItem( player, partItemID, 1 );
+				itemModificationSystem.QueueRequest( CreateInstallPartRequest( player, itemList[ i ], partItemID ) );
+			}
+			if( itemList[ i ].HasTag( 'Buck_Grad' ) )
+			{
+				partItemID = ItemID.FromTDBID( T"Items.Buck_scope" );
+				transactionSystem.GiveItem( player, partItemID, 1 );
+				itemModificationSystem.QueueRequest( CreateInstallPartRequest( player, itemList[ i ], partItemID ) );
+			}
+		}
+	}
+
+	private function CreateInstallPartRequest( player : weak< PlayerPuppet >, itemData : weak< gameItemData >, part : ItemID ) : InstallItemPart
+	{
+		var installPartRequest : InstallItemPart;
+		var slotID : TweakDBID;
+		switch( itemData.GetItemType() )
+		{
+			case gamedataItemType.Clo_InnerChest:
+				slotID = T"AttachmentSlots.InnerChestFabricEnhancer4";
+			break;
+			case gamedataItemType.Clo_OuterChest:
+				slotID = T"AttachmentSlots.OuterChestFabricEnhancer4";
+			break;
+			case gamedataItemType.Wea_Katana:
+				slotID = T"AttachmentSlots.IconicMeleeWeaponMod1";
+			break;
+			case gamedataItemType.Wea_SniperRifle:
+				slotID = T"AttachmentSlots.Scope";
+			break;
+			default:
+				break;
+		}
+		installPartRequest = new InstallItemPart;
+		installPartRequest.Set( player, itemData.GetID(), part, slotID );
+		return installPartRequest;
+	}
+
+	private function HideButchersKnifeRecipes()
+	{
+		m_playerCraftBook.HideRecipe( T"Items.Craftable_Common_Butchers_Knife", true );
+		m_playerCraftBook.HideRecipe( T"Items.Craftable_Uncommon_Butchers_Knife", true );
+		m_playerCraftBook.HideRecipe( T"Items.Craftable_Rare_Butchers_Knife", true );
+		m_playerCraftBook.HideRecipe( T"Items.Craftable_Epic_Butchers_Knife", true );
+		m_playerCraftBook.HideRecipe( T"Items.Craftable_Legendary_Butchers_Knife", true );
+	}
+
+	private function CompensateForOwnedButchersKnifeRecipes()
+	{
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Craftable_Common_Butchers_Knife" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Craftable_Common_Knife",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Craftable_Uncommon_Butchers_Knife" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Craftable_Uncommon_Tanto",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Craftable_Rare_Butchers_Knife" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Craftable_Rare_Tanto",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Craftable_Epic_Butchers_Knife" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Craftable_Epic_Knife",  );
+		}
+		if( m_playerCraftBook.KnowsRecipe( T"Items.Craftable_Legendary_Butchers_Knife" ) )
+		{
+			m_playerCraftBook.AddRecipe( T"Items.Craftable_Legendary_Knife",  );
+		}
+	}
+
+	public static function GetAmmoBulletAmount( ammoId : TweakDBID ) : Int32
+	{
+		var recipeRecord : weak< ItemRecipe_Record >;
+		var craftingResult : weak< CraftingResult_Record >;
+		var ammoRecipeId : TweakDBID;
+		var amount : Int32;
+		switch( ammoId )
+		{
+			case T"Ammo.HandgunAmmo":
+				ammoRecipeId = T"Ammo.RecipeHandgunAmmo";
+			break;
+			case T"Ammo.ShotgunAmmo":
+				ammoRecipeId = T"Ammo.RecipeShotgunAmmo";
+			break;
+			case T"Ammo.RifleAmmo":
+				ammoRecipeId = T"Ammo.RecipeRifleAmmo";
+			break;
+			case T"Ammo.SniperRifleAmmo":
+				ammoRecipeId = T"Ammo.RecipeSniperRifleAmmo";
+			break;
+		}
+		recipeRecord = TweakDBInterface.GetItemRecipeRecord( ammoRecipeId );
+		craftingResult = recipeRecord.CraftingResult();
+		amount = craftingResult.Amount();
+		return amount;
+	}
+
+}
+
+class CraftBook
+{
+	protected persistent var m_knownRecipes : array< ItemRecipe >;
+	var m_newRecipes : array< TweakDBID >;
+	var m_owner : weak< GameObject >;
+
+	public function InitializeCraftBookOwner( owner : weak< GameObject > )
+	{
+		m_owner = owner;
+		return;
+	}
+
+	public function InitializeCraftBook( owner : weak< GameObject >, recipes : weak< Craftable_Record > )
+	{
+		var craftItems : array< weak< Item_Record > >;
+		var i : Int32;
+		recipes.CraftableItem( craftItems );
+		for( i = 0; i < craftItems.Size(); i += 1 )
+		{
+			if( GetRecipeIndex( craftItems[ i ].GetID() ) == -1 )
+			{
+				AddRecipe( craftItems[ i ].GetID() );
+			}
+		}
+		return;
+	}
+
+	public const function GetCraftableItems() : array< weak< Item_Record > >
+	{
+		var itemList : array< weak< Item_Record > >;
+		var i : Int32;
+		for( i = 0; i < m_knownRecipes.Size(); i += 1 )
+		{
+			if( !( m_knownRecipes[ i ].isHidden ) )
+			{
+				itemList.PushBack( TweakDBInterface.GetItemRecord( m_knownRecipes[ i ].targetItem ) );
+			}
+		}
+		return itemList;
+	}
+
+	public const function GetRecipeData( Recipe : TweakDBID ) : ItemRecipe
+	{
+		var nullRecipe : ItemRecipe;
+		var index : Int32;
+		index = GetRecipeIndex( Recipe );
+		if( index != -1 )
+		{
+			return m_knownRecipes[ index ];
+		}
+		return nullRecipe;
+	}
+
+	public const function GetRecipeIndex( recipe : TweakDBID ) : Int32
+	{
+		var i : Int32;
+		for( i = 0; i < m_knownRecipes.Size(); i += 1 )
+		{
+			if( m_knownRecipes[ i ].targetItem == recipe )
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	public const function KnowsRecipe( recipe : TweakDBID ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_knownRecipes.Size(); i += 1 )
+		{
+			if( m_knownRecipes[ i ].targetItem == recipe )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function AddRecipe( targetItem : TweakDBID, optional hideOnItemsAdded : array< weak< Item_Record > >, optional amount : Int32 )
+	{
+		var itemRecipe : ItemRecipe;
+		var transactionSystem : TransactionSystem;
+		var itemID : ItemID;
+		var i : Int32;
+		if( !( TDBID.IsValid( targetItem ) ) )
+		{
+			return;
+		}
+		itemRecipe.targetItem = targetItem;
+		if( ( amount > 0 ) && ( amount != 1 ) )
+		{
+			itemRecipe.amount = amount;
+		}
+		else
+		{
+			itemRecipe.amount = 1;
+		}
+		if( hideOnItemsAdded.Size() > 0 )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
+			for( i = 0; i < hideOnItemsAdded.Size(); i += 1 )
+			{
+				itemID = ItemID.CreateQuery( hideOnItemsAdded[ i ].GetID() );
+				if( transactionSystem.HasItem( m_owner, itemID ) )
+				{
+					itemRecipe.isHidden = true;
+					break;
+				}
+			}
+		}
+		i = GetRecipeIndex( targetItem );
+		if( i != -1 )
+		{
+			m_knownRecipes[ i ] = itemRecipe;
+			return;
+		}
+		m_knownRecipes.PushBack( itemRecipe );
+		m_newRecipes.PushBack( itemRecipe.targetItem );
+	}
+
+	public function SetRecipeInspected( itemID : TweakDBID )
+	{
+		if( m_newRecipes.Contains( itemID ) )
+		{
+			m_newRecipes.Remove( itemID );
+		}
+	}
+
+	public function IsRecipeNew( itemID : TweakDBID ) : Bool
+	{
+		return m_newRecipes.Contains( itemID );
+	}
+
+	public function HideRecipe( recipe : TweakDBID, shouldHide : Bool ) : Bool
+	{
+		var index : Int32;
+		index = GetRecipeIndex( recipe );
+		if( index != -1 )
+		{
+			m_knownRecipes[ index ].isHidden = shouldHide;
+			return true;
+		}
+		return false;
+	}
+
+	public const function GetOwner() : weak< GameObject >
+	{
+		return m_owner;
+	}
+
+	public function ResetRecipeCraftedAmount()
+	{
+		var i : Int32;
+		for( i = 0; i < m_knownRecipes.Size(); i += 1 )
+		{
+			if( m_knownRecipes[ i ].amount == 0 )
+			{
+				m_knownRecipes[ i ].amount = 1;
+			}
+		}
+	}
+
+}
+
+class CraftItemRequest extends PlayerScriptableSystemRequest
+{
+	var target : weak< GameObject >;
+	var itemRecord : Item_Record;
+	var amount : Int32;
+	var bulletAmount : Int32;
+}
+
+class DisassembleItemRequest extends PlayerScriptableSystemRequest
+{
+	var target : weak< GameObject >;
+	var itemID : ItemID;
+	var amount : Int32;
+}
+
+class UpgradeItemRequest extends PlayerScriptableSystemRequest
+{
+	var itemID : ItemID;
+}
+
+class AddRecipeRequest extends PlayerScriptableSystemRequest
+{
+	var recipe : TweakDBID;
+	var amount : Int32;
+	var hideOnItemsAdded : array< weak< Item_Record > >;
+}
+
+class HideRecipeRequest extends PlayerScriptableSystemRequest
+{
+	var recipe : TweakDBID;
+}
+
+class ShowRecipeRequest extends PlayerScriptableSystemRequest
+{
+	var recipe : TweakDBID;
+}
+
+class CraftingSystemInventoryCallback extends InventoryScriptCallback
+{
+	var player : weak< PlayerPuppet >;
+
+	public export override function OnItemAdded( item : ItemID, itemData : weak< gameItemData >, flaggedAsSilent : Bool )
+	{
+		var addRecipeRequest : AddRecipeRequest;
+		var craftingSystem : CraftingSystem;
+		var recipeRecord : weak< ItemRecipe_Record >;
+		var itemToAdd : weak< CraftingResult_Record >;
+		var transactionSystem : TransactionSystem;
+		if( itemData.HasTag( 'Recipe' ) )
+		{
+			transactionSystem = GameInstance.GetTransactionSystem( player.GetGame() );
+			craftingSystem = ( ( CraftingSystem )( GameInstance.GetScriptableSystemsContainer( player.GetGame() ).Get( 'CraftingSystem' ) ) );
+			recipeRecord = TweakDBInterface.GetItemRecipeRecord( ItemID.GetTDBID( item ) );
+			itemToAdd = recipeRecord.CraftingResult();
+			addRecipeRequest = new AddRecipeRequest;
+			addRecipeRequest.recipe = itemToAdd.Item().GetID();
+			addRecipeRequest.amount = itemToAdd.Amount();
+			if( recipeRecord.GetHideOnItemsAddedCount() > 0 )
+			{
+				recipeRecord.HideOnItemsAdded( addRecipeRequest.hideOnItemsAdded );
+			}
+			craftingSystem.QueueRequest( addRecipeRequest );
+			transactionSystem.RemoveItem( player, item, transactionSystem.GetItemQuantity( player, item ) );
+		}
+	}
+
+}
+
+struct ItemRecipe
+{
+	persistent var targetItem : TweakDBID;
+	persistent var isHidden : Bool;
+	persistent var amount : Int32;
+}
+
+enum CraftingCommands
+{
+	CraftingFinished = 0,
+	DisassemblingFinished = 1,
+	UpgradingFinished = 2,
+	Failed = 3,
+}
+

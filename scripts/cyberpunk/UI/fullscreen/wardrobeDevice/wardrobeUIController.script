@@ -1,0 +1,456 @@
+class WardrobeUIGameController extends gameuiMenuGameController
+{
+	private editable var m_tooltipsManagerRef : inkWidgetRef;
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_setEditorWidget : inkWidgetRef;
+	private editable var m_setGridWidget : inkCompoundRef;
+	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_equipmentSystem : weak< EquipmentSystem >;
+	private var m_setEditorController : weak< WardrobeSetEditorUIController >;
+	private var m_isMainScreen : Bool;
+	private var m_tooltipsManager : weak< gameuiTooltipsManager >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_sets : array< ClothingSet >;
+	private var m_currentSetController : weak< ClothingSetController >;
+	private var m_maxSetsAmount : Int32;
+	default m_maxSetsAmount = 6;
+	private var m_setControllers : array< weak< ClothingSetController > >;
+	private var m_confirmationRequestToken : inkGameNotificationToken;
+	private var m_deletedSetController : weak< ClothingSetController >;
+	private var m_introAnimProxy : inkAnimProxy;
+	private var m_outroAnimProxy : inkAnimProxy;
+	private var m_introFinished : Bool;
+	private var m_finalEquippedSet : gameWardrobeClothingSetIndex;
+	private var m_equipmentBlackboard : weak< IBlackboard >;
+	private var m_equipmentInProgressCallback : CallbackHandle;
+
+	protected event OnSetUserData( userData : IScriptable )
+	{
+		m_player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetPlayerControlledObject().GetGame() ).GetLocalPlayerMainGameObject() ) );
+	}
+
+	protected event OnInitialize()
+	{
+		var currentEquipped : gameWardrobeClothingSetIndex;
+		var selectedSetIndex : Int32;
+		m_equipmentBlackboard = GameInstance.GetBlackboardSystem( m_player.GetGame() ).Get( GetAllBlackboardDefs().UI_Equipment );
+		if( m_equipmentBlackboard )
+		{
+			m_equipmentInProgressCallback = m_equipmentBlackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_Equipment.EquipmentInProgress, this, 'OnEquipmentInProgress' );
+		}
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		m_tooltipsManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_tooltipsManagerRef, 'gameuiTooltipsManager' ) ) );
+		m_tooltipsManager.Setup( ETooltipsStyle.Menus );
+		m_setEditorController = ( ( WardrobeSetEditorUIController )( inkWidgetRef.GetController( m_setEditorWidget ) ) );
+		m_setEditorController.Initialize( m_player, m_tooltipsManager, m_buttonHintsController, this );
+		m_equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( m_player.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		InitSetPanel();
+		currentEquipped = EquipmentSystem.GetActiveWardrobeSetID( m_player );
+		selectedSetIndex = ( ( currentEquipped == gameWardrobeClothingSetIndex.INVALID ) ? ( 0 ) : ( WardrobeSystem.WardrobeClothingSetIndexToNumber( currentEquipped ) ) );
+		SelectSlot( m_setControllers[ selectedSetIndex ] );
+		PlayIntroAnimation();
+	}
+
+	protected event OnUninitialize()
+	{
+		var i : Int32;
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
+		for( i = 0; i < m_setControllers.Size(); i += 1 )
+		{
+			m_setControllers[ i ].UnregisterFromCallback( 'OnRelease', this, 'OnSetClick' );
+			m_setControllers[ i ].UnregisterFromCallback( 'OnHoverOver', this, 'OnSetHoverOver' );
+			m_setControllers[ i ].UnregisterFromCallback( 'OnHoverOut', this, 'OnSetHoverOut' );
+		}
+		if( m_equipmentBlackboard )
+		{
+			m_equipmentBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_Equipment.EquipmentInProgress, m_equipmentInProgressCallback );
+		}
+		super.OnUninitialize();
+	}
+
+	protected event OnEquipmentInProgress( inProgress : Bool )
+	{
+		var i : Int32;
+		var controller, hovered : weak< ClothingSetController >;
+		for( i = 0; i < m_setControllers.Size(); i += 1 )
+		{
+			controller = m_setControllers[ i ];
+			controller.SetDisabled( inProgress );
+			if( controller.IsHovered() )
+			{
+				hovered = controller;
+			}
+		}
+		if( inProgress )
+		{
+			RemoveButtonHints();
+		}
+		else if( hovered )
+		{
+			AddButtonHints( hovered );
+		}
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		super.OnSetMenuEventDispatcher( menuEventDispatcher );
+		m_menuEventDispatcher = menuEventDispatcher;
+		m_menuEventDispatcher.RegisterToEvent( 'OnBack', this, 'OnBack' );
+	}
+
+	protected event OnBack( userData : IScriptable )
+	{
+		if( m_outroAnimProxy.IsPlaying() )
+		{
+			return true;
+		}
+		CloseWardrobe();
+	}
+
+	protected event OnSetClick( e : inkPointerEvent )
+	{
+		var actionName : inkActionName;
+		var setController : weak< ClothingSetController >;
+		if( m_outroAnimProxy.IsPlaying() )
+		{
+			return true;
+		}
+		setController = ( ( ClothingSetController )( e.GetCurrentTarget().GetController() ) );
+		if( setController.IsDisabled() )
+		{
+			return true;
+		}
+		actionName = e.GetActionName();
+		if( actionName.IsAction( 'select' ) )
+		{
+			PlayWardrobeSound( 'Button', 'OnPress' );
+			if( m_currentSetController.GetClothingSetChanged() )
+			{
+				m_setEditorController.SaveSet();
+			}
+			SelectSlot( setController );
+		}
+		else if( setController.GetDefined() && actionName.IsAction( 'delete_wardrobe_set' ) )
+		{
+			m_deletedSetController = setController;
+			m_confirmationRequestToken = GenericMessageNotification.Show( this, GetLocalizedText( "UI-Wardrobe-LabelWarning" ), GetLocalizedText( "UI-Wardrobe-NotificationDeleteSet" ), GenericMessageNotificationType.ConfirmCancel );
+			m_confirmationRequestToken.RegisterListener( this, 'OnDeleteSetConfirmationResults' );
+		}
+	}
+
+	private function PlayIntroAnimation()
+	{
+		m_introAnimProxy = PlayLibraryAnimation( 'intro' );
+		if( m_introAnimProxy )
+		{
+			GameInstance.GetAudioSystem( GetPlayerControlledObject().GetGame() ).Play( 'ui_main_menu_cc_loading' );
+			m_introAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnIntroAnimationFinished' );
+		}
+		else
+		{
+			PlayIdleLoopAnimation();
+		}
+	}
+
+	protected event OnIntroAnimationFinished( proxy : inkAnimProxy )
+	{
+		m_introFinished = true;
+		if( m_outroAnimProxy.IsPlaying() )
+		{
+			return true;
+		}
+		PlayIdleLoopAnimation();
+	}
+
+	private function PlayIdleLoopAnimation()
+	{
+		var playbackOptions : inkAnimOptions;
+		if( m_outroAnimProxy.IsPlaying() )
+		{
+			return;
+		}
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		PlayLibraryAnimation( 'idle_loop', playbackOptions );
+	}
+
+	private override function ReadUICondition( condition : gamedataUICondition ) : Bool
+	{
+		var value : Bool;
+		value = condition == gamedataUICondition.IsIntroFinished && m_introFinished;
+		return value;
+	}
+
+	private function CloseWardrobe()
+	{
+		if( m_introAnimProxy.IsPlaying() )
+		{
+			GameInstance.GetAudioSystem( GetPlayerControlledObject().GetGame() ).Stop( 'ui_main_menu_cc_loading' );
+			FinalizeTransmog();
+			m_menuEventDispatcher.SpawnEvent( 'OnWardrobeClose' );
+			return;
+		}
+		if( m_outroAnimProxy.IsPlaying() )
+		{
+			return;
+		}
+		m_outroAnimProxy = PlayLibraryAnimation( 'outro' );
+		if( m_outroAnimProxy )
+		{
+			m_outroAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnCloseAnimationFinished' );
+		}
+		else
+		{
+			FinalizeTransmog();
+			m_menuEventDispatcher.SpawnEvent( 'OnWardrobeClose' );
+		}
+	}
+
+	protected event OnCloseAnimationFinished( proxy : inkAnimProxy )
+	{
+		FinalizeTransmog();
+		m_menuEventDispatcher.SpawnEvent( 'OnWardrobeClose' );
+	}
+
+	public function EquipSet( setID : gameWardrobeClothingSetIndex )
+	{
+		var req : EquipWardrobeSetRequest;
+		req = new EquipWardrobeSetRequest;
+		req.setID = setID;
+		req.owner = m_player;
+		m_equipmentSystem.QueueRequest( req );
+	}
+
+	public function UnequipSet()
+	{
+		var req : UnequipWardrobeSetRequest;
+		req = new UnequipWardrobeSetRequest;
+		req.owner = m_player;
+		m_equipmentSystem.QueueRequest( req );
+	}
+
+	public function DeleteSet( setID : gameWardrobeClothingSetIndex )
+	{
+		var req : DeleteWardrobeSetRequest;
+		req = new DeleteWardrobeSetRequest;
+		req.setID = setID;
+		req.owner = m_player;
+		m_equipmentSystem.QueueRequest( req );
+	}
+
+	public function SetEquippedState( currentSet : gameWardrobeClothingSetIndex )
+	{
+		var i : Int32;
+		var set : ClothingSet;
+		m_finalEquippedSet = currentSet;
+		for( i = 0; i < m_setControllers.Size(); i += 1 )
+		{
+			set = m_setControllers[ i ].GetClothingSet();
+			m_setControllers[ i ].SetEquipped( set.setID == currentSet );
+		}
+	}
+
+	private function FinalizeTransmog()
+	{
+		var slots : array< ClothingSet >;
+		var slotsUsed : Int32;
+		slotsUsed = 0;
+		if( m_currentSetController.GetClothingSetChanged() )
+		{
+			m_setEditorController.SaveSet();
+		}
+		m_setEditorController.GetPreviewController().ClearPuppet();
+		m_setEditorController.GetPreviewController().RestorePuppetWeapons();
+		SendDeleteRequests();
+		if( m_finalEquippedSet == gameWardrobeClothingSetIndex.INVALID )
+		{
+			if( EquipmentSystem.GetActiveWardrobeSetID( m_player ) == gameWardrobeClothingSetIndex.INVALID )
+			{
+				m_setEditorController.GetPreviewController().RestorePuppetEquipment();
+			}
+			else
+			{
+				UnequipSet();
+			}
+		}
+		else
+		{
+			EquipSet( m_finalEquippedSet );
+		}
+		m_setEditorController.GetPreviewController().DelayedResetItemAppearanceInSlot( T"AttachmentSlots.Chest" );
+		slots = GameInstance.GetWardrobeSystem( m_player.GetGame() ).GetClothingSets();
+		slotsUsed = slots.Size();
+		GameInstance.GetTelemetrySystem( m_player.GetGame() ).LogWardrobeUsed( slotsUsed );
+	}
+
+	private function SendDeleteRequests()
+	{
+		var savedSets : array< ClothingSet >;
+		var i, setSumber : Int32;
+		savedSets = GameInstance.GetWardrobeSystem( m_player.GetGame() ).GetClothingSets();
+		for( i = 0; i < savedSets.Size(); i += 1 )
+		{
+			setSumber = WardrobeSystem.WardrobeClothingSetIndexToNumber( savedSets[ i ].setID );
+			if( !( m_setControllers[ setSumber ].GetDefined() ) )
+			{
+				DeleteSet( savedSets[ i ].setID );
+			}
+		}
+	}
+
+	protected event OnSetHoverOver( e : inkPointerEvent )
+	{
+		AddButtonHints( ( ( ClothingSetController )( e.GetCurrentTarget().GetController() ) ) );
+	}
+
+	protected function AddButtonHints( setController : weak< ClothingSetController > )
+	{
+		if( setController && !( setController.IsDisabled() ) )
+		{
+			m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-Settings-ButtonMappings-Actions-Select" ) );
+			if( setController.GetDefined() )
+			{
+				m_buttonHintsController.AddButtonHint( 'delete_wardrobe_set', GetLocalizedText( "UI-Wardrobe-Deleteset" ) );
+			}
+		}
+	}
+
+	protected event OnSetHoverOut( e : inkPointerEvent )
+	{
+		RemoveButtonHints();
+	}
+
+	protected function RemoveButtonHints()
+	{
+		m_buttonHintsController.RemoveButtonHint( 'select' );
+		m_buttonHintsController.RemoveButtonHint( 'delete_wardrobe_set' );
+	}
+
+	private function InitSetPanel()
+	{
+		var i, controllerIndex, setAmount : Int32;
+		var currentEquipped : gameWardrobeClothingSetIndex;
+		var controller : weak< ClothingSetController >;
+		var widget : weak< inkWidget >;
+		m_sets = GameInstance.GetWardrobeSystem( m_player.GetGame() ).GetClothingSets();
+		setAmount = m_sets.Size();
+		m_setControllers.Clear();
+		inkCompoundRef.RemoveAllChildren( m_setGridWidget );
+		currentEquipped = EquipmentSystem.GetActiveWardrobeSetID( m_player );
+		m_finalEquippedSet = currentEquipped;
+		for( i = 0; i < m_maxSetsAmount; i += 1 )
+		{
+			widget = SpawnFromLocal( inkCompoundRef.Get( m_setGridWidget ), 'wardrobeOutfitSlot' );
+			controller = ( ( ClothingSetController )( widget.GetController() ) );
+			controller.RegisterToCallback( 'OnRelease', this, 'OnSetClick' );
+			controller.RegisterToCallback( 'OnHoverOver', this, 'OnSetHoverOver' );
+			controller.RegisterToCallback( 'OnHoverOut', this, 'OnSetHoverOut' );
+			controller.UpdateNumbering( i );
+			controller.SetEquipped( controller.GetClothingSet().setID == currentEquipped );
+			m_setControllers.PushBack( controller );
+		}
+		for( i = 0; i < setAmount; i += 1 )
+		{
+			controllerIndex = WardrobeSystem.WardrobeClothingSetIndexToNumber( m_sets[ i ].setID );
+			m_setControllers[ controllerIndex ].SetClothingSet( m_sets[ i ], true );
+		}
+	}
+
+	public function ResetSet( setID : gameWardrobeClothingSetIndex )
+	{
+		var controllerIndex, setAmount, i : Int32;
+		var setController : weak< ClothingSetController >;
+		var clothingSet : ClothingSet;
+		controllerIndex = WardrobeSystem.WardrobeClothingSetIndexToNumber( setID );
+		setController = m_setControllers[ controllerIndex ];
+		if( setController == NULL )
+		{
+			return;
+		}
+		if( setController.GetDefined() )
+		{
+			m_sets = GameInstance.GetWardrobeSystem( m_player.GetGame() ).GetClothingSets();
+			setAmount = m_sets.Size();
+			for( i = 0; i < setAmount; i += 1 )
+			{
+				if( m_sets[ i ].setID == setID )
+				{
+					setController.SetClothingSet( m_sets[ i ], true );
+					break;
+				}
+			}
+		}
+		else
+		{
+			clothingSet = setController.GetClothingSet();
+			for( i = 0; i < clothingSet.clothingList.Size(); i += 1 )
+			{
+				clothingSet.clothingList[ i ].visualItem = ItemID.None();
+			}
+		}
+		setController.SetClothingSetChanged( false );
+	}
+
+	private function SelectSlot( setController : weak< ClothingSetController > )
+	{
+		if( m_currentSetController != NULL )
+		{
+			m_currentSetController.SetSelected( false );
+		}
+		setController.SetSelected( true );
+		m_currentSetController = setController;
+		m_setEditorController.OpenSet( setController );
+	}
+
+	protected event OnDeleteSetConfirmationResults( data : inkGameNotificationData )
+	{
+		var resultData : GenericMessageNotificationCloseData;
+		var clothingSet : ClothingSet;
+		var i : Int32;
+		PlayWardrobeSound( 'Item', 'OnDisassemble' );
+		resultData = ( ( GenericMessageNotificationCloseData )( data ) );
+		if( resultData.result == GenericMessageNotificationResult.Confirm )
+		{
+			m_deletedSetController.SetDefined( false );
+			if( m_deletedSetController.GetEquipped() )
+			{
+				m_finalEquippedSet = gameWardrobeClothingSetIndex.INVALID;
+				m_deletedSetController.SetEquipped( false );
+			}
+			clothingSet = m_deletedSetController.GetClothingSet();
+			for( i = 0; i < clothingSet.clothingList.Size(); i += 1 )
+			{
+				clothingSet.clothingList[ i ].visualItem = ItemID.None();
+			}
+			if( m_currentSetController == m_deletedSetController )
+			{
+				SelectSlot( m_deletedSetController );
+			}
+		}
+		m_confirmationRequestToken = NULL;
+		m_deletedSetController = NULL;
+	}
+
+	protected event OnExitConfirmationResults( data : inkGameNotificationData )
+	{
+		var resultData : GenericMessageNotificationCloseData;
+		resultData = ( ( GenericMessageNotificationCloseData )( data ) );
+		if( resultData.result == GenericMessageNotificationResult.Confirm )
+		{
+			CloseWardrobe();
+		}
+		m_confirmationRequestToken = NULL;
+	}
+
+	public function PlayWardrobeSound( widgetName : CName, eventName : CName, optional actionKey : CName )
+	{
+		if( ( !( m_introAnimProxy ) || !( m_introAnimProxy.IsPlaying() ) ) && ( !( m_outroAnimProxy ) || !( m_outroAnimProxy.IsPlaying() ) ) )
+		{
+			PlaySound( widgetName, eventName, actionKey );
+		}
+	}
+
+}
+

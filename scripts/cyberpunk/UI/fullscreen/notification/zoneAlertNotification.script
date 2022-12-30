@@ -1,0 +1,331 @@
+class ZoneAlertNotificationRemoveRequestData extends IScriptable
+{
+	var m_areaType : ESecurityAreaType;
+}
+
+class ZoneAlertNotificationViewData extends GenericNotificationViewData
+{
+	var m_canBeMerged : Bool;
+	var securityZoneData : ESecurityAreaType;
+
+	public override function CanMerge( data : GenericNotificationViewData ) : Bool
+	{
+		var userData : ZoneAlertNotificationViewData;
+		userData = ( ( ZoneAlertNotificationViewData )( data ) );
+		return ( m_canBeMerged && userData ) && userData.m_canBeMerged == m_canBeMerged;
+	}
+
+	public export override function OnRemoveNotification( data : IScriptable ) : Bool
+	{
+		var requestData : ZoneAlertNotificationRemoveRequestData;
+		requestData = ( ( ZoneAlertNotificationRemoveRequestData )( data ) );
+		return ( requestData != NULL ) && requestData.m_areaType != securityZoneData;
+	}
+
+}
+
+class VehicleAlertNotificationViewData extends GenericNotificationViewData
+{
+	var m_canBeMerged : Bool;
+
+	public override function CanMerge( data : GenericNotificationViewData ) : Bool
+	{
+		return m_canBeMerged;
+	}
+
+}
+
+class AwacsAlertNotificationViewData extends GenericNotificationViewData
+{
+	var m_canBeMerged : Bool;
+
+	public override function CanMerge( data : GenericNotificationViewData ) : Bool
+	{
+		return m_canBeMerged;
+	}
+
+}
+
+class PreventionBountyViewData extends GenericNotificationViewData
+{
+	var m_canBeMerged : Bool;
+	var bountyTitle : String;
+	var bountyPrice : Int32;
+}
+
+class ZoneAlertNotificationQueue extends gameuiGenericNotificationGameController
+{
+	private editable var m_duration : Float;
+	default m_duration = 2.0f;
+	private var m_securityBlackBoardID : CallbackHandle;
+	private var m_combatBlackBoardID : CallbackHandle;
+	private var m_wantedValueBlackboardID : CallbackHandle;
+	private var m_bountyAmountBlackboardID : CallbackHandle;
+	private var m_playerBlackboardID : CallbackHandle;
+	private var m_blackboard : weak< IBlackboard >;
+	private var m_bountyPrice : Int32;
+	private var m_wantedBlackboard : weak< IBlackboard >;
+	private var m_wantedBlackboardDef : UI_WantedBarDef;
+	private var m_playerInCombat : Bool;
+	private var m_playerPuppet : weak< GameObject >;
+	private var m_currentSecurityZoneType : ESecurityAreaType;
+	private var m_vehicleZoneBlackboard : weak< IBlackboard >;
+	private var m_vehicleZoneBlackboardDef : LocalPlayerDef;
+	private var m_vehicleZoneBlackboardID : CallbackHandle;
+	private const var WANTED_TIER_SIZE : Int32;
+	default WANTED_TIER_SIZE = 5;
+	private var m_wantedLevel : Int32;
+	private var m_factListenerID : Uint32;
+
+	public export override function GetShouldSaveState() : Bool
+	{
+		return false;
+	}
+
+	public export override function GetID() : Int32
+	{
+		return ( ( Int32 )( GenericNotificationType.ZoneNotification ) );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		var ownerObject : GameObject;
+		ownerObject = ( ( GameObject )( GetOwnerEntity() ) );
+		m_factListenerID = GameInstance.GetQuestsSystem( ownerObject.GetGame() ).RegisterListener( 'awacs_warning', this, 'OnFact' );
+		m_playerPuppet = playerPuppet;
+		m_blackboard = GetPSMBlackboard( m_playerPuppet );
+		m_securityBlackBoardID = m_blackboard.RegisterListenerVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, this, 'OnSecurityDataChange' );
+		m_combatBlackBoardID = m_blackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, this, 'OnCombatChange' );
+		m_playerInCombat = ( ( gamePSMCombat )( m_blackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) ) ) == gamePSMCombat.InCombat;
+		m_wantedBlackboardDef = GetAllBlackboardDefs().UI_WantedBar;
+		m_wantedBlackboard = GetBlackboardSystem().Get( m_wantedBlackboardDef );
+		m_wantedValueBlackboardID = m_wantedBlackboard.RegisterListenerInt( m_wantedBlackboardDef.CurrentWantedLevel, this, 'OnPlayerBountyChange' );
+		m_bountyAmountBlackboardID = m_wantedBlackboard.RegisterListenerInt( m_wantedBlackboardDef.CurrentBounty, this, 'OnPlayerBountyAmountChange' );
+		m_vehicleZoneBlackboardDef = GetAllBlackboardDefs().UI_LocalPlayer;
+		m_vehicleZoneBlackboard = GetBlackboardSystem().Get( m_vehicleZoneBlackboardDef );
+		m_vehicleZoneBlackboardID = m_vehicleZoneBlackboard.RegisterDelayedListenerInt( m_vehicleZoneBlackboardDef.InsideVehicleForbiddenAreasCount, this, 'OnVehicleZone' );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		GameInstance.GetQuestsSystem( m_playerPuppet.GetGame() ).UnregisterListener( 'awacs_warning', m_factListenerID );
+		m_blackboard.UnregisterListenerVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, m_securityBlackBoardID );
+		m_blackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, m_combatBlackBoardID );
+		m_wantedBlackboard.UnregisterDelayedListener( m_wantedBlackboardDef.CurrentWantedLevel, m_wantedValueBlackboardID );
+		m_wantedBlackboard.UnregisterDelayedListener( m_wantedBlackboardDef.CurrentBounty, m_bountyAmountBlackboardID );
+		m_vehicleZoneBlackboard.UnregisterDelayedListener( m_vehicleZoneBlackboardDef.InsideVehicleForbiddenAreasCount, m_vehicleZoneBlackboardID );
+	}
+
+	protected event OnCombatChange( value : Int32 )
+	{
+		m_playerInCombat = ( ( gamePSMCombat )( value ) ) == gamePSMCombat.InCombat;
+	}
+
+	public function OnFact( val : Int32 )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : AwacsAlertNotificationViewData;
+		if( val > 0 )
+		{
+			notificationData.widgetLibraryItemName = 'AVACS_Notification';
+			userData = new AwacsAlertNotificationViewData;
+			userData.m_canBeMerged = false;
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+		}
+	}
+
+	protected event OnVehicleZone( arg : Int32 )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : VehicleAlertNotificationViewData;
+		notificationData.time = m_duration;
+		if( arg > 0 )
+		{
+			notificationData.widgetLibraryItemName = 'Area_VehicleForbidden';
+			userData = new VehicleAlertNotificationViewData;
+			userData.m_canBeMerged = false;
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+		}
+	}
+
+	protected event OnSecurityDataChange( arg : Variant )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : ZoneAlertNotificationViewData;
+		var securityZoneData : SecurityAreaData;
+		var removeRequest : ZoneAlertNotificationRemoveRequestData;
+		securityZoneData = ( ( SecurityAreaData )arg );
+		notificationData.time = m_duration;
+		if( ( securityZoneData.entered || securityZoneData.securityAreaType == ESecurityAreaType.DISABLED ) && !( m_playerInCombat ) )
+		{
+			switch( securityZoneData.securityAreaType )
+			{
+				case ESecurityAreaType.DANGEROUS:
+					notificationData.widgetLibraryItemName = 'Area_Dangerous';
+				userData = new ZoneAlertNotificationViewData;
+				userData.m_canBeMerged = false;
+				if( m_currentSecurityZoneType != securityZoneData.securityAreaType )
+				{
+					userData.securityZoneData = m_currentSecurityZoneType = ESecurityAreaType.DANGEROUS;
+					notificationData.notificationData = userData;
+					AddNewNotificationData( notificationData );
+				}
+				break;
+				case ESecurityAreaType.RESTRICTED:
+					break;
+				notificationData.widgetLibraryItemName = 'Area_Restricted';
+				userData = new ZoneAlertNotificationViewData;
+				userData.m_canBeMerged = false;
+				if( m_currentSecurityZoneType != securityZoneData.securityAreaType )
+				{
+					userData.securityZoneData = m_currentSecurityZoneType = ESecurityAreaType.RESTRICTED;
+					notificationData.notificationData = userData;
+					AddNewNotificationData( notificationData );
+				}
+				break;
+				case ESecurityAreaType.SAFE:
+					notificationData.widgetLibraryItemName = 'Area_Safe';
+				userData = new ZoneAlertNotificationViewData;
+				userData.m_canBeMerged = false;
+				if( m_currentSecurityZoneType != securityZoneData.securityAreaType )
+				{
+					userData.securityZoneData = m_currentSecurityZoneType = ESecurityAreaType.SAFE;
+					notificationData.notificationData = userData;
+					AddNewNotificationData( notificationData );
+				}
+				break;
+				default:
+					break;
+				notificationData.widgetLibraryItemName = 'Area_Public';
+				userData = new ZoneAlertNotificationViewData;
+				userData.m_canBeMerged = false;
+				if( m_currentSecurityZoneType != securityZoneData.securityAreaType )
+				{
+					userData.securityZoneData = m_currentSecurityZoneType = ESecurityAreaType.DISABLED;
+					notificationData.notificationData = userData;
+					AddNewNotificationData( notificationData );
+				}
+				break;
+			}
+		}
+		removeRequest = new ZoneAlertNotificationRemoveRequestData;
+		removeRequest.m_areaType = securityZoneData.securityAreaType;
+		RemoveNotification( removeRequest );
+		m_currentSecurityZoneType = securityZoneData.securityAreaType;
+	}
+
+	protected event OnPlayerBountyChange( wantedLevel : Int32 )
+	{
+		var notificationData : gameuiGenericNotificationData;
+		var userData : PreventionBountyViewData;
+		var newWantedLevelReached : Bool;
+		var i : Int32;
+		newWantedLevelReached = false;
+		notificationData.time = 4.69999981;
+		if( m_wantedLevel < wantedLevel )
+		{
+			m_wantedLevel = wantedLevel;
+			newWantedLevelReached = true;
+		}
+		if( ( m_wantedLevel == 1 ) && newWantedLevelReached )
+		{
+			notificationData.widgetLibraryItemName = 'NCPD_Bounty1';
+			userData = new PreventionBountyViewData;
+			userData.m_canBeMerged = true;
+			userData.bountyTitle = ( "Level " + ( ( String )( i ) ) ) + " Bounty Activated";
+			userData.bountyPrice = m_bountyPrice;
+			notificationData.notificationData = userData;
+			AddNewNotificationData( notificationData );
+		}
+	}
+
+	protected event OnPlayerBountyAmountChange( arg : Int32 )
+	{
+		m_bountyPrice = arg;
+	}
+
+}
+
+class ZoneAlertNotification extends GenericNotificationController
+{
+	private var m_animation : inkAnimProxy;
+	private var m_zone_data : ZoneAlertNotificationViewData;
+	private editable var m_ZoneLabelText : inkTextRef;
+
+	public export override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		m_zone_data = ( ( ZoneAlertNotificationViewData )( notificationData ) );
+		switch( m_zone_data.securityZoneData )
+		{
+			case ESecurityAreaType.DANGEROUS:
+				PlayLibraryAnimation( 'anim_dangerous' );
+			PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+			break;
+			case ESecurityAreaType.RESTRICTED:
+				PlayLibraryAnimation( 'anim_restricted' );
+			PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+			break;
+			case ESecurityAreaType.SAFE:
+				PlayLibraryAnimation( 'anim_safe' );
+			PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+			break;
+			default:
+				PlayLibraryAnimation( 'anim_public' );
+			PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+			break;
+		}
+	}
+
+}
+
+class VehicleAlertNotification extends GenericNotificationController
+{
+	private var m_animation : inkAnimProxy;
+	private var m_zone_data : VehicleAlertNotificationViewData;
+	private editable var m_ZoneLabelText : inkTextRef;
+
+	public override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		PlayLibraryAnimation( 'anim_vehicleforbidden' );
+		PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+	}
+
+}
+
+class AwacsAlertNotification extends GenericNotificationController
+{
+	private var m_animation : inkAnimProxy;
+	private var m_zone_data : VehicleAlertNotificationViewData;
+	private editable var m_ZoneLabelText : inkTextRef;
+
+	public override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		PlayLibraryAnimation( 'AVACS_Notification' );
+		PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+	}
+
+}
+
+class PreventionNotification extends GenericNotificationController
+{
+	private var bounty_data : PreventionBountyViewData;
+	private editable var m_bountyTitleText : inkTextRef;
+	private editable var m_bountyAmountText : inkTextRef;
+
+	public override function SetNotificationData( notificationData : GenericNotificationViewData )
+	{
+		PlaySound( 'StealthTrespassingPopup', 'OnOpen' );
+		bounty_data = ( ( PreventionBountyViewData )( notificationData ) );
+		inkTextRef.SetText( m_bountyTitleText, bounty_data.bountyTitle );
+		inkTextRef.SetText( m_bountyAmountText, ( ( String )( bounty_data.bountyPrice ) ) );
+	}
+
+}
+
+exec function awacstest( gi : GameInstance )
+{
+	AddFact( gi, 'awacs_warning', 1 );
+}
+

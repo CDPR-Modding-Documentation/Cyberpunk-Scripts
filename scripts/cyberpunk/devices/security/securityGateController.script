@@ -1,0 +1,559 @@
+class SecurityGateController extends MasterController
+{
+
+	public const override function GetPS() : SecurityGateControllerPS
+	{
+		return ( ( SecurityGateControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+struct TrespasserEntry
+{
+	var trespasser : weak< GameObject >;
+	var isScanned : Bool;
+	var isInsideA : Bool;
+	var isInsideB : Bool;
+	var isInsideScanner : Bool;
+	var areaStack : array< CName >;
+}
+
+struct SecurityGateDetectionProperties
+{
+	[ tooltip = "Checks if puppet has any item that falls into gamedataItemCategory.Weapon category" ]
+	instanceeditable var performWeaponCheck : Bool;
+	default performWeaponCheck = true;
+	[ tooltip = "Checks if puppet has any item that falls into gamedataItemCategory.Cyberware category" ]
+	instanceeditable var performCyberwareCheck : Bool;
+	default performCyberwareCheck = false;
+	[ tooltip = "Define whether security gate should perform scan if puppet enters from particular side or any side" ]
+	instanceeditable var scannerEntranceType : ESecurityGateEntranceType;
+	instanceeditable var performCheckOnPlayerOnly : Bool;
+	default performCheckOnPlayerOnly = true;
+}
+
+struct SecurityGateResponseProperties
+{
+	[ tooltip = "How security gate should react to tresspassing. Reprimand / Combat work only with Security System connected to this Gate" ]
+	instanceeditable var securityGateResponseType : ESecurityGateResponseType;
+	default securityGateResponseType = ESecurityGateResponseType.SEC_SYS_REPRIMAND;
+	[ tooltip = "What access should be given to the user if he passes scanner succesfully" ]
+	instanceeditable var securityLevelAccessGranted : ESecurityAccessLevel;
+	default securityLevelAccessGranted = ESecurityAccessLevel.ESL_3;
+}
+
+class SecurityGateControllerPS extends MasterControllerPS
+{
+	default m_deviceName = "Gameplay-Devices-DisplayNames-Terminal";
+	private instanceeditable var m_securityGateDetectionProperties : SecurityGateDetectionProperties;
+	private instanceeditable var m_securityGateResponseProperties : SecurityGateResponseProperties;
+	private var m_securityGateStatus : ESecurityGateStatus;
+	private var m_trespassersDataList : array< TrespasserEntry >;
+
+	public const function GetScannerEntranceType() : ESecurityGateEntranceType
+	{
+		return m_securityGateDetectionProperties.scannerEntranceType;
+	}
+
+	public const function GetShouldCheckPlayerOnly() : Bool
+	{
+		return m_securityGateDetectionProperties.performCheckOnPlayerOnly;
+	}
+
+	protected function ActionQuickHackAuthorization() : QuickHackAuthorization
+	{
+		var action : QuickHackAuthorization;
+		action = new QuickHackAuthorization;
+		action.clearanceLevel = DefaultActionsParametersHolder.GetInteractiveClearance();
+		action.SetUp( this );
+		action.AddDeviceName( GetDeviceName() );
+		action.CreateInteraction();
+		return action;
+	}
+
+	protected const override function CanCreateAnyQuickHackActions() : Bool
+	{
+		return true;
+	}
+
+	protected override function GetQuickHackActions( out outActions : array< DeviceAction >, context : GetActionsContext )
+	{
+		var currentAction : ScriptableDeviceAction;
+		currentAction = ActionQuickHackDistraction();
+		currentAction.SetObjectActionID( T"DeviceAction.MalfunctionClassHack" );
+		currentAction.SetDurationValue( GetDistractionDuration( currentAction ) );
+		currentAction.SetInactiveWithReason( QuickHackDistraction.IsDefaultConditionMet( this, context ), "LocKey#7003" );
+		outActions.PushBack( currentAction );
+		if( IsGlitching() || IsDistracting() )
+		{
+			SetActionsInactiveAll( outActions, "LocKey#7004" );
+		}
+		currentAction = ActionQuickHackAuthorization();
+		currentAction.SetObjectActionID( T"DeviceAction.OverrideAttitudeClassHack" );
+		currentAction.SetInactiveWithReason( !( IsUserAuthorized( context.processInitiatorObject.GetEntityID() ) ), "LocKey#7016" );
+		outActions.PushBack( currentAction );
+		super.GetQuickHackActions( outActions, context );
+	}
+
+	public function UpdateTrespassersList( evt : TriggerEvent, isEntering : Bool )
+	{
+		var index : Int32;
+		var trespasser : ScriptedPuppet;
+		if( ( evt.componentName != 'scanningArea' && evt.componentName != 'sideA' ) && evt.componentName != 'sideB' )
+		{
+			return;
+		}
+		trespasser = ( ( ScriptedPuppet )( EntityGameInterface.GetEntity( evt.activator ) ) );
+		if( !( trespasser ) )
+		{
+			return;
+		}
+		if( !( ( ( PlayerPuppet )( trespasser ) ) ) && GetShouldCheckPlayerOnly() )
+		{
+			return;
+		}
+		if( IsTrespasserOnTheList( trespasser, index ) )
+		{
+			UpdateTrespasserEntry( index, isEntering, evt.componentName );
+			EvaluateIfActionIsRequired( evt.componentName, trespasser.GetEntityID(), isEntering );
+		}
+		else
+		{
+			AddTrespasserEntry( trespasser, evt.componentName );
+		}
+	}
+
+	private function IsTrespasserOnTheList( trespasser : ScriptedPuppet, out index : Int32 ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_trespassersDataList.Size(); i += 1 )
+		{
+			if( m_trespassersDataList[ i ].trespasser == trespasser )
+			{
+				index = i;
+				return true;
+			}
+		}
+		index = -1;
+		return false;
+	}
+
+	private function UpdateTrespasserEntry( index : Int32, isEntering : Bool, areaName : CName )
+	{
+		switch( areaName )
+		{
+			case 'sideA':
+				m_trespassersDataList[ index ].isInsideA = isEntering;
+			break;
+			case 'sideB':
+				m_trespassersDataList[ index ].isInsideB = isEntering;
+			break;
+			case 'scanningArea':
+				m_trespassersDataList[ index ].isInsideScanner = isEntering;
+			break;
+			default:
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, NameToString( areaName ) + "is not supported. Check if Security Gate entity has proper StaticAreaComponents", ELogType.WARNING );
+				}
+			return;
+		}
+		if( IsTrespasserOutside( index ) )
+		{
+			ProtectEntityFromSecuritySystem( false, m_trespassersDataList[ index ].trespasser.GetEntityID(), false, DetermineIfEntityIsWithdrawing( index, areaName ) );
+			RemoveTrespasserEntry( index );
+		}
+		if( isEntering )
+		{
+			m_trespassersDataList[ index ].areaStack.PushBack( areaName );
+		}
+	}
+
+	private function AddTrespasserEntry( trespasser : ScriptedPuppet, areaName : CName )
+	{
+		var newEntry : TrespasserEntry;
+		if( IsConnectedToSecuritySystem() )
+		{
+			ProtectEntityFromSecuritySystem( true, trespasser.GetEntityID(), true, false );
+		}
+		newEntry.trespasser = trespasser;
+		m_trespassersDataList.PushBack( newEntry );
+		UpdateTrespasserEntry( m_trespassersDataList.Size() - 1, true, areaName );
+	}
+
+	private function RemoveTrespasserEntry( index : Int32 )
+	{
+		if( m_securityGateStatus == ESecurityGateStatus.SCANNING )
+		{
+			TriggerScanResponse( false );
+		}
+		m_trespassersDataList.Erase( index );
+	}
+
+	private function IsTrespasserOutside( index : Int32 ) : Bool
+	{
+		if( ( m_trespassersDataList[ index ].isInsideA || m_trespassersDataList[ index ].isInsideB ) || m_trespassersDataList[ index ].isInsideScanner )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private function EvaluateIfActionIsRequired( mostRecentArea : CName, tresspasser : EntityID, isEntering : Bool )
+	{
+		var trespasserIndex : Int32;
+		var problem : ESecurityGateScannerIssueType;
+		if( GetUserAuthorizationLevel( tresspasser ) > m_securityGateResponseProperties.securityLevelAccessGranted )
+		{
+			if( mostRecentArea == 'scanningArea' && isEntering )
+			{
+				TriggerScanResponse( true );
+			}
+			return;
+		}
+		if( !( PerformScannerSmokeCheck( problem ) ) )
+		{
+			ResolveScannerNotReady( problem );
+			return;
+		}
+		if( !( GetTrespasserInScannerArea( trespasserIndex ) ) )
+		{
+			return;
+		}
+		if( m_trespassersDataList[ trespasserIndex ].isScanned )
+		{
+			problem = ESecurityGateScannerIssueType.TargetAlreadyScanned;
+			ResolveScannerNotReady( problem );
+			return;
+		}
+		if( m_securityGateDetectionProperties.scannerEntranceType == ESecurityGateEntranceType.AnySide )
+		{
+			InitiateScan( trespasserIndex );
+		}
+		else
+		{
+			if( DetermineIfEnteredFromCorrectSide( trespasserIndex, mostRecentArea ) )
+			{
+				InitiateScan( trespasserIndex );
+			}
+		}
+	}
+
+	private function PerformScannerSmokeCheck( out reason : ESecurityGateScannerIssueType ) : Bool
+	{
+		var numberOfPuppetsInTheScanner : Int32;
+		var i : Int32;
+		for( i = 0; i < m_trespassersDataList.Size(); i += 1 )
+		{
+			if( m_trespassersDataList[ i ].isInsideScanner )
+			{
+				numberOfPuppetsInTheScanner += 1;
+			}
+		}
+		if( numberOfPuppetsInTheScanner == 1 )
+		{
+			return true;
+		}
+		else if( numberOfPuppetsInTheScanner > 1 )
+		{
+			reason = ESecurityGateScannerIssueType.Overcrowded;
+			return false;
+		}
+		else
+		{
+			reason = ESecurityGateScannerIssueType.ScannerEmpty;
+			return false;
+		}
+	}
+
+	private function ResolveScannerNotReady( reason : ESecurityGateScannerIssueType ) {}
+
+	private function InitiateScan( entryIndex : Int32 )
+	{
+		var initiateScanEvent : InitiateScanner;
+		GameInstance.GetActivityLogSystem( GetGameInstance() ).AddLog( "Security Gate: Scanning!" );
+		initiateScanEvent = new InitiateScanner;
+		initiateScanEvent.trespasserEntryIndex = entryIndex;
+		QueuePSEventWithDelay( this, initiateScanEvent, 1.0 );
+		QueueEntityEvent( GetMyEntityID(), initiateScanEvent );
+		m_securityGateStatus = ESecurityGateStatus.SCANNING;
+	}
+
+	public function OnInitiateScanner( evt : InitiateScanner ) : EntityNotificationType
+	{
+		PerformScan( evt.trespasserEntryIndex );
+		return EntityNotificationType.DoNotNotifyEntity;
+	}
+
+	private function PerformScan( index : Int32 )
+	{
+		var allItems : array< weak< gameItemData > >;
+		var weapons : array< weak< gameItemData > >;
+		var hasCyberware : Bool;
+		if( GetUserAuthorizationLevel( m_trespassersDataList[ index ].trespasser.GetEntityID() ) > m_securityGateResponseProperties.securityLevelAccessGranted )
+		{
+			TriggerScanResponse( true );
+			return;
+		}
+		RevokeAuthorization( m_trespassersDataList[ index ].trespasser.GetEntityID() );
+		if( m_securityGateStatus != ESecurityGateStatus.SCANNING )
+		{
+			return;
+		}
+		GameInstance.GetTransactionSystem( GetGameInstance() ).GetItemList( m_trespassersDataList[ index ].trespasser, allItems );
+		RPGManager.ExtractItemsOfEquipArea( gamedataEquipmentArea.Weapon, allItems, weapons );
+		hasCyberware = EquipmentSystem.HasItemInArea( m_trespassersDataList[ index ].trespasser, gamedataEquipmentArea.ArmsCW );
+		m_trespassersDataList[ index ].isScanned = true;
+		if( ( m_securityGateDetectionProperties.performWeaponCheck && ( weapons.Size() > 0 ) ) || ( m_securityGateDetectionProperties.performCyberwareCheck && hasCyberware ) )
+		{
+			TriggerScanResponse( false );
+			return;
+		}
+		TriggerScanResponse( true );
+	}
+
+	private function GetTrespasserInScannerArea( out index : Int32 ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_trespassersDataList.Size(); i += 1 )
+		{
+			if( m_trespassersDataList[ i ].isInsideScanner )
+			{
+				index = i;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function TriggerScanResponse( isSuccessful : Bool )
+	{
+		var scanResult : SecurityGateResponse;
+		var trespasser : weak< GameObject >;
+		var index : Int32;
+		var securityNotificationType : ESecurityNotificationType;
+		if( !( GetTrespasserInScannerArea( index ) ) )
+		{
+			return;
+		}
+		scanResult = new SecurityGateResponse;
+		scanResult.scanSuccessful = isSuccessful;
+		QueueEntityEvent( GetMyEntityID(), scanResult );
+		trespasser = m_trespassersDataList[ index ].trespasser;
+		ManageSlaves( trespasser.GetEntityID(), isSuccessful );
+		if( isSuccessful )
+		{
+			GameInstance.GetActivityLogSystem( GetGameInstance() ).AddLog( "Security Gate: Scan Successful" );
+			if( IsPartOfSystem( ESystems.SecuritySystem ) )
+			{
+				if( ( ( Int32 )( m_securityGateResponseProperties.securityLevelAccessGranted ) ) > ( ( Int32 )( ESecurityAccessLevel.ESL_NONE ) ) )
+				{
+					GetSecuritySystem().AuthorizeUser( trespasser.GetEntityID(), m_securityGateResponseProperties.securityLevelAccessGranted );
+					GameInstance.GetActivityLogSystem( GetGameInstance() ).AddLog( "Security Gate: User Authorized " + EnumValueToString( "ESecurityAccessLevel", ( ( Int32 )( m_securityGateResponseProperties.securityLevelAccessGranted ) ) ) );
+				}
+			}
+			m_securityGateStatus = ESecurityGateStatus.READY;
+		}
+		else
+		{
+			GameInstance.GetActivityLogSystem( GetGameInstance() ).AddLog( "Security Gate: Threat detected!" );
+			m_securityGateStatus = ESecurityGateStatus.THREAT_DETECTED;
+			switch( m_securityGateResponseProperties.securityGateResponseType )
+			{
+				case ESecurityGateResponseType.AUDIOVISUAL_ONLY:
+					return;
+				case ESecurityGateResponseType.SEC_SYS_REPRIMAND:
+					securityNotificationType = ESecurityNotificationType.SECURITY_GATE;
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, "Security Gate Requests REPRIMAND!" );
+				}
+				break;
+				case ESecurityGateResponseType.SEC_SYS_COMBAT:
+					securityNotificationType = ESecurityNotificationType.COMBAT;
+				if( !( IsFinal() ) )
+				{
+					LogDevices( this, "Security Gate Requests COMBAT!" );
+				}
+				break;
+				default:
+					if( !( IsFinal() ) )
+					{
+						LogDevices( this, "Unsupported securityGateResponseType" );
+					}
+			}
+			TriggerSecuritySystemNotification( trespasser, trespasser.GetWorldPosition(), securityNotificationType );
+		}
+	}
+
+	private function ManageSlaves( trespasser : EntityID, shouldUnlock : Bool )
+	{
+		var i : Int32;
+		var slaves : array< DeviceComponentPS >;
+		var action : SecurityGateForceUnlock;
+		slaves = GetImmediateSlaves();
+		for( i = 0; i < slaves.Size(); i += 1 )
+		{
+			action = new SecurityGateForceUnlock;
+			action.entranceAllowedFor = trespasser;
+			action.shouldUnlock = shouldUnlock;
+			QueuePSEvent( slaves[ i ], action );
+		}
+	}
+
+	private const function ProtectEntityFromSecuritySystem( shouldProtect : Bool, whoToProtect : EntityID, entered : Bool, hasEntityWithdrawn : Bool )
+	{
+		var suppressSecSysReaction : SuppressSecuritySystemReaction;
+		if( m_securityGateResponseProperties.securityGateResponseType == ESecurityGateResponseType.AUDIOVISUAL_ONLY )
+		{
+			return;
+		}
+		suppressSecSysReaction = new SuppressSecuritySystemReaction;
+		suppressSecSysReaction.enableProtection = shouldProtect;
+		suppressSecSysReaction.protectedEntityID = whoToProtect;
+		suppressSecSysReaction.hasEntityWithdrawn = hasEntityWithdrawn;
+		if( m_securityGateResponseProperties.securityGateResponseType == ESecurityGateResponseType.SEC_SYS_REPRIMAND )
+		{
+			suppressSecSysReaction.entered = entered;
+		}
+		QueuePSEvent( GetSecuritySystem(), suppressSecSysReaction );
+	}
+
+	private function DetermineIfEnteredFromCorrectSide( trespasserIndex : Int32, areaName : CName ) : Bool
+	{
+		var firstSideName : CName;
+		if( m_trespassersDataList[ trespasserIndex ].areaStack.Size() < 1 )
+		{
+			if( !( IsFinal() ) )
+			{
+				LogDevices( this, "Weird staticTriggerAreaComponent setup - debug entity", ELogType.WARNING );
+			}
+			return false;
+		}
+		firstSideName = m_trespassersDataList[ trespasserIndex ].areaStack[ 0 ];
+		if( areaName != 'scanningArea' )
+		{
+			return false;
+		}
+		if( m_securityGateDetectionProperties.scannerEntranceType == ESecurityGateEntranceType.OnlySideA && firstSideName == 'sideA' )
+		{
+			return true;
+		}
+		if( m_securityGateDetectionProperties.scannerEntranceType == ESecurityGateEntranceType.OnlySideB && firstSideName == 'sideB' )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected function DetermineIfEntityIsWithdrawing( index : Int32, areaName : CName ) : Bool
+	{
+		if( m_securityGateDetectionProperties.scannerEntranceType == ESecurityGateEntranceType.AnySide )
+		{
+			if( areaName == m_trespassersDataList[ index ].areaStack[ 0 ] )
+			{
+				return true;
+			}
+		}
+		else if( m_securityGateDetectionProperties.scannerEntranceType == ESecurityGateEntranceType.OnlySideA )
+		{
+			if( areaName == 'sideA' )
+			{
+				return true;
+			}
+		}
+		else
+		{
+			if( areaName == 'sideB' )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	protected function RevokeAuthorization( user : EntityID )
+	{
+		var revokeEvent : RevokeAuthorization;
+		var secSys : SecuritySystemControllerPS;
+		var i : Int32;
+		secSys = GetSecuritySystem();
+		if( secSys )
+		{
+			revokeEvent = new RevokeAuthorization;
+			revokeEvent.user = user;
+			revokeEvent.level = m_securityGateResponseProperties.securityLevelAccessGranted;
+			QueuePSEvent( secSys, revokeEvent );
+		}
+		else
+		{
+			for( i = 0; i < m_currentlyAuthorizedUsers.Size(); i += 1 )
+			{
+				if( m_currentlyAuthorizedUsers[ i ].user == user )
+				{
+					if( m_currentlyAuthorizedUsers[ i ].level > ESecurityAccessLevel.ESL_0 )
+					{
+						m_currentlyAuthorizedUsers[ i ].level = ESecurityAccessLevel.ESL_0;
+					}
+				}
+			}
+		}
+	}
+
+	protected override function PerformRestart()
+	{
+		var emptyID : EntityID;
+		ManageSlaves( emptyID, true );
+		super.PerformRestart();
+	}
+
+	protected override function WakeUpDevice() : Bool
+	{
+		var emptyID : EntityID;
+		var value : Bool;
+		value = super.WakeUpDevice();
+		ManageSlaves( emptyID, false );
+		return value;
+	}
+
+	protected override function GetDeviceIconTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceIcon";
+	}
+
+	protected override function GetBackgroundTextureTweakDBID() : TweakDBID
+	{
+		return T"DeviceIcons.SecuritySystemDeviceBackground";
+	}
+
+}
+
+enum ESecurityGateStatus
+{
+	READY = 0,
+	SCANNING = 1,
+	THREAT_DETECTED = 2,
+}
+
+enum ESecurityGateScannerIssueType
+{
+	NoIssues = 0,
+	ScannerEmpty = 1,
+	Overcrowded = 2,
+	TargetAlreadyScanned = 3,
+}
+
+enum ESecurityGateEntranceType
+{
+	OnlySideA = 0,
+	OnlySideB = 1,
+	AnySide = 2,
+}
+
+enum ESecurityGateResponseType
+{
+	AUDIOVISUAL_ONLY = 0,
+	SEC_SYS_REPRIMAND = 1,
+	SEC_SYS_COMBAT = 2,
+}
+

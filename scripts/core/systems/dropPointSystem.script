@@ -1,0 +1,573 @@
+class DropPointCallback extends InventoryScriptCallback
+{
+	var dps : weak< DropPointSystem >;
+
+	public override function OnItemRemoved( item : ItemID, difference : Int32, currentQuantity : Int32 )
+	{
+		var request : DropPointRequest;
+		request = new DropPointRequest;
+		request.CreateRequest( ItemID.GetTDBID( item ), DropPointPackageStatus.COLLECTED );
+		dps.QueueRequest( request );
+	}
+
+}
+
+class DropPointRequest extends ScriptableSystemRequest
+{
+	[ customEditor = "TweakDBGroupInheritance;Item" ]
+	private editable var record : TweakDBID;
+	[ Tooltip = "NOT_ACTIVE = DropPoints will not accept them | ACTIVE = drop points will allow to deposit them | COLLECTED = treated as if it was already deposited" ]
+	private editable var status : DropPointPackageStatus;
+	private var holder : PersistentID;
+
+	public function CreateRequest( _record : TweakDBID, _status : DropPointPackageStatus, optional _holder : PersistentID )
+	{
+		record = _record;
+		status = _status;
+		if( PersistentID.IsDefined( _holder ) )
+		{
+			holder = _holder;
+		}
+	}
+
+	public const function Record() : TweakDBID
+	{
+		return record;
+	}
+
+	public const function Status() : DropPointPackageStatus
+	{
+		return status;
+	}
+
+	public const function Holder() : PersistentID
+	{
+		return holder;
+	}
+
+	public constexpr export function GetFriendlyDescription() : String
+	{
+		return "ENABLE / DISABLE PACKAGE";
+	}
+
+}
+
+class DropPointMappinRegistrationData extends IScriptable
+{
+	private persistent var m_ownerID : EntityID;
+	private persistent var m_position : Vector4;
+	private var m_mapinID : NewMappinID;
+	private var m_trackingAlternativeMappinID : NewMappinID;
+
+	public function Initalize( ownerID : EntityID, position : Vector4 )
+	{
+		m_ownerID = ownerID;
+		m_position = position;
+	}
+
+	public function SetMappinID( id : NewMappinID )
+	{
+		m_mapinID = id;
+	}
+
+	public function SetTrackingAlternativeMappinID( id : NewMappinID )
+	{
+		m_trackingAlternativeMappinID = id;
+	}
+
+	public const function GetOwnerID() : EntityID
+	{
+		return m_ownerID;
+	}
+
+	public const function GetPosition() : Vector4
+	{
+		return m_position;
+	}
+
+	public const function GetMappinID() : NewMappinID
+	{
+		return m_mapinID;
+	}
+
+	public const function GetTrackingAlternativeMappinID() : NewMappinID
+	{
+		return m_trackingAlternativeMappinID;
+	}
+
+}
+
+class RegisterDropPointMappinRequest extends ScriptableSystemRequest
+{
+	var ownerID : EntityID;
+	var position : Vector4;
+	var trackingAlternativeMappinID : NewMappinID;
+}
+
+class UnregisterDropPointMappinRequest extends ScriptableSystemRequest
+{
+	var ownerID : EntityID;
+	var removeFromSystem : Bool;
+	default removeFromSystem = true;
+}
+
+struct DropPointSystemLock
+{
+	persistent var lockReason : CName;
+}
+
+class ToggleDropPointSystemRequest extends ScriptableSystemRequest
+{
+	editable var isEnabled : Bool;
+	editable var reason : CName;
+	default reason = 'quest';
+
+	public constexpr function GetFriendlyDescription() : String
+	{
+		return "Toggle Drop Point System";
+	}
+
+}
+
+class UpdateDropPointEvent extends Event
+{
+	var isEnabled : Bool;
+}
+
+class DropPointPackage extends IScriptable
+{
+	private persistent var itemID : TweakDBID;
+	[ Tooltip = "NOT_ACTIVE = DropPoints will not accept them | ACTIVE = drop points will allow to deposit them | EXPOSED = treated as if it was already deposited" ]
+	private persistent var status : DropPointPackageStatus;
+	private persistent var predefinedDrop : PersistentID;
+	private var statusHistory : array< DropPointPackageStatus >;
+
+	public function SetStatus( newStatus : DropPointPackageStatus )
+	{
+		statusHistory.PushBack( newStatus );
+		status = newStatus;
+	}
+
+	public function SetRecord( record : TweakDBID )
+	{
+		itemID = record;
+	}
+
+	public function SetHolder( _holder : PersistentID )
+	{
+		if( PersistentID.IsDefined( _holder ) )
+		{
+			predefinedDrop = _holder;
+		}
+	}
+
+	public const function Status() : DropPointPackageStatus
+	{
+		return status;
+	}
+
+	public const function Record() : TweakDBID
+	{
+		return itemID;
+	}
+
+	public const function Holder() : PersistentID
+	{
+		return predefinedDrop;
+	}
+
+}
+
+class DropPointSystem extends ScriptableSystem
+{
+	private persistent var m_packages : array< DropPointPackage >;
+	private persistent var m_mappins : array< DropPointMappinRegistrationData >;
+	private persistent var m_isEnabled : Bool;
+	default m_isEnabled = true;
+	private persistent var m_dropPointSystemLocks : array< DropPointSystemLock >;
+
+	private export override function OnAttach() {}
+
+	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
+	{
+		RestoreDropPointMappins();
+	}
+
+	public const function CanDeposit( record : TweakDBID, dropPoint : PersistentID ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_packages.Size(); i += 1 )
+		{
+			if( ( m_packages[ i ].Record() == record ) && m_packages[ i ].Status() == DropPointPackageStatus.ACTIVE )
+			{
+				if( !( PersistentID.IsDefined( m_packages[ i ].Holder() ) ) || m_packages[ i ].Holder() == dropPoint )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public quest const function IsCollected( record : TweakDBID ) : Bool
+	{
+		return Is( record, DropPointPackageStatus.COLLECTED );
+	}
+
+	public quest const function IsActive( record : TweakDBID ) : Bool
+	{
+		return Is( record, DropPointPackageStatus.ACTIVE );
+	}
+
+	public const function HasItemsThatCanBeDeposited( user : GameObject, dropPoint : PersistentID ) : Bool
+	{
+		var items : array< weak< gameItemData > >;
+		var ts : TransactionSystem;
+		if( !( user ) )
+		{
+			return false;
+		}
+		ts = GameInstance.GetTransactionSystem( GetGameInstance() );
+		ts.GetItemList( user, items );
+		return HasMeaningfulItems( items, dropPoint );
+	}
+
+	protected const function HasMeaningfulItems( items : array< weak< gameItemData > >, dropPoint : PersistentID ) : Bool
+	{
+		var i : Int32;
+		var k : Int32;
+		for( i = 0; i < m_packages.Size(); i += 1 )
+		{
+			for( k = 0; k < items.Size(); k += 1 )
+			{
+				if( ( m_packages[ i ].Record() == ItemID.GetTDBID( items[ k ].GetID() ) ) && m_packages[ i ].Status() == DropPointPackageStatus.ACTIVE )
+				{
+					if( !( PersistentID.IsDefined( m_packages[ i ].Holder() ) ) || m_packages[ i ].Holder() == dropPoint )
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	public const function Is( record : TweakDBID, status : DropPointPackageStatus ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_packages.Size(); i += 1 )
+		{
+			if( m_packages[ i ].Record() == record )
+			{
+				return m_packages[ i ].Status() == status;
+			}
+		}
+		return false;
+	}
+
+	private function UpdateRecord( package : DropPointPackage, status : DropPointPackageStatus, holder : PersistentID )
+	{
+		package.SetStatus( status );
+		package.SetHolder( holder );
+	}
+
+	private function CreatePackage( request : DropPointRequest )
+	{
+		var package : DropPointPackage;
+		package = new DropPointPackage;
+		package.SetRecord( request.Record() );
+		package.SetStatus( request.Status() );
+		package.SetHolder( request.Holder() );
+		m_packages.PushBack( package );
+	}
+
+	protected export function OnDropPointRequest( dropPointRequest : DropPointRequest )
+	{
+		UpdatePackage( dropPointRequest );
+	}
+
+	private function UpdatePackage( dropPointRequest : DropPointRequest )
+	{
+		var i : Int32;
+		for( i = 0; i < m_packages.Size(); i += 1 )
+		{
+			if( m_packages[ i ].Record() == dropPointRequest.Record() )
+			{
+				UpdateRecord( m_packages[ i ], dropPointRequest.Status(), dropPointRequest.Holder() );
+				return;
+			}
+		}
+		if( dropPointRequest.Status() != DropPointPackageStatus.ACTIVE )
+		{
+			return;
+		}
+		CreatePackage( dropPointRequest );
+	}
+
+	protected function OnToggleDropPointSystemRequest( request : ToggleDropPointSystemRequest )
+	{
+		var shouldUpdate : Bool;
+		var newState : Bool;
+		if( !( request.isEnabled ) )
+		{
+			AddDropPointSystemLock( request.reason );
+		}
+		else
+		{
+			RemoveDropPointSystemLock( request.reason );
+		}
+		newState = m_dropPointSystemLocks.Size() <= 0;
+		shouldUpdate = m_isEnabled != newState;
+		m_isEnabled = newState;
+		if( shouldUpdate )
+		{
+			if( m_isEnabled )
+			{
+				RestoreDropPointMappins( true );
+			}
+			else
+			{
+				HideDropPointMappins( true );
+			}
+		}
+	}
+
+	private function AddDropPointSystemLock( reason : CName )
+	{
+		var i : Int32;
+		var newLock : DropPointSystemLock;
+		if( IsNameValid( reason ) )
+		{
+			for( i = 0; i < m_dropPointSystemLocks.Size(); i += 1 )
+			{
+				if( m_dropPointSystemLocks[ i ].lockReason == reason )
+				{
+					return;
+				}
+			}
+			newLock.lockReason = reason;
+			m_dropPointSystemLocks.PushBack( newLock );
+		}
+	}
+
+	private function RemoveDropPointSystemLock( reason : CName )
+	{
+		var i : Int32;
+		if( IsNameValid( reason ) )
+		{
+			for( i = 0; i < m_dropPointSystemLocks.Size(); i += 1 )
+			{
+				if( m_dropPointSystemLocks[ i ].lockReason == reason )
+				{
+					m_dropPointSystemLocks.EraseFast( i );
+					return;
+				}
+			}
+		}
+	}
+
+	protected export function OnRegisterDropPointMappinRequest( request : RegisterDropPointMappinRequest )
+	{
+		var registrationData : DropPointMappinRegistrationData;
+		var invalidMappinID : NewMappinID;
+		registrationData = GetMappinData( request.ownerID );
+		if( !( registrationData ) )
+		{
+			registrationData = new DropPointMappinRegistrationData;
+			registrationData.Initalize( request.ownerID, request.position );
+			m_mappins.PushBack( registrationData );
+		}
+		if( m_isEnabled && registrationData.GetMappinID() == invalidMappinID )
+		{
+			RegisterDropPointMappin( registrationData );
+		}
+		if( request.trackingAlternativeMappinID != invalidMappinID && registrationData.GetTrackingAlternativeMappinID() == invalidMappinID )
+		{
+			registrationData.SetTrackingAlternativeMappinID( request.trackingAlternativeMappinID );
+			GetMappinSystem().SetMappinTrackingAlternative( registrationData.GetMappinID(), registrationData.GetTrackingAlternativeMappinID() );
+		}
+	}
+
+	protected function OnUnregisterDropPointMappinRequest( request : UnregisterDropPointMappinRequest )
+	{
+		var registrationData : DropPointMappinRegistrationData;
+		if( request.removeFromSystem )
+		{
+			RemoveMappinData( request.ownerID );
+		}
+		else
+		{
+			registrationData = GetMappinData( request.ownerID );
+			if( registrationData )
+			{
+				UnregisterDropPointMappin( registrationData );
+			}
+		}
+	}
+
+	private function RestoreDropPointMappins( optional informDevice : Bool )
+	{
+		var i : Int32;
+		var evt : UpdateDropPointEvent;
+		if( !( m_isEnabled ) )
+		{
+			return;
+		}
+		for( i = 0; i < m_mappins.Size(); i += 1 )
+		{
+			RegisterDropPointMappin( m_mappins[ i ] );
+			if( informDevice )
+			{
+				evt = new UpdateDropPointEvent;
+				evt.isEnabled = true;
+				GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( m_mappins[ i ].GetOwnerID(), evt );
+			}
+		}
+	}
+
+	private function HideDropPointMappins( optional informDevice : Bool )
+	{
+		var i : Int32;
+		var evt : UpdateDropPointEvent;
+		if( m_isEnabled )
+		{
+			return;
+		}
+		for( i = 0; i < m_mappins.Size(); i += 1 )
+		{
+			UnregisterDropPointMappin( m_mappins[ i ] );
+			if( informDevice )
+			{
+				evt = new UpdateDropPointEvent;
+				evt.isEnabled = false;
+				GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( m_mappins[ i ].GetOwnerID(), evt );
+			}
+		}
+	}
+
+	private function RegisterDropPointMappin( data : DropPointMappinRegistrationData )
+	{
+		var mappinData : MappinData;
+		var mappinID : NewMappinID;
+		if( ( data == NULL ) || data.GetMappinID() != mappinID )
+		{
+			return;
+		}
+		mappinData.mappinType = T"Mappins.DropPointStaticMappin";
+		mappinData.variant = gamedataMappinVariant.ServicePointDropPointVariant;
+		mappinData.active = true;
+		mappinID = GetMappinSystem().RegisterMappin( mappinData, data.GetPosition() );
+		data.SetMappinID( mappinID );
+	}
+
+	private function UnregisterDropPointMappin( data : DropPointMappinRegistrationData )
+	{
+		var invalidMappinID : NewMappinID;
+		if( ( data == NULL ) || data.GetMappinID() == invalidMappinID )
+		{
+			return;
+		}
+		GetMappinSystem().UnregisterMappin( data.GetMappinID() );
+		data.SetMappinID( invalidMappinID );
+		data.SetTrackingAlternativeMappinID( invalidMappinID );
+	}
+
+	private function HasMappin( ownerID : EntityID ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_mappins.Size(); i += 1 )
+		{
+			if( m_mappins[ i ].GetOwnerID() == ownerID )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function GetMappinData( ownerID : EntityID ) : DropPointMappinRegistrationData
+	{
+		var i : Int32;
+		for( i = 0; i < m_mappins.Size(); i += 1 )
+		{
+			if( m_mappins[ i ].GetOwnerID() == ownerID )
+			{
+				return m_mappins[ i ];
+			}
+		}
+		return NULL;
+	}
+
+	private function RemoveMappinData( ownerID : EntityID )
+	{
+		var i : Int32;
+		for( i = m_mappins.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( m_mappins[ i ].GetOwnerID() == ownerID )
+			{
+				UnregisterDropPointMappin( m_mappins[ i ] );
+				m_mappins[ i ] = NULL;
+				m_mappins.Erase( i );
+				break;
+			}
+		}
+	}
+
+	private function GetMappinSystem() : MappinSystem
+	{
+		return GameInstance.GetMappinSystem( GetGameInstance() );
+	}
+
+	public const function IsEnabled() : Bool
+	{
+		return m_isEnabled;
+	}
+
+}
+
+enum DropPointPackageStatus
+{
+	NOT_ACTIVE = 0,
+	ACTIVE = 1,
+	COLLECTED = 2,
+}
+
+operator==( record_1 : ItemID, record_2 : TweakDBID ) : Bool
+{
+	if( ItemID.GetTDBID( record_1 ) == record_2 )
+	{
+		return true;
+	}
+	return false;
+}
+
+operator==( record_1 : TweakDBID, record_2 : ItemID ) : Bool
+{
+	if( record_1 == ItemID.GetTDBID( record_2 ) )
+	{
+		return true;
+	}
+	return false;
+}
+
+exec function TestDrop( gameInstance : GameInstance )
+{
+	var request : DropPointRequest;
+	var itemID : ItemID;
+	var player : GameObject;
+	var ts : TransactionSystem;
+	var dps : DropPointSystem;
+	player = GameInstance.GetPlayerSystem( gameInstance ).GetLocalPlayerMainGameObject();
+	ts = GameInstance.GetTransactionSystem( gameInstance );
+	dps = ( ( DropPointSystem )( GameInstance.GetScriptableSystemsContainer( gameInstance ).Get( 'DropPointSystem' ) ) );
+	if( !( ts ) )
+	{
+		return;
+	}
+	itemID = ItemID.FromTDBID( T"Items.w_special_flak" );
+	ts.GiveItem( player, itemID, 1 );
+	request = new DropPointRequest;
+	request.CreateRequest( ItemID.GetTDBID( itemID ), DropPointPackageStatus.ACTIVE );
+	dps.QueueRequest( request );
+}
+

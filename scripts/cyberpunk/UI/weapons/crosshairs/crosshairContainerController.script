@@ -1,0 +1,200 @@
+import class gameuiCrosshairContainerController extends inkHUDGameController
+{
+	private var m_bbUIData : weak< IBlackboard >;
+	private var m_bbWeaponInfo : weak< IBlackboard >;
+	private var m_bbPlayerTierEventId : CallbackHandle;
+	private var m_bbWeaponEventId : CallbackHandle;
+	private var m_interactionBlackboardId : CallbackHandle;
+	private var m_crosshairStateBlackboardId : CallbackHandle;
+	private var m_visionStateBlackboardId : CallbackHandle;
+	private var m_isMountedBlackboardId : CallbackHandle;
+	private var m_rootWidget : weak< inkCanvas >;
+	private var m_fadeOutAnimation : inkAnimDef;
+	private var m_fadeInAnimation : inkAnimDef;
+	private var m_sceneTier : GameplayTier;
+	private var m_isScanning : Bool;
+	default m_isScanning = false;
+	private var m_isUnarmed : Bool;
+	private var m_isMounted : Bool;
+	default m_isMounted = false;
+	private var m_fadeOutValue : Float;
+	default m_fadeOutValue = 0.0f;
+	private var m_wasLastInteractionWithDevice : Bool;
+	private var m_CombatStateBlackboardId : CallbackHandle;
+	private var m_hiddenAnimProxy : inkAnimProxy;
+	private var m_Player : weak< PlayerPuppet >;
+	private editable var HiddenTextCanvas : inkWidgetRef;
+
+	protected event OnInitialize()
+	{
+		m_bbUIData = GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData );
+		m_interactionBlackboardId = m_bbUIData.RegisterListenerVariant( GetAllBlackboardDefs().UIGameData.InteractionData, this, 'OnInteractionStateChange' );
+		m_bbWeaponInfo = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveWeaponData );
+		m_bbWeaponEventId = m_bbWeaponInfo.RegisterListenerVariant( GetAllBlackboardDefs().UI_ActiveWeaponData.WeaponRecordID, this, 'OnWeaponSwap' );
+		m_isUnarmed = true;
+		m_rootWidget = ( ( inkCanvas )( GetRootWidget() ) );
+		m_wasLastInteractionWithDevice = false;
+		inkWidgetRef.SetVisible( HiddenTextCanvas, false );
+		CreateAnimations();
+	}
+
+	protected event OnUninitialize()
+	{
+		if( m_bbUIData )
+		{
+			m_bbUIData.UnregisterListenerVariant( GetAllBlackboardDefs().UIGameData.InteractionData, m_interactionBlackboardId );
+		}
+		if( m_bbWeaponInfo )
+		{
+			m_bbWeaponInfo.UnregisterListenerVariant( GetAllBlackboardDefs().UI_ActiveWeaponData.WeaponRecordID, m_bbWeaponEventId );
+		}
+	}
+
+	protected event OnPlayerAttach( playerGameObject : GameObject )
+	{
+		RegisterPSMListeners( playerGameObject );
+	}
+
+	protected event OnPlayerDetach( playerGameObject : GameObject )
+	{
+		UnregisterPSMListeners( playerGameObject );
+	}
+
+	protected function RegisterPSMListeners( playerPuppet : GameObject )
+	{
+		var bbCrosshairInfo : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		var bbVehicleInfo : IBlackboard;
+		m_Player = ( ( PlayerPuppet )( playerPuppet ) );
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			bbCrosshairInfo = GetPSMBlackboard( playerPuppet );
+			if( bbCrosshairInfo )
+			{
+				m_crosshairStateBlackboardId = bbCrosshairInfo.RegisterListenerInt( playerSMDef.Crosshair, this, 'OnPSMCrosshairStateChanged' );
+				m_visionStateBlackboardId = bbCrosshairInfo.RegisterDelayedListenerInt( playerSMDef.Vision, this, 'OnPSMVisionStateChanged' );
+				m_bbPlayerTierEventId = bbCrosshairInfo.RegisterListenerInt( playerSMDef.SceneTier, this, 'OnSceneTierChange' );
+			}
+		}
+		if( m_Player && m_Player.IsControlledByLocalPeer() )
+		{
+			bbVehicleInfo = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+			m_isMountedBlackboardId = bbVehicleInfo.RegisterListenerBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsPlayerMounted, this, 'OnMountChanged' );
+		}
+	}
+
+	protected function UnregisterPSMListeners( playerPuppet : GameObject )
+	{
+		var bbCrosshairInfo : IBlackboard;
+		var playerSMDef : PlayerStateMachineDef;
+		var playerSMBB : IBlackboard;
+		var bbVehicleInfo : IBlackboard;
+		playerSMDef = GetAllBlackboardDefs().PlayerStateMachine;
+		if( playerSMDef )
+		{
+			bbCrosshairInfo = GetPSMBlackboard( playerPuppet );
+			if( bbCrosshairInfo )
+			{
+				bbCrosshairInfo.UnregisterListenerInt( playerSMDef.Crosshair, m_crosshairStateBlackboardId );
+				bbCrosshairInfo.UnregisterDelayedListener( playerSMDef.Vision, m_visionStateBlackboardId );
+				bbCrosshairInfo.UnregisterListenerInt( playerSMDef.SceneTier, m_bbPlayerTierEventId );
+			}
+		}
+		playerSMBB = GetPSMBlackboard( playerPuppet );
+		if( m_crosshairStateBlackboardId )
+		{
+			playerSMBB.UnregisterDelayedListener( GetAllBlackboardDefs().PlayerStateMachine.Crosshair, m_crosshairStateBlackboardId );
+		}
+		if( m_CombatStateBlackboardId )
+		{
+			playerSMBB.UnregisterDelayedListener( GetAllBlackboardDefs().PlayerStateMachine.Combat, m_CombatStateBlackboardId );
+		}
+		if( m_isMountedBlackboardId )
+		{
+			bbVehicleInfo = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+			bbVehicleInfo.UnregisterDelayedListener( GetAllBlackboardDefs().UI_ActiveVehicleData.IsPlayerMounted, m_isMountedBlackboardId );
+		}
+	}
+
+	private import function GetActiveCrosshairWidget() : weak< inkWidget >;
+	private import function GetActiveCrosshairGameController() : weak< gameuiCrosshairBaseGameController >;
+
+	protected event OnPSMVisionStateChanged( value : Int32 )
+	{
+		m_isScanning = value == ( ( Int32 )( gamePSMVision.Focus ) );
+		UpdateRootVisibility();
+	}
+
+	protected event OnMountChanged( mounted : Bool )
+	{
+		m_isMounted = mounted;
+		UpdateRootVisibility();
+	}
+
+	private function UpdateRootVisibility()
+	{
+		GetRootWidget().SetVisible( !( m_isScanning ) && ( !( m_isUnarmed ) || !( m_isMounted ) ) );
+	}
+
+	protected event OnInteractionStateChange( value : Variant )
+	{
+		var interactionData : bbUIInteractionData;
+		interactionData = ( ( bbUIInteractionData )value );
+		if( interactionData.terminalInteractionActive != m_wasLastInteractionWithDevice )
+		{
+			if( interactionData.terminalInteractionActive && ( m_isUnarmed || m_sceneTier != GameplayTier.Tier1_FullGameplay ) )
+			{
+				m_rootWidget.StopAllAnimations();
+				m_rootWidget.SetOpacity( m_fadeOutValue );
+			}
+			else if( interactionData.terminalInteractionActive )
+			{
+				m_rootWidget.StopAllAnimations();
+				m_rootWidget.PlayAnimation( m_fadeOutAnimation );
+			}
+			else if( m_wasLastInteractionWithDevice )
+			{
+				m_rootWidget.StopAllAnimations();
+				m_rootWidget.PlayAnimation( m_fadeInAnimation );
+			}
+		}
+		m_wasLastInteractionWithDevice = interactionData.terminalInteractionActive;
+	}
+
+	protected event OnWeaponSwap( value : Variant )
+	{
+		m_isUnarmed = ( ( TweakDBID )value ) == TDBID.None();
+		UpdateRootVisibility();
+	}
+
+	protected event OnSceneTierChange( argTier : Int32 )
+	{
+		m_sceneTier = ( ( GameplayTier )( argTier ) );
+	}
+
+	private function CreateAnimations()
+	{
+		var fadeOutInterp : inkAnimTransparency;
+		var fadeInInterp : inkAnimTransparency;
+		m_fadeOutAnimation = new inkAnimDef;
+		fadeOutInterp = new inkAnimTransparency;
+		fadeOutInterp.SetStartDelay( 0.75 );
+		fadeOutInterp.SetStartTransparency( 1.0 );
+		fadeOutInterp.SetEndTransparency( m_fadeOutValue );
+		fadeOutInterp.SetDuration( 0.2 );
+		fadeOutInterp.SetType( inkanimInterpolationType.Quadratic );
+		fadeOutInterp.SetMode( inkanimInterpolationMode.EasyIn );
+		m_fadeOutAnimation.AddInterpolator( fadeOutInterp );
+		m_fadeInAnimation = new inkAnimDef;
+		fadeInInterp = new inkAnimTransparency;
+		fadeInInterp.SetStartTransparency( m_rootWidget.GetOpacity() );
+		fadeInInterp.SetEndTransparency( 1.0 );
+		fadeInInterp.SetDuration( 0.1 );
+		fadeOutInterp.SetType( inkanimInterpolationType.Quadratic );
+		fadeOutInterp.SetMode( inkanimInterpolationMode.EasyOut );
+		m_fadeInAnimation.AddInterpolator( fadeInInterp );
+	}
+
+}
+

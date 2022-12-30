@@ -1,0 +1,374 @@
+import class gameuiSaveHandlingController extends gameuiMenuGameController
+{
+	public import function DeleteSavedGame( saveId : Int32 );
+	public import function IsTransferSavedExportSupported() : Bool;
+	public import function IsTransferSavedImportSupported() : Bool;
+	public import function TransferSavedGame( scriptableData : IScriptable );
+	public import function RequestSaveFailedNotification();
+	public import function RequestGameSavedNotification();
+	public import function IsSaveFailedNotificationActive() : Bool;
+	public import function IsGameSavedNotificationActive() : Bool;
+	public import function LoadSaveInGame( saveId : Int32 );
+	public import function LoadModdedSave( saveId : Int32 );
+	public import function OverrideSavedGame( saveId : Int32 );
+	public import function SetNextInitialLoadingScreen( tweakID : Uint64 );
+	public import function PreSpawnInitialLoadingScreen( tweakID : Uint64 );
+
+	public function ShowSavingLockedNotification( const locks : ref< array< gameSaveLock > > )
+	{
+		GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() ).QueueEvent( new UIInGameNotificationRemoveEvent );
+		GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() ).QueueEvent( UIInGameNotificationEvent.CreateSavingLockedEvent( locks ) );
+	}
+
+}
+
+importonly class ShowEngagementScreen extends IScriptable
+{
+	import var show : Bool;
+}
+
+importonly class ShowInitializeUserScreen extends IScriptable
+{
+	import var show : Bool;
+}
+
+importonly class MainMenuGameController extends gameuiMenuItemListGameController
+{
+	public import function LoadBackgroundWidget( dataID : Uint64 );
+}
+
+class RetrySaveDataRequestDelay extends Event
+{
+}
+
+class SingleplayerMenuGameController extends MainMenuGameController
+{
+	private editable var m_buttonHintsManagerRef : inkWidgetRef;
+	private editable var m_gogButtonWidgetRef : inkWidgetRef;
+	private editable var m_continuetooltipContainer : inkCompoundRef;
+	private var m_onlineSystem : weak< IOnlineSystem >;
+	private var m_requestHandler : weak< inkISystemRequestsHandler >;
+	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_continueGameTooltipController : weak< ContinueGameTooltip >;
+	private var m_dataSyncStatus : CloudSavesQueryStatus;
+	private var m_savesCount : Int32;
+	private var m_savesReady : Bool;
+	private var m_isOffline : Bool;
+	private var m_isModded : Bool;
+
+	protected event OnInitialize()
+	{
+		m_requestHandler = GetSystemRequestsHandler();
+		m_savesCount = 0;
+		m_savesCount = m_requestHandler.RequestSavesCountSync();
+		m_requestHandler.RegisterToCallback( 'OnSavesForLoadReady', this, 'OnSavesForLoadReady' );
+		m_requestHandler.RegisterToCallback( 'OnBoughtFullGame', this, 'OnRedrawRequested' );
+		m_requestHandler.RegisterToCallback( 'OnSaveMetadataReady', this, 'OnSaveMetadataReady' );
+		m_requestHandler.RegisterToCallback( 'OnCloudSavesQueryStatusChanged', this, 'OnCloudSavesQueryStatusChanged' );
+		m_requestHandler.RequestSavesForLoad();
+		m_onlineSystem = GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() );
+		super.OnInitialize();
+		m_menuListController.GetRootWidget().RegisterToCallback( 'OnRelease', this, 'OnListRelease' );
+		m_menuListController.GetRootWidget().RegisterToCallback( 'OnRepeat', this, 'OnListRelease' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnGlobalRelease' );
+		SetNextInitialLoadingScreen( m_requestHandler.GetLatestSaveMetadata().initialLoadingScreenID );
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-UserActions-Select" ) );
+		if( GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ) )
+		{
+			inkWidgetRef.RegisterToCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, true );
+			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, false );
+			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, false );
+		}
+		AsyncSpawnFromLocal( inkCompoundRef.Get( m_continuetooltipContainer ), 'ContinueTooltip', this, 'OnTooltipContainerSpawned' );
+	}
+
+	protected event OnUninitialize()
+	{
+		m_requestHandler.CancelSavesRequest();
+		m_requestHandler.CancelSavedGameScreenshotRequests();
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnGlobalRelease' );
+		m_menuListController.GetRootWidget().UnregisterFromCallback( 'OnRelease', this, 'OnListRelease' );
+		m_menuListController.GetRootWidget().UnregisterFromCallback( 'OnRepeat', this, 'OnListRelease' );
+		if( GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ) )
+		{
+			inkWidgetRef.UnregisterFromCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+		}
+		super.OnUninitialize();
+		m_requestHandler.UnregisterFromCallback( 'OnBoughtFullGame', this, 'OnRedrawRequested' );
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnCheckPatchNotes', this, 'OnCheckPatchNotes' );
+		m_menuEventDispatcher.UnregisterFromEvent( 'OnClosePatchNotes', this, 'OnClosePatchNotes' );
+	}
+
+	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
+	{
+		super.OnSetMenuEventDispatcher( menuEventDispatcher );
+		menuEventDispatcher.RegisterToEvent( 'OnCheckPatchNotes', this, 'OnCheckPatchNotes' );
+		menuEventDispatcher.RegisterToEvent( 'OnClosePatchNotes', this, 'OnClosePatchNotes' );
+	}
+
+	protected event OnCheckPatchNotes( userData : IScriptable )
+	{
+		var uiSystem : UISystem;
+		var introPackage : gameuiPatchIntroPackage;
+		uiSystem = GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() );
+		introPackage = uiSystem.GetNeededPatchIntroPackage();
+		if( introPackage.patchIntrosNeeded.Size() > 0 )
+		{
+			m_menuEventDispatcher.SpawnEvent( 'OnRequetPatchNotes' );
+			inkWidgetRef.SetOpacity( m_gogButtonWidgetRef, 0.0 );
+			inkCompoundRef.SetVisible( m_menuList, false );
+			inkWidgetRef.SetVisible( m_buttonHintsManagerRef, false );
+		}
+	}
+
+	protected event OnClosePatchNotes( userData : IScriptable )
+	{
+		inkWidgetRef.SetOpacity( m_gogButtonWidgetRef, 1.0 );
+		inkCompoundRef.SetVisible( m_menuList, true );
+		inkWidgetRef.SetVisible( m_buttonHintsManagerRef, true );
+	}
+
+	protected event OnRedrawRequested()
+	{
+		ShowActionsList();
+	}
+
+	protected event OnTooltipContainerSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var previewImageWidget : weak< inkImage >;
+		widget.SetVisible( false );
+		m_continueGameTooltipController = ( ( ContinueGameTooltip )( widget.GetController() ) );
+		if( m_savesReady || m_dataSyncStatus == CloudSavesQueryStatus.FetchedSuccessfully )
+		{
+			previewImageWidget = m_continueGameTooltipController.GetPreviewImageWidget();
+			if( previewImageWidget )
+			{
+				GetSystemRequestsHandler().RequestSavedGameScreenshot( 0, previewImageWidget );
+			}
+			m_continueGameTooltipController.UpdateNetworkStatus( m_dataSyncStatus );
+			m_continueGameTooltipController.SetOfflineStatus( m_isOffline );
+		}
+	}
+
+	protected event OnContinueButtonEnter( evt : inkPointerEvent )
+	{
+		if( ( m_savesCount > 0 ) || !( m_savesReady ) )
+		{
+			m_continueGameTooltipController.GetRootWidget().SetVisible( true );
+		}
+	}
+
+	protected event OnContinueButtonLeave( evt : inkPointerEvent )
+	{
+		m_continueGameTooltipController.GetRootWidget().SetVisible( false );
+	}
+
+	protected event OnSavesForLoadReady( saves : array< String > )
+	{
+		var previewImageWidget : weak< inkImage >;
+		var prevSavesCount : Int32;
+		prevSavesCount = m_savesCount;
+		m_savesCount = saves.Size();
+		m_savesReady = true;
+		if( ( m_savesCount > 0 ) && ( prevSavesCount == 0 ) )
+		{
+			ShowActionsList();
+		}
+		if( m_continueGameTooltipController )
+		{
+			if( m_savesCount > 0 )
+			{
+				previewImageWidget = m_continueGameTooltipController.GetPreviewImageWidget();
+				if( previewImageWidget )
+				{
+					GetSystemRequestsHandler().RequestSavedGameScreenshot( 0, m_continueGameTooltipController.GetPreviewImageWidget() );
+				}
+			}
+			else
+			{
+				m_continueGameTooltipController.GetRootWidget().SetVisible( false );
+			}
+		}
+	}
+
+	protected override function ShowActionsList()
+	{
+		var continueButton : weak< inkWidget >;
+		super.ShowActionsList();
+		continueButton = inkCompoundRef.GetWidgetByIndex( m_menuList, 0 );
+		continueButton.RegisterToCallback( 'OnEnter', this, 'OnContinueButtonEnter' );
+		continueButton.RegisterToCallback( 'OnLeave', this, 'OnContinueButtonLeave' );
+	}
+
+	protected event OnSaveMetadataReady( info : SaveMetadataInfo )
+	{
+		var characterCustomizationSystem : gameuiICharacterCustomizationSystem;
+		if( info.saveIndex == 0 )
+		{
+			if( info.isValid )
+			{
+				m_isModded = info.isModded;
+				characterCustomizationSystem = GameInstance.GetCharacterCustomizationSystem( GetPlayerControlledObject().GetGame() );
+				m_continueGameTooltipController.SetMetadata( info );
+				m_continueGameTooltipController.CheckThumbnailCensorship( !( characterCustomizationSystem.IsNudityAllowed() ) );
+				LoadBackgroundWidget( info.initialLoadingScreenID );
+			}
+			else
+			{
+				m_continueGameTooltipController.SetInvalid( info );
+			}
+		}
+	}
+
+	private override function PopulateMenuItemList()
+	{
+		if( m_savesCount > 0 )
+		{
+			AddMenuItem( GetLocalizedText( "UI-ScriptExports-Continue0" ), PauseMenuAction.QuickLoad );
+		}
+		AddMenuItem( GetLocalizedText( "UI-ScriptExports-NewGame0" ), 'OnNewGame' );
+		AddMenuItem( GetLocalizedText( "UI-ScriptExports-LoadGame0" ), 'OnLoadGame' );
+		AddMenuItem( GetLocalizedText( "UI-Labels-Settings" ), 'OnSwitchToSettings' );
+		AddMenuItem( GetLocalizedText( "UI-DLC-MenuTitle" ), 'OnSwitchToDlc' );
+		AddMenuItem( GetLocalizedText( "UI-Labels-Credits" ), 'OnSwitchToCredits' );
+		if( TrialHelper.IsInPS5TrialMode() )
+		{
+			AddMenuItem( GetLocalizedText( "UI-Notifications-Ps5TrialBuyMenuItem" ), 'OnBuyGame' );
+		}
+		if( !( IsFinal() ) || UseProfiler() )
+		{
+			AddMenuItem( "DEBUG NEW GAME", 'OnDebug' );
+		}
+		m_menuListController.Refresh();
+		SetCursorOverWidget( inkCompoundRef.GetWidgetByIndex( m_menuList, 0 ) );
+	}
+
+	protected event OnListRelease( e : inkPointerEvent )
+	{
+		if( e.IsHandled() )
+		{
+			return false;
+		}
+		m_menuListController.HandleInput( e, this );
+	}
+
+	protected event OnGlobalRelease( e : inkPointerEvent )
+	{
+		var delayEvent : RetrySaveDataRequestDelay;
+		if( e.IsHandled() )
+		{
+			return false;
+		}
+		if( e.IsAction( 'back' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			m_menuEventDispatcher.SpawnEvent( 'OnBack' );
+			e.Handle();
+		}
+		else if( e.IsAction( 'next_menu' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			m_menuEventDispatcher.SpawnEvent( 'OnGOGProfile' );
+			e.Handle();
+		}
+		else if( ( ( e.IsAction( 'navigate_down' ) || e.IsAction( 'navigate_up' ) ) || e.IsAction( 'navigate_left' ) ) || e.IsAction( 'navigate_right' ) )
+		{
+			SetCursorOverWidget( inkCompoundRef.GetWidgetByIndex( m_menuList, 0 ) );
+		}
+		else if( e.IsAction( 'reload' ) )
+		{
+			m_continueGameTooltipController.DisplayDataSyncIndicator( true );
+			delayEvent = new RetrySaveDataRequestDelay;
+			GameInstance.GetDelaySystem( GetPlayerControlledObject().GetGame() ).DelayEvent( GetPlayerControlledObject(), delayEvent, 1.0 );
+		}
+	}
+
+	protected event OnRetrySaveDataRequestDelay( evt : RetrySaveDataRequestDelay )
+	{
+		m_requestHandler.RequestSavesForLoad();
+		m_onlineSystem.RequestInitialStatus();
+	}
+
+	protected event OnGogPressed( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			evt.Handle();
+			m_menuEventDispatcher.SpawnEvent( 'OnGOGProfile' );
+		}
+	}
+
+	protected event OnCloudSavesQueryStatusChanged( status : CloudSavesQueryStatus )
+	{
+		var previewImageWidget : weak< inkImage >;
+		m_dataSyncStatus = status;
+		if( m_continueGameTooltipController )
+		{
+			m_continueGameTooltipController.UpdateNetworkStatus( m_dataSyncStatus );
+			if( m_dataSyncStatus == CloudSavesQueryStatus.FetchedSuccessfully )
+			{
+				previewImageWidget = m_continueGameTooltipController.GetPreviewImageWidget();
+				if( previewImageWidget )
+				{
+					GetSystemRequestsHandler().RequestSavedGameScreenshot( 0, m_continueGameTooltipController.GetPreviewImageWidget() );
+				}
+			}
+		}
+	}
+
+	protected event OnOnlineStatusChanged( value : GOGRewardsSystemStatus )
+	{
+		var error : GOGRewardsSystemErrors;
+		error = m_onlineSystem.GetError();
+		m_isOffline = error != GOGRewardsSystemErrors.None;
+		if( m_continueGameTooltipController )
+		{
+			m_continueGameTooltipController.SetOfflineStatus( m_isOffline );
+		}
+	}
+
+	protected override function HandleMenuItemActivate( data : PauseMenuListItemData ) : Bool
+	{
+		if( super.HandleMenuItemActivate( data ) )
+		{
+			return false;
+		}
+		switch( data.action )
+		{
+			case PauseMenuAction.QuickLoad:
+				if( m_savesCount > 0 )
+				{
+					GameInstance.GetTelemetrySystem( GetPlayerControlledObject().GetGame() ).LogLastCheckpointLoaded();
+					if( m_isModded )
+					{
+						LoadModdedSave( 0 );
+					}
+					else
+					{
+						GetSystemRequestsHandler().LoadLastCheckpoint( false );
+					}
+					return true;
+				}
+			break;
+		}
+		return false;
+	}
+
+}
+
+import enum CloudSavesQueryStatus : Uint8
+{
+	NotFetched,
+	FetchedSuccessfully,
+	CloudSavesDisabled,
+	NotLoggedIn,
+	FetchFailed,
+}
+
