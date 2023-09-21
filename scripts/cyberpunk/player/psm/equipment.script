@@ -9,6 +9,21 @@ class ItemIdWrapper extends IScriptable
 	var itemID : ItemID;
 }
 
+enum EEquipmentState
+{
+	Unequipped = 0,
+	Equipped = 1,
+	Equipping = 2,
+	Unequipping = 3,
+	FirstEquip = 4,
+}
+
+enum EEquipmentSide
+{
+	Left = 0,
+	Right = 1,
+}
+
 abstract class EquipmentBaseTransition extends DefaultTransition
 {
 
@@ -185,6 +200,10 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		var weapon : weak< WeaponObject >;
 		var statSystem : StatsSystem;
 		statSystem = scriptInterface.GetStatsSystem();
+		if( GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext ).equipAnim == gameEquipAnimationType.HACK_ForceInstantEquip )
+		{
+			return 0.0;
+		}
 		weapon = ( ( WeaponObject )( GetSlotAttachedItemObject( scriptInterface, stateMachineInstanceData ) ) );
 		return statSystem.GetStatValue( weapon.GetEntityID(), gamedataStatType.EquipDuration );
 	}
@@ -194,9 +213,11 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		var weapon : weak< WeaponObject >;
 		var statSystem : StatsSystem;
 		var duration : Float;
+		var instantEquipRequested : Bool;
 		statSystem = scriptInterface.GetStatsSystem();
 		weapon = ( ( WeaponObject )( GetSlotAttachedItemObject( scriptInterface, stateMachineInstanceData ) ) );
-		if( GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext ).equipAnim == gameEquipAnimationType.Instant )
+		instantEquipRequested = GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext ).equipAnim == gameEquipAnimationType.Instant;
+		if( instantEquipRequested || HasThrowableCooldown( scriptInterface, weapon ) )
 		{
 			duration = 0.0;
 		}
@@ -233,26 +254,35 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		var isInCombat : Bool;
 		var statsEvent : UpdateWeaponStatsEvent;
 		var animFeatureMeleeData : AnimFeature_MeleeData;
+		var preventFirstEquip : Bool;
+		var autoRefillEvent : SetAmmoCountEvent;
+		var autoRefillRatio : Float;
+		var magazineCapacity : Uint32;
+		var firstEquip : Bool;
 		animFeature = new AnimFeature_EquipUnequipItem;
 		weaponEquipAnimFeature = new AnimFeature_EquipType;
 		transactionSystem = scriptInterface.GetTransactionSystem();
 		statSystem = scriptInterface.GetStatsSystem();
 		mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
 		firstEqSystem = FirstEquipSystem.GetInstance( scriptInterface.owner );
+		firstEquip = false;
 		itemObject = ( ( WeaponObject )( transactionSystem.GetItemInSlot( scriptInterface.executionOwner, TDBID.Create( mappedInstanceData.attachmentSlot ) ) ) );
 		isInCombat = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) == ( ( Int32 )( gamePSMCombat.InCombat ) );
 		if( TDB.GetBool( T"player.weapon.enableWeaponBlur", false ) )
 		{
 			GetBlurParametersFromWeapon( scriptInterface );
 		}
-		if( !( isInCombat ) )
+		preventFirstEquip = scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.ScenePreventFirstEquip );
+		if( !( isInCombat ) && !( preventFirstEquip ) )
 		{
 			if( weaponEquipAnimFeature.firstEquip = ( GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext ).equipAnim == gameEquipAnimationType.FirstEquip || GetStaticBoolParameterDefault( "forceFirstEquip", false ) ) || !( firstEqSystem.HasPlayedFirstEquip( ItemID.GetTDBID( itemObject.GetItemID() ) ) ) )
 			{
 				weaponEquipAnimFeature.firstEquip = true;
 				stateContext.SetConditionBoolParameter( 'firstEquip', true, true );
+				firstEquip = true;
 			}
 		}
+		scriptInterface.localBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsWeaponFirstEquip, firstEquip );
 		animFeature.stateTransitionDuration = statSystem.GetStatValue( itemObject.GetEntityID(), gamedataStatType.EquipDuration );
 		animFeature.itemState = 1;
 		animFeature.itemType = ( ( Int32 )( TDB.GetItemRecord( ItemID.GetTDBID( item ) ).ItemType().AnimFeatureIndex() ) );
@@ -264,7 +294,7 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		weaponEquipEvent = new WeaponEquipEvent;
 		weaponEquipEvent.animFeature = weaponEquipAnimFeature;
 		weaponEquipEvent.item = itemObject;
-		GameInstance.GetDelaySystem( scriptInterface.executionOwner.GetGame() ).DelayEvent( scriptInterface.executionOwner, weaponEquipEvent, 0.03 );
+		scriptInterface.executionOwner.QueueEvent( weaponEquipEvent );
 		if( itemObject.WeaponHasTag( 'Throwable' ) && !( scriptInterface.GetStatPoolsSystem().HasStatPoolValueReachedMax( itemObject.GetEntityID(), gamedataStatPoolType.ThrowRecovery ) ) )
 		{
 			animFeatureMeleeData = new AnimFeature_MeleeData;
@@ -287,6 +317,15 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		{
 			scriptInterface.SetAnimationParameterFloat( 'safe', 1.0 );
 		}
+		autoRefillRatio = statSystem.GetStatValue( itemObject.GetEntityID(), gamedataStatType.MagazineAutoRefill );
+		if( autoRefillRatio > 0.0 )
+		{
+			magazineCapacity = WeaponObject.GetMagazineCapacity( itemObject );
+			autoRefillEvent = new SetAmmoCountEvent;
+			autoRefillEvent.ammoTypeID = WeaponObject.GetAmmoType( itemObject );
+			autoRefillEvent.count = ( ( Uint32 )( ( ( Float )( magazineCapacity ) ) * autoRefillRatio ) );
+			itemObject.QueueEvent( autoRefillEvent );
+		}
 	}
 
 	protected const function HandleWeaponUnequip( scriptInterface : StateGameScriptInterface, stateContext : StateContext, stateMachineInstanceData : StateMachineInstanceData, item : ItemID )
@@ -297,11 +336,14 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		var animFeature : AnimFeature_EquipUnequipItem;
 		var transactionSystem : TransactionSystem;
 		var placementSlot : TweakDBID;
+		var gunzerkerLevel : Int32;
+		var playerDevelopmentData : PlayerDevelopmentData;
 		mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
 		unequipStartEvent = new UnequipStart;
 		animFeature = new AnimFeature_EquipUnequipItem;
 		transactionSystem = scriptInterface.GetTransactionSystem();
 		placementSlot = EquipmentSystem.GetPlacementSlot( item );
+		playerDevelopmentData = PlayerDevelopmentSystem.GetData( scriptInterface.executionOwner );
 		itemObject = ( ( WeaponObject )( transactionSystem.GetItemInSlot( scriptInterface.executionOwner, TDBID.Create( mappedInstanceData.attachmentSlot ) ) ) );
 		animFeature.stateTransitionDuration = GetWeaponUnEquipDuration( scriptInterface, stateContext, stateMachineInstanceData );
 		animFeature.itemState = 3;
@@ -311,6 +353,12 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		scriptInterface.SetAnimationParameterFeature( 'equipUnequipItem', animFeature, itemObject );
 		unequipStartEvent.SetSlotID( placementSlot );
 		scriptInterface.executionOwner.QueueEvent( unequipStartEvent );
+		gunzerkerLevel = playerDevelopmentData.IsNewPerkBought( gamedataNewPerkType.Reflexes_Master_Perk_2 );
+		if( ( itemObject && ( gunzerkerLevel > 0 ) ) && WeaponObject.GetWeaponType( itemObject.GetItemID() ) == gamedataItemType.Wea_SubmachineGun )
+		{
+			itemObject.StartReload();
+			itemObject.StopReload( gameweaponReloadStatus.Standard );
+		}
 	}
 
 	protected function DropActiveWeapon( scriptInterface : StateGameScriptInterface, stateContext : StateContext, stateMachineInstanceData : StateMachineInstanceData )
@@ -337,6 +385,23 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		requestToSend = new CompletionOfFirstEquipRequest;
 		requestToSend.weaponID = weaponTweakID;
 		firstEqSystem.QueueRequest( requestToSend );
+	}
+
+	protected const function HasThrowableCooldown( scriptInterface : StateGameScriptInterface, weapon : WeaponObject ) : Bool
+	{
+		if( !( weapon ) )
+		{
+			return false;
+		}
+		if( !( weapon.WeaponHasTag( 'Throwable' ) ) )
+		{
+			return false;
+		}
+		if( scriptInterface.GetStatPoolsSystem().HasStatPoolValueReachedMax( weapon.GetEntityID(), gamedataStatPoolType.ThrowRecovery ) )
+		{
+			return false;
+		}
+		return true;
 	}
 
 	protected const function GetSlotAttachedItem( const scriptInterface : StateGameScriptInterface, stateMachineInstanceData : StateMachineInstanceData ) : ItemObject
@@ -631,6 +696,22 @@ class UnequippedDecisions extends EquipmentBaseDecisions
 
 }
 
+class DelayedAnimFeatureCall extends DelayCallback
+{
+	var featureName : CName;
+	var animFeature : AnimFeature_EquipUnequipItem;
+	var scriptInterface : StateGameScriptInterface;
+
+	public override function Call()
+	{
+		if( scriptInterface )
+		{
+			scriptInterface.SetAnimationParameterFeature( featureName, animFeature );
+		}
+	}
+
+}
+
 class UnequippedEvents extends EquipmentBaseEvents
 {
 	const var stateMachineInstanceData : StateMachineInstanceData;
@@ -640,10 +721,22 @@ class UnequippedEvents extends EquipmentBaseEvents
 	{
 		var itemHandling : AnimFeature_EquipUnequipItem;
 		var mappedInstanceData : InstanceDataMappedToReferenceName;
+		var delayedAnimFeature : DelayedAnimFeatureCall;
 		mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
 		itemHandling = new AnimFeature_EquipUnequipItem;
 		itemHandling.itemState = 0;
-		scriptInterface.SetAnimationParameterFeature( mappedInstanceData.itemHandlingFeatureName, itemHandling );
+		if( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle ) == ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) )
+		{
+			delayedAnimFeature = new DelayedAnimFeatureCall;
+			delayedAnimFeature.featureName = mappedInstanceData.itemHandlingFeatureName;
+			delayedAnimFeature.animFeature = itemHandling;
+			delayedAnimFeature.scriptInterface = scriptInterface;
+			scriptInterface.GetDelaySystem().DelayCallbackNextFrame( delayedAnimFeature );
+		}
+		else
+		{
+			scriptInterface.SetAnimationParameterFeature( mappedInstanceData.itemHandlingFeatureName, itemHandling );
+		}
 		if( IsRightHandLogic( stateMachineInstanceData ) )
 		{
 			ClearRightHandItemParam( stateContext );
@@ -814,6 +907,43 @@ class EquipCycleInitDecisions extends EquipmentBaseDecisions
 {
 	const var stateMachineInstanceData : StateMachineInstanceData;
 
+	public constexpr const function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var item : ItemID;
+		var equipmentSystemPlayerData : EquipmentSystemPlayerData;
+		var record : Item_Record;
+		var vehicleState : CName;
+		record = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( item ) );
+		item = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
+		if( !( ItemID.IsValid( item ) ) )
+		{
+			return true;
+		}
+		record = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( item ) );
+		if( !( record ) || record.ItemCategory().Type() != gamedataItemCategory.Weapon )
+		{
+			return true;
+		}
+		equipmentSystemPlayerData = EquipmentSystem.GetData( scriptInterface.executionOwner );
+		if( !( equipmentSystemPlayerData ) )
+		{
+			return true;
+		}
+		if( WeaponObject.IsCyberwareWeapon( item ) )
+		{
+			vehicleState = stateContext.GetStateMachineCurrentState( 'Vehicle' );
+			if( ( vehicleState == 'exit' || vehicleState == 'coolExiting' ) || vehicleState == 'slideExiting' )
+			{
+				return true;
+			}
+		}
+		if( equipmentSystemPlayerData.CheckWeaponAgainstGameplayRestrictions( item ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
 	protected export const function ToEquipCycle( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		return IsVisualItemInSlot( scriptInterface, stateMachineInstanceData ) || IsUsingFluffConsumable( scriptInterface, stateMachineInstanceData );
@@ -866,10 +996,13 @@ class EquipCycleInitEvents extends EquipmentBaseEvents
 		}
 		if( ItemID.IsValid( item ) )
 		{
-			mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
-			itemHandling = new AnimFeature_EquipUnequipItem;
-			itemHandling.itemState = 0;
-			scriptInterface.SetAnimationParameterFeature( mappedInstanceData.itemHandlingFeatureName, itemHandling );
+			if( !( WeaponObject.IsRanged( item ) ) && !( stateContext.IsStateMachineActive( 'Vehicle' ) ) )
+			{
+				mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
+				itemHandling = new AnimFeature_EquipUnequipItem;
+				itemHandling.itemState = 0;
+				scriptInterface.SetAnimationParameterFeature( mappedInstanceData.itemHandlingFeatureName, itemHandling );
+			}
 			if( IsClient() && scriptInterface.owner.IsControlledByLocalPeer() )
 			{
 				scriptInterface.RequestWeaponEquipOnServer( placementSlot, item );
@@ -879,7 +1012,7 @@ class EquipCycleInitEvents extends EquipmentBaseEvents
 				equipStartEvent.SetSlotID( placementSlot );
 				equipStartEvent.SetItemID( item );
 				equipStartEvent.SetHighPriority( WeaponObject.GetWeaponType( item ) != gamedataItemType.Invalid );
-				if( !( stateContext.IsStateMachineActive( 'Vehicle' ) ) )
+				if( !( stateContext.IsStateMachineActive( 'Vehicle' ) ) || GetMountedVehicle( scriptInterface.executionOwner ).GetCameraManager().GetActivePerspective() == vehicleCameraPerspective.FPP )
 				{
 					equipStartEvent.SetStartingRenderingPlane( ERenderingPlane.RPl_Weapon );
 				}
@@ -932,12 +1065,14 @@ class EquipCycleDecisions extends EquipmentBaseDecisions
 	protected export const function ToFirstEquip( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		var firstEquipResult : StateResultBool;
+		var preventFirstEquip : Bool;
 		var firstEqSystem : FirstEquipSystem;
 		var itemId : ItemID;
 		firstEqSystem = FirstEquipSystem.GetInstance( scriptInterface.owner );
 		firstEquipResult = stateContext.GetConditionBoolParameter( 'firstEquip' );
+		preventFirstEquip = scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.ScenePreventFirstEquip );
 		itemId = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
-		return ( firstEquipResult.value && ToEquipped( stateContext, scriptInterface ) ) && !( firstEqSystem.HasPlayedFirstEquip( ItemID.GetTDBID( itemId ) ) );
+		return ( ( firstEquipResult.value && !( preventFirstEquip ) ) && ToEquipped( stateContext, scriptInterface ) ) && !( firstEqSystem.HasPlayedFirstEquip( ItemID.GetTDBID( itemId ) ) );
 	}
 
 }
@@ -1193,6 +1328,7 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		var animFeature : AnimFeature_EquipUnequipItem;
 		var statSystem : StatsSystem;
 		var placementSlot : TweakDBID;
+		var itemId : ItemID;
 		var upperBodyState : Int32;
 		item = GetItemIDFromParam( stateMachineInstanceData, stateContext );
 		mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
@@ -1200,6 +1336,7 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		animFeature = new AnimFeature_EquipUnequipItem;
 		statSystem = scriptInterface.GetStatsSystem();
 		placementSlot = EquipmentSystem.GetPlacementSlot( item );
+		itemId = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
 		upperBodyState = 0;
 		if( !( ItemID.IsValid( item ) ) )
 		{
@@ -1214,6 +1351,10 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 				animFeature.stateTransitionDuration = statSystem.GetStatValue( scriptInterface.executionOwnerEntityID, gamedataStatType.UnequipDuration );
 				animFeature.itemState = 4;
 				animFeature.itemType = ( ( Int32 )( TDB.GetItemRecord( ItemID.GetTDBID( item ) ).ItemType().AnimFeatureIndex() ) );
+				if( itemId != ItemID.None() )
+				{
+					animFeature.swappingWeapons = true;
+				}
 				scriptInterface.SetAnimationParameterFeature( mappedInstanceData.itemHandlingFeatureName, animFeature, scriptInterface.executionOwner );
 				itemObject = scriptInterface.GetTransactionSystem().GetItemInSlot( scriptInterface.executionOwner, TDBID.Create( mappedInstanceData.attachmentSlot ) );
 				scriptInterface.SetAnimationParameterFeature( 'equipUnequipItem', animFeature, itemObject );
@@ -1226,20 +1367,5 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		}
 	}
 
-}
-
-enum EEquipmentState
-{
-	Unequipped = 0,
-	Equipped = 1,
-	Equipping = 2,
-	Unequipping = 3,
-	FirstEquip = 4,
-}
-
-enum EEquipmentSide
-{
-	Left = 0,
-	Right = 1,
 }
 

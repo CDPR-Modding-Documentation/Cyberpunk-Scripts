@@ -207,11 +207,11 @@ class LocomotionSwimmingEvents extends LocomotionEventsTransition
 	public function ExitCleanup( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		SetSwimmingState( stateContext, scriptInterface, 0 );
-		ScriptedPuppet.ReevaluateOxygenConsumption( ( ( ScriptedPuppet )( scriptInterface.owner ) ) );
 		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Swimming, ( ( Int32 )( gamePSMSwimming.Default ) ) );
 		PlayerPuppet.ReevaluateAllBreathingEffects( ( ( PlayerPuppet )( scriptInterface.owner ) ) );
 		GameObjectEffectHelper.StopEffectEvent( scriptInterface.executionOwner, 'swimming_surface' );
 		GameObjectEffectHelper.StopEffectEvent( scriptInterface.executionOwner, 'swimming_diving' );
+		ScriptedPuppet.ReevaluateOxygenConsumption( ( ( ScriptedPuppet )( scriptInterface.owner ) ) );
 	}
 
 	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
@@ -227,12 +227,49 @@ class LocomotionSwimmingEvents extends LocomotionEventsTransition
 
 }
 
+class SwimmingInitialDecisions extends LocomotionSwimming
+{
+
+	protected const function IsUnderwater( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentDepth : Float;
+		var depthTreshold : Float;
+		depthTreshold = GetStaticFloatParameterDefault( "skipTransitionDepthTreshold", 0.0 );
+		currentDepth = GetCurrentDepth( stateContext, scriptInterface );
+		return currentDepth <= depthTreshold;
+	}
+
+	protected const function ToDiving( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return IsUnderwater( stateContext, scriptInterface );
+	}
+
+	protected const function ToSurface( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return !( IsUnderwater( stateContext, scriptInterface ) );
+	}
+
+}
+
 class SwimmingSurfaceDecisions extends LocomotionSwimming
 {
 
 	protected const function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		return !( CanEnterFastSwimming( stateContext, scriptInterface ) ) && !( IsDeepEnoughToDive( stateContext, scriptInterface ) );
+	}
+
+	protected const function ToDiving( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentDepth : Float;
+		var depthTreshold : Float;
+		if( CanEnterFastSwimming( stateContext, scriptInterface ) )
+		{
+			return false;
+		}
+		depthTreshold = GetStaticFloatParameterDefault( "skipTransitionDepthTreshold", 0.0 );
+		currentDepth = GetCurrentDepth( stateContext, scriptInterface );
+		return currentDepth <= depthTreshold;
 	}
 
 }
@@ -390,7 +427,6 @@ class SwimmingSurfaceFastEvents extends LocomotionSwimmingEvents
 	{
 		super.OnUpdate( timeDelta, stateContext, scriptInterface );
 		UpdateSwimmingStroke( timeDelta, stateContext, scriptInterface );
-		ConsumeStaminaBasedOnLocomotionState( stateContext, scriptInterface );
 		CreateWaterImpulse( timeDelta, stateContext, scriptInterface );
 	}
 
@@ -449,7 +485,7 @@ class SwimmingTransitionDecisions extends LocomotionSwimming
 	{
 		var isFallSpeedToEnterDiveAcceptable : Bool;
 		isFallSpeedToEnterDiveAcceptable = IsFallingSpeedToEnterDiveAcceptable( stateContext, scriptInterface );
-		if( ( ( isFallSpeedToEnterDiveAcceptable || scriptInterface.IsActionJustPressed( 'ToggleCrouch' ) ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) ) || ( IsCameraPitchAcceptable( stateContext, scriptInterface, GetStaticFloatParameterDefault( "cameraPitchThreshold", -30.0 ) ) && ( ( scriptInterface.GetActionValue( 'Jump' ) == 0.0 ) && !( scriptInterface.IsActionJustPressed( 'Jump' ) ) ) ) )
+		if( ( ( isFallSpeedToEnterDiveAcceptable || scriptInterface.IsActionJustPressed( 'Dive' ) ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) ) || ( IsCameraPitchAcceptable( stateContext, scriptInterface, GetStaticFloatParameterDefault( "cameraPitchThreshold", -30.0 ) ) && ( ( scriptInterface.GetActionValue( 'Jump' ) == 0.0 ) && !( scriptInterface.IsActionJustPressed( 'Jump' ) ) ) ) )
 		{
 			if( IsDivingBlockedByPhoneCall( stateContext, scriptInterface ) && !( isFallSpeedToEnterDiveAcceptable ) )
 			{
@@ -490,7 +526,6 @@ class SwimmingTransitionEvents extends LocomotionSwimmingEvents
 		if( m_maxDownwardSpeed <= 0.0 )
 		{
 			m_maxDownwardSpeed = 1.0;
-			LogError( " Tweakdb value for maxDownwardVerticalSpeed is lesser or equal to zero, that's not a valid value" );
 		}
 	}
 
@@ -558,7 +593,7 @@ class SwimmingDivingEvents extends LocomotionSwimmingEvents
 		{
 			AddVerticalImpulse( stateContext, GetStaticFloatParameterDefault( "divingUpwardsImpulseStrength", 1.0 ) );
 		}
-		if( ( scriptInterface.GetActionValue( 'ToggleCrouch' ) > 0.0 ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) )
+		if( ( scriptInterface.GetActionValue( 'Dive' ) > 0.0 ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) )
 		{
 			AddVerticalImpulse( stateContext, GetStaticFloatParameterDefault( "divingDownwardsImpulseStrength", 1.0 ) );
 		}
@@ -579,9 +614,14 @@ class SwimmingDivingEvents extends LocomotionSwimmingEvents
 
 	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
+		var speedSquared : Float;
+		speedSquared = Vector4.LengthSquared( GetLinearVelocity( scriptInterface ) );
 		m_lapsedTime = 0.0;
 		GameObjectEffectHelper.StartEffectEvent( scriptInterface.executionOwner, 'swimming_diving', false );
-		AddImpulseInMovingDirection( stateContext, scriptInterface, GetStaticFloatParameterDefault( "divingStrokeImpulseForce", 1.0 ) );
+		if( speedSquared > ( 0.01 * 0.01 ) )
+		{
+			AddImpulseInMovingDirection( stateContext, scriptInterface, GetStaticFloatParameterDefault( "divingStrokeImpulseForce", 1.0 ) );
+		}
 		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Swimming, ( ( Int32 )( gamePSMSwimming.Diving ) ) );
 		super.OnEnter( stateContext, scriptInterface );
 	}
@@ -616,12 +656,11 @@ class SwimmingFastDivingEvents extends LocomotionSwimmingEvents
 		{
 			AddVerticalImpulse( stateContext, GetStaticFloatParameterDefault( "divingUpwardsImpulseStrength", 1.0 ) );
 		}
-		if( scriptInterface.IsActionJustPressed( 'ToggleCrouch' ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) )
+		if( ( scriptInterface.GetActionValue( 'Dive' ) > 0.0 ) || ( scriptInterface.GetActionValue( 'Crouch' ) > 0.0 ) )
 		{
 			AddVerticalImpulse( stateContext, GetStaticFloatParameterDefault( "divingDownwardsImpulseStrength", 1.0 ) );
 		}
 		UpdateFastDivingStroke( timeDelta, stateContext, scriptInterface );
-		ConsumeStaminaBasedOnLocomotionState( stateContext, scriptInterface );
 	}
 
 	private function UpdateFastDivingStroke( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
@@ -731,7 +770,19 @@ class SwimmingClimbEvents extends ClimbEvents
 	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		super.OnEnter( stateContext, scriptInterface );
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Swimming, ( ( Int32 )( gamePSMSwimming.Climbing ) ) );
+	}
+
+	protected override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
 		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Swimming, ( ( Int32 )( gamePSMSwimming.Default ) ) );
+		super.OnExit( stateContext, scriptInterface );
+	}
+
+	protected override function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.Swimming, ( ( Int32 )( gamePSMSwimming.Default ) ) );
+		super.OnForcedExit( stateContext, scriptInterface );
 	}
 
 }

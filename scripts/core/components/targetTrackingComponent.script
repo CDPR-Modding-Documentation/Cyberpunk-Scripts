@@ -1,3 +1,18 @@
+import enum AITrackedStatusType
+{
+	Unknown,
+	Friendly,
+	Neutral,
+	Hostile,
+}
+
+import enum AIThreatPersistenceStatus
+{
+	ThreatNotFound,
+	Persistent,
+	NotPersistent,
+}
+
 importonly struct LocationInformation
 {
 	import var position : Vector4;
@@ -95,6 +110,7 @@ importonly class ThreatRemoved extends AIEvent
 	import var threat : weak< Entity >;
 	import var isHostile : Bool;
 	import var isEnemy : Bool;
+	import var distanceBasedInstantDrop : Bool;
 }
 
 importonly class ThreatDeath extends AIEvent
@@ -203,16 +219,20 @@ importonly class TargetTrackerComponent extends GameComponent
 	public import final function GetHostileThreats( onlyVisible : Bool ) : array< TrackedLocation >;
 	public import final function GetTopHostileThreat( onlyVisible : Bool, out threat : TrackedLocation ) : Bool;
 	public import final function ThreatFromEntity( et : Entity, out threat : TrackedLocation ) : Bool;
-	public import final function HasHostileThreat( onlyVisible : Bool ) : Bool;
+	public import final function HasHostileThreat( onlyVisible : Bool, optional onlyEntities : Bool ) : Bool;
 	public import final function AddThreat( et : Entity, isHostile : Bool, pos : Vector4, accuracy : Float, cooldown : Float, isPersistent : Bool ) : Uint32;
 	public import final function AddThreatOnPosition( pos : Vector4, timeToLive : Float ) : Uint32;
 	public import final function SetThreatPersistence( et : Entity, isPersistent : Bool, src : Uint32 );
 	public import final function GetThreatPersistence( et : Entity ) : AIThreatPersistenceStatus;
+	public import final function GetThreatPersistenceBySource( et : Entity, src : Uint32 ) : AIThreatPersistenceStatus;
 	public import final function SetCurrentThreatsPersistence( isPersistent : Bool, src : Uint32 );
 	public import final function SetThreatBaseMul( et : Entity, threatValue : Float );
 	public import final function ClearThreats();
+	public import final function ActivateThreat( et : Entity );
+	public import final function DeactivateThreat( et : Entity );
 	public import final function SetThreatAccuracy( et : Entity, accuracy : Float );
 	public import final function SetThreatBeliefAccuracy( et : Entity, accuracy : Float );
+	public import final function GetVisibleThreatBeliefAccuracy( et : Entity ) : Float;
 	public import final function RequestThreatBeliefAccuracyMinValue( et : Entity, reason : CName, minAccuracy : Float );
 	public import final function RemoveThreatBeliefAccuracyMinValue( et : Entity, reason : CName );
 	public import final function RemoveThreat( id : Uint32 );
@@ -238,22 +258,24 @@ importonly class TargetTrackerComponent extends GameComponent
 	public import final function GetThreatBeliefPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
 	public import final function GetThreatSharedLastKnownPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
 	public import final function GetThreatSharedBeliefPositionProvider( threat : weak< Entity >, optional offset : Vector3, optional failIfVisible : Bool, optional slotName : CName, optional failSafeProvider : IPositionProvider ) : IPositionProvider;
+	public import final function SetRecentlyDroppedThreat( threat : weak< Entity >, position : Vector4, optional validFor : Float );
+	public import final function ResetRecentlyDroppedThreat( optional delay : Float );
+	public import final function ResetRecentlyDroppedThreatNoCallbacks();
+	public import final function GetRecentlyDroppedThreat() : DroppedThreatData;
 }
 
 class PlayerHostileThreatDetected extends HostileThreatDetected
 {
 }
 
-struct DroppedThreatData
+importonly struct DroppedThreatData
 {
-	var threat : weak< Entity >;
-	var position : Vector4;
-	var timeStamp : Float;
+	import var threat : weak< Entity >;
+	import var position : Vector4;
 }
 
 class TargetTrackingExtension extends TargetTrackerComponent
 {
-	private var m_droppedThreatData : DroppedThreatData;
 	private var m_trackedCombatSquads : array< CombatSquadScriptInterface >;
 	private var m_trackedCombatSquadsCounters : array< Int32 >;
 	private var m_threatPersistanceMemory : ThreatPersistanceMemory;
@@ -351,7 +373,7 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		}
 	}
 
-	public static function HasHostileThreat( puppet : weak< ScriptedPuppet >, optional onlyVisible : Bool ) : Bool
+	public static function HasHostileThreat( puppet : weak< ScriptedPuppet >, optional onlyVisible : Bool, optional onlyEntities : Bool ) : Bool
 	{
 		var tt : TargetTrackerComponent;
 		if( !( puppet ) )
@@ -363,10 +385,10 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		{
 			return false;
 		}
-		return tt.HasHostileThreat( onlyVisible );
+		return tt.HasHostileThreat( onlyVisible, onlyEntities );
 	}
 
-	public static function InjectThreat( puppet : weak< ScriptedPuppet >, threat : TrackedLocation )
+	public static function InjectThreat( puppet : weak< ScriptedPuppet >, const threat : ref< TrackedLocation > )
 	{
 		var tt : TargetTrackerComponent;
 		var pos : Vector4;
@@ -399,6 +421,20 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		else
 		{
 			tt.AddThreatOnPosition( pos, 0.5 );
+		}
+	}
+
+	public static function InjectThreat( puppet : weak< ScriptedPuppet >, pos : Vector4, timeToLive : Float )
+	{
+		var tt : TargetTrackerComponent;
+		if( !( puppet ) )
+		{
+			return;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( tt )
+		{
+			tt.AddThreatOnPosition( pos, timeToLive );
 		}
 	}
 
@@ -515,6 +551,21 @@ class TargetTrackingExtension extends TargetTrackerComponent
 			puppet.QueueEvent( evt );
 		}
 		tt.SetThreatPersistence( target, isPersistent, persistenceSource );
+	}
+
+	public static function SetCurrentThreatsPersistence( puppet : weak< ScriptedPuppet >, isPersistent : Bool, persistenceSource : Uint32 )
+	{
+		var tt : TargetTrackerComponent;
+		if( !( puppet ) )
+		{
+			return;
+		}
+		tt = puppet.GetTargetTrackerComponent();
+		if( !( tt ) )
+		{
+			return;
+		}
+		tt.SetCurrentThreatsPersistence( isPersistent, persistenceSource );
 	}
 
 	protected event OnSetThreatsPersistenceRequest( evt : SetThreatsPersistenceRequest )
@@ -732,7 +783,7 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		return false;
 	}
 
-	public static function GetHostileThreats( const context : ScriptExecutionContext, visible : Bool, out trackedLocations : array< TrackedLocation > ) : Bool
+	public static function GetHostileThreats( const context : ScriptExecutionContext, visible : Bool, trackedLocations : ref< array< TrackedLocation > > ) : Bool
 	{
 		var targetTracker : weak< TargetTrackerComponent >;
 		if( Get( context, targetTracker ) )
@@ -743,7 +794,7 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		return false;
 	}
 
-	public static function GetHostileThreats( puppet : weak< ScriptedPuppet >, visible : Bool, out trackedLocations : array< TrackedLocation > ) : Bool
+	public static function GetHostileThreats( puppet : weak< ScriptedPuppet >, visible : Bool, trackedLocations : ref< array< TrackedLocation > > ) : Bool
 	{
 		var targetTracker : weak< TargetTrackerComponent >;
 		if( Get( puppet, targetTracker ) )
@@ -754,7 +805,7 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		return false;
 	}
 
-	public static function GetPlayerFromThreats( hostileThreats : array< TrackedLocation >, out player : weak< GameObject > ) : Bool
+	public static function GetPlayerFromThreats( const hostileThreats : ref< array< TrackedLocation > >, out player : weak< GameObject > ) : Bool
 	{
 		var i : Int32;
 		for( i = 0; i < hostileThreats.Size(); i += 1 )
@@ -766,37 +817,6 @@ class TargetTrackingExtension extends TargetTrackerComponent
 			}
 		}
 		return false;
-	}
-
-	public const function GetDroppedThreat( game : GameInstance, out threatData : DroppedThreatData ) : Bool
-	{
-		if( ( !( GameInstance.IsValid( game ) ) || !( m_droppedThreatData.threat ) ) || Vector4.IsZero( m_droppedThreatData.position ) )
-		{
-			return false;
-		}
-		if( ( m_droppedThreatData.timeStamp >= 0.0 ) && ( EngineTime.ToFloat( GameInstance.GetSimTime( game ) ) > m_droppedThreatData.timeStamp ) )
-		{
-			return false;
-		}
-		threatData = m_droppedThreatData;
-		return true;
-	}
-
-	public function SetRecentlyDroppedThreat( game : GameInstance, threat : Entity, position : Vector4, validFor : Float )
-	{
-		if( threat )
-		{
-			m_droppedThreatData.threat = threat;
-			m_droppedThreatData.position = position;
-			if( validFor >= 0.0 )
-			{
-				m_droppedThreatData.timeStamp = EngineTime.ToFloat( GameInstance.GetSimTime( game ) ) + validFor;
-			}
-			else
-			{
-				m_droppedThreatData.timeStamp = -1.0;
-			}
-		}
 	}
 
 	protected event OnEnemyPushedToSquad( evt : EnemyPushedToSquad )
@@ -813,14 +833,19 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		}
 	}
 
-	public function ResetRecentlyDroppedThreat()
-	{
-		m_droppedThreatData.threat = NULL;
-	}
-
 	protected event OnHostJoinedSquad( th : HostJoinedSquad )
 	{
-		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) )
+		var isPolice : Bool;
+		var vehicle : weak< GameObject >;
+		isPolice = NPCManager.HasTag( ( ( ScriptedPuppet )( GetEntity() ) ).GetRecordID(), 'InActivePoliceChase' );
+		if( VehicleComponent.GetVehicle( ( ( GameObject )( GetEntity() ) ).GetGame(), ( ( GameObject )( GetEntity() ) ), vehicle ) )
+		{
+			if( ( ( VehicleObject )( vehicle ) ).GetPoliceStrategy() == vehiclePoliceStrategy.GetToPlayerFromAnywhere )
+			{
+				isPolice = false;
+			}
+		}
+		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) && !( isPolice ) )
 		{
 			PullSquadSync( AISquadType.Combat );
 		}
@@ -865,7 +890,6 @@ class TargetTrackingExtension extends TargetTrackerComponent
 
 	protected event OnThreatRemoved( th : ThreatRemoved )
 	{
-		var validTimeStamp : Float;
 		var evt : RemoveLinkedStatusEffectsEvent;
 		var owner : GameObject;
 		var threat : GameObject;
@@ -883,6 +907,11 @@ class TargetTrackingExtension extends TargetTrackerComponent
 		if( !( threat ) )
 		{
 			return false;
+		}
+		if( th.distanceBasedInstantDrop && owner.IsPrevention() )
+		{
+			StatusEffectHelper.ApplyStatusEffect( owner, T"PreventionStatusEffect.InstantThreatDropGracePeriod" );
+			VehicleComponent.OnThreatInstantDrop( owner );
 		}
 		if( !( ScriptedPuppet.IsActive( ( ( GameObject )( th.threat ) ) ) ) )
 		{
@@ -925,18 +954,32 @@ class TargetTrackingExtension extends TargetTrackerComponent
 			{
 				if( th.isHostile )
 				{
-					validTimeStamp = EngineTime.ToFloat( GameInstance.GetSimTime( ( ( GameObject )( th.owner ) ).GetGame() ) ) + 10.0;
-					SetRecentlyDroppedThreat( ( ( GameObject )( th.owner ) ).GetGame(), th.threat, th.threat.GetWorldPosition(), validTimeStamp );
+					SetRecentlyDroppedThreat( th.threat, th.threat.GetWorldPosition() );
 				}
 				else
 				{
-					StatusEffectHelper.ApplyStatusEffect( owner, T"AIQuickHackStatusEffect.HackingInterrupted", th.owner.GetEntityID() );
+					if( threat.IsPlayer() && StatusEffectSystem.ObjectHasStatusEffect( threat, T"StatusEffect.HackReveal" ) )
+					{
+						StatusEffectHelper.ApplyStatusEffect( owner, T"AIQuickHackStatusEffect.HackRevealInterrupted", th.owner.GetEntityID() );
+					}
+					else
+					{
+						StatusEffectHelper.ApplyStatusEffect( owner, T"AIQuickHackStatusEffect.HackingInterrupted", th.owner.GetEntityID() );
+					}
 					evt = new RemoveLinkedStatusEffectsEvent;
 					th.owner.QueueEvent( evt );
 				}
 				AISquadHelper.GetCombatSquadInterface( threat, playerSquad );
 				RemoveWholeSquadFromThreats( playerSquad );
 			}
+		}
+	}
+
+	protected event OnStoppedBeingTrackedAsHostile( evt : StoppedBeingTrackedAsHostile )
+	{
+		if( m_canBeAddedToBossHealthbar && m_playerPuppet )
+		{
+			BossHealthBarGameController.ReevaluateBossHealthBar( ( ( NPCPuppet )( GetEntity() ) ), m_playerPuppet, true );
 		}
 	}
 
@@ -1139,7 +1182,7 @@ class TargetTrackingExtension extends TargetTrackerComponent
 			else if( threat.IsNPC() )
 			{
 				npcThreat = ( ( NPCPuppet )( threat ) );
-				npcThreatRarity = npcThreat.GetPuppetRarityEnum();
+				npcThreatRarity = npcThreat.GetNPCRarity();
 				switch( npcThreat.GetNPCType() )
 				{
 					case gamedataNPCType.Drone:
@@ -1398,6 +1441,9 @@ abstract class AIActionTarget
 		var securitySystem : SecuritySystemControllerPS;
 		var sensorDevices : array< SensorDeviceControllerPS >;
 		var sensorDevice : weak< SensorDevice >;
+		var candidate : weak< Entity >;
+		var compareDistance : Float;
+		var distance : Float;
 		var i, j : Int32;
 		target = ScriptExecutionContext.GetArgumentObject( context, 'CombatTarget' );
 		if( !( target ) )
@@ -1415,7 +1461,7 @@ abstract class AIActionTarget
 					sensorDevice = ( ( weak< weak< SensorDevice > > )( sensorDevices[ i ].GetOwnerEntityWeak() ) );
 					if( sensorDevice && ( sensorDevice.GetCurrentlyFollowedTarget() == target ) )
 					{
-						return sensorDevice;
+						candidate = ( ( weak< weak< Entity > > )( sensorDevice ) );
 					}
 				}
 			}
@@ -1433,15 +1479,16 @@ abstract class AIActionTarget
 			{
 				for( j = 0; j < trackedLocations.Size(); j += 1 )
 				{
-					if( trackedLocations[ j ].entity == target )
+					distance = Vector4.Distance( squadMembers[ i ].GetWorldPosition(), target.GetWorldPosition() );
+					if( ( trackedLocations[ j ].entity == target ) && ( ( compareDistance == 0.0 ) || ( compareDistance > distance ) ) )
 					{
-						return ( ( weak< weak< GameObject > > )( squadMembers[ i ] ) );
+						compareDistance = distance;
+						candidate = squadMembers[ i ];
 					}
 				}
-				trackedLocations.Clear();
 			}
 		}
-		return NULL;
+		return ( ( weak< weak< GameObject > > )( candidate ) );
 	}
 
 	public static function GetObjectLegacy( const context : ScriptExecutionContext, record : AIActionTarget_Record, out object : weak< GameObject > ) : Bool
@@ -1784,22 +1831,40 @@ abstract class AIActionTarget
 		var i : Int32;
 		var threatBaseVal : Float;
 		var currentTime : Float;
-		if( !( puppet ) )
-		{
-			return;
-		}
+		var isPlayersFollower : Bool;
+		var isVisTargetingMode : Bool;
+		var visTargetingTolerance : Float;
+		visTargetingTolerance = 0.80000001;
 		ownerPos = puppet.GetWorldPosition();
 		if( Vector4.IsZero( ownerPos ) )
 		{
 			return;
 		}
+		isPlayersFollower = ScriptedPuppet.IsPlayerCompanion( puppet ) && puppet.GetAIControllerComponent().GetAIRole().GetRoleEnum() == EAIRole.Follower;
 		targetTrackerComponent = puppet.GetTargetTrackerComponent();
 		allThreats = targetTrackerComponent.GetHostileThreats( false );
 		currentTime = EngineTime.ToFloat( GameInstance.GetSimTime( puppet.GetGame() ) );
+		isVisTargetingMode = isPlayersFollower && StatusEffectSystem.ObjectHasStatusEffect( puppet, T"BaseStatusEffect.FollowerVisibilityTargeting" );
 		for( i = 0; i < allThreats.Size(); i += 1 )
 		{
 			threat = ( ( GameObject )( allThreats[ i ].entity ) );
 			threatBaseVal = 0.0;
+			if( threat.IsPlayerControlled() )
+			{
+				if( StatusEffectSystem.ObjectHasStatusEffectOfType( threat, gamedataStatusEffectType.BlockTargetingPlayer ) || StatusEffectSystem.ObjectHasStatusEffectOfType( puppet, gamedataStatusEffectType.BlockTargetingPlayer ) )
+				{
+					targetTrackerComponent.SetThreatBaseMul( threat, -1.0 );
+					continue;
+				}
+			}
+			if( isVisTargetingMode && ( !( allThreats[ i ].visible ) || ( targetTrackerComponent.GetVisibleThreatBeliefAccuracy( threat ) < visTargetingTolerance ) ) )
+			{
+				if( !( IsThreatCloseOrVisibleByPlayer( ownerPos, threat ) ) )
+				{
+					targetTrackerComponent.SetThreatBaseMul( threat, -1.0 );
+					continue;
+				}
+			}
 			if( ( ( SurveillanceCamera )( threat ) ) )
 			{
 				targetTrackerComponent.SetThreatBaseMul( threat, -1.0 );
@@ -2107,6 +2172,41 @@ abstract class AIActionTarget
 		return 0.0;
 	}
 
+	private static function IsThreatCloseOrVisibleByPlayer( ownerPos : Vector4, threat : GameObject ) : Bool
+	{
+		var minDistSqr : Float;
+		var playerDistSqr : Float;
+		var playerPuppet : PlayerPuppet;
+		var playerPos : Vector4;
+		var playerFwd : Vector4;
+		var threatPos : Vector4;
+		var threatFwd : Vector4;
+		var continuousLineOfSight : Float;
+		minDistSqr = 18.0 * 18.0;
+		playerDistSqr = 12.0 * 12.0;
+		if( !( threat ) )
+		{
+			return false;
+		}
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( threat.GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		if( playerPuppet )
+		{
+			playerPos = playerPuppet.GetWorldPosition();
+			playerFwd = playerPuppet.GetWorldForward();
+			threatPos = threat.GetWorldPosition();
+			threatFwd = Vector4.Normalize( threatPos - playerPos );
+			if( ( Vector4.Dot( playerFwd, threatFwd ) > 0.0 ) && threat.GetSourceShootComponent().GetContinuousLineOfSightToTarget( playerPuppet, continuousLineOfSight ) )
+			{
+				return true;
+			}
+			if( Vector4.DistanceSquared( ownerPos, playerPos ) > playerDistSqr )
+			{
+				return false;
+			}
+		}
+		return Vector4.DistanceSquared( ownerPos, threatPos ) < minDistSqr;
+	}
+
 	private static function GetClosestMemberId( smi : SquadScriptInterface, pos : Vector4 ) : EntityID
 	{
 		var members : array< weak< Entity > >;
@@ -2131,20 +2231,5 @@ abstract class AIActionTarget
 		return closestId;
 	}
 
-}
-
-import enum AITrackedStatusType
-{
-	Unknown,
-	Friendly,
-	Neutral,
-	Hostile,
-}
-
-import enum AIThreatPersistenceStatus
-{
-	ThreatNotFound,
-	Persistent,
-	NotPersistent,
 }
 

@@ -22,6 +22,7 @@ class InvalidateTooltipOwnerEvent extends Event
 class LootingGameController extends inkGameController
 {
 	private var m_dataManager : InventoryDataManagerV2;
+	private var m_uiInventorySystem : weak< UIInventoryScriptableSystem >;
 	private var m_bbInteractions : weak< IBlackboard >;
 	private var m_bbEquipmentData : weak< IBlackboard >;
 	private var m_bbEquipment : weak< IBlackboard >;
@@ -38,9 +39,8 @@ class LootingGameController extends inkGameController
 	private var m_introAnim : inkAnimProxy;
 	private var m_outroAnim : inkAnimProxy;
 	private var m_lastActiveWeapon : SlotWeaponData;
-	private var m_lastActiveWeaponData : InventoryItemData;
+	private var m_lastActiveWeaponID : ItemID;
 	private var m_previousData : LootData;
-	var m_lastActiveOwnerId : EntityID;
 
 	protected event OnInitialize()
 	{
@@ -48,16 +48,19 @@ class LootingGameController extends inkGameController
 		m_player = ( ( PlayerPuppet )( GetOwnerEntity() ) );
 		m_dataManager = new InventoryDataManagerV2;
 		m_dataManager.Initialize( m_player );
+		m_uiInventorySystem = UIInventoryScriptableSystem.GetInstance( m_player.GetGame() );
 		m_controller = ( ( LootingController )( GetController() ) );
 		m_controller.SetDataManager( m_dataManager );
+		m_controller.SetUIInventorySystem( m_uiInventorySystem );
 		if( m_player )
 		{
 			m_controller.SetGameInstance( m_player.GetGame() );
+			m_controller.SetPlayer( m_player );
 		}
 		m_controller.Hide();
 	}
 
-	protected event OnUnitialize()
+	protected event OnUninitialize()
 	{
 		m_dataManager.UnInitialize();
 		UnregisterFromBB();
@@ -117,8 +120,8 @@ class LootingGameController extends inkGameController
 			if( m_lastActiveWeapon.weaponID != currentData.weaponID )
 			{
 				item = m_dataManager.GetPlayerItemData( currentData.weaponID );
-				m_lastActiveWeaponData = m_dataManager.GetInventoryItemData( item );
-				m_controller.SetActiveWeapon( m_lastActiveWeaponData );
+				m_lastActiveWeaponID = item.GetID();
+				m_controller.SetActiveWeapon( m_lastActiveWeaponID );
 			}
 			m_lastActiveWeapon = currentData;
 		}
@@ -141,7 +144,7 @@ class LootingGameController extends inkGameController
 		}
 	}
 
-	private function IsUpdateRequired( newData : LootData ) : Bool
+	private function IsUpdateRequired( const newData : ref< LootData > ) : Bool
 	{
 		var i, choicesSize, itemIDsSize : Int32;
 		if( ( ( ( ( ( newData.isActive != m_previousData.isActive || newData.isListOpen != m_previousData.isListOpen ) || newData.e3hack_isWeapon != m_previousData.e3hack_isWeapon ) || newData.isLocked != m_previousData.isLocked ) || ( newData.ownerId != m_previousData.ownerId ) ) || ( newData.currentIndex != m_previousData.currentIndex ) ) || newData.title != m_previousData.title )
@@ -175,6 +178,9 @@ class LootingGameController extends inkGameController
 		return false;
 	}
 
+
+	var m_lastActiveOwnerId : EntityID;
+
 	protected event OnInvalidateTooltipOwnerEvent( e : InvalidateTooltipOwnerEvent )
 	{
 		if( m_controller.IsTooltipVisible() && ( m_controller.GetTooltipOwner( 0 ) != m_controller.GetCurrentItemOwnerId() ) )
@@ -185,12 +191,15 @@ class LootingGameController extends inkGameController
 
 	protected event OnUpdateData( value : Variant )
 	{
-		var container : gameLootContainerBase;
-		var lootObject : gameLootObject;
-		var lootEntity : Entity;
 		var data : LootData;
+		var ownerId : EntityID;
+		var container : gameLootContainerBase;
+		var forceDisableLockIcon : Bool;
 		data = ( ( LootData )value );
-		m_controller.SetTooltipVisible( data.isActive && ( data.itemIDs.Size() > 0 ) );
+		ownerId = data.ownerId;
+		container = ( ( gameLootContainerBase )( GameInstance.FindEntityByID( m_player.GetGame(), ownerId ) ) );
+		forceDisableLockIcon = ( container && container.ShouldHideLockedUI() ) && data.isLocked;
+		m_controller.SetTooltipVisible( ( data.isActive && ( data.itemIDs.Size() > 0 ) ) && !( forceDisableLockIcon ) );
 		if( IsUpdateRequired( data ) )
 		{
 			m_previousData = data;
@@ -208,20 +217,10 @@ class LootingGameController extends inkGameController
 					}
 					m_introAnim = PlayLibraryAnimation( 'actions_intro' );
 				}
-				m_controller.Show();
-				m_controller.ShowLockedStatus( m_previousData.isLocked );
-				if( m_player )
+				if( !( forceDisableLockIcon ) )
 				{
-					lootEntity = GameInstance.FindEntityByID( m_player.GetGame(), m_previousData.ownerId );
-					container = ( ( gameLootContainerBase )( GameInstance.FindEntityByID( m_player.GetGame(), m_previousData.ownerId ) ) );
-				}
-				if( !( container ) )
-				{
-					lootObject = ( ( gameLootObject )( lootEntity ) );
-					if( lootObject )
-					{
-						container = ( ( gameLootContainerBase )( lootObject.GetOwner() ) );
-					}
+					m_controller.Show();
+					m_controller.ShowLockedStatus( m_previousData.isLocked );
 				}
 				m_controller.SetLootData( m_previousData );
 				SetShouldHideClampedMappins( true );
@@ -254,6 +253,9 @@ class TooltipLootingCachedData
 	var comparisonItemData : weak< gameItemData >;
 	var comparisonItemId : ItemID;
 	var lootingData : MinimalLootingListItemData;
+	var comparisonWeaponBars : UIInventoryItemWeaponBars;
+	var comparisonQualityF : Float;
+	default comparisonQualityF = -1.0f;
 }
 
 class LootingController extends inkLogicController
@@ -271,11 +273,18 @@ class LootingController extends inkLogicController
 	private var m_lootList : array< weak< inkWidget > >;
 	private var m_requestedItemsPoolItems : Int32;
 	private var m_dataManager : weak< InventoryDataManagerV2 >;
+	private var m_uiInventorySystem : weak< UIInventoryScriptableSystem >;
 	private var m_gameInstance : GameInstance;
+	private var m_player : weak< GameObject >;
 	private editable var m_maxItemsNum : Int32;
 	default m_maxItemsNum = 3;
+	private var m_boundOwnerID : EntityID;
+	private var m_lootingItems : array< weak< gameItemData > >;
+	private var m_uiInventoryItems : array< UIInventoryItem >;
 	private var m_tooltipProvider : weak< TooltipProvider >;
 	private var m_cachedTooltipData : ATooltipData;
+	private var m_cachedTooltipUIInventoryItem : UIInventoryItem;
+	private var m_displayContext : ItemDisplayContextData;
 	private var m_startIndex : Int32;
 	private var m_selectedItemIndex : Int32;
 	private var m_itemsToCompare : Int32;
@@ -292,11 +301,10 @@ class LootingController extends inkLogicController
 	private var bufferedOwnerId : EntityID;
 	private var introAnimProxy : inkAnimProxy;
 	private var m_currendData : LootData;
-	private var m_activeWeapon : InventoryItemData;
+	private var m_activeWeaponID : ItemID;
 	private var m_isLocked : Bool;
 	private var m_currentWidgetRequestVersion : Int32;
 	private var m_currentItemRequestVersion : Int32;
-	private var m_requestsCounter : Int32;
 
 	protected event OnInitialize()
 	{
@@ -310,9 +318,21 @@ class LootingController extends inkLogicController
 		m_tooltipProvider.InvalidateHidden();
 	}
 
+	public function SetPlayer( player : weak< GameObject > )
+	{
+		m_player = player;
+		m_displayContext = ItemDisplayContextData.Make( m_player, ItemDisplayContext.Tooltip );
+		m_displayContext.AddTag( 'Looting' );
+	}
+
 	public function SetDataManager( dataManager : InventoryDataManagerV2 )
 	{
 		m_dataManager = dataManager;
+	}
+
+	public function SetUIInventorySystem( uiInventorySystem : weak< UIInventoryScriptableSystem > )
+	{
+		m_uiInventorySystem = uiInventorySystem;
 	}
 
 	public function SetGameInstance( gameInstance : GameInstance )
@@ -320,21 +340,12 @@ class LootingController extends inkLogicController
 		m_gameInstance = gameInstance;
 	}
 
-	public function SetActiveWeapon( weapon : InventoryItemData )
+	public function SetActiveWeapon( weaponID : ItemID )
 	{
-		m_activeWeapon = weapon;
+		m_activeWeaponID = weaponID;
 		if( m_isShown )
 		{
 			SetLootData( m_currendData );
-		}
-	}
-
-	public function CycleSelectedItem()
-	{
-		if( m_itemsToCompare > 1 )
-		{
-			m_selectedItemIndex = ( m_selectedItemIndex + 1 ) % m_itemsToCompare;
-			RefreshTooltips();
 		}
 	}
 
@@ -370,20 +381,24 @@ class LootingController extends inkLogicController
 
 	private function RefreshComparisonData()
 	{
-		var i : Int32;
-		var itemData : InventoryItemData;
-		var equippedItem : InventoryItemData;
-		var comparisonTooltipData : InventoryTooltipData;
+		var i, limit : Int32;
 		var controller : LootingListItemController;
-		for( i = 0; i < m_lootList.Size(); i += 1 )
+		for( i = 0, limit = m_lootList.Size(); i < limit; i += 1 )
 		{
 			controller = ( ( LootingListItemController )( m_lootList[ i ].GetController() ) );
-			itemData = controller.GetTooltipData().inventoryItemData;
-			equippedItem = GetPureItemForComparison( itemData );
-			comparisonTooltipData = m_dataManager.GetComparisonTooltipsData( equippedItem, itemData );
-			controller.SetData( comparisonTooltipData );
+			if( m_dataManager.CanItemTypeBeCompared( m_currentTooltipLootingData.comparisonItemId, controller.GetItemID() ) )
+			{
+				controller.SetComparedQualityF( m_currentTooltipLootingData.comparisonQualityF );
+			}
+			else
+			{
+				controller.SetComparedQualityF( -1.0 );
+			}
 		}
 	}
+
+
+	private var m_requestsCounter : Int32;
 
 	[ profile = "Looting: RefreshChoicesPool" ]
 	private function RefreshChoicesPool( choices : ref< array< InteractionChoiceData > > )
@@ -543,6 +558,8 @@ class LootingController extends inkLogicController
 		var comparisonItemID : ItemID;
 		var comparisionItemData : weak< gameItemData >;
 		var lootingData : MinimalLootingListItemData;
+		var record : weak< UIStatsMap_Record >;
+		var statsManager : UIInventoryItemStatsManager;
 		lootListWidget = m_lootList[ index ];
 		if( !( lootListWidget ) )
 		{
@@ -580,6 +597,18 @@ class LootingController extends inkLogicController
 				m_currentTooltipLootingData.comparisonItemData = comparisionItemData;
 				m_currentTooltipLootingData.comparisonItemId = comparisonItemID;
 				m_currentTooltipLootingData.lootingData = lootingData;
+				if( comparisionItemData )
+				{
+					record = UIInventoryItemsManager.GetUIStatsMap( m_currentTooltipLootingData.comparisonItemData.GetItemType() );
+					statsManager = UIInventoryItemStatsManager.Make( m_currentTooltipLootingData.comparisonItemData, record, m_dataManager.GetUIInventorySystem().GetInventoryItemsManager() );
+					m_currentTooltipLootingData.comparisonWeaponBars = statsManager.GetWeaponBars();
+					m_currentTooltipLootingData.comparisonQualityF = UIItemsHelper.GetQualityF( UIItemsHelper.QualityToInt( RPGManager.GetItemQuality( comparisionItemData ) ), RPGManager.IsItemIconic( comparisionItemData ), RPGManager.GetItemPlus( comparisionItemData ) );
+				}
+				else
+				{
+					m_currentTooltipLootingData.comparisonWeaponBars = NULL;
+					m_currentTooltipLootingData.comparisonQualityF = -1.0;
+				}
 				RefreshTooltips();
 			}
 		}
@@ -589,9 +618,10 @@ class LootingController extends inkLogicController
 	private function GetMinimalLootingData( itemData : weak< gameItemData >, itemRecord : weak< Item_Record >, equipmentArea : gamedataEquipmentArea, comparisionItemData : weak< gameItemData > ) : MinimalLootingListItemData
 	{
 		var lootingData : MinimalLootingListItemData;
+		var lootObject : gameLootObject;
+		var lootEntity : Entity;
+		var container : gameLootContainerBase;
 		var shardData : weak< JournalOnscreen >;
-		var localDPS, comparisionDPS : Float;
-		var localArmor, comparisionArmor : Float;
 		lootingData = new MinimalLootingListItemData;
 		lootingData.gameItemData = itemData;
 		lootingData.lootItemType = LootItemType.Default;
@@ -613,17 +643,65 @@ class LootingController extends inkLogicController
 		lootingData.isIconic = RPGManager.IsItemIconic( itemData );
 		lootingData.quantity = itemData.GetQuantity();
 		lootingData.equipmentArea = equipmentArea;
+		if( GameInstance.IsValid( m_gameInstance ) )
+		{
+			lootEntity = GameInstance.FindEntityByID( m_gameInstance, m_currendData.ownerId );
+			container = ( ( gameLootContainerBase )( GameInstance.FindEntityByID( m_gameInstance, m_currendData.ownerId ) ) );
+			lootingData.isQuestContainer = container.IsQuest();
+		}
+		if( !( container ) )
+		{
+			lootObject = ( ( gameLootObject )( lootEntity ) );
+			if( lootObject )
+			{
+				container = ( ( gameLootContainerBase )( lootObject.GetOwner() ) );
+				lootingData.isQuestContainer = container.IsQuest();
+			}
+		}
+		lootingData.itemId = itemData.GetID();
 		lootingData.tweakDBID = ItemID.GetTDBID( itemData.GetID() );
+		lootingData.qualityF = UIItemsHelper.GetQualityF( UIItemsHelper.QualityToInt( lootingData.quality ), lootingData.isIconic, RPGManager.GetItemPlus( lootingData.gameItemData ) );
 		if( comparisionItemData )
 		{
-			localDPS = itemData.GetStatValueByType( gamedataStatType.EffectiveDPS );
-			comparisionDPS = comparisionItemData.GetStatValueByType( gamedataStatType.EffectiveDPS );
-			lootingData.dpsDiff = localDPS - comparisionDPS;
-			localArmor = itemData.GetStatValueByType( gamedataStatType.Armor );
-			comparisionArmor = comparisionItemData.GetStatValueByType( gamedataStatType.Armor );
-			lootingData.armorDiff = localArmor - comparisionArmor;
+			lootingData.comparedQualityF = UIItemsHelper.GetQualityF( UIItemsHelper.QualityToInt( RPGManager.GetItemQuality( comparisionItemData ) ), RPGManager.IsItemIconic( comparisionItemData ), RPGManager.GetItemPlus( comparisionItemData ) );
+		}
+		else
+		{
+			lootingData.comparedQualityF = -1.0;
 		}
 		return lootingData;
+	}
+
+	private function UpdateCachedItems( data : LootData )
+	{
+		var i, limit : Int32;
+		var alreadyPresentIDs : array< ItemID >;
+		for( i = m_uiInventoryItems.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( !( m_currendData.itemIDs.Contains( m_uiInventoryItems[ i ].GetID() ) ) )
+			{
+				m_uiInventoryItems.EraseFast( i );
+			}
+		}
+		for( i = m_lootingItems.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( ( m_lootingItems[ i ] == NULL ) || !( m_currendData.itemIDs.Contains( m_lootingItems[ i ].GetID() ) ) )
+			{
+				m_lootingItems.EraseFast( i );
+			}
+		}
+		alreadyPresentIDs.Resize( m_lootingItems.Size() );
+		for( i = 0, i < m_lootingItems.Size(); i < limit; i += 1 )
+		{
+			alreadyPresentIDs[ i ] = m_lootingItems[ i ].GetID();
+		}
+		for( i = 0, limit = m_currendData.itemIDs.Size(); i < limit; i += 1 )
+		{
+			if( !( alreadyPresentIDs.Contains( m_currendData.itemIDs[ i ] ) ) )
+			{
+				m_lootingItems.PushBack( m_dataManager.GetExternalGameItemData( m_currendData.ownerId, m_currendData.itemIDs[ i ] ) );
+			}
+		}
 	}
 
 	[ profile = "Looting: SetLootData" ]
@@ -642,6 +720,7 @@ class LootingController extends inkLogicController
 		bufferedOwnerId = data.ownerId;
 		totalItems = data.itemIDs.Size();
 		visibleItems = Min( m_maxItemsNum, totalItems );
+		UpdateCachedItems( data );
 		RefreshChoicesPool( data.choices );
 		RefreshItemsData( data, visibleItems, totalItems, lastIndex );
 		RefreshItemsPool( totalItems, visibleItems );
@@ -693,6 +772,8 @@ class LootingController extends inkLogicController
 	public function UpdateEquipmentArea( equipmentArea : gamedataEquipmentArea )
 	{
 		var comparisonItemID : ItemID;
+		var record : weak< UIStatsMap_Record >;
+		var statsManager : UIInventoryItemStatsManager;
 		if( m_currentComparisonEquipmentArea == equipmentArea )
 		{
 			m_isComaprisonDirty = true;
@@ -701,6 +782,10 @@ class LootingController extends inkLogicController
 			{
 				m_currentTooltipLootingData.comparisonItemId = comparisonItemID;
 				m_currentTooltipLootingData.comparisonItemData = m_dataManager.GetPlayerItemData( comparisonItemID );
+				record = UIInventoryItemsManager.GetUIStatsMap( m_currentTooltipLootingData.comparisonItemData.GetItemType() );
+				statsManager = UIInventoryItemStatsManager.Make( m_currentTooltipLootingData.comparisonItemData, record, m_dataManager.GetUIInventorySystem().GetInventoryItemsManager() );
+				m_currentTooltipLootingData.comparisonWeaponBars = statsManager.GetWeaponBars();
+				m_currentTooltipLootingData.comparisonQualityF = UIItemsHelper.GetQualityF( UIItemsHelper.QualityToInt( RPGManager.GetItemQuality( m_currentTooltipLootingData.comparisonItemData ) ), RPGManager.IsItemIconic( m_currentTooltipLootingData.comparisonItemData ), RPGManager.GetItemPlus( m_currentTooltipLootingData.comparisonItemData ) );
 			}
 			RefreshTooltips();
 		}
@@ -732,89 +817,13 @@ class LootingController extends inkLogicController
 		return NULL;
 	}
 
-	private function FilterOutEmptyItems( items : array< InventoryItemData > ) : array< InventoryItemData >
-	{
-		var i : Int32;
-		var result : array< InventoryItemData >;
-		for( i = 0; i < items.Size(); i += 1 )
-		{
-			if( !( InventoryItemData.IsEmpty( items[ i ] ) ) )
-			{
-				result.PushBack( items[ i ] );
-			}
-		}
-		return result;
-	}
-
-	private function FilterComparableItems( itemToCompare : ItemID, items : array< InventoryItemData > ) : array< InventoryItemData >
-	{
-		var i : Int32;
-		var result : array< InventoryItemData >;
-		for( i = 0; i < items.Size(); i += 1 )
-		{
-			if( m_dataManager.CanCompareItems( itemToCompare, InventoryItemData.GetID( items[ i ] ) ) )
-			{
-				result.PushBack( items[ i ] );
-			}
-		}
-		return result;
-	}
-
-	private function GetPrefferedComparisonItem( item : InventoryItemData ) : InventoryItemData
-	{
-		var inventoryItems, comparableItems : array< InventoryItemData >;
-		var prefferedItemIndex : Int32;
-		inventoryItems = FilterOutEmptyItems( m_dataManager.GetItemsToCompare( item ) );
-		comparableItems = FilterComparableItems( InventoryItemData.GetID( item ), inventoryItems );
-		prefferedItemIndex = m_dataManager.GetPrefferedEquipedItemToCompare( item, comparableItems );
-		return comparableItems[ prefferedItemIndex ];
-	}
-
-	private function GetCurrentlyEquippedComparisonItem( equipmentArea : gamedataEquipmentArea ) : InventoryItemData
-	{
-		if( equipmentArea == gamedataEquipmentArea.Weapon )
-		{
-			return m_activeWeapon;
-		}
-		return m_dataManager.GetItemToCompare( equipmentArea );
-	}
-
 	private function GetCurrentlyEquippedComparisonItemID( equipmentArea : gamedataEquipmentArea ) : ItemID
 	{
 		if( equipmentArea == gamedataEquipmentArea.Weapon )
 		{
-			return InventoryItemData.GetID( m_activeWeapon );
+			return m_activeWeaponID;
 		}
 		return m_dataManager.GetItemIDToCompare( equipmentArea );
-	}
-
-	private function GetComparisonTooltipData( inspectedItem : InventoryItemData, itemToCompareWith : InventoryItemData ) : InventoryTooltipData
-	{
-		var inspectedTooltip : InventoryTooltipData;
-		inspectedTooltip = m_dataManager.GetComparisonTooltipsData( itemToCompareWith, inspectedItem );
-		inspectedTooltip.ToCollapsedVersion();
-		return inspectedTooltip;
-	}
-
-	private function GetPrefferedComparisonTooltipData( item : InventoryItemData ) : InventoryTooltipData
-	{
-		return GetComparisonTooltipData( item, GetPrefferedComparisonItem( item ) );
-	}
-
-	private function GetCurrentlyUsedComparisonTooltipData( item : InventoryItemData ) : InventoryTooltipData
-	{
-		return GetComparisonTooltipData( item, GetCurrentlyEquippedComparisonItem( InventoryItemData.GetEquipmentArea( item ) ) );
-	}
-
-	public function GetItemForComparison( inspectedItem : InventoryItemData ) : InventoryItemData
-	{
-		var equippedItem : InventoryItemData;
-		equippedItem = GetCurrentlyEquippedComparisonItem( InventoryItemData.GetEquipmentArea( inspectedItem ) );
-		if( m_dataManager.CanCompareItems( InventoryItemData.GetID( inspectedItem ), InventoryItemData.GetID( equippedItem ) ) )
-		{
-			return equippedItem;
-		}
-		return m_dataManager.GetPrefferedComparisonItem( inspectedItem, m_dataManager.GetComparisonItems( inspectedItem ) );
 	}
 
 	public function GetItemIDForComparison( item : weak< gameItemData >, itemRecord : weak< Item_Record >, equipmentArea : gamedataEquipmentArea ) : ItemID
@@ -823,213 +832,92 @@ class LootingController extends inkLogicController
 		var itemID : ItemID;
 		itemID = item.GetID();
 		equippedItem = GetCurrentlyEquippedComparisonItemID( equipmentArea );
-		if( m_dataManager.CanCompareItems( itemID, equippedItem ) )
+		if( m_dataManager.CanItemTypeBeCompared( itemID, equippedItem ) )
 		{
 			return equippedItem;
 		}
-		return m_dataManager.GetPrefferedComparisonItemID( item, itemRecord, equipmentArea, m_dataManager.GetComparisonItemsIDs( itemID, equipmentArea ) );
+		if( ItemID.IsValid( equippedItem ) )
+		{
+			m_isComaprisonDirty = true;
+		}
+		return ItemID.None();
 	}
 
-	public function GetPureItemForComparison( inspectedItem : InventoryItemData ) : InventoryItemData
+	private function GetOrCreateUIInventoryItem( itemData : gameItemData ) : weak< UIInventoryItem >
 	{
-		var itemData : InventoryItemData;
-		itemData = GetItemForComparison( inspectedItem );
-		if( InventoryItemData.IsEmpty( itemData ) )
+		var owner : weak< GameObject >;
+		var i, limit : Int32;
+		if( itemData == NULL )
 		{
-			return itemData;
+			return NULL;
 		}
-		return m_dataManager.GetItemDataFromIDInLoadout( InventoryItemData.GetID( itemData ) );
-	}
-
-	public function GetPureItemForComparison( item : weak< gameItemData >, itemRecord : weak< Item_Record >, equipmentArea : gamedataEquipmentArea ) : InventoryItemData
-	{
-		var itemData : InventoryItemData;
-		var comparisonItemID : ItemID;
-		comparisonItemID = GetItemIDForComparison( item, itemRecord, equipmentArea );
-		if( !( ItemID.IsValid( comparisonItemID ) ) )
+		for( i = 0, limit = m_uiInventoryItems.Size(); i < limit; i += 1 )
 		{
-			return itemData;
+			if( m_uiInventoryItems[ i ].GetRealItemData() == itemData )
+			{
+				if( m_uiInventoryItems[ i ].GetItemType() == gamedataItemType.Cyb_NanoWires )
+				{
+					m_uiInventoryItems[ i ].Internal_MarkModsDirty();
+				}
+				return m_uiInventoryItems[ i ];
+			}
 		}
-		return m_dataManager.GetItemDataFromIDInLoadout( comparisonItemID );
+		owner = m_dataManager.GetExternalGameObject( m_currentItemOwnerId );
+		m_uiInventoryItems.PushBack( UIInventoryItem.Make( owner, itemData, m_uiInventorySystem.GetInventoryItemsManager() ) );
+		return m_uiInventoryItems.Last();
 	}
 
 	[ profile = "Looting: RefreshTooltips" ]
 	private function RefreshTooltips()
 	{
-		var equippedItem : InventoryItemData;
-		var inspectedTooltip : InventoryTooltipData;
-		var shardData : weak< JournalOnscreen >;
+		var item : weak< UIInventoryItem >;
+		var uiInventoryItemTooltip : UIInventoryItemTooltipWrapper;
 		var identifiedTooltipData : IdentifiedWrappedTooltipData;
-		var isPart, isCyberdeck : Bool;
+		var comparisonItemId : ItemID;
+		var comparisonItem : weak< UIInventoryItem >;
 		if( m_isLocked )
 		{
 			m_tooltipProvider.ClearTooltipData();
 			return;
-		}
-		if( !( m_isComaprisonDirty ) )
-		{
-			m_isComaprisonDirty = m_currentTooltipLootingData.comparisonItemId != m_currentComparisonItemId;
 		}
 		if( ( ( m_lastTooltipItemId != m_currentTooltipItemId ) || ( m_lastItemOwnerId != m_currentItemOwnerId ) ) || m_isComaprisonDirty )
 		{
 			m_tooltipProvider.ClearTooltipData();
 			if( ItemID.IsValid( m_currentTooltipItemId ) )
 			{
-				if( m_currentTooltipLootingData.externalItemData )
+				item = GetOrCreateUIInventoryItem( m_currentTooltipLootingData.externalItemData );
+				identifiedTooltipData = new IdentifiedWrappedTooltipData;
+				uiInventoryItemTooltip = UIInventoryItemTooltipWrapper.Make( item, m_displayContext );
+				identifiedTooltipData.m_data = uiInventoryItemTooltip;
+				identifiedTooltipData.m_identifier = 'itemTooltip';
+				if( item.IsWeapon() )
 				{
-					isPart = m_currentTooltipLootingData.lootingData.itemType == gamedataItemType.Prt_Program;
-					isCyberdeck = m_currentTooltipLootingData.lootingData.equipmentArea == gamedataEquipmentArea.SystemReplacementCW;
-					if( !( isPart ) && !( isCyberdeck ) )
+					identifiedTooltipData.m_identifier = 'newItemTooltip';
+				}
+				else if( item.IsCyberdeck() )
+				{
+					identifiedTooltipData.m_identifier = 'cyberdeckTooltip';
+				}
+				else if( item.GetItemType() == gamedataItemType.Prt_Program )
+				{
+					identifiedTooltipData.m_identifier = 'programTooltip';
+				}
+				identifiedTooltipData.m_tooltipOwner = m_currentItemOwnerId;
+				m_cachedTooltipUIInventoryItem = item;
+				m_cachedTooltipData = identifiedTooltipData;
+				comparisonItemId = GetItemIDForComparison( m_currentTooltipLootingData.externalItemData, m_currentTooltipLootingData.itemRecord, m_currentTooltipLootingData.lootingData.equipmentArea );
+				if( ItemID.IsValid( comparisonItemId ) )
+				{
+					comparisonItem = m_uiInventorySystem.GetPlayerItem( comparisonItemId );
+					if( comparisonItem )
 					{
-						identifiedTooltipData = new IdentifiedWrappedTooltipData;
-						identifiedTooltipData.m_identifier = 'itemTooltip';
-						identifiedTooltipData.m_tooltipOwner = m_currentItemOwnerId;
-						identifiedTooltipData.m_data = GetTooltipMinimalData( m_dataManager.GetExternalGameObject( m_currentItemOwnerId ) );
-						m_lastTooltipItemId = m_currentTooltipItemId;
-						m_lastItemOwnerId = m_currentItemOwnerId;
-						m_isComaprisonDirty = false;
-						m_currentComparisonEquipmentArea = m_currentTooltipLootingData.lootingData.equipmentArea;
-						m_cachedTooltipData = identifiedTooltipData;
-						m_tooltipProvider.PushData( identifiedTooltipData );
-					}
-					else
-					{
-						equippedItem = GetPureItemForComparison( m_currentTooltipLootingData.externalItemData, m_currentTooltipLootingData.itemRecord, m_currentTooltipLootingData.lootingData.equipmentArea );
-						inspectedTooltip = m_dataManager.GetComparisonTooltipsData( equippedItem, m_dataManager.GetExternalItemData( m_currentItemOwnerId, m_currentTooltipLootingData.externalItemData, true ) );
-						inspectedTooltip.ToCollapsedVersion();
-						shardData = GetShardData( ItemID.GetTDBID( inspectedTooltip.itemID ) );
-						if( shardData )
-						{
-							inspectedTooltip.itemName = shardData.GetTitle();
-						}
-						inspectedTooltip.showIcon = true;
-						inspectedTooltip.displayContext = InventoryTooltipDisplayContext.HUD;
-						identifiedTooltipData = new IdentifiedWrappedTooltipData;
-						if( isPart )
-						{
-							identifiedTooltipData.m_identifier = 'programTooltip';
-						}
-						else if( isCyberdeck )
-						{
-							identifiedTooltipData.m_identifier = 'cyberdeckTooltip';
-						}
-						identifiedTooltipData.m_tooltipOwner = m_currentItemOwnerId;
-						identifiedTooltipData.m_data = inspectedTooltip;
-						m_lastTooltipItemId = m_currentTooltipItemId;
-						m_cachedTooltipData = identifiedTooltipData;
-						m_tooltipProvider.PushData( identifiedTooltipData );
+						uiInventoryItemTooltip.m_comparisonData = UIInventoryItemComparisonManager.Make( item, comparisonItem );
 					}
 				}
-				else
-				{
-					m_cachedTooltipData = NULL;
-				}
+				m_tooltipProvider.PushData( identifiedTooltipData );
 			}
-			else
-			{
-				m_cachedTooltipData = NULL;
-			}
+			m_tooltipProvider.RefreshTooltips();
 		}
-		else
-		{
-			if( !( m_tooltipProvider.HasAnyTooltipData() ) && ( m_cachedTooltipData != NULL ) )
-			{
-				m_tooltipProvider.PushData( m_cachedTooltipData );
-			}
-			else if( m_cachedTooltipData == NULL )
-			{
-				m_tooltipProvider.ClearTooltipData();
-			}
-		}
-		m_tooltipProvider.RefreshTooltips();
-	}
-
-	[ profile = "Looting: GetTooltipMinimalData" ]
-	private function GetTooltipMinimalData( lootingOwner : weak< GameObject > ) : MinimalItemTooltipData
-	{
-		var data : MinimalItemTooltipData;
-		var hasComparisionItem : Bool;
-		var transactionSystem : TransactionSystem;
-		var emptySlots, usedSlots : array< TweakDBID >;
-		data = new MinimalItemTooltipData;
-		hasComparisionItem = m_currentTooltipLootingData.comparisonItemData != NULL;
-		data.itemData = m_currentTooltipLootingData.externalItemData;
-		data.itemID = data.itemData.GetID();
-		data.itemTweakID = ItemID.GetTDBID( data.itemID );
-		data.itemCategory = m_currentTooltipLootingData.itemRecord.ItemCategory().Type();
-		data.itemType = m_currentTooltipLootingData.lootingData.itemType;
-		data.equipmentArea = m_currentTooltipLootingData.lootingData.equipmentArea;
-		if( data.equipmentArea == gamedataEquipmentArea.Weapon )
-		{
-			data.itemEvolution = RPGManager.GetWeaponEvolution( data.itemID );
-		}
-		data.itemName = UIItemsHelper.GetTooltipItemName( data.itemTweakID, data.itemData, m_currentTooltipLootingData.lootingData.itemName );
-		data.isIconic = RPGManager.IsItemIconic( data.itemData );
-		data.isCrafted = RPGManager.IsItemCrafted( data.itemData );
-		data.quality = m_currentTooltipLootingData.lootingData.quality;
-		data.useMaleIcon = m_dataManager.GetIconGender() == ItemIconGender.Male;
-		data.iconPath = m_currentTooltipLootingData.itemRecord.IconPath();
-		transactionSystem = m_dataManager.GetTransactionSystem();
-		transactionSystem.GetEmptySlotsOnItem( lootingOwner, data.itemID, emptySlots );
-		transactionSystem.GetUsedSlotsOnItem( lootingOwner, data.itemID, usedSlots );
-		if( data.equipmentArea == gamedataEquipmentArea.Weapon || data.equipmentArea == gamedataEquipmentArea.WeaponHeavy )
-		{
-			data.dpsValue = data.itemData.GetStatValueByType( gamedataStatType.EffectiveDPS );
-			if( hasComparisionItem )
-			{
-				data.dpsDiff = data.dpsValue - m_currentTooltipLootingData.comparisonItemData.GetStatValueByType( gamedataStatType.EffectiveDPS );
-			}
-			data.ammoCount = m_dataManager.GetPlayerAmmoCount( m_currentTooltipLootingData.itemRecord );
-			data.isSilencerInstalled = usedSlots.Contains( T"AttachmentSlots.PowerModule" );
-			data.isScopeInstalled = usedSlots.Contains( T"AttachmentSlots.Scope" );
-			if( data.isSilencerInstalled )
-			{
-				data.hasSilencer = true;
-			}
-			else
-			{
-				data.hasSilencer = emptySlots.Contains( T"AttachmentSlots.PowerModule" );
-			}
-			if( data.isScopeInstalled )
-			{
-				data.hasScope = true;
-			}
-			else
-			{
-				data.hasScope = emptySlots.Contains( T"AttachmentSlots.Scope" );
-			}
-		}
-		else
-		{
-			data.stats = MinimalItemTooltipData.GetSecondaryStatsForStatMap( data.itemData, data.itemType, data.itemCategory );
-		}
-		if( data.itemCategory == gamedataItemCategory.Clothing )
-		{
-			data.armorValue = data.itemData.GetStatValueByType( gamedataStatType.Armor );
-			if( hasComparisionItem )
-			{
-				data.armorDiff = data.armorValue - m_currentTooltipLootingData.comparisonItemData.GetStatValueByType( gamedataStatType.Armor );
-				if( AbsF( data.armorDiff ) < 0.1 )
-				{
-					data.armorDiff = 0.0;
-				}
-			}
-		}
-		else if( data.itemType == gamedataItemType.Gad_Grenade )
-		{
-			data.grenadeData = m_dataManager.GetGrenadeTooltipData( data.itemTweakID, data.itemData );
-		}
-		MinimalItemTooltipData.GetModsDataPackages( data.itemData, m_currentTooltipLootingData.itemRecord, InventoryTooltipDisplayContext.HUD, , , data.mods );
-		if( !( m_currentTooltipLootingData.itemRecord.IsPart() ) )
-		{
-			m_dataManager.GetAttachements( lootingOwner, data.itemData, usedSlots, emptySlots, data.mods, data.dedicatedMods );
-		}
-		data.displayContext = InventoryTooltipDisplayContext.HUD;
-		data.description = NameToString( m_currentTooltipLootingData.itemRecord.LocalizedDescription() );
-		data.weight = data.itemData.GetStatValueByType( gamedataStatType.Weight );
-		data.price = m_dataManager.GetSellPrice( lootingOwner, data.itemData );
-		data.requirements = MinimalItemTooltipData.GetMinimalTooltipDataRequirements( data.itemData, m_dataManager );
-		return data;
 	}
 
 	public function SetDialogOpen( isDialogOpen : Bool )
@@ -1058,7 +946,7 @@ class LootingItemController extends inkLogicController
 	protected editable var m_itemSelection : inkWidgetRef;
 	protected editable var m_itemIcon : inkImageRef;
 
-	public function SetIcon( itemData : InventoryItemData )
+	public function SetIcon( const itemData : ref< InventoryItemData > )
 	{
 		var iconNameStr : String;
 		var iconName : CName;
@@ -1074,7 +962,7 @@ class LootingItemController extends inkLogicController
 		}
 	}
 
-	public function SetData( itemData : ItemViewData, isCurrentlySelected : Bool )
+	public function SetData( const itemData : ref< ItemViewData >, isCurrentlySelected : Bool )
 	{
 		m_isCurrentlySelected = isCurrentlySelected;
 		inkTextRef.SetText( m_itemName, itemData.itemName );
@@ -1097,7 +985,7 @@ class LootingItemController extends inkLogicController
 		}
 	}
 
-	public function SetText( text : String )
+	public function SetText( const text : ref< String > )
 	{
 		inkTextRef.SetText( m_itemName, text );
 		inkTextRef.SetTintColor( m_itemName, Color( 235, 42, 65, 255 ) );
@@ -1108,5 +996,11 @@ class LootingItemController extends inkLogicController
 class LootingScrollBlockController
 {
 	private editable var m_rectangle : inkWidgetRef;
+}
+
+class ShardTooltipWrapper extends ATooltipData
+{
+	var m_data : weak< JournalOnscreen >;
+	var m_displayContext : ItemDisplayContextData;
 }
 

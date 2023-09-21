@@ -125,32 +125,31 @@ class LiftDevice extends InteractiveMasterDevice
 		super.DetermineInteractionState( context );
 	}
 
+	protected event OnQuestSetLiftSpeed( evt : QuestSetLiftSpeed )
+	{
+		var destination : Int32;
+		destination = GetDevicePS().GetTargetFloor();
+		if( destination != -1 )
+		{
+			SendLiftStartDelayedEvent( destination );
+		}
+	}
+
 	protected event OnInitializeFloorsData( evt : RefreshFloorDataEvent )
 	{
-		var floorName : String;
-		var arrivedAtEvent : ArrivedAt;
 		var activeFloor : Int32;
-		var teleportToEvent : TeleportTo;
-		arrivedAtEvent = new ArrivedAt;
-		teleportToEvent = new TeleportTo;
-		m_floors = GetDevicePS().GetFloors();
 		activeFloor = GetDevicePS().GetActiveFloor();
+		m_floors = GetDevicePS().GetFloors();
 		GameObject.PlayMetadataEvent( this, 'startMusic' );
 		GameObject.PlayMetadataEvent( this, 'unmuteMusic' );
-		floorName = ElevatorFloorSetup.GetFloorName( m_floors[ activeFloor ] );
-		SendLiftDataToUIBlackboard( floorName, true );
 		if( GetDevicePS().GetMovementState() == gamePlatformMovementState.Stopped )
 		{
-			arrivedAtEvent.destinationName = 'startingFloor';
-			arrivedAtEvent.data = activeFloor;
-			QueueEvent( arrivedAtEvent );
-			teleportToEvent.destinationNode = GetDevicePS().GetFloorMarker( activeFloor );
-			teleportToEvent.rootEntityPosition = GetWorldPosition();
-			QueueEvent( teleportToEvent );
+			ScheduleTeleportTo( activeFloor );
 		}
 		else if( ( GetDevicePS().GetCachedGoToFloorAction() != -1 ) && ( GetDevicePS().GetCachedGoToFloorAction() != activeFloor ) )
 		{
 			SendLiftMovementLoadEvent();
+			TrySetLiftUIData( activeFloor );
 			m_isLoadPerformed = true;
 		}
 	}
@@ -170,10 +169,7 @@ class LiftDevice extends InteractiveMasterDevice
 			EvaluateOffMeshLinks();
 			return true;
 		}
-		else
-		{
-			return false;
-		}
+		return false;
 	}
 
 	private function RefreshFloorsData_Event()
@@ -195,6 +191,12 @@ class LiftDevice extends InteractiveMasterDevice
 		super.OnDetach();
 		GameObject.PlayMetadataEvent( this, 'stopMusic' );
 		GetDevicePS().SetStartingFloor( GetDevicePS().GetActiveFloor() );
+		if( GetDevicePS().IsPlayerInsideLift() )
+		{
+			SetPlayerInsideElevatorBlackboard( false );
+			SetIsPlayerInsideLift( false );
+			SetIsPlayerScannedBlackboard( false );
+		}
 	}
 
 	public const function GetMovingMode() : Int32
@@ -207,7 +209,7 @@ class LiftDevice extends InteractiveMasterDevice
 				return 1;
 			case gamePlatformMovementState.MovingDown:
 				return -1;
-			case gamePlatformMovementState.Paused:
+			default:
 				return 2;
 		}
 	}
@@ -234,11 +236,13 @@ class LiftDevice extends InteractiveMasterDevice
 	{
 		var moveToEvent : MoveTo;
 		var dynamicMov : MovingPlatformMovementDynamic;
+		var ps : LiftControllerPS;
+		ps = GetDevicePS();
 		moveToEvent = new MoveTo;
 		dynamicMov = new MovingPlatformMovementDynamic;
-		dynamicMov.curveName = 'cosine';
+		dynamicMov.curveName = ps.GetMovingCurve();
 		dynamicMov.SetInitData( type, value );
-		dynamicMov.SetDestinationNode( GetDevicePS().GetFloorMarker( ending ) );
+		dynamicMov.SetDestinationNode( ps.GetFloorMarker( ending ) );
 		moveToEvent.movement = dynamicMov;
 		moveToEvent.data = ending;
 		if( destName != '' )
@@ -246,7 +250,30 @@ class LiftDevice extends InteractiveMasterDevice
 			moveToEvent.destinationName = destName;
 		}
 		QueueEvent( moveToEvent );
+		FireExtraFX();
 		ToggleOccluders( true );
+	}
+
+	protected function FireExtraFX()
+	{
+		var ps : LiftControllerPS;
+		var fxData : EffectFiringData;
+		var fxEvent : FireFXEvent;
+		ps = GetDevicePS();
+		fxData = ps.GetExtraFX();
+		fxEvent = new FireFXEvent;
+		if( fxData.m_FXTime > 0.0 )
+		{
+			fxEvent.vFX = fxData.m_VFX;
+			fxEvent.sFX = fxData.m_SFX;
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, fxEvent, fxData.m_FXTime );
+		}
+	}
+
+	protected event OnFireFXEvent( evt : FireFXEvent )
+	{
+		PlaySoundEvent( this, evt.sFX );
+		GameObjectEffectHelper.StartEffectEvent( this, evt.vFX );
 	}
 
 	protected function PauseMovement()
@@ -293,19 +320,22 @@ class LiftDevice extends InteractiveMasterDevice
 		}
 	}
 
-	protected function SendLiftStartDelayedEvent( target : Int32 )
+	protected function SendLiftStartDelayedEvent( targetFloorIndex : Int32 )
 	{
 		var delayEvent : LiftStartDelayEvent;
 		delayEvent = new LiftStartDelayEvent;
-		delayEvent.targetFloor = target;
+		delayEvent.targetFloor = targetFloorIndex;
 		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, delayEvent, GetDevicePS().GetLiftStartingDelay() );
-		GetDevicePS().SetCachedGoToFloorAction( target );
+		GetDevicePS().SetCachedGoToFloorAction( targetFloorIndex );
 		ToggleSafeguardColliders( true );
-		GameObject.PlayMetadataEvent( this, 'startMoving' );
-		GameObject.PlayMetadataEvent( this, 'floorSelection' );
+		if( !( GetDevicePS().IsMoving() ) )
+		{
+			GameObject.PlayMetadataEvent( this, 'startMoving' );
+			GameObject.PlayMetadataEvent( this, 'floorSelection' );
+		}
 		SendLiftDepartedEvent( GetDevicePS().GetActiveFloor() );
 		SetIsMovingFromToFloor( GetDevicePS().GetActiveFloor(), delayEvent.targetFloor, false );
-		SendLiftDataToUIBlackboard( ElevatorFloorSetup.GetFloorName( m_floors[ target ] ) );
+		TrySetLiftUIData( targetFloorIndex );
 		UpdateAnimState( false, false, false );
 	}
 
@@ -359,7 +389,30 @@ class LiftDevice extends InteractiveMasterDevice
 
 	protected event OnQuestForceTeleportToFloor( evt : QuestForceTeleportToFloor )
 	{
-		MoveToFloor( ( ( Int32 )evt.prop.first ), ( ( Int32 )evt.prop.first ) );
+		ScheduleTeleportTo( ( ( Int32 )evt.prop.first ) );
+	}
+
+	private function ScheduleTeleportTo( floorIndex : Int32 )
+	{
+		var teleportToEvent : TeleportTo;
+		var arrivedAtEvent : ArrivedAt;
+		teleportToEvent = new TeleportTo;
+		arrivedAtEvent = new ArrivedAt;
+		arrivedAtEvent.destinationName = 'startingFloor';
+		arrivedAtEvent.data = floorIndex;
+		QueueEvent( arrivedAtEvent );
+		teleportToEvent.destinationNode = GetDevicePS().GetFloorMarker( floorIndex );
+		QueueEvent( teleportToEvent );
+		GetDevicePS().SetMovementState( gamePlatformMovementState.Stopped );
+		TrySetLiftUIData( floorIndex );
+	}
+
+	private function TrySetLiftUIData( floorIndex : Int32 )
+	{
+		if( ( floorIndex >= 0 ) && ( floorIndex < m_floors.Size() ) )
+		{
+			SendLiftDataToUIBlackboard( ElevatorFloorSetup.GetFloorName( m_floors[ floorIndex ] ) );
+		}
 	}
 
 	protected function MoveToFloor( start : Int32, target : Int32 )
@@ -511,7 +564,6 @@ class LiftDevice extends InteractiveMasterDevice
 
 	private function PlayRadioStation()
 	{
-		var station : RadioStationsMap;
 		var stationIndex : Int32;
 		if( GetDevicePS().IsSpeakerDestroyed() )
 		{
@@ -525,8 +577,7 @@ class LiftDevice extends InteractiveMasterDevice
 		}
 		else
 		{
-			station = GetDevicePS().GetStationByIndex( stationIndex );
-			AudioSwitch( this, 'radio_station', station.soundEvent, 'radio' );
+			AudioSwitch( this, 'radio_station', RadioStationDataProvider.GetStationNameByIndex( stationIndex ), 'radio' );
 		}
 	}
 
@@ -905,6 +956,12 @@ class LiftDevice extends InteractiveMasterDevice
 		}
 	}
 
+}
+
+class FireFXEvent extends Event
+{
+	var sFX : CName;
+	var vFX : CName;
 }
 
 class LiftArrivedEvent extends Event

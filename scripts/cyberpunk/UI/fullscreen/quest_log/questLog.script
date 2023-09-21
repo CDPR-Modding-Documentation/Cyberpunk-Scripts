@@ -3,7 +3,8 @@ class questLogGameController extends gameuiMenuGameController
 	private editable var m_virtualList : inkWidgetRef;
 	private editable var m_detailsPanel : inkWidgetRef;
 	private editable var m_buttonHints : inkWidgetRef;
-	private editable var m_buttonTrack : inkWidgetRef;
+	private editable var m_filtersList : inkWidgetRef;
+	private editable var m_questList : inkWidgetRef;
 	private var m_game : GameInstance;
 	private var m_journalManager : weak< JournalManager >;
 	private var m_quests : array< weak< JournalEntry > >;
@@ -17,41 +18,95 @@ class questLogGameController extends gameuiMenuGameController
 	private var m_recommendedLevel : Int32;
 	private var m_entryAnimProxy : inkAnimProxy;
 	private var m_canUsePhone : Bool;
-	var m_listData : array< VirutalNestedListData >;
+	private var m_detailsPanelCtrl : weak< QuestDetailsPanelController >;
+	private var m_virtualListController : weak< QuestListVirtualController >;
+	private var m_filters : array< weak< QuestListFilterButtonController > >;
+	private var m_activeFilter : weak< QuestListFilterButtonController >;
+	private var m_currentCustomFilterIndex : Int32;
+	private var m_axisDataThreshold : Float;
+	default m_axisDataThreshold = 0.5f;
+	private var m_mouseDataThreshold : Float;
+	default m_mouseDataThreshold = 7.0f;
+	private var m_delayedShowDuration : Float;
+	default m_delayedShowDuration = 0.2f;
+	private var m_delayedShow : DelayID;
+	private var m_listPanelHoverd : Bool;
+	private var m_isDelayTicking : Bool;
+	private var m_firstInit : Bool;
+	private var m_filterSwich : Bool;
+	private var m_questData : weak< JournalQuest >;
+	private var m_appliedQuestData : weak< JournalQuest >;
+	private var m_skipAnimation : Bool;
+	var m_listData : array< QuestListItemData >;
+	var m_questTypeList : array< QuestListItemType >;
+	var m_questToOpen : weak< JournalQuest >;
 
 	protected event OnInitialize()
 	{
-		inkWidgetRef.RegisterToCallback( m_buttonTrack, 'OnRelease', this, 'OnTrackButtonRelease' );
+		SetupFilterButtons();
+		RegisterToGlobalInputCallback( 'OnPostOnAxis', this, 'OnAxisInput' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelative', this, 'OnAxisInput' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnReleaseInput' );
+		inkWidgetRef.RegisterToCallback( m_questList, 'OnEnter', this, 'OnQuestListPanelEnter' );
+		inkWidgetRef.RegisterToCallback( m_questList, 'OnLeave', this, 'OnQuestListLeave' );
+		m_detailsPanelCtrl = ( ( QuestDetailsPanelController )( inkWidgetRef.GetController( m_detailsPanel ) ) );
+		m_virtualListController = ( ( QuestListVirtualController )( inkWidgetRef.GetController( m_virtualList ) ) );
+		m_virtualListController.RegisterToCallback( 'OnAllElementsSpawned', this, 'OnAllElementsSpawned' );
 		m_game = ( ( GameObject )( GetPlayerControlledObject() ) ).GetGame();
 		m_journalManager = GameInstance.GetJournalManager( m_game );
 		m_journalManager.RegisterScriptCallback( this, 'OnJournalReady', gameJournalListenerType.State );
 		m_playerLevel = RoundMath( GameInstance.GetStatsSystem( m_game ).GetStatValue( GetPlayerControlledObject().GetEntityID(), gamedataStatType.Level ) );
 		OnJournalReady( 0, '', JournalNotifyOption.Notify, JournalChangeType.Undefined );
+		m_virtualListController.SortQuests( false );
 		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHints ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
 		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		m_buttonHintsController.AddButtonHint( 'sort_list', GetSortTypeName( m_virtualListController.GetQuestSortType() ) );
+		m_buttonHintsController.AddButtonHint( 'track', GetLocalizedText( "UI-UserActions-TrackQuest" ) );
 		PlayLibraryAnimation( 'journal_intro' );
 		m_canUsePhone = IsPhoneAvailable();
+		m_firstInit = true;
+		m_filterSwich = false;
 	}
 
 	protected event OnUninitialize()
 	{
+		UnregisterFromGlobalInputCallback( 'OnPostOnAxis', this, 'OnAxisInput' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelative', this, 'OnAxisInput' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnReleaseInput' );
+		inkWidgetRef.UnregisterFromCallback( m_questList, 'OnEnter', this, 'OnQuestListPanelEnter' );
+		inkWidgetRef.UnregisterFromCallback( m_questList, 'OnLeave', this, 'OnQuestListLeave' );
+		m_virtualListController.UnregisterFromCallback( 'OnAllElementsSpawned', this, 'OnAllElementsSpawned' );
 		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
-		inkWidgetRef.UnregisterFromCallback( m_buttonTrack, 'OnRelease', this, 'OnTrackButtonRelease' );
 	}
 
-	protected event OnTrackButtonRelease( e : inkPointerEvent )
+	protected event OnAllElementsSpawned()
 	{
-		var trackEvt : RequestChangeTrackedObjective;
-		if( e.IsAction( 'click' ) )
+		var entryToSelectHash : Int32;
+		if( m_firstInit )
 		{
-			trackEvt = new RequestChangeTrackedObjective;
-			trackEvt.m_quest = m_curreentQuest;
-			inkWidgetRef.SetVisible( m_buttonTrack, false );
-			PlayLibraryAnimation( 'tracked' );
-			PlaySound( 'MapPin', 'OnCreate' );
-			QueueEvent( trackEvt );
+			entryToSelectHash = m_journalManager.GetEntryHash( ( ( m_questToOpen ) ? ( m_questToOpen ) : ( m_trackedQuest ) ) );
+			m_firstInit = false;
+			m_questToOpen = NULL;
+			m_virtualListController.SelectItemByHash( entryToSelectHash );
+		}
+		else if( m_filterSwich )
+		{
+			m_filterSwich = false;
+			m_virtualListController.SelectItemByHash( m_journalManager.GetEntryHash( m_questData ) );
 		}
 	}
+
+	protected event OnQuestListPanelEnter( evt : inkPointerEvent )
+	{
+		m_listPanelHoverd = true;
+	}
+
+	protected event OnQuestListLeave( evt : inkPointerEvent )
+	{
+		m_listPanelHoverd = false;
+	}
+
+	protected event OnAxisInput( evt : inkPointerEvent ) {}
 
 	protected event OnSetMenuEventDispatcher( menuEventDispatcher : weak< inkMenuEventDispatcher > )
 	{
@@ -67,6 +122,16 @@ class questLogGameController extends gameuiMenuGameController
 		}
 	}
 
+	protected event OnCodexPopupRequest( evt : OpenCodexPopupEvent )
+	{
+		GetRootWidget().SetVisible( false );
+	}
+
+	protected event OnCodexPopupClosedEvent( evt : CodexPopupClosedEvent )
+	{
+		GetRootWidget().SetVisible( true );
+	}
+
 	protected event OnJournalReady( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
 	{
 		var context : JournalRequestContext;
@@ -74,6 +139,10 @@ class questLogGameController extends gameuiMenuGameController
 		var resolvedContext : JournalRequestContext;
 		var resolvedEntriesBuffer : array< weak< JournalEntry > >;
 		var i : Int32;
+		if( notifyOption == JournalNotifyOption.DoNotNotify )
+		{
+			return true;
+		}
 		contextFilter.active = true;
 		contextFilter.inactive = false;
 		contextFilter.succeeded = false;
@@ -98,23 +167,96 @@ class questLogGameController extends gameuiMenuGameController
 		BuildQuestList();
 	}
 
+	private function SetupFilterButtons()
+	{
+		RequestSpawnFilterButton( ( ( Int32 )( QuestListItemType.All ) ) );
+		RequestSpawnFilterButton( ( ( Int32 )( QuestListItemType.MainQuest ) ) );
+		RequestSpawnFilterButton( ( ( Int32 )( QuestListItemType.Gig ) ) );
+		RequestSpawnFilterButton( ( ( Int32 )( QuestListItemType.Finished ) ) );
+	}
+
+	private function RequestSpawnFilterButton( type : Int32 )
+	{
+		var spawnedData : FilterButtonSpawnedData;
+		spawnedData = new FilterButtonSpawnedData;
+		spawnedData.m_type = type;
+		AsyncSpawnFromLocal( inkWidgetRef.Get( m_filtersList ), 'filterButton', this, 'OnFilterButtonSpawned', spawnedData );
+	}
+
+	protected event OnFilterButtonSpawned( widget : inkWidget, userData : IScriptable )
+	{
+		var controller : QuestListFilterButtonController;
+		var spawnedData : FilterButtonSpawnedData;
+		var filterType : QuestListItemType;
+		var questCount, finishedQuestCount : Int32;
+		controller = ( ( QuestListFilterButtonController )( widget.GetController() ) );
+		m_filters.PushBack( controller );
+		widget.SetHAlign( inkEHorizontalAlign.Left );
+		widget.SetVAlign( inkEVerticalAlign.Top );
+		widget.RegisterToCallback( 'OnRelease', this, 'OnFilterReleased' );
+		spawnedData = ( ( FilterButtonSpawnedData )( userData ) );
+		filterType = ( ( QuestListItemType )( spawnedData.m_type ) );
+		controller.SetData( filterType );
+		if( filterType == QuestListItemType.All )
+		{
+			m_activeFilter = controller;
+			controller.SetActive( true );
+			m_virtualListController.SetFilter( m_activeFilter.GetType() );
+			finishedQuestCount = m_questTypeList.Count( QuestListItemType.Finished );
+			questCount = m_questTypeList.Size() - finishedQuestCount;
+		}
+		else if( filterType == QuestListItemType.MainQuest )
+		{
+			questCount = m_questTypeList.Count( QuestListItemType.MainQuest ) + m_questTypeList.Count( QuestListItemType.SideQuest );
+		}
+		else if( filterType == QuestListItemType.Gig )
+		{
+			questCount = ( ( ( m_questTypeList.Count( QuestListItemType.Apartment ) + m_questTypeList.Count( QuestListItemType.Gig ) ) + m_questTypeList.Count( QuestListItemType.Cyberpsycho ) ) + m_questTypeList.Count( QuestListItemType.NCPDQuest ) ) + m_questTypeList.Count( QuestListItemType.Courier );
+		}
+		else
+		{
+			questCount = m_questTypeList.Count( filterType );
+		}
+		controller.SetCounter( questCount );
+	}
+
+	protected event OnFilterReleased( evt : inkPointerEvent )
+	{
+		var controller : weak< QuestListFilterButtonController >;
+		var i : Int32;
+		if( evt.IsAction( 'click' ) )
+		{
+			controller = ( ( QuestListFilterButtonController )( evt.GetTarget().GetController() ) );
+			if( m_activeFilter != controller )
+			{
+				if( m_activeFilter )
+				{
+					m_activeFilter.SetActive( false );
+				}
+				m_activeFilter = controller;
+				m_activeFilter.SetActive( true );
+				m_virtualListController.SetFilter( m_activeFilter.GetType() );
+				m_filterSwich = true;
+				for( i = 0; i < m_filters.Size(); i += 1 )
+				{
+					if( m_filters[ i ] == m_activeFilter )
+					{
+						m_currentCustomFilterIndex = i;
+					}
+				}
+			}
+		}
+	}
+
 	private function IsPhoneAvailable() : Bool
 	{
-		var blackboardSystem : BlackboardSystem;
-		var comDeviceBackboard : weak< IBlackboard >;
-		var psmBlackboard : weak< IBlackboard >;
-		var lastCallInformation : PhoneCallInformation;
-		var statusEffectLock : Bool;
-		var tierLock : Bool;
-		var tier : Int32;
-		blackboardSystem = GetBlackboardSystem();
-		comDeviceBackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ComDevice );
-		psmBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().PlayerStateMachine );
-		tier = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel );
-		statusEffectLock = StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'NoPhone' );
-		tierLock = ( tier >= ( ( Int32 )( gamePSMHighLevel.SceneTier3 ) ) ) && ( tier <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) );
-		lastCallInformation = ( ( PhoneCallInformation )( comDeviceBackboard.GetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation ) ) );
-		return ( !( statusEffectLock ) && !( tierLock ) ) && ( lastCallInformation.callPhase != questPhoneCallPhase.IncomingCall && lastCallInformation.callPhase != questPhoneCallPhase.StartCall );
+		var phoneSystem : weak< PhoneSystem >;
+		phoneSystem = ( ( PhoneSystem )( GameInstance.GetScriptableSystemsContainer( m_game ).Get( 'PhoneSystem' ) ) );
+		if( phoneSystem )
+		{
+			return phoneSystem.IsPhoneEnabled();
+		}
+		return false;
 	}
 
 	private function GetListedCategories() : array< gameJournalQuestType >
@@ -127,16 +269,33 @@ class questLogGameController extends gameuiMenuGameController
 		result.PushBack( gameJournalQuestType.CyberPsycho );
 		result.PushBack( gameJournalQuestType.VehicleQuest );
 		result.PushBack( gameJournalQuestType.ApartmentQuest );
+		result.PushBack( gameJournalQuestType.CourierQuest );
+		result.PushBack( gameJournalQuestType.CourierSideQuest );
 		return result;
 	}
 
-	private function GetDisplayedCategory( category : gameJournalQuestType ) : gameJournalQuestType
+	private function GetDisplayedCategory( category : gameJournalQuestType ) : QuestListItemType
 	{
-		if( category == gameJournalQuestType.MinorQuest )
+		switch( category )
 		{
-			return gameJournalQuestType.SideQuest;
+			case gameJournalQuestType.MainQuest:
+				return QuestListItemType.MainQuest;
+			case gameJournalQuestType.SideQuest:
+			case gameJournalQuestType.MinorQuest:
+			case gameJournalQuestType.CourierSideQuest:
+				return QuestListItemType.SideQuest;
+			case gameJournalQuestType.StreetStory:
+				return QuestListItemType.Gig;
+			case gameJournalQuestType.CyberPsycho:
+				return QuestListItemType.Cyberpsycho;
+			case gameJournalQuestType.Contract:
+				return QuestListItemType.NCPDQuest;
+			case gameJournalQuestType.ApartmentQuest:
+				return QuestListItemType.Apartment;
+			case gameJournalQuestType.CourierQuest:
+				return QuestListItemType.Courier;
 		}
-		return category;
+		return QuestListItemType.Invalid;
 	}
 
 	protected event OnSetUserData( userData : IScriptable )
@@ -149,31 +308,103 @@ class questLogGameController extends gameuiMenuGameController
 		}
 	}
 
+	protected event OnReleaseInput( e : inkPointerEvent )
+	{
+		var trackEvt : RequestChangeTrackedObjective;
+		var linkEvt : ActivateLink;
+		var mapEvt : ActivateMapLink;
+		if( e.IsAction( 'option_switch_next_settings' ) )
+		{
+			NavigateCustomFilters( ECustomFilterDPadNavigationOption.SelectNext );
+			PlaySound( 'Button', 'OnPress' );
+		}
+		else if( e.IsAction( 'option_switch_prev_settings' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			NavigateCustomFilters( ECustomFilterDPadNavigationOption.SelectPrev );
+		}
+		else if( e.IsAction( 'sort_list' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			m_virtualListController.SortQuests( true );
+			m_buttonHintsController.AddButtonHint( 'sort_list', GetSortTypeName( m_virtualListController.GetQuestSortType() ) );
+		}
+		else if( e.IsAction( 'toggle_map' ) || e.IsAction( 'open_map_link' ) )
+		{
+			if( ( !( e.IsHandled() ) && !( e.IsConsumed() ) ) && !( m_detailsPanelCtrl.HasMultipleActionLinks() ) )
+			{
+				e.Handle();
+				e.Consume();
+				PlaySound( 'Button', 'OnPress' );
+				mapEvt = new ActivateMapLink;
+				QueueEvent( mapEvt );
+			}
+		}
+		else if( e.IsAction( 'open_codex_link' ) )
+		{
+			if( ( !( e.IsHandled() ) && !( e.IsConsumed() ) ) && !( m_detailsPanelCtrl.HasMultipleActionLinks() ) )
+			{
+				e.Handle();
+				e.Consume();
+				PlaySound( ' Button', 'OnPress' );
+				linkEvt = new ActivateLink;
+				QueueEvent( linkEvt );
+			}
+		}
+		else if( e.IsAction( 'track' ) )
+		{
+			if( ( m_curreentQuest && !( e.IsHandled() ) ) && !( m_listPanelHoverd ) )
+			{
+				trackEvt = new RequestChangeTrackedObjective;
+				trackEvt.m_quest = m_curreentQuest;
+				QueueEvent( trackEvt );
+			}
+		}
+	}
+
+	private function NavigateCustomFilters( option : ECustomFilterDPadNavigationOption )
+	{
+		var filtersAmount : Int32;
+		var newCustomFilterIndex : Int32;
+		var controller : weak< QuestListFilterButtonController >;
+		filtersAmount = m_filters.Size();
+		if( filtersAmount == 0 )
+		{
+			return;
+		}
+		newCustomFilterIndex = m_currentCustomFilterIndex;
+		do
+		{
+			if( option == ECustomFilterDPadNavigationOption.SelectNext )
+			{
+				newCustomFilterIndex = ( ( newCustomFilterIndex < ( filtersAmount - 1 ) ) ? ( newCustomFilterIndex + 1 ) : ( 0 ) );
+			}
+			else if( option == ECustomFilterDPadNavigationOption.SelectPrev )
+			{
+				newCustomFilterIndex = ( ( newCustomFilterIndex > 0 ) ? ( newCustomFilterIndex - 1 ) : ( filtersAmount - 1 ) );
+			}
+			controller = ( ( QuestListFilterButtonController )( m_filters[ newCustomFilterIndex ].GetController() ) );
+		}
+		while( !( controller.IsVisible() || ( newCustomFilterIndex == m_currentCustomFilterIndex ) ) );
+		m_currentCustomFilterIndex = newCustomFilterIndex;
+		if( m_activeFilter )
+		{
+			m_activeFilter.SetActive( false );
+		}
+		m_activeFilter = controller;
+		m_activeFilter.SetActive( true );
+		m_virtualListController.SetFilter( m_activeFilter.GetType() );
+	}
+
 	private function BuildQuestList()
 	{
-		var categoriesWithEntries : array< Int32 >;
-		var listedCategories : array< gameJournalQuestType >;
-		var categoryData, itemData : VirutalNestedListData;
-		var questToOpen : weak< JournalQuest >;
+		var itemData : QuestListItemData;
 		var targetQuestEntry : weak< JournalEntry >;
-		var evt : QuestlListItemClicked;
-		var resolvedCategoryHeaderData : QuestListHeaderData;
-		var listController : QuestListVirtualNestedListController;
-		var trackedQuestType, trackedQuestPositionInList : Int32;
-		var i : Int32;
+		var trackedQuestType : Int32;
+		var scriptableListData : array< IScriptable >;
+		var i, limit : Int32;
 		var questEntry : weak< JournalQuest >;
 		m_listData.Clear();
-		listedCategories = GetListedCategories();
-		for( i = 0; i < listedCategories.Size(); i += 1 )
-		{
-			categoryData = new VirutalNestedListData;
-			categoryData.m_collapsable = false;
-			categoryData.m_isHeader = true;
-			categoryData.m_level = ( ( Int32 )( GetDisplayedCategory( listedCategories[ i ] ) ) );
-			categoryData.m_widgetType = 0;
-			categoryData.m_data = GetQuestListHeaderData( GetDisplayedCategory( listedCategories[ i ] ) );
-			m_listData.PushBack( categoryData );
-		}
 		if( m_externallyOpenedQuestHash != 0 )
 		{
 			targetQuestEntry = m_journalManager.GetEntry( ( ( Uint32 )( m_externallyOpenedQuestHash ) ) );
@@ -186,96 +417,42 @@ class questLogGameController extends gameuiMenuGameController
 				}
 			}
 		}
-		categoryData = new VirutalNestedListData;
-		categoryData.m_collapsable = false;
-		categoryData.m_isHeader = true;
-		categoryData.m_level = listedCategories.Size() + 1;
-		categoryData.m_widgetType = 0;
-		resolvedCategoryHeaderData = new QuestListHeaderData;
-		resolvedCategoryHeaderData.m_type = listedCategories.Size() + 1;
-		resolvedCategoryHeaderData.m_nameLocKey = 'UI-ResourceExports-Completed';
-		categoryData.m_data = resolvedCategoryHeaderData;
-		m_listData.PushBack( categoryData );
 		for( i = 0; i < m_quests.Size(); i += 1 )
 		{
 			questEntry = ( ( JournalQuest )( m_quests[ i ] ) );
-			itemData = new VirutalNestedListData;
-			itemData.m_collapsable = true;
-			itemData.m_isHeader = false;
-			itemData.m_forceToTopWithinLevel = false;
-			itemData.m_level = ( ( Int32 )( GetDisplayedCategory( m_journalManager.GetQuestType( questEntry ) ) ) );
-			itemData.m_widgetType = 1;
-			itemData.m_data = GetQuestListItemData( questEntry, m_trackedQuest );
-			if( !( categoriesWithEntries.Contains( itemData.m_level ) ) )
-			{
-				categoriesWithEntries.PushBack( itemData.m_level );
-			}
+			itemData = GetQuestListItemData( questEntry, GetDisplayedCategory( questEntry.GetType() ), m_trackedQuest );
 			if( m_externallyOpenedQuestHash != 0 )
 			{
 				if( m_journalManager.GetEntryHash( questEntry ) == m_externallyOpenedQuestHash )
 				{
-					questToOpen = questEntry;
+					m_questToOpen = questEntry;
 				}
 			}
-			else if( ( questToOpen == NULL ) || ( questEntry == m_trackedQuest ) )
+			else if( ( m_questToOpen == NULL ) || ( questEntry == m_trackedQuest ) )
 			{
-				questToOpen = questEntry;
-			}
-			if( questToOpen == questEntry )
-			{
-				trackedQuestPositionInList = m_listData.Size();
+				m_questToOpen = questEntry;
 			}
 			m_listData.PushBack( itemData );
 		}
 		for( i = 0; i < m_resolvedQuests.Size(); i += 1 )
 		{
 			questEntry = ( ( JournalQuest )( m_resolvedQuests[ i ] ) );
-			itemData = new VirutalNestedListData;
-			itemData.m_collapsable = true;
-			itemData.m_isHeader = false;
-			itemData.m_level = listedCategories.Size() + 1;
-			itemData.m_widgetType = 1;
-			itemData.m_data = GetQuestListItemData( questEntry, m_trackedQuest, true, listedCategories.Size() + 1 );
-			if( !( categoriesWithEntries.Contains( itemData.m_level ) ) )
-			{
-				categoriesWithEntries.PushBack( itemData.m_level );
-			}
+			itemData = GetQuestListItemData( questEntry, QuestListItemType.Finished, m_trackedQuest );
 			m_listData.PushBack( itemData );
 		}
-		for( i = m_listData.Size() - 1; i >= 0; i -= 1 )
+		if( m_questToOpen )
 		{
-			if( ( m_listData[ i ].m_widgetType == ( ( Uint32 )( 0 ) ) ) && ( m_listData[ i ].m_level != ( ( Int32 )( gameJournalQuestType.MainQuest ) ) ) )
-			{
-				if( !( categoriesWithEntries.Contains( m_listData[ i ].m_level ) ) )
-				{
-					m_listData.Erase( i );
-				}
-			}
-		}
-		if( questToOpen )
-		{
-			trackedQuestType = ( ( Int32 )( GetDisplayedCategory( questToOpen.GetType() ) ) );
+			trackedQuestType = ( ( Int32 )( GetDisplayedCategory( m_questToOpen.GetType() ) ) );
 			if( trackedQuestType != ( ( Int32 )( gameJournalQuestType.MainQuest ) ) )
 			{
-				m_listData[ trackedQuestPositionInList ].m_forceToTopWithinLevel = true;
 			}
 		}
-		listController = ( ( QuestListVirtualNestedListController )( inkWidgetRef.GetController( m_virtualList ) ) );
-		listController.SetData( m_listData );
-		if( questToOpen )
+		for( i = 0, limit = m_listData.Size(); i < limit; i += 1 )
 		{
-			evt = new QuestlListItemClicked;
-			evt.m_questData = questToOpen;
-			evt.m_skipAnimation = true;
-			QueueEvent( evt );
-			for( i = 0; i < categoriesWithEntries.Size(); i += 1 )
-			{
-				if( categoriesWithEntries[ i ] != trackedQuestType )
-				{
-					listController.ToggleLevel( categoriesWithEntries[ i ] );
-				}
-			}
+			m_questTypeList.PushBack( m_listData[ i ].GetQuestType() );
+			scriptableListData.PushBack( ( ( IScriptable )( m_listData[ i ] ) ) );
 		}
+		m_virtualListController.SetData( scriptableListData );
 	}
 
 	public static function GetTopQuestEntry( journalManager : JournalManager, entry : weak< JournalEntry > ) : weak< JournalQuest >
@@ -294,101 +471,72 @@ class questLogGameController extends gameuiMenuGameController
 		return lastValidQuestEntry;
 	}
 
-	private function GetQuestListHeaderData( type : gameJournalQuestType ) : QuestListHeaderData
-	{
-		var result : QuestListHeaderData;
-		result = new QuestListHeaderData;
-		result.m_type = ( ( Int32 )( type ) );
-		switch( type )
-		{
-			case gameJournalQuestType.MainQuest:
-				result.m_nameLocKey = 'UI-Quests-Labels-MainQuests';
-			break;
-			case gameJournalQuestType.SideQuest:
-				result.m_nameLocKey = 'UI-Quests-Labels-SideQuests';
-			break;
-			case gameJournalQuestType.MinorQuest:
-				result.m_nameLocKey = 'UI-Quests-Labels-MinorQuests';
-			break;
-			case gameJournalQuestType.StreetStory:
-				result.m_nameLocKey = 'UI-Quests-Labels-StreetStories';
-			break;
-			case gameJournalQuestType.Contract:
-				result.m_nameLocKey = 'UI-Quests-Labels-Contracts';
-			break;
-			case gameJournalQuestType.VehicleQuest:
-				result.m_nameLocKey = 'UI-Quests-Labels-VehicleQuests';
-			break;
-			case gameJournalQuestType.ApartmentQuest:
-				result.m_nameLocKey = 'UI-Quests-Labels-ApartmentQuests';
-			break;
-			case gameJournalQuestType.CyberPsycho:
-				result.m_nameLocKey = 'LocKey#34335';
-			break;
-		}
-		return result;
-	}
-
-	private function GetQuestListItemData( questEntry : JournalQuest, optional trackedQuest : JournalQuest, optional overrideType : Bool, optional forcedType : Int32 ) : QuestListItemData
+	private function GetQuestListItemData( questEntry : JournalQuest, questType : QuestListItemType, optional trackedQuest : JournalQuest ) : QuestListItemData
 	{
 		var result : QuestListItemData;
 		var recommendedLevel : Int32;
 		recommendedLevel = GameInstance.GetLevelAssignmentSystem( m_game ).GetLevelAssignment( m_journalManager.GetRecommendedLevelID( questEntry ) );
 		result = new QuestListItemData;
-		result.m_questType = ( ( overrideType ) ? ( forcedType ) : ( ( ( Int32 )( GetDisplayedCategory( questEntry.GetType() ) ) ) ) );
-		result.m_timestamp = m_journalManager.GetEntryTimestamp( questEntry );
+		result.m_questType = questType;
 		result.m_journalManager = m_journalManager;
 		result.m_questData = questEntry;
 		result.m_playerLevel = m_playerLevel;
 		result.m_recommendedLevel = recommendedLevel;
-		result.m_isResolved = overrideType;
 		result.m_State = m_journalManager.GetEntryState( questEntry );
+		result.QuestLastUpdateTime();
 		if( trackedQuest != NULL )
 		{
 			result.m_isTrackedQuest = trackedQuest == questEntry;
 		}
-		result.m_isVisited = m_journalManager.IsEntryVisited( questEntry );
 		return result;
 	}
 
-	protected event OnQuestListHeaderClicked( evt : QuestListHeaderClicked )
+	protected event OnQuestListItemSelected( e : QuestlListItemSelected )
 	{
-		var listController : VirtualNestedListController;
-		listController = ( ( VirtualNestedListController )( inkWidgetRef.GetController( m_virtualList ) ) );
-		listController.ToggleLevel( evt.m_questType );
+		m_questData = e.m_questData;
+		m_skipAnimation = e.m_skipAnimation;
+		m_appliedQuestData = m_questData;
+		DisplayQuestData( m_appliedQuestData, m_skipAnimation );
+		UpdateTrackingInputHint();
 	}
 
-	protected event OnQuestListItemClicked( e : QuestlListItemClicked )
+	protected event OnQuestlListItemDelayedHover( evt : QuestlListItemDelayedHover )
+	{
+		m_isDelayTicking = false;
+		if( ( m_questData && ( m_appliedQuestData != m_questData ) ) && m_listPanelHoverd )
+		{
+			m_appliedQuestData = m_questData;
+			DisplayQuestData( m_appliedQuestData, m_skipAnimation );
+		}
+	}
+
+	private function DisplayQuestData( questData : weak< JournalQuest >, skipAnimation : Bool )
 	{
 		var i : Int32;
 		var data : QuestListItemData;
 		var updateEvent : UpdateOpenedQuestEvent;
-		var detailsPanel : QuestDetailsPanelController;
-		updateEvent = new UpdateOpenedQuestEvent;
-		updateEvent.m_openedQuest = e.m_questData;
-		m_curreentQuest = e.m_questData;
-		inkWidgetRef.SetVisible( m_buttonTrack, ( m_journalManager.GetEntryState( m_curreentQuest ) != gameJournalEntryState.Failed && m_journalManager.GetEntryState( m_curreentQuest ) != gameJournalEntryState.Succeeded ) && ( m_curreentQuest != m_trackedQuest ) );
-		QueueEvent( updateEvent );
-		for( i = 0; i < m_listData.Size(); i += 1 )
+		if( m_curreentQuest != questData )
 		{
-			data = ( ( QuestListItemData )( m_listData[ i ].m_data ) );
-			if( data )
+			updateEvent = new UpdateOpenedQuestEvent;
+			updateEvent.m_openedQuest = questData;
+			m_curreentQuest = questData;
+			QueueEvent( updateEvent );
+			for( i = 0; i < m_listData.Size(); i += 1 )
 			{
-				data.m_isOpenedQuest = updateEvent.m_openedQuest == data.m_questData;
-				if( !( m_journalManager.IsEntryVisited( data.m_questData ) ) )
+				data = ( ( QuestListItemData )( m_listData[ i ] ) );
+				if( data )
 				{
-					m_journalManager.SetEntryVisited( data.m_questData, true );
+					data.m_isOpenedQuest = updateEvent.m_openedQuest == data.m_questData;
 				}
 			}
+			m_detailsPanelCtrl.SetPhoneAvailable( m_canUsePhone );
+			m_detailsPanelCtrl.Setup( questData, m_journalManager, ( ( PhoneSystem )( GameInstance.GetScriptableSystemsContainer( m_game ).Get( 'PhoneSystem' ) ) ), GameInstance.GetMappinSystem( m_game ), GameInstance.GetUISystem( m_game ), m_game, skipAnimation );
+			if( m_entryAnimProxy.IsPlaying() )
+			{
+				m_entryAnimProxy.Stop();
+			}
+			m_entryAnimProxy = PlayLibraryAnimation( 'entry_fade_in' );
 		}
-		detailsPanel = ( ( QuestDetailsPanelController )( inkWidgetRef.GetController( m_detailsPanel ) ) );
-		detailsPanel.SetPhoneAvailable( m_canUsePhone );
-		detailsPanel.Setup( e.m_questData, m_journalManager, ( ( PhoneSystem )( GameInstance.GetScriptableSystemsContainer( m_game ).Get( 'PhoneSystem' ) ) ), GameInstance.GetMappinSystem( m_game ), m_game, e.m_skipAnimation );
-		if( m_entryAnimProxy.IsPlaying() )
-		{
-			m_entryAnimProxy.Stop();
-		}
-		m_entryAnimProxy = PlayLibraryAnimation( 'entry_fade_in' );
 	}
 
 	private function GetFirstObjectiveFromQuest( journalQuest : weak< JournalQuest > ) : weak< JournalQuestObjective >
@@ -406,63 +554,79 @@ class questLogGameController extends gameuiMenuGameController
 		return NULL;
 	}
 
+	private function GetSortTypeName( currentQuestSortType : QuestListSortType ) : String
+	{
+		var sortTypeName : String;
+		sortTypeName = ( GetLocalizedText( "UI-Quests-Sorting-Sort" ) + GetLocalizedText( "Common-Characters-Semicolon" ) ) + " ";
+		if( currentQuestSortType == QuestListSortType.Distance )
+		{
+			sortTypeName += GetLocalizedText( "UI-Quests-Sorting-Distance" );
+		}
+		else
+		{
+			sortTypeName += GetLocalizedText( "UI-Quests-Sorting-Update" );
+		}
+		return sortTypeName;
+	}
+
 	protected event OnRequestChangeTrackedObjective( e : RequestChangeTrackedObjective )
 	{
 		var i : Int32;
 		var data : QuestListItemData;
 		var updateEvent : UpdateTrackedObjectiveEvent;
+		var trackedEntry : weak< JournalEntry >;
 		if( m_journalManager.GetEntryState( e.m_quest ) != gameJournalEntryState.Failed && m_journalManager.GetEntryState( e.m_quest ) != gameJournalEntryState.Succeeded )
 		{
+			if( e.m_forceSelectEntry != 0 )
+			{
+				m_virtualListController.SelectItemByHash( e.m_forceSelectEntry );
+			}
 			if( e.m_objective == NULL )
 			{
 				e.m_objective = GetFirstObjectiveFromQuest( e.m_quest );
 			}
-			m_journalManager.TrackEntry( e.m_objective );
-			PlaySound( 'MapPin', 'OnCreate' );
-			updateEvent = new UpdateTrackedObjectiveEvent;
-			updateEvent.m_trackedObjective = e.m_objective;
-			updateEvent.m_trackedQuest = GetTopQuestEntry( m_journalManager, e.m_objective );
-			m_trackedQuest = updateEvent.m_trackedQuest;
+			trackedEntry = m_journalManager.GetTrackedEntry();
+			if( ( ( m_trackedQuest == e.m_quest ) && ( m_trackedQuest != NULL ) ) || ( ( trackedEntry == e.m_objective ) && ( trackedEntry != NULL ) ) )
+			{
+				m_journalManager.UntrackEntry();
+				updateEvent = new UpdateTrackedObjectiveEvent;
+				updateEvent.m_trackedObjective = NULL;
+				updateEvent.m_trackedQuest = NULL;
+				m_trackedQuest = NULL;
+			}
+			else
+			{
+				m_journalManager.TrackEntry( e.m_objective );
+				updateEvent = new UpdateTrackedObjectiveEvent;
+				updateEvent.m_trackedObjective = e.m_objective;
+				updateEvent.m_trackedQuest = GetTopQuestEntry( m_journalManager, e.m_objective );
+				m_trackedQuest = updateEvent.m_trackedQuest;
+			}
 			QueueEvent( updateEvent );
+			PlaySound( 'MapPin', 'OnCreate' );
+			PlayRumble( RumbleStrength.SuperLight, RumbleType.Fast, RumblePosition.Right );
 			for( i = 0; i < m_listData.Size(); i += 1 )
 			{
-				data = ( ( QuestListItemData )( m_listData[ i ].m_data ) );
+				data = ( ( QuestListItemData )( m_listData[ i ] ) );
 				if( data )
 				{
 					data.m_isTrackedQuest = updateEvent.m_trackedQuest == data.m_questData;
 				}
 			}
+			UpdateTrackingInputHint();
 		}
 	}
 
-	protected event OnQuestListItemHoverOver( e : QuestListItemHoverOverEvent )
+	private function UpdateTrackingInputHint()
 	{
-		m_buttonHintsController.ClearButtonHints();
-		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
-		if( !( e.m_isQuestResolved ) )
+		if( m_trackedQuest == m_questData )
 		{
-			m_buttonHintsController.AddButtonHint( 'track', GetLocalizedText( "UI-UserActions-TrackObjective" ) );
+			m_buttonHintsController.AddButtonHint( 'track', GetLocalizedText( "UI-Quests-Untrack" ) );
 		}
-		m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-UserActions-Select" ) );
-	}
-
-	protected event OnQuestObjectiveHoverOver( e : QuestObjectiveHoverOverEvent )
-	{
-		m_buttonHintsController.ClearButtonHints();
-		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
-		m_buttonHintsController.AddButtonHint( 'track', GetLocalizedText( "UI-UserActions-TrackObjective" ) );
-	}
-
-	protected event OnQuestListItemHoverOut( e : QuestListItemHoverOutEvent )
-	{
-		m_buttonHintsController.ClearButtonHints();
-		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
-	}
-
-	protected event OnQuestObjectiveHoverOut( e : QuestObjectiveHoverOutEvent )
-	{
-		m_buttonHintsController.ClearButtonHints();
-		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		else
+		{
+			m_buttonHintsController.AddButtonHint( 'track', GetLocalizedText( "UI-UserActions-TrackQuest" ) );
+		}
 	}
 
 }
@@ -498,19 +662,51 @@ class QuestListDistanceData
 
 class QuestListItemData
 {
-	var m_questType : Int32;
-	var m_timestamp : GameTime;
+	var m_questType : QuestListItemType;
+	var m_lastUpdateTimestamp : GameTime;
 	var m_isTrackedQuest : Bool;
 	var m_isOpenedQuest : Bool;
 	var m_questData : weak< JournalQuest >;
 	var m_journalManager : weak< JournalManager >;
 	var m_playerLevel : Int32;
 	var m_recommendedLevel : Int32;
-	var m_isVisited : Bool;
-	var m_isResolved : Bool;
 	var m_State : gameJournalEntryState;
+	var m_distance : Float;
 	private var m_distancesFetched : Bool;
 	private var m_objectivesDistances : array< QuestListDistanceData >;
+
+	public function GetFirstObjective() : weak< JournalQuestObjective >
+	{
+		var i : Int32;
+		var unpackedData : array< weak< JournalEntry > >;
+		QuestLogUtils.UnpackRecursive( m_journalManager, m_questData, unpackedData );
+		for( i = 0; i < unpackedData.Size(); i += 1 )
+		{
+			if( ( ( JournalQuestObjective )( unpackedData[ i ] ) ) )
+			{
+				return ( ( JournalQuestObjective )( unpackedData[ i ] ) );
+			}
+		}
+		return NULL;
+	}
+
+	public function isVisited() : Bool
+	{
+		return m_journalManager.IsEntryVisited( m_questData );
+	}
+
+	public function isDone() : Bool
+	{
+		return m_State == gameJournalEntryState.Succeeded || m_State == gameJournalEntryState.Failed;
+	}
+
+	public function SetVisited()
+	{
+		if( !( m_journalManager.IsEntryVisited( m_questData ) ) )
+		{
+			m_journalManager.SetEntryVisited( m_questData, true );
+		}
+	}
 
 	public function GetDistances() : array< QuestListDistanceData >
 	{
@@ -526,13 +722,44 @@ class QuestListItemData
 				{
 					distanceData = new QuestListDistanceData;
 					distanceData.m_objective = ( ( weak< weak< JournalQuestObjective > > )( unpackedData[ i ] ) );
-					distanceData.m_distance = m_journalManager.GetDistanceToNearestMappin( ( ( JournalQuestObjective )( unpackedData[ i ] ) ) );
+					distanceData.m_distance = m_journalManager.GetDistanceToNearestMappin( ( ( JournalQuestObjective )( unpackedData[ i ] ) ), QuestLogUtils.GetDefaultFilter() );
 					m_objectivesDistances.PushBack( distanceData );
 				}
 			}
 			m_distancesFetched = true;
 		}
 		return m_objectivesDistances;
+	}
+
+	public function QuestLastUpdateTime()
+	{
+		var i : Int32;
+		var time : GameTime;
+		var unpackedData : array< weak< JournalEntry > >;
+		time = GameTime.MakeGameTime( 0, 0, 0, 0 );
+		QuestLogUtils.UnpackRecursive( m_journalManager, m_questData, unpackedData );
+		for( i = 0; i < unpackedData.Size(); i += 1 )
+		{
+			time = m_journalManager.GetEntryTimestamp( unpackedData[ i ] );
+			if( m_lastUpdateTimestamp < time )
+			{
+				m_lastUpdateTimestamp = time;
+			}
+		}
+	}
+
+	public function GetQuestType() : QuestListItemType
+	{
+		return m_questType;
+	}
+
+	public function GetEntryHash() : Int32
+	{
+		if( m_journalManager )
+		{
+			return m_journalManager.GetEntryHash( m_questData );
+		}
+		return -1;
 	}
 
 	public function GetNearestDistance() : QuestListDistanceData
@@ -548,11 +775,12 @@ class QuestListItemData
 				result = distances[ i ];
 				continue;
 			}
-			if( distances[ i ].m_distance < result.m_distance )
+			if( ( result.m_distance <= 0.0 ) || ( distances[ i ].m_distance < result.m_distance ) )
 			{
 				result = distances[ i ];
 			}
 		}
+		m_distance = result.m_distance;
 		return result;
 	}
 
@@ -589,360 +817,239 @@ class QuestListItemData
 
 }
 
-class QuestListHeaderController extends inkLogicController
-{
-	private editable var m_title : inkTextRef;
-	private editable var m_arrow : inkWidgetRef;
-	private editable var m_root : inkWidgetRef;
-	private var m_questType : Int32;
-	private var m_hovered : Bool;
-
-	protected event OnInitialize()
-	{
-		RegisterToCallback( 'OnRelease', this, 'OnRelease' );
-		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
-		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
-	}
-
-	protected event OnRelease( e : inkPointerEvent )
-	{
-		var evt : QuestListHeaderClicked;
-		if( e.IsAction( 'click' ) )
-		{
-			evt = new QuestListHeaderClicked;
-			evt.m_questType = m_questType;
-			QueueEvent( evt );
-		}
-	}
-
-	public function Setup( titleLocKey : CName, questType : Int32 )
-	{
-		m_questType = questType;
-		inkTextRef.SetText( m_title, NameToString( titleLocKey ) );
-		m_hovered = false;
-		UpdateState();
-	}
-
-	public function ToggleArrow( open : Bool )
-	{
-		inkWidgetRef.SetRotation( m_arrow, ( ( open ) ? ( 0.0 ) : ( 180.0 ) ) );
-	}
-
-	public function UpdateState()
-	{
-		var targetState : CName;
-		targetState = 'Default';
-		if( m_hovered )
-		{
-			targetState = 'Hover';
-		}
-		inkWidgetRef.SetState( m_root, targetState );
-	}
-
-	protected event OnHoverOver( e : inkPointerEvent )
-	{
-		m_hovered = true;
-		UpdateState();
-	}
-
-	protected event OnHoverOut( e : inkPointerEvent )
-	{
-		m_hovered = false;
-		UpdateState();
-	}
-
-}
-
 class QuestListHeaderClicked extends Event
 {
 	var m_questType : Int32;
 }
 
-class QuestlListItemClicked extends Event
+class QuestlListItemSelected extends Event
 {
 	var m_questData : weak< JournalQuest >;
 	var m_skipAnimation : Bool;
+	var m_hash : Int32;
+	var m_selectionIndex : Uint32;
 }
 
-class QuestListItemController extends inkLogicController
+class QuestlListItemHover extends Event
 {
-	private editable var m_title : inkTextRef;
-	private editable var m_level : inkTextRef;
-	private editable var m_trackedMarker : inkWidgetRef;
-	private editable var m_districtIcon : inkImageRef;
-	private editable var m_stateIcon : inkImageRef;
-	private editable var m_distance : inkTextRef;
-	private editable var m_root : inkWidgetRef;
-	private editable var m_newIcon : inkWidgetRef;
-	private var m_data : QuestListItemData;
-	private var m_closestObjective : QuestListDistanceData;
-	private var m_hovered : Bool;
-	private var animProxy : inkAnimProxy;
+	var m_hash : Int32;
+}
 
-	public function Setup( data : QuestListItemData )
-	{
-		var districtRecord : weak< District_Record >;
-		var iconRecord : UIIcon_Record;
-		m_data = data;
-		inkTextRef.SetText( m_title, data.m_questData.GetTitle( data.m_journalManager ) );
-		districtRecord = data.m_journalManager.GetDistrict( data.m_questData );
-		iconRecord = TweakDBInterface.GetUIIconRecord( TDBID.Create( "UIIcon." + ( ( String )( districtRecord.Type() ) ) ) );
-		inkImageRef.SetAtlasResource( m_districtIcon, iconRecord.AtlasResourcePath() );
-		inkImageRef.SetTexturePart( m_districtIcon, iconRecord.AtlasPartName() );
-		if( data.m_State == gameJournalEntryState.Succeeded )
-		{
-			inkTextRef.SetState( m_level, 'ThreatVeryLow' );
-			inkTextRef.SetText( m_level, GetLocalizedText( "UI-Notifications-QuestCompleted" ) );
-			inkWidgetRef.SetVisible( m_newIcon, false );
-		}
-		else if( data.m_State == gameJournalEntryState.Failed )
-		{
-			inkTextRef.SetState( m_level, 'ThreatVeryLow' );
-			inkTextRef.SetText( m_level, GetLocalizedText( "UI-Notifications-Failed" ) );
-			inkWidgetRef.SetVisible( m_newIcon, false );
-		}
-		else
-		{
-			inkTextRef.SetState( m_level, QuestLogUtils.GetLevelState( data.m_playerLevel, data.m_recommendedLevel ) );
-			inkTextRef.SetText( m_level, QuestLogUtils.GetThreatText( data.m_playerLevel, data.m_recommendedLevel ) );
-			inkWidgetRef.SetVisible( m_newIcon, !( data.m_isVisited ) );
-		}
-		inkWidgetRef.SetState( m_trackedMarker, ( ( data.m_isTrackedQuest ) ? ( 'Tracked' ) : ( 'Default' ) ) );
-		m_hovered = false;
-		UpdateState();
-		UpdateDistance();
-	}
+class QuestlListItemDelayedHover extends Event
+{
+}
 
-	private function UpdateDistance()
-	{
-		var unitName : CName;
-		m_closestObjective = m_data.GetTrackedOrNearest();
-		unitName = MeasurementUtils.GetUnitLocalizationKey( UILocalizationHelper.GetSystemBaseUnit() );
-		if( ( m_closestObjective == NULL ) || ( m_closestObjective.m_distance < 0.0 ) )
-		{
-			inkTextRef.SetVisible( m_distance, false );
-		}
-		else
-		{
-			inkTextRef.SetVisible( m_distance, true );
-			inkTextRef.SetText( m_distance, IntToString( RoundF( m_closestObjective.m_distance ) ) + GetLocalizedText( NameToString( unitName ) ) );
-		}
-	}
+class ActivateLink extends Event
+{
+}
 
-	protected event OnInitialize()
-	{
-		RegisterToCallback( 'OnRelease', this, 'OnRelease' );
-		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
-		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
-	}
+class ActivateMapLink extends Event
+{
+}
 
-	protected event OnRelease( e : inkPointerEvent )
-	{
-		var evt : QuestlListItemClicked;
-		var trackEvt : RequestChangeTrackedObjective;
-		if( e.IsAction( 'click' ) )
-		{
-			PlaySound( 'Button', 'OnPress' );
-			evt = new QuestlListItemClicked;
-			evt.m_questData = m_data.m_questData;
-			QueueEvent( evt );
-		}
-		else if( e.IsAction( 'track' ) )
-		{
-			if( !( m_data.m_isResolved ) )
-			{
-				PlaySound( 'Button', 'OnPress' );
-				evt = new QuestlListItemClicked;
-				evt.m_questData = m_data.m_questData;
-				QueueEvent( evt );
-				trackEvt = new RequestChangeTrackedObjective;
-				trackEvt.m_quest = m_data.m_questData;
-				QueueEvent( trackEvt );
-			}
-		}
-	}
+class QuestListVirtualTemplateClassifier extends inkVirtualItemTemplateClassifier
+{
 
-	protected event OnUpdateTrackedObjectiveEvent( e : UpdateTrackedObjectiveEvent )
+	public virtual function ClassifyItem( data : Variant ) : Uint32
 	{
-		m_data.m_isTrackedQuest = m_data.m_questData == e.m_trackedQuest;
-		inkWidgetRef.SetState( m_trackedMarker, ( ( m_data.m_isTrackedQuest ) ? ( 'Tracked' ) : ( 'Default' ) ) );
-		UpdateDistance();
-	}
-
-	protected event OnUpdateOpenedQuestEvent( e : UpdateOpenedQuestEvent )
-	{
-		UpdateState( m_data.m_isOpenedQuest );
-	}
-
-	public function UpdateState( optional forceActive : Bool )
-	{
-		var animOptions : inkAnimOptions;
-		var targetState : CName;
-		var shouldBePlaying, isPlaying : Bool;
-		shouldBePlaying = m_data.m_isOpenedQuest || forceActive;
-		isPlaying = animProxy != NULL;
-		if( shouldBePlaying )
-		{
-			if( !( isPlaying ) )
-			{
-				animOptions.loopType = inkanimLoopType.Cycle;
-				animOptions.loopInfinite = true;
-				animProxy = PlayLibraryAnimationOnAutoSelectedTargets( 'disk_anim', GetRootWidget(), animOptions );
-			}
-		}
-		else
-		{
-			animProxy.Stop();
-			animProxy = NULL;
-			PlayLibraryAnimationOnAutoSelectedTargets( 'clear_disk_anim', GetRootWidget() );
-		}
-		if( forceActive )
-		{
-			inkWidgetRef.SetState( m_root, 'Active' );
-			return;
-		}
-		targetState = ( ( m_data.m_isOpenedQuest ) ? ( 'Active' ) : ( 'Default' ) );
-		if( m_hovered )
-		{
-			targetState = 'Hover';
-		}
-		inkWidgetRef.SetState( m_root, targetState );
-	}
-
-	protected event OnHoverOver( e : inkPointerEvent )
-	{
-		var evt : QuestListItemHoverOverEvent;
-		evt = new QuestListItemHoverOverEvent;
-		evt.m_isQuestResolved = m_data.m_isResolved;
-		QueueEvent( evt );
-		m_hovered = true;
-		UpdateState();
-	}
-
-	protected event OnHoverOut( e : inkPointerEvent )
-	{
-		var evt : QuestListItemHoverOutEvent;
-		evt = new QuestListItemHoverOutEvent;
-		QueueEvent( evt );
-		m_hovered = false;
-		UpdateState();
+		return 0;
 	}
 
 }
 
-class QuestListVirtualNestedDataView extends VirtualNestedListDataView
+class QuestListVirtualDataView extends ScriptableDataView
 {
+	private var m_filterType : QuestListItemType;
+	private var m_compareBuilder : CompareBuilder;
+	private var m_currentQuestSortType : QuestListSortType;
+	default m_currentQuestSortType = QuestListSortType.Updated;
 
-	protected override function SortItems( compareBuilder : CompareBuilder, left : VirutalNestedListData, right : VirutalNestedListData )
+	public function Setup()
+	{
+		m_compareBuilder = CompareBuilder.Make();
+	}
+
+	public function SetFilter( type : QuestListItemType )
+	{
+		m_filterType = type;
+		Filter();
+	}
+
+	public override function FilterItem( data : IScriptable ) : Bool
+	{
+		var questData : QuestListItemData;
+		questData = ( ( QuestListItemData )( data ) );
+		if( !( questData ) )
+		{
+			return false;
+		}
+		if( m_filterType == QuestListItemType.All )
+		{
+			return questData.m_questType != QuestListItemType.Finished;
+		}
+		if( m_filterType == QuestListItemType.MainQuest )
+		{
+			return questData.m_questType == QuestListItemType.SideQuest || questData.m_questType == QuestListItemType.MainQuest;
+		}
+		if( m_filterType == QuestListItemType.Gig )
+		{
+			return ( ( ( questData.m_questType == QuestListItemType.Apartment || questData.m_questType == QuestListItemType.Gig ) || questData.m_questType == QuestListItemType.Cyberpsycho ) || questData.m_questType == QuestListItemType.NCPDQuest ) || questData.m_questType == QuestListItemType.Courier;
+		}
+		return questData.m_questType == m_filterType;
+	}
+
+	public function SetSortType( type : QuestListSortType )
+	{
+		m_currentQuestSortType = type;
+	}
+
+	protected override function SortItem( left : IScriptable, right : IScriptable ) : Bool
 	{
 		var leftData, rightData : QuestListItemData;
-		leftData = ( ( QuestListItemData )( left.m_data ) );
-		rightData = ( ( QuestListItemData )( right.m_data ) );
+		leftData = ( ( QuestListItemData )( left ) );
+		rightData = ( ( QuestListItemData )( right ) );
+		m_compareBuilder.Reset();
 		if( leftData && rightData )
 		{
-			compareBuilder.GameTimeDesc( leftData.m_timestamp, rightData.m_timestamp );
+			m_compareBuilder.IntAsc( ( ( Int32 )( leftData.m_questType ) ), ( ( Int32 )( rightData.m_questType ) ) );
+			if( m_currentQuestSortType == QuestListSortType.Distance )
+			{
+				m_compareBuilder.FloatAsc( leftData.m_distance, rightData.m_distance );
+			}
+			else
+			{
+				m_compareBuilder.GameTimeDesc( leftData.m_lastUpdateTimestamp, rightData.m_lastUpdateTimestamp );
+			}
 		}
+		return m_compareBuilder.GetBool();
 	}
 
 }
 
-class QuestListVirtualNestedListController extends VirtualNestedListController
+class ScrollToJournalEntryEvent extends Event
 {
-
-	protected override function GetDataView() : VirtualNestedListDataView
-	{
-		var result : QuestListVirtualNestedDataView;
-		result = new QuestListVirtualNestedDataView;
-		return ( ( VirtualNestedListDataView )( result ) );
-	}
-
+	var m_hash : Int32;
 }
 
-class VirtualQuestListController extends inkVirtualCompoundItemController
+class QuestListVirtualController extends inkVirtualListController
 {
-	protected editable var m_questList : inkWidgetRef;
+	protected var m_dataView : QuestListVirtualDataView;
+	protected var m_dataSource : ScriptableDataSource;
+	protected var m_classifier : QuestListVirtualTemplateClassifier;
+	private var m_controller : weak< QuestMissionLinkController >;
+	private var m_uiScriptableSystem : weak< UIScriptableSystem >;
+	private var m_questSortType : QuestListSortType;
 
 	protected event OnInitialize()
 	{
-		GetRootWidget().SetVAlign( inkEVerticalAlign.Top );
-		GetRootWidget().SetHAlign( inkEHorizontalAlign.Left );
-		RegisterToCallback( 'OnSelected', this, 'OnSelected' );
+		m_dataView = new QuestListVirtualDataView;
+		m_dataSource = new ScriptableDataSource;
+		m_classifier = new QuestListVirtualTemplateClassifier;
+		m_questSortType = QuestListSortType.Updated;
+		m_dataView.Setup();
+		m_dataView.EnableSorting();
+		m_dataView.SetSource( m_dataSource );
+		SetSource( m_dataView );
+		SetClassifier( m_classifier );
 	}
 
-	public function GetWidget() : inkWidgetRef
+	protected event OnUninitialize()
 	{
-		return m_questList;
+		m_dataView.SetSource( NULL );
+		SetSource( NULL );
+		SetClassifier( NULL );
+		m_dataSource = NULL;
 	}
 
-	public function GetListController() : QuestListHeaderController
+	protected event OnScrollToJournalEntry( evt : ScrollToJournalEntryEvent )
 	{
-		return ( ( QuestListHeaderController )( inkWidgetRef.GetController( GetWidget() ) ) );
+		SetFilter( QuestListItemType.All );
+		SelectItemByHash( evt.m_hash );
 	}
 
-	protected event OnDataChanged( value : Variant )
+	public virtual function SetData( const data : ref< array< IScriptable > >, optional sortOnce : Bool )
 	{
-		var listEntryData : VirutalNestedListData;
-		var data : QuestListHeaderData;
-		listEntryData = ( ( VirutalNestedListData )( ( ( IScriptable )value ) ) );
-		if( !( listEntryData ) )
+		m_dataSource.Reset( data );
+		EnableSorting();
+		if( sortOnce )
 		{
-			return false;
+			DisableSorting();
 		}
-		data = ( ( QuestListHeaderData )( listEntryData.m_data ) );
-		GetListController().Setup( data.m_nameLocKey, data.m_type );
 	}
 
-	protected event OnSelected( itemController : weak< inkVirtualCompoundItemController >, discreteNav : Bool )
+	public virtual function GetDataSize() : Int32
 	{
-		if( discreteNav )
+		return ( ( Int32 )( m_dataView.Size() ) );
+	}
+
+	public virtual function EnableSorting()
+	{
+		m_dataView.EnableSorting();
+	}
+
+	public virtual function DisableSorting()
+	{
+		m_dataView.DisableSorting();
+	}
+
+	public virtual function SortQuests( cycleSortType : Bool )
+	{
+		m_dataView.EnableSorting();
+		if( cycleSortType )
 		{
-			SetCursorOverWidget( GetRootWidget() );
+			m_questSortType = ( ( ( ( Int32 )( m_questSortType ) ) < ( ( ( Int32 )( QuestListSortType.Size ) ) - 1 ) ) ? ( ( ( QuestListSortType )( ( ( Int32 )( m_questSortType ) ) + 1 ) ) ) : ( QuestListSortType.Updated ) );
 		}
+		m_dataView.SetSortType( m_questSortType );
+		m_dataView.Sort();
+		m_dataView.DisableSorting();
 	}
 
-}
-
-class VirtualQuestItemController extends inkVirtualCompoundItemController
-{
-	protected editable var m_questItem : inkWidgetRef;
-	protected var m_data : VirutalNestedListData;
-
-	protected event OnInitialize()
+	public function GetQuestSortType() : QuestListSortType
 	{
-		GetRootWidget().SetVAlign( inkEVerticalAlign.Top );
-		GetRootWidget().SetHAlign( inkEHorizontalAlign.Left );
-		RegisterToCallback( 'OnSelected', this, 'OnSelected' );
+		return m_questSortType;
 	}
 
-	public function GetWidget() : inkWidgetRef
+	public virtual function IsSortingEnabled() : Bool
 	{
-		return m_questItem;
+		return m_dataView.IsSortingEnabled();
 	}
 
-	public function GetItemController() : QuestListItemController
+	public function SetFilter( type : QuestListItemType )
 	{
-		return ( ( QuestListItemController )( inkWidgetRef.GetController( GetWidget() ) ) );
+		m_dataView.SetFilter( type );
+		SortQuests( false );
 	}
 
-	protected event OnDataChanged( value : Variant )
+	public function SelectItemByHash( questHash : Int32 )
 	{
-		var listEntryData : VirutalNestedListData;
-		var data : QuestListItemData;
-		listEntryData = ( ( VirutalNestedListData )( ( ( IScriptable )value ) ) );
-		if( !( listEntryData ) )
+		var i, targetIndex, size : Int32;
+		var currentData : weak< QuestListItemData >;
+		targetIndex = -1;
+		size = ( ( Int32 )( m_dataView.Size() ) );
+		for( i = 0; i < size; i += 1 )
 		{
-			return false;
+			currentData = ( ( QuestListItemData )( m_dataView.GetItem( ( ( Uint32 )( i ) ) ) ) );
+			if( currentData.GetEntryHash() == ( ( Int32 )( questHash ) ) )
+			{
+				targetIndex = i;
+				break;
+			}
 		}
-		data = ( ( QuestListItemData )( listEntryData.m_data ) );
-		GetItemController().Setup( data );
+		if( targetIndex != -1 )
+		{
+			ForceSelectIndex( ( ( Uint32 )( targetIndex ) ), currentData.m_questData );
+		}
 	}
 
-	protected event OnSelected( itemController : weak< inkVirtualCompoundItemController >, discreteNav : Bool )
+	private function ForceSelectIndex( idx : Uint32, questRecord : weak< JournalQuest > )
 	{
-		if( discreteNav )
-		{
-			SetCursorOverWidget( GetRootWidget() );
-		}
+		var evt : QuestlListItemSelected;
+		ToggleItem( idx );
+		ScrollToIndex( idx );
+		evt = new QuestlListItemSelected;
+		evt.m_selectionIndex = idx;
+		evt.m_questData = questRecord;
+		QueueEvent( evt );
 	}
 
 }
@@ -953,48 +1060,53 @@ class QuestDetailsObjectiveController extends inkLogicController
 	private editable var m_trackingMarker : inkWidgetRef;
 	private editable var m_root : inkWidgetRef;
 	private var m_objective : weak< JournalQuestObjective >;
+	private var m_journalManager : weak< JournalManager >;
 	private var m_hovered : Bool;
+	private var m_isTracked : Bool;
 
 	protected event OnInitialize()
 	{
-		RegisterToCallback( 'OnRelease', this, 'OnRelease' );
-		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
-		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+		GetRootWidget().RegisterToCallback( 'OnRelease', this, 'OnRelease' );
+		GetRootWidget().RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		GetRootWidget().RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
 	}
 
-	public function Setup( objective : weak< JournalQuestObjective >, currentCounter, totalCounter : Int32, optional isTracked : Bool )
+	public function Setup( objective : weak< JournalQuestObjective >, journalManager : weak< JournalManager >, currentCounter, totalCounter : Int32, optional isTracked : Bool )
 	{
 		var finalTitle : String;
+		m_journalManager = journalManager;
 		m_objective = objective;
 		finalTitle = objective.GetDescription();
 		if( totalCounter > 0 )
 		{
 			finalTitle = ( ( ( ( GetLocalizedText( finalTitle ) + " [" ) + IntToString( currentCounter ) ) + "/" ) + IntToString( totalCounter ) ) + "]";
 		}
-		if( m_objective.IsOptional() )
+		if( m_journalManager.GetIsObjectiveOptional( objective ) )
 		{
 			finalTitle = ( ( GetLocalizedText( finalTitle ) + " [" ) + GetLocalizedText( "UI-ScriptExports-Optional0" ) ) + "]";
 		}
 		inkTextRef.SetText( m_objectiveName, finalTitle );
-		inkWidgetRef.SetState( m_trackingMarker, ( ( isTracked ) ? ( 'Tracked' ) : ( 'Default' ) ) );
+		m_isTracked = isTracked;
+		inkWidgetRef.SetState( m_trackingMarker, ( ( m_isTracked ) ? ( 'Tracked' ) : ( 'Default' ) ) );
 		m_hovered = false;
 		UpdateState();
 	}
 
 	protected event OnUpdateTrackedObjectiveEvent( e : UpdateTrackedObjectiveEvent )
 	{
-		inkWidgetRef.SetState( m_trackingMarker, ( ( m_objective == e.m_trackedObjective ) ? ( 'Tracked' ) : ( 'Default' ) ) );
+		m_isTracked = m_objective == e.m_trackedObjective;
+		inkWidgetRef.SetState( m_trackingMarker, ( ( m_isTracked ) ? ( 'Tracked' ) : ( 'Default' ) ) );
 	}
 
 	protected event OnRelease( e : inkPointerEvent )
 	{
 		var evt : RequestChangeTrackedObjective;
-		if( e.IsAction( 'click' ) || e.IsAction( 'track' ) )
+		if( e.IsAction( 'click' ) || ( e.IsAction( 'track' ) && !( m_isTracked ) ) )
 		{
 			evt = new RequestChangeTrackedObjective;
 			evt.m_objective = m_objective;
+			e.Handle();
 			QueueEvent( evt );
-			PlayLibraryAnimationOnAutoSelectedTargets( 'quest_tracking_set', GetRootWidget() );
 		}
 	}
 
@@ -1044,369 +1156,112 @@ class RequestChangeTrackedObjective extends Event
 {
 	var m_objective : weak< JournalQuestObjective >;
 	var m_quest : weak< JournalQuest >;
+	var m_forceSelectEntry : Int32;
 }
 
-class QuestDetailsPanelController extends inkLogicController
+class QuestListFilterButtonController extends inkLogicController
 {
-	private editable var m_questTitle : inkTextRef;
-	private editable var m_questDescription : inkTextRef;
-	private editable var m_questLevel : inkTextRef;
-	private editable var m_activeObjectives : inkCompoundRef;
-	private editable var m_optionalObjectives : inkCompoundRef;
-	private editable var m_completedObjectives : inkCompoundRef;
-	private editable var m_codexLinksContainer : inkCompoundRef;
-	private editable var m_contentContainer : inkWidgetRef;
-	private editable var m_noSelectedQuestContainer : inkWidgetRef;
-	private var m_currentQuestData : weak< JournalQuest >;
-	private var m_journalManager : weak< JournalManager >;
-	private var m_phoneSystem : weak< PhoneSystem >;
-	private var m_mappinSystem : weak< MappinSystem >;
-	private var m_trackedObjective : weak< JournalQuestObjective >;
-	private var m_canUsePhone : Bool;
+	editable var m_icon : inkImageRef;
+	editable var m_counter : inkTextRef;
+	var m_filterType : QuestListItemType;
+	var m_hovered : Bool;
+	var m_active : Bool;
 
 	protected event OnInitialize()
 	{
-		inkWidgetRef.SetVisible( m_noSelectedQuestContainer, true );
-		inkWidgetRef.SetVisible( m_contentContainer, false );
+		GetRootWidget().RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		GetRootWidget().RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
 	}
 
-	public function Setup( questData : weak< JournalQuest >, journalManager : weak< JournalManager >, phoneSystem : weak< PhoneSystem >, mappinSystem : weak< MappinSystem >, game : GameInstance, optional skipAnimation : Bool )
+	protected event OnHoverOver( evt : inkPointerEvent )
 	{
-		var playerLevel : Float;
-		var recommendedLevel : Int32;
-		playerLevel = GameInstance.GetStatsSystem( game ).GetStatValue( GameInstance.GetPlayerSystem( game ).GetLocalPlayerMainGameObject().GetEntityID(), gamedataStatType.Level );
-		recommendedLevel = GameInstance.GetLevelAssignmentSystem( game ).GetLevelAssignment( questData.GetRecommendedLevelID() );
-		m_currentQuestData = questData;
-		m_journalManager = journalManager;
-		m_phoneSystem = phoneSystem;
-		m_mappinSystem = mappinSystem;
-		inkWidgetRef.SetVisible( m_noSelectedQuestContainer, false );
-		inkWidgetRef.SetVisible( m_contentContainer, true );
-		inkTextRef.SetText( m_questTitle, questData.GetTitle( journalManager ) );
-		inkTextRef.SetState( m_questLevel, QuestLogUtils.GetLevelState( RoundMath( playerLevel ), recommendedLevel ) );
-		inkTextRef.SetText( m_questLevel, QuestLogUtils.GetThreatText( RoundMath( playerLevel ), recommendedLevel ) );
-		inkTextRef.SetText( m_questDescription, "" );
-		m_trackedObjective = ( ( weak< weak< JournalQuestObjective > > )( journalManager.GetTrackedEntry() ) );
-		inkCompoundRef.RemoveAllChildren( m_codexLinksContainer );
-		PopulateObjectives();
+		m_hovered = true;
+		UpdateState();
 	}
 
-	public function SetPhoneAvailable( value : Bool )
+	protected event OnHoverOut( evt : inkPointerEvent )
 	{
-		m_canUsePhone = value;
+		m_hovered = false;
+		UpdateState();
 	}
 
-	private function PopulateObjectives()
+	public function SetData( filterType : QuestListItemType )
 	{
-		var i : Int32;
-		var currentCounter, totalCounter : Int32;
-		var isObjectiveTracked : Bool;
-		var childEntries : array< weak< JournalEntry > >;
-		var objectiveEntry : weak< JournalQuestObjective >;
-		var codexLinksObjectiveEntry : weak< JournalQuestObjective >;
-		var widget : weak< inkWidget >;
-		var controller : QuestDetailsObjectiveController;
-		var descriptionEntries : array< weak< JournalQuestDescription > >;
-		var description : String;
-		QuestLogUtils.UnpackRecursive( m_journalManager, m_currentQuestData, childEntries );
-		inkCompoundRef.RemoveAllChildren( m_activeObjectives );
-		inkCompoundRef.RemoveAllChildren( m_optionalObjectives );
-		for( i = 0; i < childEntries.Size(); i += 1 )
+		m_filterType = filterType;
+		if( m_filterType == QuestListItemType.Apartment )
 		{
-			objectiveEntry = ( ( JournalQuestObjective )( childEntries[ i ] ) );
-			if( objectiveEntry )
-			{
-				isObjectiveTracked = m_trackedObjective == objectiveEntry;
-				widget = SpawnFromLocal( inkCompoundRef.Get( m_activeObjectives ), 'questObjective' );
-				widget.SetHAlign( inkEHorizontalAlign.Left );
-				widget.SetVAlign( inkEVerticalAlign.Top );
-				currentCounter = m_journalManager.GetObjectiveCurrentCounter( objectiveEntry );
-				totalCounter = m_journalManager.GetObjectiveTotalCounter( objectiveEntry );
-				controller = ( ( QuestDetailsObjectiveController )( widget.GetController() ) );
-				controller.Setup( objectiveEntry, currentCounter, totalCounter, isObjectiveTracked );
-				if( isObjectiveTracked || !( codexLinksObjectiveEntry ) )
-				{
-					codexLinksObjectiveEntry = objectiveEntry;
-				}
-			}
+			inkImageRef.SetTexturePart( m_icon, 'apartment_car_buy' );
 		}
-		if( codexLinksObjectiveEntry )
+		else
 		{
-			PopulateCodexLinks( codexLinksObjectiveEntry );
+			inkImageRef.SetTexturePart( m_icon, QuestTypeIconUtils.GetFilterIcon( m_filterType ) );
 		}
-		descriptionEntries = QuestLogUtils.GetDescriptions( m_journalManager, m_currentQuestData );
-		description = "";
-		for( i = 0; i < descriptionEntries.Size(); i += 1 )
+		inkImageRef.SetState( m_icon, QuestTypeIconUtils.GetIconState( m_filterType ) );
+	}
+
+	public function SetCounter( count : Int32 )
+	{
+		inkTextRef.SetState( m_counter, QuestTypeIconUtils.GetIconState( m_filterType ) );
+		inkTextRef.SetText( m_counter, ( ( String )( count ) ) );
+		GetRootWidget().SetVisible( count );
+	}
+
+	public function GetType() : QuestListItemType
+	{
+		return m_filterType;
+	}
+
+	public function SetActive( active : Bool )
+	{
+		m_active = active;
+		UpdateState();
+	}
+
+	public function IsVisible() : Bool
+	{
+		return GetRootWidget() && GetRootWidget().IsVisible();
+	}
+
+	private function UpdateState()
+	{
+		if( m_active )
 		{
-			description = ( description + GetLocalizedText( descriptionEntries[ i ].GetDescription() ) ) + "\n";
+			GetRootWidget().SetState( 'Active' );
+			return;
 		}
-		inkTextRef.SetText( m_questDescription, description );
-	}
-
-	protected event OnUpdateTrackedObjectiveEvent( e : UpdateTrackedObjectiveEvent )
-	{
-		PopulateCodexLinks( e.m_trackedObjective );
-	}
-
-	private function PopulateCodexLinks( trackedObjective : JournalQuestObjective )
-	{
-		var codexLink : weak< JournalQuestCodexLink >;
-		var childEntries : array< weak< JournalEntry > >;
-		var childEntriesSorted : array< weak< JournalEntry > >;
-		var childEntry : weak< JournalEntry >;
-		var childEntryHash : Int32;
-		var childEntryState : gameJournalEntryState;
-		var mappinPosition : Vector3;
-		var mappinLinkAdded : Bool;
-		var i : Int32;
-		var unpackFilter : JournalRequestStateFilter;
-		unpackFilter.active = true;
-		unpackFilter.inactive = true;
-		QuestLogUtils.UnpackRecursiveWithFilter( m_journalManager, trackedObjective, unpackFilter, childEntries, true );
-		inkCompoundRef.RemoveAllChildren( m_codexLinksContainer );
-		for( i = 0; i < childEntries.Size(); i += 1 )
-		{
-			if( ( ( JournalQuestMapPinBase )( childEntries[ i ] ) ) )
-			{
-				if( !( mappinLinkAdded ) )
-				{
-					childEntriesSorted.Insert( 0, childEntries[ i ] );
-					mappinLinkAdded = true;
-				}
-			}
-			else
-			{
-				childEntry = ( ( JournalEntry )( m_journalManager.GetEntry( codexLink.GetLinkPathHash() ) ) );
-				if( ( ( JournalContact )( childEntry ) ) )
-				{
-					childEntriesSorted.Insert( ( ( mappinLinkAdded ) ? ( 1 ) : ( 0 ) ), childEntries[ i ] );
-				}
-				else
-				{
-					childEntriesSorted.PushBack( childEntries[ i ] );
-				}
-			}
-		}
-		for( i = 0; ( i < childEntriesSorted.Size() ) && ( i < 4 ); i += 1 )
-		{
-			codexLink = ( ( JournalQuestCodexLink )( childEntriesSorted[ i ] ) );
-			if( codexLink )
-			{
-				childEntry = ( ( JournalEntry )( m_journalManager.GetEntry( codexLink.GetLinkPathHash() ) ) );
-				childEntryState = m_journalManager.GetEntryState( childEntry );
-				if( childEntryState == gameJournalEntryState.Inactive )
-				{
-					childEntryHash = m_journalManager.GetEntryHash( childEntry );
-					m_journalManager.ChangeEntryStateByHash( ( ( Uint32 )( childEntryHash ) ), gameJournalEntryState.Active, JournalNotifyOption.DoNotNotify );
-				}
-				if( ( ( JournalCodexEntry )( childEntry ) ) )
-				{
-					SpawnCodexLink( childEntry );
-				}
-				else if( ( ( JournalContact )( childEntry ) ) && m_canUsePhone )
-				{
-					SpawnContactLink( ( ( JournalContact )( childEntry ) ) );
-				}
-			}
-			else if( ( ( JournalImageEntry )( childEntriesSorted[ i ] ) ) )
-			{
-				SpawnCodexLink( childEntriesSorted[ i ] );
-			}
-			else if( ( ( JournalQuestMapPinBase )( childEntriesSorted[ i ] ) ) )
-			{
-				m_mappinSystem.GetQuestMappinPosition( ( ( Uint32 )( m_journalManager.GetEntryHash( childEntriesSorted[ i ] ) ) ), mappinPosition );
-				SpawnMappinLink( ( ( JournalQuestMapPinBase )( childEntriesSorted[ i ] ) ), mappinPosition );
-			}
-		}
-	}
-
-	private function SpawnMappinLink( mappinEntry : JournalQuestMapPinBase, jumpTo : Vector3 )
-	{
-		var widget : weak< inkWidget >;
-		var controller : QuestMappinLinkController;
-		widget = SpawnFromLocal( inkCompoundRef.Get( m_codexLinksContainer ), 'linkMappin' );
-		controller = ( ( QuestMappinLinkController )( widget.GetController() ) );
-		controller.Setup( mappinEntry, jumpTo );
-	}
-
-	private function SpawnCodexLink( journalEntry : JournalEntry )
-	{
-		var widget : weak< inkWidget >;
-		var controller : QuestCodexLinkController;
-		widget = SpawnFromLocal( inkCompoundRef.Get( m_codexLinksContainer ), 'linkCodex' );
-		controller = ( ( QuestCodexLinkController )( widget.GetController() ) );
-		controller.Setup( journalEntry );
-	}
-
-	private function SpawnContactLink( contactEntry : JournalContact )
-	{
-		var widget : weak< inkWidget >;
-		var controller : QuestContactLinkController;
-		widget = SpawnFromLocal( inkCompoundRef.Get( m_codexLinksContainer ), 'linkPhoneContact' );
-		controller = ( ( QuestContactLinkController )( widget.GetController() ) );
-		controller.Setup( contactEntry, m_journalManager, m_phoneSystem );
+		GetRootWidget().SetState( ( ( m_hovered ) ? ( 'Hover' ) : ( 'Default' ) ) );
 	}
 
 }
 
-abstract class QuestLogUtils
+class FilterButtonSpawnedData
 {
+	var m_type : Int32;
+}
 
-	public static function GetDefaultFilter() : JournalRequestStateFilter
-	{
-		var contextFilter : JournalRequestStateFilter;
-		contextFilter.active = true;
-		contextFilter.inactive = true;
-		contextFilter.succeeded = false;
-		contextFilter.failed = false;
-		return contextFilter;
-	}
+enum QuestListItemType
+{
+	MainQuest = 0,
+	SideQuest = 1,
+	Gig = 2,
+	Cyberpsycho = 3,
+	NCPDQuest = 4,
+	Apartment = 5,
+	Courier = 6,
+	Finished = 7,
+	Count = 8,
+	All = 9,
+	Invalid = -1,
+}
 
-	public static function GetObjectiveFilter() : JournalRequestStateFilter
-	{
-		var contextFilter : JournalRequestStateFilter;
-		contextFilter.active = false;
-		contextFilter.inactive = true;
-		contextFilter.succeeded = false;
-		contextFilter.failed = false;
-		return contextFilter;
-	}
+enum QuestListSortType
+{
+	Updated = 0,
+	Distance = 1,
+	Size = 2,
+}
 
-	public static function GetSuccessFilter() : JournalRequestStateFilter
-	{
-		var contextFilter : JournalRequestStateFilter;
-		contextFilter.active = false;
-		contextFilter.inactive = false;
-		contextFilter.succeeded = true;
-		contextFilter.failed = false;
-		return contextFilter;
-	}
-
-	public static function GetFailedFilter() : JournalRequestStateFilter
-	{
-		var contextFilter : JournalRequestStateFilter;
-		contextFilter.active = false;
-		contextFilter.inactive = false;
-		contextFilter.succeeded = false;
-		contextFilter.failed = true;
-		return contextFilter;
-	}
-
-	public static function UnpackRecursiveWithFilter( journalManager : JournalManager, entry : weak< JournalContainerEntry >, filter : JournalRequestStateFilter, result : ref< array< weak< JournalEntry > > >, optional includeInactive : Bool )
-	{
-		var i : Int32;
-		var containerEntry : JournalContainerEntry;
-		var childEntries : array< weak< JournalEntry > >;
-		var currentEntry : weak< JournalEntry >;
-		childEntries = Unpack( journalManager, entry, filter );
-		for( i = 0; i < childEntries.Size(); i += 1 )
-		{
-			currentEntry = childEntries[ i ];
-			if( !( includeInactive ) && ( journalManager.GetEntryState( currentEntry ) == gameJournalEntryState.Inactive && ( ( ( JournalQuestMapPinBase )( currentEntry ) ) == NULL ) ) )
-			{
-				continue;
-			}
-			result.PushBack( currentEntry );
-			containerEntry = ( ( JournalContainerEntry )( currentEntry ) );
-			if( containerEntry )
-			{
-				if( ( ( JournalQuestObjective )( containerEntry ) ) )
-				{
-					UnpackRecursiveWithFilter( journalManager, containerEntry, GetDefaultFilter(), result, includeInactive );
-					UnpackRecursiveWithFilter( journalManager, containerEntry, GetObjectiveFilter(), result, includeInactive );
-				}
-				else
-				{
-					UnpackRecursiveWithFilter( journalManager, containerEntry, filter, result, includeInactive );
-				}
-			}
-		}
-	}
-
-	public static function UnpackRecursive( journalManager : JournalManager, entry : weak< JournalContainerEntry >, result : ref< array< weak< JournalEntry > > > )
-	{
-		UnpackRecursiveWithFilter( journalManager, entry, GetDefaultFilter(), result );
-	}
-
-	public static function Unpack( journalManager : JournalManager, entry : weak< JournalContainerEntry >, filter : JournalRequestStateFilter ) : array< weak< JournalEntry > >
-	{
-		var childEntries : array< weak< JournalEntry > >;
-		journalManager.GetChildren( entry, filter, childEntries );
-		return childEntries;
-	}
-
-	public static function GetDescriptions( journalManager : JournalManager, entry : weak< JournalContainerEntry > ) : array< weak< JournalQuestDescription > >
-	{
-		var contextFilter : JournalRequestStateFilter;
-		var objects : array< weak< JournalEntry > >;
-		var results : array< weak< JournalQuestDescription > >;
-		var i : Int32;
-		contextFilter.active = true;
-		contextFilter.inactive = false;
-		contextFilter.succeeded = true;
-		contextFilter.failed = true;
-		UnpackRecursiveWithFilter( journalManager, entry, contextFilter, objects );
-		for( i = 0; i < objects.Size(); i += 1 )
-		{
-			if( ( ( JournalQuestDescription )( objects[ i ] ) ) )
-			{
-				results.PushBack( ( ( JournalQuestDescription )( objects[ i ] ) ) );
-			}
-		}
-		return results;
-	}
-
-	public static function GetLevelState( playerLevel : Int32, targetLevel : Int32 ) : CName
-	{
-		var difference : Int32;
-		difference = playerLevel - targetLevel;
-		if( difference <= ( ( Int32 )( EPowerDifferential.IMPOSSIBLE ) ) )
-		{
-			return 'ThreatVeryHigh';
-		}
-		if( difference <= ( ( Int32 )( EPowerDifferential.HARD ) ) )
-		{
-			return 'ThreatHigh';
-		}
-		if( difference <= ( ( Int32 )( EPowerDifferential.NORMAL ) ) )
-		{
-			return 'ThreatMedium';
-		}
-		if( difference <= ( ( Int32 )( EPowerDifferential.EASY ) ) )
-		{
-			return 'ThreatLow';
-		}
-		if( difference <= ( ( Int32 )( EPowerDifferential.TRASH ) ) )
-		{
-			return 'ThreatVeryLow';
-		}
-		return 'ThreatVeryLow';
-	}
-
-	public static function GetThreatText( playerLevel : Int32, targetLevel : Int32 ) : String
-	{
-		var result : String;
-		result = GetLocalizedText( "UI-ResourceExports-Threat" ) + ": ";
-		switch( QuestLogUtils.GetLevelState( playerLevel, targetLevel ) )
-		{
-			case 'ThreatVeryLow':
-				result += GetLocalizedText( "UI-Tooltips-ThreatVeryLow" );
-			break;
-			case 'ThreatLow':
-				result += GetLocalizedText( "UI-Tooltips-Low" );
-			break;
-			case 'ThreatMedium':
-				result += GetLocalizedText( "UI-Tooltips-ThreatMedium" );
-			break;
-			case 'ThreatHigh':
-				result += GetLocalizedText( "UI-Tooltips-ThreatHigh" );
-			break;
-			case 'ThreatVeryHigh':
-				result += GetLocalizedText( "UI-Tooltips-ThreatVeryHigh" );
-			break;
-		}
-		return result;
-	}
-
+class CodexPopupClosedEvent extends Event
+{
 }
 

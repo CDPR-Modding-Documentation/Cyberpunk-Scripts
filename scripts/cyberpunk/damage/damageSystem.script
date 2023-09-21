@@ -1,18 +1,8 @@
-importonly abstract class IDamageSystemListener extends IScriptable
-{
-}
-
-import class ScriptedDamageSystemListener extends IDamageSystemListener
-{
-	protected virtual function OnHitTriggered( hitEvent : gameHitEvent );
-	protected virtual function OnHitReceived( hitEvent : gameHitEvent );
-	protected virtual function OnPipelineProcessed( hitEvent : gameHitEvent );
-}
-
 import class CacheData extends IScriptable
 {
 	var targetImmortalityMode : gameGodModeType;
 	var TEMP_ImmortalityCached : Bool;
+	var chargeDamageMultiplier : Float;
 	var logFlags : Int64;
 }
 
@@ -20,6 +10,7 @@ importonly class HitDebugData extends IScriptable
 {
 	import var sourceHitPosition : Vector4;
 	import var targetHitPosition : Vector4;
+	import var attackTime : Float;
 	import var instigator : weak< GameObject >;
 	import var source : weak< GameObject >;
 	import var target : weak< GameObject >;
@@ -57,7 +48,38 @@ struct previewTargetStruct
 {
 	var currentlyTrackedTarget : weak< GameObject >;
 	var currentBodyPart : EHitReactionZone;
+	var currentlyHittingBreach : Bool;
 }
+
+import enum gameDamageCallbackType
+{
+	HitTriggered,
+	MissTriggered,
+	HitReceived,
+	PipelineProcessed,
+	COUNT,
+	INVALID,
+}
+
+import enum gameDamagePipelineStage
+{
+	PreProcess,
+	Process,
+	ProcessHitReaction,
+	PostProcess,
+	COUNT,
+	INVALID,
+}
+
+import enum DMGPipelineType
+{
+	None,
+	Damage,
+	ProjectedDamage,
+	All,
+}
+
+import operator|( a : DMGPipelineType, b : DMGPipelineType ) : DMGPipelineType;
 
 importonly abstract class IDamageSystem extends IReplicatedGameSystem
 {
@@ -70,8 +92,8 @@ import final class DamageSystem extends IDamageSystem
 	var m_previewRWLockTemp : RWLock;
 
 	public import final function QueueHitEvent( evt : gameHitEvent, receiver : weak< GameObject > );
+	public import final function QueueMissEvent( evt : gameMissEvent );
 	public import final function StartProjectionPipeline( evt : gameProjectedHitEvent );
-	public import function UseModernArmorFormula() : Bool;
 	public import static function GetDamageModFromCurve( curve : CName, value : Float ) : Float;
 
 	private export function ProcessPipeline( hitEvent : gameHitEvent, cache : CacheData )
@@ -81,10 +103,16 @@ import final class DamageSystem extends IDamageSystem
 		{
 			ProcessSyncStageCallbacks( gameDamagePipelineStage.Process, hitEvent, DMGPipelineType.Damage );
 			Process( hitEvent, cache );
+			ProcessSyncStageCallbacks( gameDamagePipelineStage.ProcessHitReaction, hitEvent, DMGPipelineType.Damage );
 			ProcessHitReaction( hitEvent );
 			ProcessSyncStageCallbacks( gameDamagePipelineStage.PostProcess, hitEvent, DMGPipelineType.Damage );
 			PostProcess( hitEvent );
 		}
+	}
+
+	private export function ProcessMissPipeline( missEvent : gameMissEvent )
+	{
+		ProcessSyncStageMissCallbacks( missEvent );
 	}
 
 	private function ProcessProjectionPipeline( hitEvent : gameProjectedHitEvent, cache : CacheData )
@@ -106,54 +134,41 @@ import final class DamageSystem extends IDamageSystem
 	private function CheckProjectionPipelineTargetConditions( hitEvent : gameProjectedHitEvent ) : Bool
 	{
 		var hitZone : EHitReactionZone;
+		var hittingBreach : Bool;
 		var previewLockLocal : Bool;
 		var previewTargetLocal : previewTargetStruct;
 		RWLock.AcquireShared( m_previewRWLockTemp );
 		previewLockLocal = m_previewLock;
 		previewTargetLocal.currentlyTrackedTarget = m_previewTarget.currentlyTrackedTarget;
 		previewTargetLocal.currentBodyPart = m_previewTarget.currentBodyPart;
+		previewTargetLocal.currentlyHittingBreach = m_previewTarget.currentlyHittingBreach;
 		RWLock.ReleaseShared( m_previewRWLockTemp );
-		Log( "Checking pipeline" );
 		if( previewLockLocal )
 		{
 			return false;
 		}
-		if( !( previewTargetLocal.currentlyTrackedTarget ) || ( previewTargetLocal.currentlyTrackedTarget != hitEvent.target ) )
+		hitZone = GetHitReactionZone( hitEvent );
+		hittingBreach = BreachFinderComponent.TryProcessBreachHit( hitEvent, hitZone == EHitReactionZone.Head, true );
+		if( ( ( !( previewTargetLocal.currentlyTrackedTarget ) || ( previewTargetLocal.currentlyTrackedTarget != hitEvent.target ) ) || previewTargetLocal.currentlyHittingBreach != hittingBreach ) || ( previewTargetLocal.currentBodyPart != hitZone && ( previewTargetLocal.currentBodyPart == EHitReactionZone.Head || hitZone == EHitReactionZone.Head ) ) )
 		{
-			SetPreviewTargetStruct( hitEvent.target, GetHitReactionZone( hitEvent ) );
+			SetPreviewTargetStruct( hitEvent.target, hitZone, hittingBreach );
 			return true;
-		}
-		if( previewTargetLocal.currentlyTrackedTarget == hitEvent.target )
-		{
-			hitZone = GetHitReactionZone( hitEvent );
-			if( hitZone == previewTargetLocal.currentBodyPart )
-			{
-				return false;
-			}
-			else if( previewTargetLocal.currentBodyPart != EHitReactionZone.Head && hitZone != EHitReactionZone.Head )
-			{
-				return false;
-			}
-			else
-			{
-				SetPreviewTargetStruct( previewTargetLocal.currentlyTrackedTarget, hitZone );
-				return true;
-			}
 		}
 		return false;
 	}
 
-	private function SetPreviewTargetStruct( trackedTarget : weak< GameObject >, bodyPart : EHitReactionZone )
+	private function SetPreviewTargetStruct( trackedTarget : weak< GameObject >, bodyPart : EHitReactionZone, hittingBreach : Bool )
 	{
 		RWLock.Acquire( m_previewRWLockTemp );
 		m_previewTarget.currentlyTrackedTarget = trackedTarget;
 		m_previewTarget.currentBodyPart = bodyPart;
+		m_previewTarget.currentlyHittingBreach = hittingBreach;
 		RWLock.Release( m_previewRWLockTemp );
 	}
 
 	public function ClearPreviewTargetStruct()
 	{
-		SetPreviewTargetStruct( NULL, EHitReactionZone.Special );
+		SetPreviewTargetStruct( NULL, EHitReactionZone.Special, false );
 	}
 
 	public function SetPreviewLock( newState : Bool )
@@ -172,6 +187,28 @@ import final class DamageSystem extends IDamageSystem
 		return HitShapeUserDataBase.GetHitReactionZone( hitUserData );
 	}
 
+	private function CreateDebugDataName( gameObject : weak< GameObject > ) : CName
+	{
+		var entityIDString : String;
+		var displayName : String;
+		var result : CName;
+		if( !( gameObject ) )
+		{
+			return '[Unkown]';
+		}
+		entityIDString = EntityID.ToDebugStringDecimal( gameObject.GetEntityID() );
+		displayName = gameObject.GetDisplayName();
+		if( displayName == "" )
+		{
+			return StringToName( ( NameToString( gameObject.GetClassName() ) + " | " ) + entityIDString );
+		}
+		else
+		{
+			result = StringToName( ( GetLocalizedText( displayName ) + " | " ) + entityIDString );
+		}
+		return result;
+	}
+
 	private export function GatherDebugData( hitEvent : gameHitEvent, cache : CacheData, out hitDebugData : HitDebugData )
 	{
 		var attackData : AttackData;
@@ -181,47 +218,30 @@ import final class DamageSystem extends IDamageSystem
 		var appliedDamages : array< Float >;
 		var calculatedDamages : array< Float >;
 		var damageType : gamedataDamageType;
-		var appliedDamage, calculatedDamage : DamageDebugData;
+		var appliedDamage : DamageDebugData;
+		var calculatedDamage : DamageDebugData;
+		var entityIDString : String;
 		attackData = hitEvent.attackData;
 		flags = attackData.GetFlags();
 		appliedDamages = hitEvent.attackComputed.GetAttackValues();
 		calculatedDamages = hitEvent.attackComputed.GetOriginalAttackValues();
+		hitDebugData.attackTime = attackData.GetAttackTime();
 		hitDebugData.instigator = attackData.GetInstigator();
 		hitDebugData.source = attackData.GetSource();
 		hitDebugData.target = hitEvent.target;
 		hitDebugData.sourceHitPosition = attackData.GetSource().GetWorldPosition();
 		hitDebugData.targetHitPosition = hitEvent.target.GetWorldPosition();
-		if( hitDebugData.instigator )
-		{
-			hitDebugData.instigatorName = StringToName( hitDebugData.instigator.GetDisplayName() );
-			if( hitDebugData.instigatorName == '' )
-			{
-				hitDebugData.instigatorName = '[MISSING NAME]';
-			}
-		}
-		if( hitDebugData.source )
-		{
-			hitDebugData.sourceName = StringToName( hitDebugData.source.GetDisplayName() );
-			if( hitDebugData.sourceName == '' )
-			{
-				hitDebugData.sourceName = '[MISSING NAME]';
-			}
-		}
-		if( hitDebugData.target )
-		{
-			hitDebugData.targetName = StringToName( hitDebugData.target.GetDisplayName() );
-			if( hitDebugData.targetName == '' )
-			{
-				hitDebugData.targetName = '[MISSING NAME]';
-			}
-		}
+		hitDebugData.instigatorName = CreateDebugDataName( hitDebugData.instigator );
+		hitDebugData.sourceName = CreateDebugDataName( hitDebugData.source );
+		hitDebugData.targetName = CreateDebugDataName( hitDebugData.target );
 		hitDebugData.sourceAttackDebugData = attackData.GetAttackDefinition().GetDebugData();
 		if( attackData.GetWeapon() )
 		{
-			hitDebugData.sourceWeaponName = StringToName( TDBID.ToStringDEBUG( ItemID.GetTDBID( attackData.GetWeapon().GetItemID() ) ) );
+			entityIDString = EntityID.ToDebugStringDecimal( attackData.GetWeapon().GetEntityID() );
+			hitDebugData.sourceWeaponName = StringToName( ( TDBID.ToStringDEBUG( ItemID.GetTDBID( attackData.GetWeapon().GetItemID() ) ) + " | " ) + entityIDString );
 			if( hitDebugData.sourceWeaponName == '' )
 			{
-				hitDebugData.sourceWeaponName = '[MISSING NAME]';
+				hitDebugData.sourceWeaponName = StringToName( "[Unkown] " + entityIDString );
 			}
 		}
 		hitDebugData.sourceAttackName = StringToName( TDBID.ToStringDEBUG( attackData.GetAttackDefinition().GetRecord().GetID() ) );
@@ -239,7 +259,7 @@ import final class DamageSystem extends IDamageSystem
 			calculatedDamage.value = calculatedDamages[ i ];
 			hitDebugData.calculatedDamages.PushBack( calculatedDamage );
 		}
-		hitDebugData.hitType = StringToName( EnumValueToString( "gameeventsHitEventType", ( ( Int64 )( attackData.GetAttackType() ) ) ) );
+		hitDebugData.hitType = StringToName( EnumValueToString( "gamedataAttackType", ( ( Int64 )( attackData.GetAttackType() ) ) ) );
 		for( i = 0; i < flags.Size(); i += 1 )
 		{
 			hitFlagEnums += EnumValueToString( "hitFlag", ( ( Int64 )( flags[ i ].flag ) ) );
@@ -268,7 +288,6 @@ import final class DamageSystem extends IDamageSystem
 
 	private function GatherServerData( hitEvent : gameHitEvent, cache : CacheData, out serverHitData : ServerHitData )
 	{
-		LogAssert( IsServer(), "GatherServerData was called on a client" );
 		if( hitEvent.attackData.HasFlag( hitFlag.DealNoDamage ) )
 		{
 			return;
@@ -286,6 +305,9 @@ import final class DamageSystem extends IDamageSystem
 		var dmgPosition : Vector4;
 		var dmgInfo : DamageInfo;
 		var result : array< DamageInfo >;
+		var player : PlayerPuppet;
+		var breachFinder : BreachFinderComponent;
+		var breachComponent : BreachComponent;
 		hitShapes = hitEvent.hitRepresentationResult.hitShapes;
 		dmgInfo.userData = new DamageInfoUserData;
 		dmgInfo.userData.flags = hitEvent.attackData.GetFlags();
@@ -297,6 +319,22 @@ import final class DamageSystem extends IDamageSystem
 		else
 		{
 			dmgPosition = hitEvent.hitPosition;
+		}
+		if( hitEvent.attackData.HasFlag( hitFlag.BreachHit ) && !( AttackData.IsRangedOrDirectOrThrown( hitEvent.attackData.GetAttackType() ) ) )
+		{
+			player = ( ( PlayerPuppet )( hitEvent.attackData.GetInstigator() ) );
+			if( player )
+			{
+				breachFinder = player.GetBreachFinderComponent();
+				if( breachFinder )
+				{
+					breachComponent = breachFinder.GetTrackedBreachComponent();
+					if( breachComponent )
+					{
+						dmgPosition = breachComponent.GetPosition();
+					}
+				}
+			}
 		}
 		dmgInfo.hitPosition = dmgPosition;
 		dmgInfo.hitType = hitEvent.attackData.GetHitType();
@@ -326,7 +364,7 @@ import final class DamageSystem extends IDamageSystem
 		{
 			finalDmgValue = 0.0;
 		}
-		if( AttackData.IsDoT( hitEvent.attackData.GetAttackType() ) )
+		if( AttackData.IsDoT( hitEvent.attackData ) )
 		{
 			dmgInfo.damageType = hitEvent.attackComputed.GetDominatingDamageType();
 		}
@@ -341,7 +379,6 @@ import final class DamageSystem extends IDamageSystem
 
 	private function ProcessClientHit( serverHitData : ServerHitData )
 	{
-		LogAssert( !( IsServer() ), "ProcessClientHit called on server" );
 		if( serverHitData.instigator && serverHitData.instigator.IsControlledByLocalPeer() )
 		{
 			serverHitData.instigator.DisplayHitUI( serverHitData.damageInfos );
@@ -350,7 +387,6 @@ import final class DamageSystem extends IDamageSystem
 
 	private function ProcessClientKill( serverKillData : ServerKillData )
 	{
-		LogAssert( !( IsServer() ), "ProcessClientKill called on server" );
 		if( serverKillData.killInfo.killerEntity && serverKillData.killInfo.killerEntity.IsControlledByLocalPeer() )
 		{
 			serverKillData.killInfo.killerEntity.DisplayKillUI( serverKillData.killInfo );
@@ -364,8 +400,6 @@ import final class DamageSystem extends IDamageSystem
 		CacheLocalVars( hitEvent, cache );
 		if( GetDamageSystemLogFlags() & damageSystemLogFlags.GENERAL )
 		{
-			LogDamage( "" );
-			LogDamage( ( ( ( "  --== Starting damage processing from " + hitEvent.attackData.GetSource().GetDisplayName() ) + " to " ) + hitEvent.target.GetDisplayName() ) + " ==--" );
 		}
 		ModifyHitFlagsForPlayer( hitEvent, cache );
 		if( CheckForQuickExit( hitEvent, cache ) )
@@ -394,7 +428,7 @@ import final class DamageSystem extends IDamageSystem
 			if( weaponObject.IsRanged() && !( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) ) )
 			{
 				statsSystem = GameInstance.GetStatsSystem( hitEvent.attackData.GetSource().GetGame() );
-				projectilesPerShot = statsSystem.GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.ProjectilesPerShot );
+				projectilesPerShot = statsSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.ProjectilesPerShot );
 				if( projectilesPerShot > 0.0 )
 				{
 					hitEvent.attackComputed.MultAttackValue( 1.0 / projectilesPerShot );
@@ -426,20 +460,107 @@ import final class DamageSystem extends IDamageSystem
 		}
 		ProcessDamageReduction( hitEvent );
 		ProcessLocalizedDamage( hitEvent );
-		ProcessFinisher( hitEvent );
 		ProcessInstantKill( hitEvent );
 		ProcessDodge( hitEvent );
 		ProcessEvasion( hitEvent );
 		ProcessMitigation( hitEvent );
 		ProcessPlayerIncomingDamageMultiplier( hitEvent );
+		PreProcessVehicleTarget( hitEvent );
 	}
 
 	private function ProcessDamageReduction( hitEvent : gameHitEvent )
 	{
+		var statsSystem : StatsSystem;
+		var target : GameObject;
+		var instigatorPuppet : ScriptedPuppet;
+		var attackType : gamedataAttackType;
+		var instigatorNpcType : gamedataNPCType;
+		var resistance : Float;
+		var attackValues : array< Float >;
+		var i : Int32;
+		var damageType : gamedataDamageType;
+		target = hitEvent.target;
+		instigatorPuppet = ( ( ScriptedPuppet )( hitEvent.attackData.GetInstigator() ) );
+		attackType = hitEvent.attackData.GetAttackType();
+		statsSystem = GameInstance.GetStatsSystem( target.GetGame() );
 		if( hitEvent.attackData.HasFlag( hitFlag.ReduceDamage ) )
 		{
 			hitEvent.attackComputed.MultAttackValue( 0.1 );
 		}
+		if( StatusEffectSystem.ObjectHasStatusEffectOfType( instigatorPuppet, gamedataStatusEffectType.Poisoned ) && ( instigatorPuppet != target ) )
+		{
+			hitEvent.attackComputed.MultAttackValue( 1.0 - statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.PercentDamageReductionFromPoisonedEnemies ) );
+		}
+		if( AttackData.IsExplosion( attackType ) || hitEvent.attackData.HasFlag( hitFlag.BreachExplosion ) )
+		{
+			resistance = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.ExplosionResistance ) * 0.01;
+			if( resistance != 0.0 )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - resistance );
+			}
+		}
+		if( AttackData.IsMelee( attackType ) )
+		{
+			resistance = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.MeleeResistance ) * 0.01;
+			if( resistance != 0.0 )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - resistance );
+			}
+		}
+		if( AttackData.IsHack( attackType ) )
+		{
+			resistance = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.QuickhackResistance ) * 0.01;
+			if( resistance != 0.0 )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - resistance );
+			}
+		}
+		if( AttackData.IsDoT( hitEvent.attackData ) )
+		{
+			resistance = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.DamageOverTimeResistance ) * 0.01;
+			if( resistance != 0.0 )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - resistance );
+			}
+		}
+		if( instigatorPuppet )
+		{
+			if( instigatorPuppet.GetNPCRarity() == gamedataNPCRarity.Boss || instigatorPuppet.GetNPCRarity() == gamedataNPCRarity.MaxTac )
+			{
+				resistance = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.BossResistance ) * 0.01;
+				if( resistance != 0.0 )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.0 - resistance );
+				}
+			}
+			instigatorNpcType = instigatorPuppet.GetNPCType();
+			if( ( instigatorNpcType == gamedataNPCType.Drone || instigatorNpcType == gamedataNPCType.Android ) || instigatorNpcType == gamedataNPCType.Mech )
+			{
+				resistance = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.MechResistance ) * 0.01;
+				if( resistance != 0.0 )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.0 - resistance );
+				}
+			}
+		}
+		if( AttackData.IsRangedOnly( attackType ) )
+		{
+			return;
+		}
+		attackValues = hitEvent.attackComputed.GetAttackValues();
+		for( i = 0; i < attackValues.Size(); i += 1 )
+		{
+			if( attackValues[ i ] > 0.0 )
+			{
+				damageType = ( ( gamedataDamageType )( i ) );
+				if( damageType != gamedataDamageType.Physical )
+				{
+					resistance = statsSystem.GetStatValue( target.GetEntityID(), RPGManager.GetResistanceTypeFromDamageType( damageType ) ) * 0.01;
+					attackValues[ i ] = MaxF( attackValues[ i ] * ( 1.0 - resistance ), 1.0 );
+				}
+			}
+		}
+		hitEvent.attackComputed.SetAttackValues( attackValues );
 	}
 
 	private function ProcessLocalizedDamage( hitEvent : gameHitEvent )
@@ -464,6 +585,10 @@ import final class DamageSystem extends IDamageSystem
 		}
 		if( !( hitUserData ) )
 		{
+			if( ( ( WeakspotObject )( hitEvent.target ) ) )
+			{
+				BreachFinderComponent.TryProcessBreachHit( hitEvent, false );
+			}
 			return;
 		}
 		if( hitEvent.attackData.HasFlag( hitFlag.DamageNullified ) )
@@ -474,7 +599,7 @@ import final class DamageSystem extends IDamageSystem
 		{
 			hitEvent.attackData.AddFlag( hitFlag.WeakspotHit, 'ProcessLocalizedDamage' );
 		}
-		if( ( AttackData.IsBullet( hitEvent.attackData.GetAttackType() ) || AttackData.IsThrown( hitEvent.attackData.GetAttackType() ) ) && HitShapeUserDataBase.IsHitReactionZoneHead( hitUserData ) )
+		if( AttackData.IsRangedOrDirectOrThrown( hitEvent.attackData.GetAttackType() ) && HitShapeUserDataBase.IsHitReactionZoneHead( hitUserData ) )
 		{
 			GameInstance.GetTelemetrySystem( hitEvent.target.GetGame() ).LogHeadshotGGP( 1 );
 			multValue = GetHeadshotDamageModifier( GameInstance.GetStatsSystem( hitEvent.target.GetGame() ), hitEvent.attackData );
@@ -484,166 +609,16 @@ import final class DamageSystem extends IDamageSystem
 				hitEvent.attackData.AddFlag( hitFlag.Headshot, 'ProcessLocalizedDamage' );
 			}
 		}
+		BreachFinderComponent.TryProcessBreachHit( hitEvent, hitEvent.attackData.HasFlag( hitFlag.Headshot ) );
 		hitShapeDamageMod = HitShapeUserDataBase.GetHitShapeDamageMod( hitUserData );
 		if( hitShapeDamageMod != 0.0 )
 		{
 			hitEvent.attackComputed.MultAttackValue( hitShapeDamageMod );
 		}
-		multValue = DamageSystemHelper.GetLocalizedDamageMultiplier( hitUserData.m_hitShapeType );
-		hitEvent.attackComputed.MultAttackValue( multValue );
-	}
-
-	private function ProcessFinisher( hitEvent : gameHitEvent )
-	{
-		var attackData : AttackData;
-		var targetPuppet : weak< ScriptedPuppet >;
-		var weapon : WeaponObject;
-		var weaponRecord : Item_Record;
-		var tags : array< CName >;
-		var broadcaster : StimBroadcasterComponent;
-		var interactonsBlackboard : IBlackboard;
-		var interactionData : UIInteractionsDef;
-		var choiceData : DialogChoiceHubs;
-		var gameInstance : GameInstance;
-		var vecToTarget : Vector4;
-		attackData = hitEvent.attackData;
-		vecToTarget = hitEvent.target.GetWorldPosition() - attackData.GetInstigator().GetWorldPosition();
-		if( AbsF( vecToTarget.Z ) > 0.30000001 )
+		if( hitUserData.m_hitShapeType == EHitShapeType.None )
 		{
-			return;
+			hitEvent.attackComputed.MultAttackValue( 0.0 );
 		}
-		weapon = attackData.GetWeapon();
-		gameInstance = GetGameInstance();
-		if( hitEvent.projectionPipeline )
-		{
-			return;
-		}
-		if( !( weapon ) )
-		{
-			return;
-		}
-		weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
-		if( attackData.HasFlag( hitFlag.DoNotTriggerFinisher ) || attackData.HasFlag( hitFlag.Nonlethal ) )
-		{
-			return;
-		}
-		if( !( attackData.GetInstigator().IsPlayer() ) )
-		{
-			return;
-		}
-		if( StatusEffectSystem.ObjectHasStatusEffect( attackData.GetInstigator(), T"GameplayRestriction.FistFight" ) )
-		{
-			return;
-		}
-		if( attackData.GetInstigator().GetAttitudeTowards( hitEvent.target ) == EAIAttitude.AIA_Friendly )
-		{
-			return;
-		}
-		tags = weaponRecord.Tags();
-		if( !( tags.Contains( 'FinisherFront' ) ) && !( tags.Contains( 'FinisherBack' ) ) )
-		{
-			return;
-		}
-		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
-		if( !( targetPuppet ) )
-		{
-			return;
-		}
-		if( targetPuppet.IsCrowd() || targetPuppet.IsCharacterCivilian() )
-		{
-			return;
-		}
-		if( !( ScriptedPuppet.IsActive( targetPuppet ) ) )
-		{
-			return;
-		}
-		if( StatusEffectSystem.ObjectHasStatusEffect( targetPuppet, T"GameplayRestriction.FistFight" ) )
-		{
-			return;
-		}
-		if( GameInstance.GetGodModeSystem( gameInstance ).HasGodMode( targetPuppet.GetEntityID(), gameGodModeType.Immortal ) )
-		{
-			return;
-		}
-		if( GameInstance.GetGodModeSystem( gameInstance ).HasGodMode( targetPuppet.GetEntityID(), gameGodModeType.Invulnerable ) )
-		{
-			return;
-		}
-		if( targetPuppet.IsMassive() )
-		{
-			return;
-		}
-		if( targetPuppet.GetPuppetRarity().Type() == gamedataNPCRarity.Boss && !( targetPuppet.IsCharacterCyberpsycho() ) )
-		{
-			return;
-		}
-		if( targetPuppet.GetNPCType() != gamedataNPCType.Human )
-		{
-			return;
-		}
-		if( attackData.WasBlocked() || attackData.WasDeflected() )
-		{
-			return;
-		}
-		if( !( AttackData.IsStrongMelee( attackData.GetAttackType() ) ) )
-		{
-			return;
-		}
-		interactonsBlackboard = GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().UIInteractions );
-		interactionData = GetAllBlackboardDefs().UIInteractions;
-		choiceData = ( ( DialogChoiceHubs )( interactonsBlackboard.GetVariant( interactionData.DialogChoiceHubs ) ) );
-		if( choiceData.choiceHubs.Size() > 0 )
-		{
-			return;
-		}
-		if( ( StatPoolsManager.SimulateDamageDeal( hitEvent ) || CanTriggerMeleeLeapFinisher( attackData, hitEvent ) ) && PlayFinisherGameEffect( hitEvent, tags.Contains( 'FinisherFront' ), tags.Contains( 'FinisherBack' ) ) )
-		{
-			attackData.AddFlag( hitFlag.DealNoDamage, 'Finisher' );
-			attackData.AddFlag( hitFlag.FinisherTriggered, 'Finisher' );
-			broadcaster = targetPuppet.GetStimBroadcasterComponent();
-			if( broadcaster )
-			{
-				broadcaster.TriggerSingleBroadcast( targetPuppet, gamedataStimType.Scream, 10.0 );
-			}
-		}
-	}
-
-	private function CanTriggerMeleeLeapFinisher( attackData : AttackData, hitEvent : gameHitEvent ) : Bool
-	{
-		var psmBlackBoard : IBlackboard;
-		var isMeleeLeap : Bool;
-		var targetPuppet : weak< NPCPuppet >;
-		if( !( RPGManager.HasStatFlag( attackData.GetInstigator(), gamedataStatType.CanMeleeLeapTakedown ) ) )
-		{
-			return false;
-		}
-		if( !( IsPowerLevelDifferentialAcceptable( hitEvent ) ) )
-		{
-			return false;
-		}
-		targetPuppet = ( ( NPCPuppet )( hitEvent.target ) );
-		if( targetPuppet.IsPuppetTargetingPlayer() )
-		{
-			return false;
-		}
-		psmBlackBoard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( attackData.GetInstigator().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
-		isMeleeLeap = psmBlackBoard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.MeleeLeap );
-		if( isMeleeLeap )
-		{
-			return true;
-		}
-		return false;
-	}
-
-	private function IsPowerLevelDifferentialAcceptable( hitEvent : gameHitEvent ) : Bool
-	{
-		var powDifference : EPowerDifferential;
-		powDifference = RPGManager.CalculatePowerDifferential( hitEvent.target );
-		if( powDifference == EPowerDifferential.IMPOSSIBLE )
-		{
-			return false;
-		}
-		return true;
 	}
 
 	private function ProcessInstantKill( hitEvent : gameHitEvent )
@@ -710,12 +685,11 @@ import final class DamageSystem extends IDamageSystem
 	private function ProcessPlayerIncomingDamageMultiplier( hitEvent : gameHitEvent )
 	{
 		var playerIncomingDamageMultiplier : Float;
-		playerIncomingDamageMultiplier = hitEvent.attackData.GetAttackDefinition().GetRecord().PlayerIncomingDamageMultiplier();
+		playerIncomingDamageMultiplier = hitEvent.attackData.GetAttackDefinition().GetRecord().PlayerIncomingDamageMultiplier() * PreventionSystem.GetDamageToPlayerMultiplier( hitEvent.target.GetGame() );
 		if( ( ( PlayerPuppet )( hitEvent.target ) ) || ScriptedPuppet.IsPlayerCompanion( hitEvent.target ) )
 		{
 			if( playerIncomingDamageMultiplier != 1.0 )
 			{
-				Log( "" );
 			}
 			hitEvent.attackComputed.MultAttackValue( playerIncomingDamageMultiplier );
 		}
@@ -736,13 +710,23 @@ import final class DamageSystem extends IDamageSystem
 			hitEvent.attackData.AddFlag( hitFlag.DealNoDamage, 'invulnerable' );
 			if( cache.logFlags & damageSystemLogFlags.GENERAL )
 			{
-				LogDamage( ( "DamageSystem.InvulnerabilityCheck(): " + hitEvent.target.GetDisplayName() ) + "'s invulnerability reduces damage received to 0" );
 			}
 		}
 		if( GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.IsInvulnerable ) > 0.0 )
 		{
 			hitEvent.attackData.AddFlag( hitFlag.DealNoDamage, 'invulnerable stat flag' );
 		}
+	}
+
+	private function DEBUG_InvulnerabilityCheckForVehicle( hitEvent : gameHitEvent ) : Bool
+	{
+		var targetVehicle : VehicleObject;
+		targetVehicle = ( ( VehicleObject )( hitEvent.target ) );
+		if( targetVehicle )
+		{
+			return VehicleComponent.PlayerPassengerHasGodModeFromCheatSystem( hitEvent.target.GetGame(), hitEvent.target.GetEntityID(), gameGodModeType.Invulnerable );
+		}
+		return false;
 	}
 
 	private function ImmortalityCheck( hitEvent : gameHitEvent, cache : CacheData )
@@ -756,7 +740,6 @@ import final class DamageSystem extends IDamageSystem
 			hitEvent.attackData.AddFlag( hitFlag.ImmortalTarget, 'immortal' );
 			if( cache.logFlags & damageSystemLogFlags.GENERAL )
 			{
-				LogDamage( ( "DamageSystem.ImmortalityCheck(): " + hitEvent.target.GetDisplayName() ) + "'s immortality modifies damage (if drops to 0, it's restored" );
 			}
 		}
 	}
@@ -773,6 +756,25 @@ import final class DamageSystem extends IDamageSystem
 		}
 	}
 
+	private function SendVehicleImpactTelemetryIfValid( hitEvent : gameHitEvent )
+	{
+		var vehicleHitEvent : gameVehicleHitEvent;
+		if( hitEvent.attackComputed.GetAttackValue( gamedataDamageType.Physical ) <= 0.0 )
+		{
+			return;
+		}
+		if( !( hitEvent.attackData.GetInstigator().IsPlayer() ) )
+		{
+			return;
+		}
+		vehicleHitEvent = ( ( gameVehicleHitEvent )( hitEvent ) );
+		if( !( hitEvent.attackData.HasFlag( hitFlag.VehicleImpact ) ) && !( vehicleHitEvent ) )
+		{
+			return;
+		}
+		GameInstance.GetTelemetrySystem( hitEvent.attackData.GetInstigator().GetGame() ).LogPlayerVehicleImpact();
+	}
+
 	private function Process( hitEvent : gameHitEvent, cache : CacheData )
 	{
 		if( hitEvent.attackData.HasFlag( hitFlag.DealNoDamage ) )
@@ -780,12 +782,13 @@ import final class DamageSystem extends IDamageSystem
 			return;
 		}
 		ProcessPlayerFixedPercentageOverride( hitEvent );
-		CalculateSourceModifiers( hitEvent );
+		ProcessDeviceExplosionDamageToTierNPC( hitEvent );
+		CalculateSourceModifiers( hitEvent, cache );
 		CalculateTargetModifiers( hitEvent );
 		CalculateSourceVsTargetModifiers( hitEvent );
 		CalculateGlobalModifiers( hitEvent, cache );
 		ProcessCrowdTarget( hitEvent );
-		ProcessVehicleTarget( hitEvent );
+		ProcessVehicleTarget( hitEvent, cache );
 		ProcessVehicleHit( hitEvent );
 		ProcessRagdollHit( hitEvent );
 		ProcessTurretAttack( hitEvent );
@@ -814,10 +817,22 @@ import final class DamageSystem extends IDamageSystem
 		var terminalVelocityReached : Bool;
 		var isHighFall : Bool;
 		ragdollHitEvent = ( ( gameRagdollHitEvent )( hitEvent ) );
-		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
-		if( !( ragdollHitEvent ) || !( targetPuppet ) )
+		if( !( ragdollHitEvent ) )
 		{
 			return;
+		}
+		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
+		if( !( targetPuppet ) )
+		{
+			return;
+		}
+		if( targetPuppet.IsCrowd() )
+		{
+			if( ( ( NPCPuppet )( targetPuppet ) ).m_shouldBeImmuneToVehicleHit )
+			{
+				hitEvent.attackComputed.SetAttackValue( 0.0 );
+				return;
+			}
 		}
 		targetIsFriendly = GameObject.GetAttitudeTowards( targetPuppet, GameInstance.GetPlayerSystem( targetPuppet.GetGame() ).GetLocalPlayerControlledGameObject() ) == EAIAttitude.AIA_Friendly;
 		if( targetIsFriendly )
@@ -838,7 +853,7 @@ import final class DamageSystem extends IDamageSystem
 			hitEvent.attackComputed.SetAttackValue( targetMaxHealth, gamedataDamageType.Physical );
 			hitEvent.attackData.AddFlag( hitFlag.DeterministicDamage, 'ragdoll_collision' );
 		}
-		else if( RPGManager.CalculatePowerDifferential( targetPuppet ) != EPowerDifferential.IMPOSSIBLE )
+		else if( RPGManager.CalculatePowerDifferential( targetPuppet ) != gameEPowerDifferential.IMPOSSIBLE )
 		{
 			curveDamagePercentage = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'puppet_ragdoll_force_to_damage', ragdollHitEvent.speedDelta, 'ragdoll_speed_to_damage' );
 			heightDeltaMultiplier = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'puppet_ragdoll_force_to_damage', ragdollHitEvent.heightDelta, 'ragdoll_altitude_difference_multiplier' );
@@ -882,7 +897,19 @@ import final class DamageSystem extends IDamageSystem
 		isTurretFriendlyToPlayer = GameObject.GetAttitudeTowards( instigatorTurret, GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) == EAIAttitude.AIA_Friendly;
 		if( isTurretFriendlyToPlayer )
 		{
-			hitEvent.attackComputed.MultAttackValue( 15.0 );
+			hitEvent.attackComputed.MultAttackValue( 0.60000002 );
+		}
+	}
+
+	private function ProcessTurretDamageTakenFromMelee( hitEvent : gameHitEvent )
+	{
+		var targetTurret : SecurityTurret;
+		var attackType : gamedataAttackType;
+		targetTurret = ( ( SecurityTurret )( hitEvent.target ) );
+		attackType = hitEvent.attackData.GetAttackType();
+		if( targetTurret && ( ( AttackData.IsLightMelee( attackType ) || AttackData.IsStrongMelee( attackType ) ) || hitEvent.attackData.HasFlag( hitFlag.BodyPerksMeleeAttack ) ) )
+		{
+			hitEvent.attackComputed.MultAttackValue( 1.20000005 );
 		}
 	}
 
@@ -903,31 +930,36 @@ import final class DamageSystem extends IDamageSystem
 		var damageCap : Float;
 		var reductionProportion : Float;
 		var damages : array< Float >;
-		var protect : Bool;
 		var i : Int32;
+		var difficulty : gameDifficulty;
+		var statsDataSys : StatsDataSystem;
+		var maxPercentDamagePerHit : Float;
 		weapon = ( ( WeaponObject )( hitEvent.attackData.GetWeapon() ) );
 		if( !( weapon ) )
 		{
 			return;
 		}
-		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		if( !( hitEvent.attackData.GetInstigator().IsPlayer() ) && hitEvent.target.IsPlayer() )
 		{
-			if( ( ( ScriptedPuppet )( hitEvent.target ) ).IsCrowd() && weapon.IsMelee() )
+			statsDataSys = GameInstance.GetStatsDataSystem( hitEvent.target.GetGame() );
+			difficulty = statsDataSys.GetDifficulty();
+			switch( difficulty )
 			{
-				protect = true;
+				case gameDifficulty.Story:
+					maxPercentDamagePerHit = TDB.GetFloat( T"Constants.DamageSystem.maxPercentDamagePerHitStory" );
+				break;
+				case gameDifficulty.Easy:
+					maxPercentDamagePerHit = TDB.GetFloat( T"Constants.DamageSystem.maxPercentDamagePerHitEasy" );
+				break;
+				case gameDifficulty.Hard:
+					maxPercentDamagePerHit = TDB.GetFloat( T"Constants.DamageSystem.maxPercentDamagePerHitHard" );
+				break;
+				case gameDifficulty.VeryHard:
+					maxPercentDamagePerHit = TDB.GetFloat( T"Constants.DamageSystem.maxPercentDamagePerHitVeryHard" );
+				break;
 			}
-		}
-		else
-		{
-			if( hitEvent.target.IsPlayer() )
-			{
-				protect = true;
-			}
-		}
-		if( protect )
-		{
 			maxHealth = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.Health );
-			damageCap = ( maxHealth * TweakDBInterface.GetFloat( T"Constants.DamageSystem.maxPercentDamagePerHit", 0.0 ) ) / 100.0;
+			damageCap = ( maxHealth * maxPercentDamagePerHit ) / 100.0;
 			if( hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health ) > damageCap )
 			{
 				reductionProportion = damageCap / hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health );
@@ -948,11 +980,16 @@ import final class DamageSystem extends IDamageSystem
 		var hitFlags : array< String >;
 		var totalDamage : Float;
 		var playerMaxHealth : Float;
-		var overridePlayerDamageFixedPercentage : Float;
 		var numerOfDamageTypes : Float;
+		var overridePlayerDamageFixedPercentage : Float;
+		var isExplosionReductionPerkBought : Bool;
 		var i : Int32;
 		player = ( ( PlayerPuppet )( hitEvent.target ) );
 		if( !( player ) )
+		{
+			return;
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffect( player, T"BaseStatusEffect.DeviceExplosionInvulnerability" ) )
 		{
 			return;
 		}
@@ -984,6 +1021,11 @@ import final class DamageSystem extends IDamageSystem
 				}
 				playerMaxHealth = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.Health );
 				overridePlayerDamageFixedPercentage = TweakDBInterface.GetFloat( attackRecord.GetID() + T".overridePlayerDamageFixedPercentage", 0.2 );
+				isExplosionReductionPerkBought = PlayerDevelopmentSystem.GetData( player ).IsNewPerkBought( gamedataNewPerkType.Tech_Left_Perk_3_01 ) == 1;
+				if( isExplosionReductionPerkBought )
+				{
+					overridePlayerDamageFixedPercentage *= 0.5;
+				}
 				totalDamage = ( overridePlayerDamageFixedPercentage * playerMaxHealth ) / numerOfDamageTypes;
 				if( hitEvent.attackComputed.GetAttackValue( gamedataDamageType.Physical ) > 0.0 )
 				{
@@ -1003,6 +1045,85 @@ import final class DamageSystem extends IDamageSystem
 				}
 			}
 		}
+		if( hitFlags.Contains( "DeviceExplosionAttack" ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( player, T"BaseStatusEffect.DeviceExplosionInvulnerability", player.GetEntityID() );
+		}
+	}
+
+	private function ProcessDeviceExplosionDamageToTierNPC( hitEvent : gameHitEvent )
+	{
+		var targetNpcRarity : Float;
+		var npcRarityMultiplier : Float;
+		var npcHealth : Float;
+		var attackRecord : Attack_GameEffect_Record;
+		var totalDamage : Float;
+		var hitFlags : array< String >;
+		var npc : weak< ScriptedPuppet >;
+		var i : Int32;
+		npc = ( ( NPCPuppet )( hitEvent.target ) );
+		if( !( npc ) )
+		{
+			return;
+		}
+		if( !( hitEvent.attackData.GetAttackType() == gamedataAttackType.Explosion ) )
+		{
+			return;
+		}
+		attackRecord = ( ( Attack_GameEffect_Record )( hitEvent.attackData.GetAttackDefinition().GetRecord() ) );
+		hitFlags = attackRecord.HitFlags();
+		for( i = 0; i < hitFlags.Size(); i += 1 )
+		{
+			if( hitFlags[ i ] == "OverrideNPCDamageBasedOnTiers" )
+			{
+				npcHealth = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( npc.GetEntityID(), gamedataStatType.Health );
+				targetNpcRarity = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( npc.GetEntityID(), gamedataStatType.NPCRarity );
+				switch( targetNpcRarity )
+				{
+					case 1.0:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".trashNPCMaxHPDamage", 0.2 );
+						break;
+					}
+					case 2.0:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".weakNPCMaxHPDamage", 0.2 );
+						break;
+					}
+					case 3.0:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".normalNPCMaxHPDamage", 0.2 );
+						break;
+					}
+					case 4.0:
+					case 4.5:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".rareNPCMaxHPDamage", 0.2 );
+						break;
+					}
+					;
+					case 5.0:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".eliteNPCMaxHPDamage", 0.2 );
+						break;
+					}
+					case 6.0:
+					case 7.0:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".bossNPCMaxHPDamage", 0.02 );
+						break;
+					}
+					;
+					default:
+					{
+						npcRarityMultiplier = TweakDBInterface.GetFloat( attackRecord.GetID() + T".normalNPCMaxHPDamage", 0.02 );
+						break;
+					}
+				}
+				totalDamage = npcHealth * npcRarityMultiplier;
+				hitEvent.attackComputed.SetAttackValue( totalDamage, gamedataDamageType.Thermal );
+			}
+		}
 	}
 
 	private function ProcessQuickHackModifiers( hitEvent : gameHitEvent )
@@ -1013,11 +1134,16 @@ import final class DamageSystem extends IDamageSystem
 		var attackRecord : Attack_GameEffect_Record;
 		var hitFlags : array< String >;
 		var i : Int32;
+		var j : Int32;
 		var damageMultiplier : Float;
-		var currentHealthPercentage : Float;
+		var tempValue : Float;
+		var currentMemory : Float;
+		var maxMemory : Float;
 		var statusEffectSystem : StatusEffectSystem;
+		var statusEffects : array< StatusEffect >;
 		var statValue : Float;
 		var attackType : gamedataAttackType;
+		var attackValues : array< Float >;
 		statusEffectSystem = GameInstance.GetStatusEffectSystem( GetGameInstance() );
 		player = ( ( PlayerPuppet )( hitEvent.attackData.GetInstigator() ) );
 		if( !( player ) )
@@ -1028,13 +1154,25 @@ import final class DamageSystem extends IDamageSystem
 		{
 			return;
 		}
-		if( hitEvent.attackData.GetHitType() == gameuiHitType.CriticalHit )
+		if( hitEvent.attackData.HasFlag( hitFlag.CriticalHit ) )
 		{
 			attackType = hitEvent.attackData.GetAttackType();
 			if( ( ( GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.ShortCircuitOnCriticalHit ) == 1.0 ) && !( statusEffectSystem.HasStatusEffectWithTag( hitEvent.target.GetEntityID(), 'Overload' ) ) ) && ( ( ( ( ( ( attackType == gamedataAttackType.ChargedWhipAttack || attackType == gamedataAttackType.Melee ) || attackType == gamedataAttackType.QuickMelee ) || attackType == gamedataAttackType.Ranged ) || attackType == gamedataAttackType.StrongMelee ) || attackType == gamedataAttackType.Thrown ) || attackType == gamedataAttackType.WhipAttack ) )
 			{
 				statusEffectSystem.ApplyStatusEffect( hitEvent.target.GetEntityID(), T"BaseStatusEffect.Overload", GameObject.GetTDBID( player ), player.GetEntityID(), 1, hitEvent.hitDirection );
 			}
+		}
+		if( statusEffectSystem.HasStatusEffect( hitEvent.target.GetEntityID(), T"BaseStatusEffect.OverheatLevel4" ) && hitEvent.attackData.GetAttackType() != gamedataAttackType.Hack )
+		{
+			attackValues = hitEvent.attackComputed.GetAttackValues();
+			attackValues[ ( ( Int32 )( gamedataDamageType.Thermal ) ) ] += ( attackValues[ ( ( Int32 )( gamedataDamageType.Physical ) ) ] * TweakDBInterface.GetFloat( T"Items.OverheatLvl4Program.bonusThermalDamageFactor", 0.0 ) );
+			hitEvent.attackComputed.SetAttackValues( attackValues );
+		}
+		if( statusEffectSystem.HasStatusEffect( hitEvent.target.GetEntityID(), T"BaseStatusEffect.OverheatLevel4PlusPlus" ) && hitEvent.attackData.GetAttackType() != gamedataAttackType.Hack )
+		{
+			attackValues = hitEvent.attackComputed.GetAttackValues();
+			attackValues[ ( ( Int32 )( gamedataDamageType.Thermal ) ) ] += ( attackValues[ ( ( Int32 )( gamedataDamageType.Physical ) ) ] * TweakDBInterface.GetFloat( T"Items.OverheatLvl4PlusPlusProgram.bonusThermalDamageFactor", 0.0 ) );
+			hitEvent.attackComputed.SetAttackValues( attackValues );
 		}
 		if( hitEvent.attackData.GetAttackType() != gamedataAttackType.Hack )
 		{
@@ -1044,16 +1182,9 @@ import final class DamageSystem extends IDamageSystem
 		attackRecord = ( ( Attack_GameEffect_Record )( hitEvent.attackData.GetAttackDefinition().GetRecord() ) );
 		hitFlags = attackRecord.HitFlags();
 		targetNpcType = ( ( ScriptedPuppet )( hitEvent.target ) ).GetNPCType();
-		targetNpcRarity = ( ( ScriptedPuppet )( hitEvent.target ) ).GetPuppetRarity().Type();
+		targetNpcRarity = ( ( ScriptedPuppet )( hitEvent.target ) ).GetNPCRarity();
 		for( i = 0; i < hitFlags.Size(); i += 1 )
 		{
-			if( hitFlags[ i ] == "MechanicalDamageBonus" )
-			{
-				if( ( targetNpcType == gamedataNPCType.Drone || targetNpcType == gamedataNPCType.Android ) || targetNpcType == gamedataNPCType.Mech )
-				{
-					damageMultiplier += TweakDBInterface.GetFloat( attackRecord.GetID() + T".mechanicalDamageBonusMultiplier", 1.0 );
-				}
-			}
 			if( hitFlags[ i ] == "FleshDamageBonus" )
 			{
 				if( targetNpcType == gamedataNPCType.Human )
@@ -1061,26 +1192,58 @@ import final class DamageSystem extends IDamageSystem
 					damageMultiplier += TweakDBInterface.GetFloat( attackRecord.GetID() + T".fleshDamageBonusMultiplier", 1.0 );
 				}
 			}
-			if( hitFlags[ i ] == "DamageBasedOnMissingHealthBonus" )
+			if( ( hitEvent.attackData.GetInstigator() == player ) && hitFlags[ i ] == "DamageBasedOnMissingMemoryBonus" )
 			{
-				currentHealthPercentage = GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() ).GetStatPoolValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Health, true );
-				currentHealthPercentage = currentHealthPercentage / 100.0;
-				if( currentHealthPercentage < 1.0 )
+				currentMemory = GameInstance.GetStatPoolsSystem( player.GetGame() ).GetStatPoolValue( player.GetEntityID(), gamedataStatPoolType.Memory, false );
+				maxMemory = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.Memory );
+				if( currentMemory < maxMemory )
 				{
-					damageMultiplier += ( ( 1.0 - currentHealthPercentage ) * TweakDBInterface.GetFloat( attackRecord.GetID() + T".damageBasedOnMissingHealthBonusMultiplier", 2.0 ) );
+					tempValue = maxMemory - currentMemory;
+					if( statusEffectSystem.HasStatusEffect( player.GetEntityID(), T"BaseStatusEffect.Intelligence_Central_Milestone_3_Overclock_Buff" ) )
+					{
+						tempValue *= ( TDB.GetFloat( attackRecord.GetID() + T".damageBasedOnMissingMemoryBonusMultiplier" ) * 2.0 );
+					}
+					else
+					{
+						tempValue *= TDB.GetFloat( attackRecord.GetID() + T".damageBasedOnMissingMemoryBonusMultiplier" );
+					}
+					damageMultiplier += MinF( tempValue, TDB.GetFloat( attackRecord.GetID() + T".damageBasedOnMissingMemoryBonusMax" ) );
 				}
+			}
+			if( hitFlags[ i ] == "CyberwareMalfunctionDamageBonus" )
+			{
+				tempValue = 0.0;
+				statusEffectSystem.GetAppliedEffectsWithTag( hitEvent.target.GetEntityID(), 'CyberwareMalfunction', statusEffects );
+				for( j = 0; j < statusEffects.Size(); j += 1 )
+				{
+					tempValue += ( ( Float )( statusEffects[ j ].GetStackCount() ) );
+				}
+				tempValue *= TweakDBInterface.GetFloat( attackRecord.GetID() + T".cyberwareMalfunctionDamageBonus", 0.0 );
+				damageMultiplier += tempValue;
 			}
 			if( hitFlags[ i ] == "NonEliteDamageBonus" )
 			{
-				if( ( targetNpcRarity == gamedataNPCRarity.Normal || targetNpcRarity == gamedataNPCRarity.Trash ) || targetNpcRarity == gamedataNPCRarity.Weak )
+				if( ( ( ( targetNpcRarity == gamedataNPCRarity.Normal || targetNpcRarity == gamedataNPCRarity.Trash ) || targetNpcRarity == gamedataNPCRarity.Weak ) || targetNpcRarity == gamedataNPCRarity.Rare ) || targetNpcRarity == gamedataNPCRarity.Officer )
 				{
-					damageMultiplier += TweakDBInterface.GetFloat( attackRecord.GetID() + T".nonEliteDamageBonusMultiplier", 0.5 );
+					damageMultiplier += TweakDBInterface.GetFloat( attackRecord.GetID() + T".nonEliteDamageBonusMultiplier", 0.0 );
 				}
+			}
+			if( hitFlags[ i ] == "DamageOverTime" )
+			{
+				damageMultiplier += GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.QuickhackDamageOverTimeBonusMultiplier );
 			}
 		}
 		if( StatusEffectSystem.ObjectHasStatusEffect( hitEvent.target, T"MinigameAction.VulnerabilityMinigame" ) )
 		{
 			statValue = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.QuickhackExtraDamageMultiplier );
+			if( statValue > 0.0 )
+			{
+				damageMultiplier += statValue;
+			}
+		}
+		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		{
+			statValue = GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.QuickhackDamageBonusMultiplier );
 			if( statValue > 0.0 )
 			{
 				damageMultiplier += statValue;
@@ -1092,79 +1255,195 @@ import final class DamageSystem extends IDamageSystem
 		}
 	}
 
-	private function ProcessVehicleTarget( hitEvent : gameHitEvent )
+	private function PreProcessVehicleTarget( hitEvent : gameHitEvent )
 	{
+		var hitComponentName : CName;
 		var targetVehicle : VehicleObject;
+		targetVehicle = ( ( VehicleObject )( hitEvent.target ) );
+		if( targetVehicle )
+		{
+			hitComponentName = hitEvent.hitComponent.GetName();
+			if( targetVehicle.ShouldDamageSystemIgnoreHit( hitComponentName ) )
+			{
+				hitEvent.attackData.AddFlag( hitFlag.DealNoDamage, 'DamageSystemIgnoreHit' );
+			}
+			hitEvent.attackData.AddFlag( hitFlag.ForceNoCrit, 'PreProcessVehicleTarget' );
+		}
+	}
+
+	private function ProcessVehicleTarget( hitEvent : gameHitEvent, cache : CacheData )
+	{
+		var vehicleDamageQualityDivisor, minimumHealthPercent : Float;
+		var targetVehicle : VehicleObject;
+		var statsSystem : StatsSystem;
 		var weaponType : gamedataItemType;
 		var multiplier : Float;
-		var impactForce : Float;
-		var maxDamage : Float;
 		var godModeSystem : GodModeSystem;
-		var currentHealth : Float;
-		var maxHealth : Float;
-		var threshold : Float;
-		var statPoolMod : PoolValueModifier_Record;
+		var weaponObject : WeaponObject;
+		var instigator : GameObject;
 		multiplier = 1.0;
 		if( hitEvent.projectionPipeline )
 		{
 			return;
 		}
-		godModeSystem = GameInstance.GetGodModeSystem( hitEvent.target.GetGame() );
 		targetVehicle = ( ( VehicleObject )( hitEvent.target ) );
+		weaponObject = hitEvent.attackData.GetWeapon();
 		if( targetVehicle )
 		{
-			hitEvent.attackData.AddFlag( hitFlag.DontShowDamageFloater, 'target is vehicle' );
-			if( hitEvent.attackData.HasFlag( hitFlag.VehicleImpact ) )
+			if( ( targetVehicle.IsPlayerMounted() || targetVehicle.IsCrowdVehicle() ) || !( targetVehicle.HasPassengers() ) )
 			{
-				impactForce = hitEvent.attackData.GetVehicleImpactForce();
-				multiplier = impactForce * 1.29999995;
+				hitEvent.attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Target is either the player vehicle, a crowd vehicle or does not have any passengers' );
+			}
+			if( targetVehicle.GetVehicleComponent().IsVehicleImmuneInDecay() )
+			{
+				hitEvent.attackComputed.MultAttackValue( 0.0 );
+				hitEvent.attackData.AddFlag( hitFlag.DealNoDamage, 'VehicleInDecayState' );
+				return;
+			}
+			instigator = hitEvent.attackData.GetInstigator();
+			if( hitEvent.attackData.HasFlag( hitFlag.PlayerWallImpact ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 0.0 );
+				hitEvent.attackData.AddFlag( hitFlag.DealNoDamage, 'PlayerWallImpact' );
+				return;
+			}
+			else if( hitEvent.attackData.HasFlag( hitFlag.VehicleImpact ) )
+			{
+				hitEvent.attackComputed.SetAttackValues( hitEvent.attackComputed.GetOriginalAttackValues() );
+				multiplier = hitEvent.attackData.GetVehicleImpactForce();
+				if( targetVehicle.IsPlayerDriver() )
+				{
+					if( PlayerDevelopmentSystem.GetData( VehicleComponent.GetDriver( targetVehicle.GetGame(), targetVehicle, targetVehicle.GetEntityID() ) ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Body_Right_Milestone_1 ) )
+					{
+						multiplier *= 0.5;
+					}
+				}
+				else if( instigator.IsPlayer() && hitEvent.attackData.HasFlag( hitFlag.VehicleImpactWithPlayer ) )
+				{
+					if( PlayerDevelopmentSystem.GetData( instigator ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Body_Right_Milestone_1 ) )
+					{
+						multiplier *= 1.5;
+					}
+				}
 			}
 			else
 			{
-				hitEvent.attackComputed.MultAttackValue( 0.0 );
-				weaponType = RPGManager.GetItemRecord( hitEvent.attackData.GetWeapon().GetItemID() ).ItemType().Type();
-				if( AttackData.IsExplosion( hitEvent.attackData.GetAttackType() ) )
+				weaponType = RPGManager.GetItemRecord( weaponObject.GetItemID() ).ItemType().Type();
+				statsSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
+				if( !( IsOverridenExplosionVsVehicleHit( hitEvent ) ) )
 				{
-					hitEvent.attackComputed.SetAttackValue( 50.0, gamedataDamageType.Physical );
-					if( weaponType == gamedataItemType.Wea_HeavyMachineGun && !( GameInstance.GetTransactionSystem( hitEvent.target.GetGame() ).HasTag( hitEvent.attackData.GetInstigator(), 'PanzerWeapon', hitEvent.attackData.GetWeapon().GetItemID() ) ) )
+					if( !( targetVehicle.IsPlayerMounted() ) && instigator.IsPlayer() )
 					{
-						hitEvent.attackComputed.SetAttackValue( hitEvent.attackComputed.GetAttackValue( gamedataDamageType.Physical ) / 4.0, gamedataDamageType.Physical );
-					}
-				}
-				else
-				{
-					if( GameInstance.GetTransactionSystem( hitEvent.target.GetGame() ).HasTag( hitEvent.attackData.GetInstigator(), 'PanzerWeapon', hitEvent.attackData.GetWeapon().GetItemID() ) )
-					{
-						hitEvent.attackComputed.SetAttackValue( 20.0, gamedataDamageType.Physical );
+						multiplier *= ( 1.0 + statsSystem.GetStatValue( instigator.GetEntityID(), gamedataStatType.VehicleDamagePercentBonus ) );
+						multiplier *= ( 1.0 + statsSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.WeaponVehicleDamagePercentBonus ) );
+						vehicleDamageQualityDivisor = statsSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.VehicleDamageQualityDivisor );
+						if( vehicleDamageQualityDivisor > 0.0 )
+						{
+							multiplier /= vehicleDamageQualityDivisor;
+						}
+						multiplier *= GetVehiclePerksDamageMultiplier( hitEvent.attackData );
 					}
 					else
 					{
-						hitEvent.attackComputed.SetAttackValue( 1.0, gamedataDamageType.Physical );
-						switch( weaponType )
+						hitEvent.attackComputed.MultAttackValue( 0.0 );
+						if( targetVehicle.IsPlayerMounted() )
 						{
-							case gamedataItemType.Wea_HeavyMachineGun:
-								multiplier = 2.0;
-							break;
-							default:
-								break;
+							if( targetVehicle.TrySetHitCooldown() )
+							{
+								hitEvent.attackComputed.SetAttackValue( 15.0, gamedataDamageType.Physical );
+							}
+							else
+							{
+								hitEvent.attackComputed.SetAttackValue( 1.0, gamedataDamageType.Physical );
+							}
 						}
+						else
+						{
+							hitEvent.attackComputed.SetAttackValue( 4.0, gamedataDamageType.Physical );
+						}
+					}
+					switch( weaponType )
+					{
+						case gamedataItemType.Wea_HeavyMachineGun:
+							multiplier *= 1.29999995;
+						break;
+						default:
+							break;
 					}
 				}
 			}
-			hitEvent.attackComputed.MultAttackValue( multiplier, gamedataDamageType.Physical );
+			hitEvent.attackComputed.MultAttackValue( multiplier );
+			minimumHealthPercent = statsSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.VehicleMinHealthPercentWhenDamaged );
+			if( hitEvent.attackData.GetAttackType() == gamedataAttackType.QuickMelee )
+			{
+				minimumHealthPercent = MaxF( minimumHealthPercent, TDB.GetFloat( T"player.quickMelee.quickMeleeVehicleMinHealthPercentWhenDamaged", 20.0 ) );
+			}
+			godModeSystem = GameInstance.GetGodModeSystem( hitEvent.target.GetGame() );
 			if( godModeSystem.HasGodMode( hitEvent.target.GetEntityID(), gameGodModeType.Immortal ) )
 			{
-				maxHealth = GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() ).GetStatPoolMaxPointValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Health );
-				currentHealth = GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() ).GetStatPoolValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Health, false );
-				statPoolMod = TweakDBInterface.GetPoolValueModifierRecord( T"BaseStatPools.VehicleHealthDecay" );
-				threshold = ( statPoolMod.RangeEnd() + 1.0 ) / 100.0;
-				maxDamage = currentHealth - ( maxHealth * threshold );
-				if( hitEvent.attackComputed.GetAttackValue( gamedataDamageType.Physical ) > maxDamage )
-				{
-					hitEvent.attackComputed.SetAttackValue( maxDamage, gamedataDamageType.Physical );
-				}
+				minimumHealthPercent = MaxF( minimumHealthPercent, targetVehicle.GetVehicleComponent().GetVehicleDecayThreshold() + 1.0 );
+			}
+			if( minimumHealthPercent > 0.0 )
+			{
+				hitEvent.attackData.SetMinimumHealthPercent( minimumHealthPercent );
 			}
 		}
+	}
+
+	private function CalculateVehicleTargetRangedDamage( weaponObject : WeaponObject, chargeDamageMultiplier : Float, statSystem : StatsSystem ) : Float
+	{
+		var multiplier : Float;
+		var weaponMultiplier : Float;
+		var desiredWeaponDPS : Float;
+		multiplier = 1.0;
+		desiredWeaponDPS = 90.0;
+		weaponMultiplier = statSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.CycleTimeBase );
+		weaponMultiplier /= statSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.ProjectilesPerShot );
+		multiplier *= ( desiredWeaponDPS * weaponMultiplier );
+		if( chargeDamageMultiplier > 0.0 )
+		{
+			multiplier *= chargeDamageMultiplier;
+		}
+		return multiplier;
+	}
+
+	private function CalculateVehicleTargetMeleeDamage( weaponObject : WeaponObject, attackType : gamedataAttackType, isBodySlam : Bool, statSystem : StatsSystem ) : Float
+	{
+		var multiplier : Float;
+		var weaponMultiplier : Float;
+		var desiredWeaponDPS : Float;
+		var strongMeleeMultiplier : Float;
+		var bodySlamMultiplier : Float;
+		var physicalImpulse : Float;
+		multiplier = 1.0;
+		physicalImpulse = 1.0;
+		desiredWeaponDPS = 24.0;
+		strongMeleeMultiplier = 2.5;
+		bodySlamMultiplier = 0.30000001;
+		if( attackType == gamedataAttackType.QuickMelee )
+		{
+			multiplier = desiredWeaponDPS;
+			physicalImpulse = 10.0;
+		}
+		else
+		{
+			if( isBodySlam )
+			{
+				multiplier = desiredWeaponDPS * bodySlamMultiplier;
+			}
+			else
+			{
+				weaponMultiplier = statSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.AttacksPerSecondBase );
+				multiplier *= ( desiredWeaponDPS / weaponMultiplier );
+				if( attackType == gamedataAttackType.StrongMelee )
+				{
+					multiplier *= strongMeleeMultiplier;
+				}
+			}
+			physicalImpulse = statSystem.GetStatValue( weaponObject.GetEntityID(), gamedataStatType.PhysicalImpulse );
+		}
+		multiplier *= ( PowF( physicalImpulse, 0.30000001 ) - 0.80000001 );
+		return multiplier;
 	}
 
 	private function ProcessVehicleHit( hitEvent : gameHitEvent )
@@ -1176,11 +1455,24 @@ import final class DamageSystem extends IDamageSystem
 		var magnitude : Float;
 		var curveDamagePercentage : Float;
 		var targetMaxHealth : Float;
+		var isCrowdOrCivilian : Bool;
 		vehicleHitEvent = ( ( gameVehicleHitEvent )( hitEvent ) );
-		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
-		if( !( vehicleHitEvent ) || !( targetPuppet ) )
+		if( !( vehicleHitEvent ) )
 		{
 			return;
+		}
+		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
+		if( !( targetPuppet ) )
+		{
+			return;
+		}
+		if( targetPuppet.IsCrowd() )
+		{
+			if( ( ( NPCPuppet )( targetPuppet ) ).m_shouldBeImmuneToVehicleHit )
+			{
+				hitEvent.attackComputed.SetAttackValue( 0.0 );
+				return;
+			}
 		}
 		targetIsFriendly = GameObject.GetAttitudeTowards( targetPuppet, GameInstance.GetPlayerSystem( targetPuppet.GetGame() ).GetLocalPlayerControlledGameObject() ) == EAIAttitude.AIA_Friendly;
 		if( targetIsFriendly )
@@ -1188,11 +1480,11 @@ import final class DamageSystem extends IDamageSystem
 			hitEvent.attackComputed.SetAttackValue( 0.0 );
 			return;
 		}
-		hitEvent.attackData.AddFlag( hitFlag.DontShowDamageFloater, 'vehicle_collision' );
 		velocityDiff = vehicleHitEvent.vehicleVelocity - vehicleHitEvent.preyVelocity;
 		magnitude = Vector4.Length( velocityDiff );
 		targetMaxHealth = GameInstance.GetStatsSystem( targetPuppet.GetGame() ).GetStatValue( targetPuppet.GetEntityID(), gamedataStatType.Health );
-		if( ( magnitude >= TweakDBInterface.GetFloat( T"AIGeneralSettings.vehicleHitKillThreshold", 20.0 ) ) || ( ( targetPuppet.IsCrowd() || targetPuppet.IsCharacterCivilian() ) && ( magnitude >= TweakDBInterface.GetFloat( T"AIGeneralSettings.vehicleHitCrowdKillThreshold", 10.0 ) ) ) )
+		isCrowdOrCivilian = targetPuppet.IsCrowd() || targetPuppet.IsCivilian();
+		if( ( magnitude >= TweakDBInterface.GetFloat( T"AIGeneralSettings.vehicleHitKillThreshold", 25.0 ) ) || ( isCrowdOrCivilian && ( magnitude >= TweakDBInterface.GetFloat( T"AIGeneralSettings.vehicleHitCrowdKillThreshold", 20.0 ) ) ) )
 		{
 			if( ( ( NPCPuppet )( targetPuppet ) ) )
 			{
@@ -1204,16 +1496,36 @@ import final class DamageSystem extends IDamageSystem
 		}
 		else
 		{
-			if( targetPuppet.IsCrowd() || targetPuppet.IsCharacterCivilian() )
+			if( isCrowdOrCivilian )
 			{
-				curveDamagePercentage = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', magnitude, 'crowd_hit_damage' );
+				if( hitEvent.attackData.GetInstigator().IsPlayer() )
+				{
+					curveDamagePercentage = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', magnitude, 'crowd_hit_damage' );
+					if( curveDamagePercentage == 0.0 )
+					{
+						if( GameObject.IsCooldownActive( targetPuppet, 'vehicleSlowHitOnCivilian' ) )
+						{
+							curveDamagePercentage = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', magnitude, 'crowd_hit_high_damage' );
+							GameObject.StartCooldown( targetPuppet, 'vehicleSlowHitOnCivilian', 0.0 );
+						}
+						else
+						{
+							hitEvent.attackData.AddFlag( hitFlag.DontShowDamageFloater, 'dealing 0 damage' );
+						}
+						GameObject.StartCooldown( targetPuppet, 'vehicleSlowHitOnCivilian', 3.0 );
+					}
+				}
+				else
+				{
+					curveDamagePercentage = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', magnitude, 'crowd_hit_high_damage' );
+				}
 			}
 			else
 			{
 				curveDamagePercentage = GameInstance.GetStatsDataSystem( targetPuppet.GetGame() ).GetValueFromCurve( 'vehicle_collision_damage', magnitude, 'npc_hit_damage' );
 			}
 			hitEvent.attackComputed.SetAttackValue( curveDamagePercentage * targetMaxHealth, gamedataDamageType.Physical );
-			if( RPGManager.CalculatePowerDifferential( targetPuppet ) == EPowerDifferential.IMPOSSIBLE )
+			if( RPGManager.CalculatePowerDifferential( targetPuppet ) == gameEPowerDifferential.IMPOSSIBLE )
 			{
 				hitEvent.attackComputed.MultAttackValue( 0.5 );
 			}
@@ -1230,39 +1542,89 @@ import final class DamageSystem extends IDamageSystem
 		SendDamageEvents( hitEvent, resourcesLost );
 	}
 
-	private function SendDamageEvents( hitEvent : gameHitEvent, resourcesLost : array< SDamageDealt > )
+	private function SendDamageEvents( hitEvent : gameHitEvent, const resourcesLost : ref< array< SDamageDealt > > )
 	{
 		var damageDealtEvent : gameTargetDamageEvent;
 		var damageReceivedEvent : gameDamageReceivedEvent;
 		var totalDamage : Float;
 		var i : Int32;
-		damageDealtEvent = new gameTargetDamageEvent;
-		damageReceivedEvent = new gameDamageReceivedEvent;
 		totalDamage = 0.0;
 		for( i = 0; i < resourcesLost.Size(); i += 1 )
 		{
 			totalDamage += resourcesLost[ i ].value;
 		}
+		damageDealtEvent = new gameTargetDamageEvent;
 		damageDealtEvent.target = hitEvent.target;
 		damageDealtEvent.attackData = hitEvent.attackData;
 		damageDealtEvent.hitPosition = hitEvent.hitPosition;
 		damageDealtEvent.hitDirection = hitEvent.hitDirection;
 		damageDealtEvent.hitRepresentationResult = hitEvent.hitRepresentationResult;
 		damageDealtEvent.damage = totalDamage;
-		damageReceivedEvent.totalDamageReceived = totalDamage;
-		damageReceivedEvent.hitEvent = hitEvent;
 		hitEvent.attackData.GetInstigator().QueueEvent( damageDealtEvent );
 		if( totalDamage > 0.0 )
 		{
+			damageReceivedEvent = new gameDamageReceivedEvent;
+			damageReceivedEvent.totalDamageReceived = totalDamage;
+			damageReceivedEvent.hitEvent = hitEvent;
 			hitEvent.target.QueueEvent( damageReceivedEvent );
 		}
 	}
 
 	private function PostProcess( hitEvent : gameHitEvent )
 	{
+		var poiseDamage : Float;
 		ProcessStatusEffects( hitEvent );
 		ProcessReturnedDamage( hitEvent );
 		DamageManager.PostProcess( hitEvent );
+		if( ( ( hitEvent.attackData.GetInstigator().IsPlayer() && hitEvent.attackData.GetInstigator().HasFinisherAvailable() ) && hitEvent.target.CanReceivePoiseDamage() ) && !( hitEvent.attackData.GetInstigator().GetIsInFastFinisher() ) )
+		{
+			poiseDamage = hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health );
+			switch( hitEvent.attackData.GetAttackType() )
+			{
+				case gamedataAttackType.QuickMelee:
+				{
+					poiseDamage *= TweakDBInterface.GetFloat( T"NewPerks.Reflexes_Right_Milestone_3.poiseQuickMeleeMultiplier", 1.0 );
+					break;
+				}
+				case gamedataAttackType.StrongMelee:
+				{
+					poiseDamage *= TweakDBInterface.GetFloat( T"NewPerks.Reflexes_Right_Milestone_3.poiseStrongMeleeMultiplier", 1.0 );
+					break;
+				}
+			}
+			if( GameObject.TargetHasDebuff( hitEvent.target ) )
+			{
+				poiseDamage *= TweakDBInterface.GetFloat( T"NewPerks.Reflexes_Right_Milestone_3.poiseDebufMultiplier", 1.0 );
+			}
+			if( hitEvent.target.IsInFinisherHealthThreshold( hitEvent.attackData.GetInstigator() ) )
+			{
+				poiseDamage *= TweakDBInterface.GetFloat( T"NewPerks.Reflexes_Right_Milestone_3.poiseBossLowHealthMultiplier", 1.0 );
+			}
+			GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() ).RequestChangingStatPoolValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Poise, -( poiseDamage ), hitEvent.attackData.GetInstigator(), false, false );
+		}
+		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		{
+			SendDamageRequestToPreventionSystem( hitEvent );
+		}
+	}
+
+	private function SendDamageRequestToPreventionSystem( hitEvent : gameHitEvent )
+	{
+		var npcMaxHealth : Float;
+		var damage : Float;
+		var damageDealtPercent : Float;
+		npcMaxHealth = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.Health );
+		damage = hitEvent.attackComputed.GetTotalAttackValue( gamedataStatPoolType.Health );
+		damageDealtPercent = damage / npcMaxHealth;
+		if( damageDealtPercent > PreventionSystem.GetDamageReactionThreshold() )
+		{
+			PreventionSystem.CreateNewPreventionDamageRequest( GetGameInstance(), hitEvent.target, hitEvent.attackData.GetAttackTime(), hitEvent.attackData.GetAttackType(), damageDealtPercent, false );
+		}
+	}
+
+	protected static function HasGrandFinaleStatFlag( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		return RPGManager.HasStatFlag( scriptInterface.executionOwner, gamedataStatType.CanDoGrandFinaleWithMantisBlades );
 	}
 
 	private function ProcessStatusEffects( hitEvent : gameHitEvent )
@@ -1273,24 +1635,34 @@ import final class DamageSystem extends IDamageSystem
 		var effectDamages : array< weak< StatusEffectAttackData_Record > >;
 		var target : GameObject;
 		var targetId : EntityID;
+		var targetPuppet : ScriptedPuppet;
 		var statusEffectID : TweakDBID;
 		var instantApply : Bool;
 		var statusEffectSystem : StatusEffectSystem;
 		var instigator : GameObject;
+		var hasPerkPurchased : Bool;
+		var playerJustLeaped : Bool;
+		var isMechanical : Bool;
+		var isExo : Bool;
 		attackData = hitEvent.attackData;
 		target = hitEvent.target;
 		targetId = target.GetEntityID();
+		targetPuppet = ( ( ScriptedPuppet )( target ) );
 		statusEffectSystem = GameInstance.GetStatusEffectSystem( GetGameInstance() );
-		instigator = hitEvent.attackData.GetInstigator();
-		if( ( attackData.HasFlag( hitFlag.WasBlocked ) || attackData.HasFlag( hitFlag.WasDeflected ) ) || attackData.HasFlag( hitFlag.FriendlyFireIgnored ) )
+		instigator = attackData.GetInstigator();
+		hasPerkPurchased = RPGManager.HasStatFlag( instigator, gamedataStatType.CanDoGrandFinaleWithMantisBlades );
+		playerJustLeaped = StatusEffectSystem.ObjectHasStatusEffectWithTag( instigator, 'JustLeaped' );
+		isMechanical = targetPuppet.IsMechanical();
+		isExo = AIActionHelper.CheckAbility( targetPuppet, TweakDBInterface.GetGameplayAbilityRecord( T"Ability.IsExo" ) );
+		if( ( attackData.WasBlocked() || ( !( instigator.IsPlayer() ) && attackData.WasDeflectedAny() ) ) || attackData.HasFlag( hitFlag.FriendlyFireIgnored ) )
 		{
 			return;
 		}
-		if( GameObject.IsVehicle( hitEvent.target ) )
+		if( GameObject.IsVehicle( hitEvent.target ) && !( ShouldProcessStatusEffectsOnVehicleDriver( hitEvent, targetId ) ) )
 		{
 			return;
 		}
-		if( ( !( target.IsPlayer() ) && attackData.GetInstigator().IsPlayer() ) && GameObject.GetAttitudeTowards( target, attackData.GetInstigator() ) == EAIAttitude.AIA_Friendly )
+		if( ( !( target.IsPlayer() ) && instigator.IsPlayer() ) && GameObject.GetAttitudeTowards( target, instigator ) == EAIAttitude.AIA_Friendly )
 		{
 			return;
 		}
@@ -1320,20 +1692,57 @@ import final class DamageSystem extends IDamageSystem
 				}
 			}
 		}
+		if( instigator.IsPlayer() && statusEffectSystem.HasStatusEffectWithTag( targetId, 'GagOpportunity' ) )
+		{
+			statusEffectSystem.RemoveStatusEffect( targetId, T"BaseStatusEffect.GagOpportunity" );
+			statusEffectSystem.ApplyStatusEffect( targetId, T"BaseStatusEffect.Gag" );
+		}
+		if( ( ( ( ( !( target.IsPlayer() ) && instigator.IsPlayer() ) && hasPerkPurchased ) && playerJustLeaped ) && !( isMechanical ) ) && !( isExo ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( target, T"BaseStatusEffect.MantisBladesRelicDismemberment" );
+			StatusEffectHelper.ApplyStatusEffect( target, GetMantisBladesCripplingRandStatusEffectID() );
+		}
 		ProcessStatusEffectApplicationStats( hitEvent );
+	}
+
+	private static function GetMantisBladesCripplingRandStatusEffectID() : TweakDBID
+	{
+		var statusEffectNames : array< String >;
+		var statusEffectsIDs : array< TweakDBID >;
+		var appliedStatusEffect : TweakDBID;
+		var i, size : Int32;
+		statusEffectNames = TDB.GetStringArray( T"BaseStatusEffect.CripplingStatusEffects" );
+		size = statusEffectNames.Size();
+		for( i = 0; i < size; i += 1 )
+		{
+			statusEffectsIDs.PushBack( TDBID.Create( statusEffectNames[ i ] ) );
+		}
+		i = RandRange( 0, statusEffectsIDs.Size() );
+		appliedStatusEffect = statusEffectsIDs[ i ];
+		return appliedStatusEffect;
 	}
 
 	private function ProcessStatusEffectApplicationStats( hitEvent : gameHitEvent )
 	{
 		var attackType : gamedataAttackType;
+		var attackSubType : gamedataAttackSubtype;
 		var bleedingID : TweakDBID;
 		var burningID : TweakDBID;
 		var poisonedID : TweakDBID;
 		var electrocutedID : TweakDBID;
+		var stunnedID : TweakDBID;
+		var isTargetPlayer : Bool;
+		var isTargetPuppet : Bool;
+		var transactionSystem : TransactionSystem;
+		var player : PlayerPuppet;
 		attackType = hitEvent.attackData.GetAttackType();
-		if( hitEvent.target.IsPuppet() && ( ( ( AttackData.IsLightMelee( attackType ) || AttackData.IsStrongMelee( attackType ) ) || AttackData.IsBullet( attackType ) ) || AttackData.IsThrown( attackType ) ) )
+		attackSubType = hitEvent.attackData.GetAttackSubtype();
+		isTargetPlayer = hitEvent.target.IsPlayer();
+		isTargetPuppet = hitEvent.target.IsPuppet();
+		transactionSystem = GameInstance.GetTransactionSystem( hitEvent.target.GetGame() );
+		if( ( isTargetPuppet && ( ( AttackData.IsLightMelee( attackType ) || AttackData.IsStrongMelee( attackType ) ) || AttackData.IsRangedOrDirectOrThrown( attackType ) ) ) && attackSubType != gamedataAttackSubtype.BodySlamAttack )
 		{
-			if( hitEvent.target.IsPlayer() )
+			if( isTargetPlayer )
 			{
 				bleedingID = T"BaseStatusEffect.PlayerBleeding";
 				burningID = T"BaseStatusEffect.PlayerBurning";
@@ -1342,7 +1751,15 @@ import final class DamageSystem extends IDamageSystem
 			}
 			else
 			{
-				if( TDB.GetWeaponItemRecord( ItemID.GetTDBID( hitEvent.attackData.GetWeapon().GetItemID() ) ).Evolution().Type() == gamedataWeaponEvolution.Blade )
+				if( transactionSystem.HasTag( hitEvent.attackData.GetInstigator(), 'Saburo_Tanto_Bleed', hitEvent.attackData.GetWeapon().GetItemID() ) )
+				{
+					bleedingID = T"BaseStatusEffect.Tanto_Saburo_Bleeding";
+				}
+				else if( transactionSystem.HasTag( hitEvent.attackData.GetInstigator(), 'Saburo_Katana_Bleed', hitEvent.attackData.GetWeapon().GetItemID() ) )
+				{
+					bleedingID = T"BaseStatusEffect.Katana_Saburo_Bleeding";
+				}
+				else if( TDB.GetWeaponItemRecord( ItemID.GetTDBID( hitEvent.attackData.GetWeapon().GetItemID() ) ).Evolution().Type() == gamedataWeaponEvolution.Blade )
 				{
 					bleedingID = T"BaseStatusEffect.KenjutsuBleeding";
 				}
@@ -1350,9 +1767,13 @@ import final class DamageSystem extends IDamageSystem
 				{
 					bleedingID = T"BaseStatusEffect.Bleeding";
 				}
-				if( GameInstance.GetTransactionSystem( hitEvent.target.GetGame() ).HasTag( hitEvent.attackData.GetInstigator(), 'Padre_Burn', hitEvent.attackData.GetWeapon().GetItemID() ) )
+				if( transactionSystem.HasTag( hitEvent.attackData.GetInstigator(), 'Padre_Burn', hitEvent.attackData.GetWeapon().GetItemID() ) )
 				{
 					burningID = T"BaseStatusEffect.Liberty_Padre_Burning";
+				}
+				else if( transactionSystem.HasTag( hitEvent.attackData.GetInstigator(), 'AirDrop_Burn', hitEvent.attackData.GetWeapon().GetItemID() ) )
+				{
+					burningID = T"BaseStatusEffect.AirDrop_Burning";
 				}
 				else
 				{
@@ -1362,16 +1783,33 @@ import final class DamageSystem extends IDamageSystem
 				{
 					poisonedID = T"BaseStatusEffect.KnifePoison";
 				}
+				else if( transactionSystem.HasTag( hitEvent.attackData.GetInstigator(), 'Hercules_Poison', hitEvent.attackData.GetWeapon().GetItemID() ) )
+				{
+					poisonedID = T"BaseStatusEffect.Hercules_Poison";
+				}
 				else
 				{
 					poisonedID = T"BaseStatusEffect.Poisoned";
 				}
 				electrocutedID = T"BaseStatusEffect.Electrocuted";
+				stunnedID = T"BaseStatusEffect.Stun";
 			}
 			ApplyStatusEffectByApplicationRate( hitEvent, gamedataStatType.BleedingApplicationRate, bleedingID );
 			ApplyStatusEffectByApplicationRate( hitEvent, gamedataStatType.BurningApplicationRate, burningID );
 			ApplyStatusEffectByApplicationRate( hitEvent, gamedataStatType.PoisonedApplicationRate, poisonedID );
 			ApplyStatusEffectByApplicationRate( hitEvent, gamedataStatType.ElectrocutedApplicationRate, electrocutedID );
+			ApplyStatusEffectByApplicationRate( hitEvent, gamedataStatType.StunApplicationRate, stunnedID );
+		}
+		if( AttackData.IsExplosion( attackType ) )
+		{
+			player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( hitEvent.target.GetGame() ).GetLocalPlayerControlledGameObject() ) );
+			if( ( PlayerDevelopmentSystem.GetData( player ).IsNewPerkBought( gamedataNewPerkType.Tech_Left_Milestone_3 ) == 3 ) && player.IsInCombat() )
+			{
+				if( ( isTargetPlayer && ( hitEvent.attackData.GetInstigator() == player ) ) && ( GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.ManiacStatCounter ) < 1.0 ) )
+				{
+					StatusEffectHelper.ApplyStatusEffect( player, T"BaseStatusEffect.Tech_Left_Milestone_3_Buff", player.GetEntityID() );
+				}
+			}
 		}
 	}
 
@@ -1386,15 +1824,39 @@ import final class DamageSystem extends IDamageSystem
 		ses = GameInstance.GetStatusEffectSystem( hitEvent.target.GetGame() );
 		weapon = hitEvent.attackData.GetWeapon();
 		value = ss.GetStatValue( weapon.GetEntityID(), statType ) / 100.0;
+		if( hitEvent.target.IsPlayer() )
+		{
+			return;
+		}
 		if( !( FloatIsEqual( value, 0.0 ) ) )
 		{
 			rand = RandRangeF( 0.0, 1.0 );
 			if( rand <= value )
 			{
 				ses.ApplyStatusEffect( hitEvent.target.GetEntityID(), effect, , hitEvent.attackData.GetInstigator().GetEntityID(),  );
-				hitEvent.attackData.AddFlag( hitFlag.DotApplied, 'SETriggered' );
+				hitEvent.attackData.AddFlag( ( ( statType == gamedataStatType.StunApplicationRate ) ? ( hitFlag.StunApplied ) : ( hitFlag.DotApplied ) ), 'SETriggered' );
 			}
 		}
+	}
+
+	private function ShouldProcessStatusEffectsOnVehicleDriver( hitEvent : gameHitEvent, out driverEntityID : EntityID ) : Bool
+	{
+		var rec : Attack_GameEffect_Record;
+		var effectTag : CName;
+		var vehicle : VehicleObject;
+		vehicle = ( ( VehicleObject )( hitEvent.target ) );
+		if( !( vehicle ) || !( vehicle.IsPlayerDriver() ) )
+		{
+			return false;
+		}
+		rec = ( ( Attack_GameEffect_Record )( hitEvent.attackData.GetAttackDefinition().GetRecord() ) );
+		effectTag = rec.EffectTag();
+		if( effectTag == 'flashbang_explosion' )
+		{
+			driverEntityID = GameInstance.GetPlayerSystem( hitEvent.target.GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID();
+			return true;
+		}
+		return false;
 	}
 
 	private function IsImmune( target : GameObject, statusEffectID : TweakDBID ) : Bool
@@ -1474,7 +1936,6 @@ import final class DamageSystem extends IDamageSystem
 			attackData.AddFlag( hitFlag.CannotModifyDamage, 'cheat_weak' );
 			if( cache.logFlags & damageSystemLogFlags.GENERAL )
 			{
-				LogDamage( "DamageSystem.CalculateGlobalModifiers(): Weak cheat modified damage to 0.01" );
 			}
 		}
 		if( attackData.GetInstigator().IsPlayer() )
@@ -1487,7 +1948,6 @@ import final class DamageSystem extends IDamageSystem
 				attackData.AddFlag( hitFlag.CannotModifyDamage, 'cheat_op' );
 				if( cache.logFlags & damageSystemLogFlags.GENERAL )
 				{
-					LogDamage( ( "DamageSystem.CalculateGlobalModifiers(): OP cheat modified damage to 60% of " + hitEvent.target.GetDisplayName() ) + "'s max health" );
 				}
 			}
 		}
@@ -1498,18 +1958,21 @@ import final class DamageSystem extends IDamageSystem
 	{
 		DamageManager.CalculateTargetModifiers( hitEvent );
 		ProcessArmor( hitEvent );
-		ProcessResistances( hitEvent );
+		ProcessOnVehicleMitigation( hitEvent );
 	}
 
-	private function CalculateSourceModifiers( hitEvent : gameHitEvent )
+	private function CalculateSourceModifiers( hitEvent : gameHitEvent, cache : CacheData )
 	{
 		DamageManager.CalculateSourceModifiers( hitEvent );
-		ProcessChargeAttack( hitEvent );
+		ProcessChargeAttack( hitEvent, cache );
 		ProcessPierceAttack( hitEvent );
+		ProcessRicochet( hitEvent );
 		ProcessCriticalHit( hitEvent );
 		ProcessDamageMultipliers( hitEvent );
+		ProcessCyberwareModifiers( hitEvent );
 		ProcessStealthAttack( hitEvent );
-		ProcessRicochetBonus( hitEvent );
+		ProcessNPCPassengerVehicleCollision( hitEvent );
+		ProcessSpreadingMultiplier( hitEvent );
 	}
 
 	private function ProcessPierceAttack( hitEvent : gameHitEvent )
@@ -1538,7 +2001,7 @@ import final class DamageSystem extends IDamageSystem
 		}
 	}
 
-	private function ProcessChargeAttack( hitEvent : gameHitEvent )
+	private function ProcessChargeAttack( hitEvent : gameHitEvent, cache : CacheData )
 	{
 		var attackData : AttackData;
 		var statsSystem : StatsSystem;
@@ -1560,77 +2023,96 @@ import final class DamageSystem extends IDamageSystem
 			chargeNormalized = attackData.GetWeaponCharge();
 			if( chargeNormalized > 0.0 )
 			{
-				if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) )
+				statsOwner = weaponObject.GetEntityID();
+				maxChargeThreshold = weaponObject.GetMaxChargeTreshold();
+				if( maxChargeThreshold == WeaponObject.GetOverchargeThreshold( weaponObject ) )
 				{
-					chargeDamageMult = 1.0 + chargeNormalized;
-					hitEvent.attackComputed.MultAttackValue( chargeDamageMult );
+					maxChargeModifier = 1.65999997;
+				}
+				else if( maxChargeThreshold == WeaponObject.GetFullyChargedThreshold( weaponObject ) )
+				{
+					maxChargeModifier = 1.33000004;
 				}
 				else
 				{
-					statsOwner = weaponObject.GetEntityID();
-					maxChargeThreshold = weaponObject.GetMaxChargeTreshold();
-					if( maxChargeThreshold == WeaponObject.GetOverchargeThreshold() )
-					{
-						maxChargeModifier = 1.65999997;
-					}
-					else if( maxChargeThreshold == WeaponObject.GetFullyChargedThreshold() )
-					{
-						maxChargeModifier = 1.33000004;
-					}
-					else
-					{
-						maxChargeModifier = 1.0;
-					}
-					if( chargeNormalized >= 1.0 )
-					{
-						chargeDamageMult = 1.0 + ( statsSystem.GetStatValue( statsOwner, gamedataStatType.ChargeFullMultiplier ) * maxChargeModifier );
-					}
-					else
-					{
-						chargeDamageMult = 1.0 + ( ( statsSystem.GetStatValue( statsOwner, gamedataStatType.ChargeMultiplier ) * chargeNormalized ) * maxChargeModifier );
-					}
-					hitEvent.attackComputed.MultAttackValue( chargeDamageMult );
+					maxChargeModifier = 1.0;
+				}
+				if( chargeNormalized >= 1.0 )
+				{
+					chargeDamageMult = 1.0 + ( statsSystem.GetStatValue( statsOwner, gamedataStatType.ChargeFullMultiplier ) * maxChargeModifier );
+				}
+				else
+				{
+					chargeDamageMult = 1.0 + ( ( statsSystem.GetStatValue( statsOwner, gamedataStatType.ChargeMultiplier ) * chargeNormalized ) * maxChargeModifier );
+				}
+				cache.chargeDamageMultiplier = chargeDamageMult;
+				hitEvent.attackComputed.MultAttackValue( chargeDamageMult );
+			}
+		}
+	}
+
+	private function ProcessRicochet( hitEvent : gameHitEvent )
+	{
+		var baseRicochetDamage : Float;
+		var bonusDmg : Float;
+		var bonusCritChance : Float;
+		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		{
+			if( hitEvent.attackData.GetNumRicochetBounces() > 0 )
+			{
+				baseRicochetDamage = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BaseRicochetDamageModifier );
+				hitEvent.attackComputed.MultAttackValue( baseRicochetDamage );
+				bonusDmg = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusRicochetDamage );
+				if( !( FloatIsEqual( bonusDmg, 0.0 ) ) )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.0 + ( bonusDmg / 100.0 ) );
+				}
+				bonusCritChance = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( ScriptedPuppet.GetActiveWeapon( hitEvent.attackData.GetInstigator() ).GetEntityID(), gamedataStatType.BonusRicochetCritChance );
+				if( !( FloatIsEqual( bonusCritChance, 0.0 ) ) )
+				{
+					hitEvent.attackData.SetAdditionalCritChance( bonusCritChance );
 				}
 			}
 		}
 	}
 
-	private function ProcessRicochetBonus( hitEvent : gameHitEvent )
+	private function ProcessSpreadingMultiplier( hitEvent : gameHitEvent )
 	{
-		var statVal : Float;
+		var multiplier : Float;
 		if( hitEvent.attackData.GetInstigator().IsPlayer() )
 		{
-			if( hitEvent.attackData.GetNumRicochetBounces() > 0 )
+			if( hitEvent.attackData.GetNumAttackSpread() > 0 )
 			{
-				statVal = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( ScriptedPuppet.GetActiveWeapon( hitEvent.attackData.GetInstigator() ).GetEntityID(), gamedataStatType.BonusRicochetDamage );
-				if( !( FloatIsEqual( statVal, 0.0 ) ) )
-				{
-					hitEvent.attackComputed.MultAttackValue( 1.0 + ( statVal / 100.0 ) );
-				}
+				multiplier = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( ScriptedPuppet.GetActiveWeapon( hitEvent.attackData.GetInstigator() ).GetEntityID(), gamedataStatType.SpreadingAttackDamageMultiplier );
+				hitEvent.attackComputed.MultAttackValue( multiplier );
 			}
 		}
 	}
 
 	private function ProcessStealthAttack( hitEvent : gameHitEvent )
 	{
-		var stealthHitMult : Float;
+		var stealthHitDamageBonus, stealthHitMult : Float;
 		var canStealthHit : Bool;
+		var hitNotQuickMelee : Bool;
 		var player : weak< PlayerPuppet >;
-		var powerDifferential : EPowerDifferential;
+		var powerDifferential : gameEPowerDifferential;
 		player = ( ( PlayerPuppet )( hitEvent.attackData.GetInstigator() ) );
 		if( player && ( ( ScriptedPuppet )( hitEvent.target ) ) )
 		{
 			if( hitEvent.attackData.GetWeapon() )
 			{
-				if( !( AttackData.IsPlayerInCombat( hitEvent.attackData ) ) )
+				if( !( AttackData.IsPlayerInCombat( hitEvent.attackData ) ) || StatusEffectHelper.HasStatusEffectWithTagConst( player, 'ExtendedStealth' ) )
 				{
 					canStealthHit = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( hitEvent.attackData.GetWeapon().GetEntityID(), gamedataStatType.CanSilentKill ) > 0.0;
-					if( canStealthHit )
+					hitNotQuickMelee = hitEvent.attackData.GetAttackType() != gamedataAttackType.QuickMelee;
+					if( canStealthHit && hitNotQuickMelee )
 					{
 						powerDifferential = RPGManager.CalculatePowerDifferential( hitEvent.target );
-						if( powerDifferential != EPowerDifferential.IMPOSSIBLE )
+						if( powerDifferential != gameEPowerDifferential.IMPOSSIBLE )
 						{
+							stealthHitDamageBonus = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.StealthHitDamageBonus );
 							stealthHitMult = GameInstance.GetStatsSystem( GetGameInstance() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.StealthHitDamageMultiplier );
+							hitEvent.attackComputed.AddAttackValue( stealthHitDamageBonus, gamedataDamageType.Physical );
 							if( stealthHitMult > 1.0 )
 							{
 								hitEvent.attackComputed.MultAttackValue( stealthHitMult );
@@ -1642,17 +2124,29 @@ import final class DamageSystem extends IDamageSystem
 		}
 	}
 
+	private function ProcessNPCPassengerVehicleCollision( hitEvent : gameHitEvent )
+	{
+		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		{
+			if( hitEvent.attackData.HasFlag( hitFlag.NPCPassengerVehicleCollision ) )
+			{
+				if( PlayerDevelopmentSystem.GetData( hitEvent.attackData.GetInstigator() ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Body_Right_Milestone_1 ) )
+				{
+					hitEvent.attackComputed.MultAttackValue( 1.5 );
+				}
+			}
+		}
+	}
+
 	private function CalculateSourceVsTargetModifiers( hitEvent : gameHitEvent )
 	{
+		ProcessVehicleVsExplosion( hitEvent );
+		ProcessBikeMelee( hitEvent );
 		ProcessEffectiveRange( hitEvent );
 		ProcessBlockAndDeflect( hitEvent );
 		if( GetFact( GetGameInstance(), 'story_mode' ) )
 		{
 			ScalePlayerDamage( hitEvent );
-		}
-		else
-		{
-			ProcessLevelDifference( hitEvent );
 		}
 	}
 
@@ -1689,7 +2183,6 @@ import final class DamageSystem extends IDamageSystem
 		{
 			if( cache.logFlags & damageSystemLogFlags.ASSERT )
 			{
-				LogDamage( "DamageSystem.CheckForQuickExit(): no data object passed, aborting!" );
 			}
 			return true;
 		}
@@ -1697,7 +2190,6 @@ import final class DamageSystem extends IDamageSystem
 		{
 			if( cache.logFlags & damageSystemLogFlags.ASSERT )
 			{
-				LogDamage( "DamageSystem.CheckForQuickExit(): no target passed, aborting!" );
 			}
 			return true;
 		}
@@ -1705,7 +2197,6 @@ import final class DamageSystem extends IDamageSystem
 		{
 			if( cache.logFlags & damageSystemLogFlags.ASSERT )
 			{
-				LogDamage( "DamageSystem.CheckForQuickExit(): there is no root source set, aborting!" );
 			}
 			return true;
 		}
@@ -1713,7 +2204,6 @@ import final class DamageSystem extends IDamageSystem
 		{
 			if( cache.logFlags & damageSystemLogFlags.ASSERT )
 			{
-				LogDamage( "DamageSystem.CheckForQuickExit(): game instance is not valid, aborting!" );
 			}
 			return true;
 		}
@@ -1723,7 +2213,6 @@ import final class DamageSystem extends IDamageSystem
 			{
 				if( cache.logFlags & damageSystemLogFlags.ASSERT )
 				{
-					LogDamage( "DamageSystem.CheckForQuickExit(): instigator is trying to damage vehicle it's attached to. Aborting!" );
 				}
 				return true;
 			}
@@ -1734,7 +2223,6 @@ import final class DamageSystem extends IDamageSystem
 			{
 				if( cache.logFlags & damageSystemLogFlags.ASSERT )
 				{
-					LogDamage( "DamageSystem.CheckForQuickExit(): instigator is trying to damage vehicle it's attached to. Aborting!" );
 				}
 				return true;
 			}
@@ -1746,7 +2234,6 @@ import final class DamageSystem extends IDamageSystem
 				attackData.AddFlag( hitFlag.DealNoDamage, 'SelfDamageIgnored' );
 				if( cache.logFlags & damageSystemLogFlags.ASSERT )
 				{
-					LogDamage( "DamageSystem.CheckForQuickExit(): trying to damage self, but CanDamageSelf is not set. Aborting!" );
 				}
 				return true;
 			}
@@ -1772,7 +2259,7 @@ import final class DamageSystem extends IDamageSystem
 				}
 			}
 		}
-		if( AttackData.IsDoT( hitEvent.attackData.GetAttackType() ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( hitEvent.target, 'Defeated' ) )
+		if( AttackData.IsDoT( hitEvent.attackData ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( hitEvent.target, 'Defeated' ) )
 		{
 			return true;
 		}
@@ -1797,6 +2284,79 @@ import final class DamageSystem extends IDamageSystem
 		return cache.targetImmortalityMode == gameGodModeType.Invulnerable;
 	}
 
+	public function IsOverridenExplosionVsVehicleHit( hitEvent : gameHitEvent ) : Bool
+	{
+		return hitEvent.attackData.HasFlag( hitFlag.ExplosionOverride );
+	}
+
+	public function ProcessVehicleVsExplosion( hitEvent : gameHitEvent )
+	{
+		var explosionDamageVSVehicles : Float;
+		if( !( hitEvent.target.IsVehicle() ) )
+		{
+			return;
+		}
+		if( !( AttackData.IsExplosion( hitEvent.attackData.GetAttackType() ) ) )
+		{
+			return;
+		}
+		explosionDamageVSVehicles = hitEvent.attackData.GetAttackDefinition().GetRecord().ExplosionDamageVSVehicles();
+		if( explosionDamageVSVehicles <= 0.0 )
+		{
+			return;
+		}
+		explosionDamageVSVehicles *= GetVehiclePerksDamageMultiplier( hitEvent.attackData );
+		hitEvent.attackComputed.SetAttackValue( explosionDamageVSVehicles, gamedataDamageType.Physical );
+		hitEvent.attackData.AddFlag( hitFlag.ExplosionOverride, 'vs_vehicle_explosion_tuning' );
+	}
+
+	public function ProcessBikeMelee( hitEvent : gameHitEvent )
+	{
+		var attackData : AttackData;
+		var playerPuppet : PlayerPuppet;
+		var mountedBike : BikeObject;
+		var bikeVel : Vector4;
+		var bikeDmgScale : Float;
+		var targetVehicle : VehicleObject;
+		var targetPuppet : gamePuppet;
+		var targetVel : Vector4;
+		var velDelta : Vector4;
+		attackData = hitEvent.attackData;
+		targetVehicle = ( ( VehicleObject )( hitEvent.target ) );
+		targetPuppet = ( ( gamePuppet )( hitEvent.target ) );
+		if( !( attackData.GetInstigator().IsPlayer() ) )
+		{
+			return;
+		}
+		if( !( AttackData.IsMelee( attackData.GetAttackType() ) ) )
+		{
+			return;
+		}
+		playerPuppet = ( ( PlayerPuppet )( attackData.GetInstigator() ) );
+		mountedBike = ( ( BikeObject )( playerPuppet.GetMountedVehicle() ) );
+		if( !( mountedBike ) )
+		{
+			return;
+		}
+		bikeVel = mountedBike.GetLinearVelocity();
+		if( targetVehicle )
+		{
+			targetVel = targetVehicle.GetLinearVelocity();
+		}
+		else if( targetPuppet )
+		{
+			targetVel = targetPuppet.GetVelocity();
+		}
+		velDelta = bikeVel - targetVel;
+		bikeDmgScale = 1.0 + ProportionalClampF( 8.0, 30.0, Vector4.Length( velDelta ), 0.0, 4.0 );
+		hitEvent.attackComputed.MultAttackValue( bikeDmgScale, gamedataDamageType.Physical );
+		if( Vector4.Length( velDelta ) > 8.0 )
+		{
+			attackData.AddFlag( hitFlag.HighSpeedMelee, 'BikeStrike' );
+			attackData.SetHitReactionSeverityMax( 4 );
+		}
+	}
+
 	public function ProcessEffectiveRange( hitEvent : gameHitEvent )
 	{
 		var attackData : AttackData;
@@ -1804,26 +2364,21 @@ import final class DamageSystem extends IDamageSystem
 		var damageMod : Float;
 		var effectiveRange : Float;
 		var attackWeapon : WeaponObject;
-		var attackSource : ItemObject;
-		var grenadeRecord : Grenade_Record;
+		var baseGrenade : BaseGrenade;
 		var percentOfRange : Float;
 		attackData = hitEvent.attackData;
-		attackDistance = Vector4.Length( attackData.GetAttackPosition() - hitEvent.hitPosition );
 		if( AttackData.IsExplosion( attackData.GetAttackType() ) )
 		{
-			attackSource = ( ( ItemObject )( attackData.GetSource() ) );
-			if( attackSource )
+			baseGrenade = ( ( BaseGrenade )( attackData.GetSource() ) );
+			if( baseGrenade )
 			{
-				grenadeRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( attackSource.GetItemID() ) );
-			}
-			if( grenadeRecord )
-			{
-				effectiveRange = grenadeRecord.AttackRadius();
+				effectiveRange = baseGrenade.GetAttackRadius();
 			}
 			else
 			{
 				effectiveRange = attackData.GetAttackDefinition().GetRecord().Range();
 			}
+			attackDistance = Vector4.Length( attackData.GetAttackPosition() - hitEvent.hitPosition );
 			percentOfRange = ClampF( attackDistance / effectiveRange, 0.0, 1.0 );
 			damageMod = GameInstance.GetStatsDataSystem( GetGameInstance() ).GetValueFromCurve( 'explosions', percentOfRange, 'distance_to_damage_reduction' );
 			hitEvent.attackComputed.MultAttackValue( damageMod );
@@ -1832,7 +2387,6 @@ import final class DamageSystem extends IDamageSystem
 		attackWeapon = attackData.GetWeapon();
 		if( !( attackWeapon ) )
 		{
-			LogError( "[DamageSystem] Attack with no weapon!" );
 			return;
 		}
 		damageMod = GetEffectiveRangeModifierForWeapon( attackData, hitEvent.hitPosition, GameInstance.GetStatsSystem( GetGameInstance() ) );
@@ -1849,11 +2403,11 @@ import final class DamageSystem extends IDamageSystem
 		var itemRecord : WeaponItem_Record;
 		var attackDistance : Float;
 		result = 1.0;
-		attackDistance = Vector4.Length( attackData.GetAttackPosition() - hitPosition );
 		if( attackData.GetInstigator().IsPlayer() )
 		{
 			effectiveRange = statsSystem.GetStatValue( attackData.GetWeapon().GetEntityID(), gamedataStatType.EffectiveRange );
 			itemRecord = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( attackData.GetWeapon().GetItemID() ) );
+			attackDistance = Vector4.Length( attackData.GetAttackPosition() - hitPosition );
 			if( attackDistance < effectiveRange )
 			{
 				if( IsNameValid( itemRecord.EffectiveRangeCurve() ) )
@@ -1876,63 +2430,85 @@ import final class DamageSystem extends IDamageSystem
 	public function ProcessArmor( hitEvent : gameHitEvent )
 	{
 		var statsSystem : StatsSystem;
-		var armorPoints, attacksPerSec, reducedValue, damageModifier, damageMultiplier : Float;
+		var statusEffectSystem : StatusEffectSystem;
 		var weapon : weak< WeaponObject >;
-		var instigator : weak< GameObject >;
+		var hitShapes : array< HitShapeData >;
+		var hitUserData : HitShapeUserDataBase;
 		var attackValues : array< Float >;
-		var i : Int32;
-		var useModernFormula : Bool;
 		var effectiveHealthPerArmorPoint : Float;
-		useModernFormula = UseModernArmorFormula();
-		weapon = hitEvent.attackData.GetWeapon();
-		if( weapon && WeaponObject.CanIgnoreArmor( weapon ) )
+		var armorPenetration : Float;
+		var armorPoints : Float;
+		var armorMeltMaxPercent : Float;
+		var hitShapeArmorPoints : Float;
+		var reducedValue : Float;
+		var damageMultiplier : Float;
+		var i : Int32;
+		var targetIsPlayer : Bool;
+		var appliedStatusEffects : array< StatusEffect >;
+		hitShapes = hitEvent.hitRepresentationResult.hitShapes;
+		if( AttackData.IsDoT( hitEvent.attackData ) )
 		{
 			return;
 		}
-		if( instigator.IsPlayer() || !( weapon ) )
+		weapon = hitEvent.attackData.GetWeapon();
+		if( !( weapon ) )
+		{
+			return;
+		}
+		armorPenetration = GetArmorPenetrationValue( weapon, hitEvent );
+		if( armorPenetration >= 1.0 )
 		{
 			return;
 		}
 		statsSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
+		statusEffectSystem = GameInstance.GetStatusEffectSystem( hitEvent.target.GetGame() );
+		targetIsPlayer = hitEvent.target.IsPlayer();
 		armorPoints = statsSystem.GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.Armor );
-		if( useModernFormula )
+		if( hitEvent.attackData.GetInstigator().IsPlayer() && ( hitShapes.Size() > 0 ) )
 		{
-			effectiveHealthPerArmorPoint = TweakDBInterface.GetFloat( T"Constants.DamageSystem.effectiveHealthPerArmorPoint", 0.001 );
-			if( armorPoints >= 0.0 )
+			hitUserData = DamageSystemHelper.GetHitShapeUserDataBase( hitShapes[ 0 ] );
+			if( hitUserData && DamageSystemHelper.IsHitShapeArmored( hitUserData.m_hitShapeType ) )
 			{
-				damageMultiplier = 1.0 / ( 1.0 + ( armorPoints * effectiveHealthPerArmorPoint ) );
+				hitShapeArmorPoints = statsSystem.GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.HitShapeArmor );
+				if( hitShapeArmorPoints > armorPoints )
+				{
+					armorPoints = hitShapeArmorPoints;
+				}
 			}
-			else
+		}
+		statusEffectSystem.GetAppliedEffectsWithTag( hitEvent.target.GetEntityID(), 'OverheatArmorMelt', appliedStatusEffects );
+		if( appliedStatusEffects.Size() > 0 )
+		{
+			armorMeltMaxPercent = TweakDBInterface.GetFloat( appliedStatusEffects[ 0 ].GetRecord().GetID() + T".armorMeltMaxPercent", 0.0 );
+			armorPoints *= ( 1.0 - ( ( 1.0 - ( ClampF( appliedStatusEffects[ 0 ].GetRemainingDuration(), 0.0, 5.0 ) / 5.0 ) ) * armorMeltMaxPercent ) );
+		}
+		if( armorPenetration != 0.0 )
+		{
+			armorPoints *= ( 1.0 - armorPenetration );
+		}
+		effectiveHealthPerArmorPoint = GameInstance.GetStatsDataSystem( hitEvent.target.GetGame() ).GetArmorEffectivenessValue( targetIsPlayer );
+		if( targetIsPlayer )
+		{
+			effectiveHealthPerArmorPoint *= statsSystem.GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.ArmorEffectivenessMultiplier );
+		}
+		if( armorPoints >= 0.0 )
+		{
+			damageMultiplier = 1.0 / ( 1.0 + ( armorPoints * effectiveHealthPerArmorPoint ) );
+			if( ( ( armorPoints > 0.0 ) && ( armorPenetration <= 0.0 ) ) && !( hitEvent.attackData.HasFlag( hitFlag.CriticalHit ) ) )
 			{
-				damageMultiplier = 1.0 - ( armorPoints * effectiveHealthPerArmorPoint );
+				hitEvent.attackData.SetHitType( gameuiHitType.Glance );
 			}
 		}
 		else
 		{
-			instigator = hitEvent.attackData.GetInstigator();
-			if( instigator.IsPlayer() && weapon )
-			{
-				attacksPerSec = statsSystem.GetStatValue( weapon.GetEntityID(), gamedataStatType.AttacksPerSecond );
-			}
-			else if( instigator )
-			{
-				attacksPerSec = statsSystem.GetStatValue( instigator.GetEntityID(), gamedataStatType.TBHsBaseSourceMultiplierCoefficient );
-			}
-			damageModifier = ( TweakDBInterface.GetFloat( T"Constants.DamageSystem.dpsReductionPerArmorPoint", 1.0 ) * armorPoints ) * attacksPerSec;
+			damageMultiplier = 1.0 - ( armorPoints * effectiveHealthPerArmorPoint );
 		}
 		attackValues = hitEvent.attackComputed.GetAttackValues();
 		for( i = 0; i < attackValues.Size(); i += 1 )
 		{
 			if( attackValues[ i ] > 0.0 )
 			{
-				if( useModernFormula )
-				{
-					reducedValue = attackValues[ i ] * damageMultiplier;
-				}
-				else
-				{
-					reducedValue = attackValues[ i ] - damageModifier;
-				}
+				reducedValue = attackValues[ i ] * damageMultiplier;
 				if( reducedValue < 1.0 )
 				{
 					reducedValue = 1.0;
@@ -1943,128 +2519,338 @@ import final class DamageSystem extends IDamageSystem
 		hitEvent.attackComputed.SetAttackValues( attackValues );
 	}
 
-	public function ProcessResistances( hitEvent : gameHitEvent )
+	public function ProcessOnVehicleMitigation( hitEvent : gameHitEvent )
 	{
-		var i : Int32;
-		var resistType : gamedataStatType;
-		var resistValue : Float;
 		var statsSystem : StatsSystem;
-		var damageType : gamedataDamageType;
-		var attackValues : array< Float >;
-		var target : GameObject;
-		target = hitEvent.target;
-		if( hitEvent.attackData.HasFlag( hitFlag.CannotModifyDamage ) )
+		var attackType : gamedataAttackType;
+		var mountedBike : BikeObject;
+		var mountedVehicle : VehicleObject;
+		var playerPuppet : PlayerPuppet;
+		var playerBikeVel : Vector4;
+		var bikeDamageTaken : Float;
+		var isRanged : Bool;
+		var isAOE : Bool;
+		var mountedExplosionFactor : Float;
+		attackType = hitEvent.attackData.GetAttackType();
+		playerPuppet = ( ( PlayerPuppet )( hitEvent.target ) );
+		mountedExplosionFactor = 1.0;
+		if( !( playerPuppet ) || hitEvent.attackData.HasFlag( hitFlag.CannotModifyDamage ) )
 		{
 			return;
 		}
-		statsSystem = GameInstance.GetStatsSystem( hitEvent.attackData.GetSource().GetGame() );
-		attackValues = hitEvent.attackComputed.GetAttackValues();
-		for( i = 0; i < attackValues.Size(); i += 1 )
+		mountedVehicle = playerPuppet.GetMountedVehicle();
+		if( mountedVehicle == NULL )
 		{
-			damageType = ( ( gamedataDamageType )( i ) );
-			if( damageType == gamedataDamageType.Physical )
-			{
-				continue;
-			}
-			if( attackValues[ i ] <= 0.0 )
-			{
-				continue;
-			}
-			resistType = RPGManager.GetResistanceTypeFromDamageType( damageType );
-			resistValue = statsSystem.GetStatValue( target.GetEntityID(), resistType );
-			resistValue /= 100.0;
-			hitEvent.attackComputed.MultAttackValue( 1.0 - resistValue, damageType );
+			return;
 		}
+		mountedBike = ( ( BikeObject )( mountedVehicle ) );
+		if( mountedBike && AttackData.IsRangedOnly( attackType ) )
+		{
+			statsSystem = GameInstance.GetStatsSystem( playerPuppet.GetGame() );
+			bikeDamageTaken = statsSystem.GetStatValue( playerPuppet.GetEntityID(), gamedataStatType.OnBikeDamageTakenPercent );
+			if( ( bikeDamageTaken >= 1.0 ) && ( bikeDamageTaken < 0.0 ) )
+			{
+				return;
+			}
+			playerBikeVel = mountedBike.GetLinearVelocity();
+			bikeDamageTaken = ProportionalClampF( statsSystem.GetStatValue( playerPuppet.GetEntityID(), gamedataStatType.OnBikeDamageTakenPercentMinSpeed ), statsSystem.GetStatValue( playerPuppet.GetEntityID(), gamedataStatType.OnBikeDamageTakenPercentMaxSpeed ), Vector4.Length( playerBikeVel ), 1.0, bikeDamageTaken );
+			hitEvent.attackComputed.MultAttackValue( bikeDamageTaken );
+		}
+		else
+		{
+			isRanged = hitEvent.attackData.GetWeapon().IsRanged();
+			isAOE = AttackData.IsExplosion( attackType );
+			if( ( !( isRanged ) && isAOE ) && ( hitEvent.attackData.GetSource() != mountedVehicle ) )
+			{
+				if( mountedVehicle.GetRecord().IsArmoredVehicle() )
+				{
+					mountedExplosionFactor = 0.33000001;
+				}
+				else
+				{
+					mountedExplosionFactor = ( ( mountedBike ) ? ( 0.75 ) : ( 0.5 ) );
+				}
+				hitEvent.attackComputed.MultAttackValue( mountedExplosionFactor );
+			}
+		}
+	}
+
+	private const final function GetSubAttackSubType( attackData : AttackData ) : gamedataAttackSubtype
+	{
+		var attackRecord : Attack_Melee_Record;
+		var attackSubTypeRecord : AttackSubtype_Record;
+		attackRecord = ( ( Attack_Melee_Record )( attackData.GetAttackDefinition().GetRecord() ) );
+		if( attackRecord )
+		{
+			attackSubTypeRecord = attackRecord.AttackSubtype();
+			if( attackSubTypeRecord )
+			{
+				return attackSubTypeRecord.Type();
+			}
+		}
+		return gamedataAttackSubtype.Invalid;
 	}
 
 	public function ProcessCriticalHit( hitEvent : gameHitEvent )
 	{
-		var accumulatedCritChance : Float;
-		var playerCritChance : Float;
-		var weaponCritChance : Float;
-		var accumulatedCritDamage : Float;
-		var randomDraw : Float;
+		var isQuickHack : Bool;
 		var attackType : gamedataAttackType;
 		var attackData : AttackData;
-		var hitType : gameuiHitType;
+		var criticalHit : Bool;
 		var statsSystem : StatsSystem;
+		var playerCritChance : Float;
+		var weaponCritChance : Float;
+		var accumulatedCritChance : Float;
+		var accumulatedCritDamage : Float;
 		attackType = hitEvent.attackData.GetAttackType();
 		attackData = hitEvent.attackData;
+		criticalHit = attackData.HasFlag( hitFlag.CriticalHit );
 		statsSystem = GameInstance.GetStatsSystem( GetGameInstance() );
-		if( ( ( ( attackData.HasFlag( hitFlag.CannotModifyDamage ) || attackData.HasFlag( hitFlag.DeterministicDamage ) ) || attackData.HasFlag( hitFlag.ForceNoCrit ) ) || hitEvent.target.IsPlayer() ) || !( attackData.GetInstigator().IsPlayer() ) )
+		if( ( ( ( attackData.HasFlag( hitFlag.CannotModifyDamage ) || attackData.HasFlag( hitFlag.DeterministicDamage ) ) || ( attackData.HasFlag( hitFlag.ForceNoCrit ) && !( attackData.HasFlag( hitFlag.BreachHit ) ) ) ) || hitEvent.target.IsPlayer() ) || !( attackData.GetInstigator().IsPlayer() ) )
 		{
 			return;
 		}
-		if( hitEvent.projectionPipeline )
+		if( !( criticalHit ) )
 		{
-			return;
-		}
-		hitType = gameuiHitType.Hit;
-		if( attackType == gamedataAttackType.Hack || attackData.HasFlag( hitFlag.QuickHack ) )
-		{
-			if( statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CanQuickHackCriticallyHit ) <= 0.0 )
+			if( attackType == gamedataAttackType.Hack || attackData.HasFlag( hitFlag.QuickHack ) )
+			{
+				if( statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CanQuickHackCriticallyHit ) <= 0.0 )
+				{
+					return;
+				}
+				isQuickHack = true;
+			}
+			else if( AttackData.IsEffect( attackType ) && !( AttackData.CanEffectCriticallyHit( attackData, statsSystem ) ) )
 			{
 				return;
 			}
-		}
-		else
-		{
-			if( AttackData.IsEffect( attackType ) && !( AttackData.CanEffectCriticallyHit( attackData, statsSystem ) ) )
+			else if( ( ( WeaponGrenade )( hitEvent.attackData.GetSource() ) ) && !( AttackData.CanGrenadeCriticallyHit( attackData, statsSystem ) ) )
 			{
 				return;
 			}
-			if( ( ( WeaponGrenade )( hitEvent.attackData.GetSource() ) ) && !( AttackData.CanGrenadeCriticallyHit( attackData, statsSystem ) ) )
+			if( GetSubAttackSubType( attackData ) == gamedataAttackSubtype.DeflectAttack && PlayerDevelopmentSystem.GetData( attackData.GetInstigator() ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Reflexes_Right_Perk_2_2 ) )
 			{
-				return;
+				criticalHit = true;
+			}
+			if( !( criticalHit ) )
+			{
+				if( isQuickHack )
+				{
+					accumulatedCritChance = statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.QuickHackCritChance ) / 100.0;
+				}
+				else
+				{
+					if( attackData.GetInstigator() )
+					{
+						playerCritChance = statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CritChance ) / 100.0;
+					}
+					if( attackData.GetWeapon() )
+					{
+						if( AllowWeaponCrit( attackData ) )
+						{
+							weaponCritChance = statsSystem.GetStatValue( attackData.GetWeapon().GetEntityID(), gamedataStatType.CritChance ) / 100.0;
+						}
+					}
+					accumulatedCritChance = ( playerCritChance + weaponCritChance ) + hitEvent.attackData.GetAdditionalCritChance();
+				}
+				if( accumulatedCritChance >= 1.0 )
+				{
+					criticalHit = true;
+				}
+				else if( hitEvent.projectionPipeline )
+				{
+					return;
+				}
+				else
+				{
+					criticalHit = RandF() <= accumulatedCritChance;
+				}
 			}
 		}
-		if( attackData.GetInstigator() )
-		{
-			playerCritChance = statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CritChance ) / 100.0;
-		}
-		if( attackData.GetWeapon() )
-		{
-			if( AllowWeaponCrit( attackData ) )
-			{
-				weaponCritChance = statsSystem.GetStatValue( attackData.GetWeapon().GetEntityID(), gamedataStatType.CritChance ) / 100.0;
-			}
-		}
-		accumulatedCritChance = ( playerCritChance + weaponCritChance ) + hitEvent.attackData.GetAdditionalCritChance();
-		randomDraw = RandF();
-		if( ( randomDraw <= accumulatedCritChance ) || attackData.HasFlag( hitFlag.CriticalHit ) )
+		if( criticalHit && !( attackData.HasFlag( hitFlag.CriticalHitNoDamageModifier ) ) )
 		{
 			accumulatedCritDamage = GetCritDamageModifier( statsSystem, attackData );
 			if( accumulatedCritDamage > 0.0 )
 			{
 				attackData.AddFlag( hitFlag.CriticalHit, 'critical_hit' );
-				hitType = gameuiHitType.CriticalHit;
+			}
+			else
+			{
+				attackData.RemoveFlag( hitFlag.CriticalHit );
 			}
 		}
-		hitEvent.attackData.SetHitType( hitType );
+		if( !( hitEvent.attackData.HasFlag( hitFlag.Special ) ) )
+		{
+			hitEvent.attackData.SetHitType( ( ( attackData.GetHitType() == gameuiHitType.Glance ) ? ( gameuiHitType.Glance ) : ( gameuiHitType.Hit ) ) );
+		}
+		if( attackData.HasFlag( hitFlag.CriticalHit ) )
+		{
+			hitEvent.attackData.SetHitType( gameuiHitType.CriticalHit );
+		}
 	}
 
 	public function ProcessDamageMultipliers( hitEvent : gameHitEvent )
 	{
 		var attackData : AttackData;
 		var statsSystem : StatsSystem;
+		var player : PlayerPuppet;
+		var breachFinder : BreachFinderComponent;
 		var headshotDamage : Float;
 		var critDamage : Float;
+		var weakspotDamage : Float;
+		var breachDamage : Float;
 		attackData = hitEvent.attackData;
+		if( attackData.HasFlag( hitFlag.ReflexesMasterPerk1 ) )
+		{
+			return;
+		}
 		statsSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
 		if( attackData.HasFlag( hitFlag.Headshot ) )
 		{
 			headshotDamage = GetHeadshotDamageModifier( statsSystem, attackData );
 		}
-		if( attackData.HasFlag( hitFlag.CriticalHit ) )
+		if( attackData.HasFlag( hitFlag.CriticalHit ) && !( attackData.HasFlag( hitFlag.CriticalHitNoDamageModifier ) ) )
 		{
 			critDamage = GetCritDamageModifier( statsSystem, attackData );
 		}
-		hitEvent.attackComputed.MultAttackValue( ( 1.0 + headshotDamage ) + critDamage );
+		if( attackData.HasFlag( hitFlag.WeakspotHit ) )
+		{
+			weakspotDamage = GetWeakspotDamageModifier( statsSystem, attackData );
+		}
+		if( attackData.HasFlag( hitFlag.BreachHit ) )
+		{
+			player = ( ( PlayerPuppet )( attackData.GetInstigator() ) );
+			if( player )
+			{
+				breachFinder = player.GetBreachFinderComponent();
+				if( breachFinder )
+				{
+					breachDamage = 0.05 * breachFinder.GetBreachStreak();
+				}
+			}
+		}
+		hitEvent.attackComputed.MultAttackValue( ( ( ( 1.0 + headshotDamage ) + critDamage ) + weakspotDamage ) + breachDamage );
+		if( ( ( VehicleObject )( hitEvent.target ) ) == NULL )
+		{
+			hitEvent.attackComputed.MultAttackValue( GetVehiclePerksDamageMultiplier( hitEvent.attackData ) );
+		}
+	}
+
+	public function ProcessCyberwareModifiers( hitEvent : gameHitEvent )
+	{
+		var statSystem : StatsSystem;
+		var target : GameObject;
+		var instigator : GameObject;
+		var instigatorID : EntityID;
+		var attackType : gamedataAttackType;
+		var damageType : gamedataDamageType;
+		var attackValues : array< Float >;
+		var tempDamage : Float;
+		var health : Float;
+		var maxHealth : Float;
+		var i : Int32;
+		var weapon : WeaponObject;
+		statSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
+		target = hitEvent.target;
+		instigator = hitEvent.attackData.GetInstigator();
+		instigatorID = instigator.GetEntityID();
+		attackType = hitEvent.attackData.GetAttackType();
+		tempDamage = 0.0;
+		if( target == instigator )
+		{
+			return;
+		}
+		health = GameInstance.GetStatPoolsSystem( target.GetGame() ).GetStatPoolValue( target.GetEntityID(), gamedataStatPoolType.Health, false );
+		maxHealth = GameInstance.GetStatPoolsSystem( target.GetGame() ).GetStatPoolMaxPointValue( target.GetEntityID(), gamedataStatPoolType.Health );
+		tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.AllDamageDonePercentBonus );
+		if( AttackData.IsExplosion( attackType ) )
+		{
+			tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.ExplosionDamagePercentBonus );
+		}
+		if( AttackData.IsMelee( attackType ) )
+		{
+			tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.MeleeDamagePercentBonus );
+		}
+		if( FloatIsEqual( health, maxHealth ) )
+		{
+			tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.BonusPercentDamageToEnemiesAtFullHealth );
+		}
+		if( health <= ( maxHealth / 2.0 ) )
+		{
+			tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.BonusPercentDamageToEnemiesBelowHalfHealth );
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectOfType( target, gamedataStatusEffectType.Burning ) )
+		{
+			tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.BonusPercentDamageVsBurningEnemies );
+		}
+		if( AttackData.IsDoT( hitEvent.attackData ) )
+		{
+			tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.DamageOverTimePercentBonus );
+		}
+		weapon = hitEvent.attackData.GetWeapon();
+		if( weapon )
+		{
+			if( weapon.WeaponHasTag( 'SmartWeapon' ) )
+			{
+				tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.SmartWeaponDamagePercentBonus );
+			}
+			if( weapon.WeaponHasTag( 'TechWeapon' ) )
+			{
+				tempDamage += statSystem.GetStatValue( instigatorID, gamedataStatType.TechWeaponDamagePercentBonus );
+			}
+		}
+		attackValues = hitEvent.attackComputed.GetAttackValues();
+		for( i = 0; i < attackValues.Size(); i += 1 )
+		{
+			if( attackValues[ i ] > 0.0 )
+			{
+				damageType = ( ( gamedataDamageType )( i ) );
+				switch( damageType )
+				{
+					case gamedataDamageType.Thermal:
+						attackValues[ i ] *= ( ( 1.0 + tempDamage ) + statSystem.GetStatValue( instigatorID, gamedataStatType.ThermalDamagePercentBonus ) );
+					break;
+					case gamedataDamageType.Electric:
+						attackValues[ i ] *= ( ( 1.0 + tempDamage ) + statSystem.GetStatValue( instigatorID, gamedataStatType.ElectricDamagePercentBonus ) );
+					break;
+					case gamedataDamageType.Chemical:
+						attackValues[ i ] *= ( ( 1.0 + tempDamage ) + statSystem.GetStatValue( instigatorID, gamedataStatType.ChemicalDamagePercentBonus ) );
+					break;
+					default:
+						attackValues[ i ] *= ( 1.0 + tempDamage );
+				}
+			}
+		}
+		hitEvent.attackComputed.SetAttackValues( attackValues );
+	}
+
+	protected function GetArmorPenetrationValue( weapon : WeaponObject, hitEvent : gameHitEvent ) : Float
+	{
+		var armorPenetration : Float;
+		if( !( weapon ) )
+		{
+			return 0.0;
+		}
+		armorPenetration = WeaponObject.CanIgnoreArmor( weapon );
+		if( hitEvent.attackData.HasFlag( hitFlag.BreachHit ) )
+		{
+			armorPenetration += 0.25;
+		}
+		if( ( GameInstance.GetStatsSystem( weapon.GetGame() ).GetStatValue( weapon.GetEntityID(), gamedataStatType.TechPierceEnabled ) > 0.0 ) && ( WeaponObject.GetWeaponChargeNormalized( weapon ) >= WeaponObject.TechPierceChargeLevel( weapon ) ) )
+		{
+			armorPenetration += 0.25;
+		}
+		return armorPenetration;
 	}
 
 	protected function GetHeadshotDamageModifier( statSystem : StatsSystem, attackData : AttackData ) : Float
 	{
 		return statSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.HeadshotDamageMultiplier );
+	}
+
+	protected function GetWeakspotDamageModifier( statSystem : StatsSystem, attackData : AttackData ) : Float
+	{
+		return statSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.WeakspotDamageMultiplier );
 	}
 
 	protected function GetCritDamageModifier( statSystem : StatsSystem, attackData : AttackData ) : Float
@@ -2082,9 +2868,47 @@ import final class DamageSystem extends IDamageSystem
 		return playerCritDamage + weaponCritDamage;
 	}
 
+	protected function GetVehiclePerksDamageMultiplier( attackData : AttackData ) : Float
+	{
+		var statsSystem : StatsSystem;
+		var instigator : GameObject;
+		var weaponObject : WeaponObject;
+		var weaponType : gamedataItemType;
+		var damageMultiplier : Float;
+		damageMultiplier = 1.0;
+		instigator = attackData.GetInstigator();
+		if( !( instigator.IsPlayer() ) )
+		{
+			return damageMultiplier;
+		}
+		if( !( VehicleComponent.IsMountedToVehicle( instigator.GetGame(), instigator.GetEntityID() ) ) )
+		{
+			return damageMultiplier;
+		}
+		weaponObject = attackData.GetWeapon();
+		if( !( weaponObject ) )
+		{
+			return damageMultiplier;
+		}
+		statsSystem = GameInstance.GetStatsSystem( instigator.GetGame() );
+		weaponType = RPGManager.GetItemRecord( weaponObject.GetItemID() ).ItemType().Type();
+		if( weaponType == gamedataItemType.Wea_VehiclePowerWeapon || weaponType == gamedataItemType.Wea_VehicleMissileLauncher )
+		{
+			damageMultiplier = statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.GearheadDamageMultiplier );
+		}
+		else if( weaponObject.IsRanged() || weaponObject.IsMelee() )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffect( instigator, T"BaseStatusEffect.DriverCombatVehicleManeuvers" ) )
+			{
+				damageMultiplier = statsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.RoadWarriorDamageMultiplier );
+			}
+		}
+		return damageMultiplier;
+	}
+
 	protected function AllowWeaponCrit( attackData : AttackData ) : Bool
 	{
-		return !( AttackData.IsDoT( attackData.GetAttackType() ) ) && ( attackData.GetWeapon().IsRanged() || attackData.GetWeapon().IsMelee() );
+		return !( AttackData.IsDoT( attackData ) ) && ( attackData.GetWeapon().IsRanged() || attackData.GetWeapon().IsMelee() );
 	}
 
 	private function ProcessBlockAndDeflect( hitEvent : gameHitEvent )
@@ -2107,72 +2931,246 @@ import final class DamageSystem extends IDamageSystem
 		computedDamageFactor = 1.0;
 		if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) )
 		{
-			statsSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
+			if( !( hitEvent.attackData.WasBlocked() ) && !( hitEvent.attackData.WasDeflected() ) )
+			{
+				return;
+			}
 			blockingItem = GameInstance.GetTransactionSystem( hitEvent.target.GetGame() ).GetItemInSlot( hitEvent.target, T"AttachmentSlots.WeaponRight" );
 			attackingItem = hitEvent.attackData.GetWeapon();
-			if( blockingItem && attackingItem )
+			if( !( blockingItem ) || !( attackingItem ) )
 			{
-				if( hitEvent.attackData.WasBlocked() || hitEvent.attackData.WasDeflected() )
+				return;
+			}
+			statsSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
+			statPoolsSystem = GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() );
+			if( !( RPGManager.GetItemRecord( blockingItem.GetItemID() ).ItemType().Type() == gamedataItemType.Wea_Fists && RPGManager.GetItemRecord( attackingItem.GetItemID() ).ItemType().Type() != gamedataItemType.Wea_Fists ) )
+			{
+				computedDamageFactor = 0.0;
+			}
+			if( hitEvent.attackData.WasDeflected() )
+			{
+				RPGManager.AwardExperienceFromDeflect( hitEvent );
+			}
+			if( hitEvent.attackData.WasBlocked() )
+			{
+				targetID = hitEvent.target.GetEntityID();
+				currentStamina = statPoolsSystem.GetStatPoolValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Stamina, false );
+				playerTarget = ( ( PlayerPuppet )( hitEvent.target ) );
+				blockFactor = statsSystem.GetStatValue( targetID, gamedataStatType.BlockFactor );
+				if( playerTarget )
 				{
-					if( !( RPGManager.GetItemRecord( blockingItem.GetItemID() ).ItemType().Type() == gamedataItemType.Wea_Fists && RPGManager.GetItemRecord( attackingItem.GetItemID() ).ItemType().Type() != gamedataItemType.Wea_Fists ) )
+					if( StatusEffectSystem.ObjectHasStatusEffect( hitEvent.target, PlayerStaminaHelpers.GetExhaustedStatusEffectID() ) )
 					{
-						computedDamageFactor = 0.0;
+						StatusEffectHelper.ApplyStatusEffect( hitEvent.target, blockBreakTDBID );
+						hitEvent.attackData.RemoveFlag( hitFlag.WasBlocked, 'BlockBreak' );
+						computedDamageFactor = TDB.GetFloat( T"Constants.DamageSystem.blockBreakPlayerDamageFactor", 0.5 );
 					}
-					if( hitEvent.attackData.WasBlocked() )
+					else
 					{
-						targetID = hitEvent.target.GetEntityID();
-						statPoolsSystem = GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() );
-						currentStamina = statPoolsSystem.GetStatPoolValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Stamina, false );
-						playerTarget = ( ( PlayerPuppet )( hitEvent.target ) );
-						blockFactor = statsSystem.GetStatValue( targetID, gamedataStatType.BlockFactor );
-						if( playerTarget )
+						meleeAttackRecord = ( ( Attack_Melee_Record )( hitEvent.attackData.GetAttackDefinition().GetRecord() ) );
+						meleeCostToBlock = statsSystem.GetStatValue( attackingItem.GetEntityID(), gamedataStatType.StaminaCostToBlock );
+						if( meleeAttackRecord )
 						{
-							if( StatusEffectSystem.ObjectHasStatusEffect( hitEvent.target, PlayerStaminaHelpers.GetExhaustedStatusEffectID() ) )
-							{
-								StatusEffectHelper.ApplyStatusEffect( hitEvent.target, blockBreakTDBID );
-								hitEvent.attackData.RemoveFlag( hitFlag.WasBlocked, 'BlockBreak' );
-								computedDamageFactor = TDB.GetFloat( T"Constants.DamageSystem.blockBreakPlayerDamageFactor", 0.5 );
-							}
-							else
-							{
-								meleeAttackRecord = ( ( Attack_Melee_Record )( hitEvent.attackData.GetAttackDefinition().GetRecord() ) );
-								meleeCostToBlock = statsSystem.GetStatValue( attackingItem.GetEntityID(), gamedataStatType.StaminaCostToBlock );
-								if( meleeAttackRecord )
-								{
-									meleeCostToBlock = meleeCostToBlock * meleeAttackRecord.BlockCostFactor();
-								}
-								staminaReduction = meleeCostToBlock / blockFactor;
-								newStamina = MaxF( currentStamina - staminaReduction, 0.0 );
-								if( newStamina <= 0.0 )
-								{
-									StatusEffectHelper.ApplyStatusEffect( hitEvent.target, blockBreakTDBID );
-									hitEvent.attackData.RemoveFlag( hitFlag.WasBlocked, 'BlockBreak' );
-									computedDamageFactor = TDB.GetFloat( T"Constants.DamageSystem.blockBreakPlayerDamageFactor", 0.5 );
-								}
-								PlayerStaminaHelpers.ModifyStamina( playerTarget, -( staminaReduction ) );
-								PlayerStaminaHelpers.OnPlayerBlock( playerTarget );
-							}
-							SetTutorialFact( 'gmpl_player_blocked_attack' );
+							meleeCostToBlock = meleeCostToBlock * meleeAttackRecord.BlockCostFactor();
 						}
-						else
+						staminaReduction = meleeCostToBlock / blockFactor;
+						newStamina = MaxF( currentStamina - staminaReduction, 0.0 );
+						if( newStamina <= 0.0 )
 						{
-							staminaReduction = statsSystem.GetStatValue( targetID, gamedataStatType.Stamina ) / blockFactor;
-							newStamina = MaxF( currentStamina - staminaReduction, 0.0 );
-							if( newStamina <= 0.0 )
-							{
-								StatusEffectHelper.ApplyStatusEffect( hitEvent.target, blockBreakTDBID );
-								newStamina = 0.0;
-							}
-							statPoolsSystem.RequestSettingStatPoolValue( targetID, gamedataStatPoolType.Stamina, newStamina, hitEvent.attackData.GetInstigator(), false );
+							StatusEffectHelper.ApplyStatusEffect( hitEvent.target, blockBreakTDBID );
+							hitEvent.attackData.RemoveFlag( hitFlag.WasBlocked, 'BlockBreak' );
+							computedDamageFactor = TDB.GetFloat( T"Constants.DamageSystem.blockBreakPlayerDamageFactor", 0.5 );
 						}
+						PlayerStaminaHelpers.ModifyStamina( playerTarget, -( staminaReduction ) );
+						PlayerStaminaHelpers.OnPlayerBlock( playerTarget );
 					}
-					if( computedDamageFactor != 1.0 )
+					SetTutorialFact( 'gmpl_player_blocked_attack' );
+				}
+				else
+				{
+					staminaReduction = statsSystem.GetStatValue( targetID, gamedataStatType.Stamina ) / blockFactor;
+					newStamina = MaxF( currentStamina - staminaReduction, 0.0 );
+					if( newStamina <= 0.0 )
 					{
-						hitEvent.attackComputed.MultAttackValue( computedDamageFactor );
+						StatusEffectHelper.ApplyStatusEffect( hitEvent.target, blockBreakTDBID );
+						newStamina = 0.0;
 					}
+					statPoolsSystem.RequestSettingStatPoolValue( targetID, gamedataStatPoolType.Stamina, newStamina, hitEvent.attackData.GetInstigator(), false );
 				}
 			}
+			if( computedDamageFactor != 1.0 )
+			{
+				hitEvent.attackComputed.MultAttackValue( computedDamageFactor );
+			}
 		}
+		else if( AttackData.IsRangedOnly( hitEvent.attackData.GetAttackType() ) )
+		{
+			ProcessBulletBlockAndDeflect( hitEvent );
+		}
+	}
+
+	private function ProcessBulletBlockAndDeflect( hitEvent : gameHitEvent )
+	{
+		var blockingItem : weak< ItemObject >;
+		var attackingItem : weak< ItemObject >;
+		var statsSystem : StatsSystem;
+		var statPoolsSystem : StatPoolsSystem;
+		var currentStamina : Float;
+		var newStamina : Float;
+		var staminaReduction : Float;
+		var targetID : EntityID;
+		var playerTarget : PlayerPuppet;
+		var computedDamageFactor : Float;
+		var meleeCostToBlock : Float;
+		var isBulletTimeActive : Bool;
+		var isDeflect : Bool;
+		var playerDevelopmentData : PlayerDevelopmentData;
+		var perkLevel : Int32;
+		computedDamageFactor = 1.0;
+		if( !( hitEvent.attackData.WasBulletBlocked() || hitEvent.attackData.WasBulletDeflected() ) )
+		{
+			return;
+		}
+		blockingItem = GameInstance.GetTransactionSystem( hitEvent.target.GetGame() ).GetItemInSlot( hitEvent.target, T"AttachmentSlots.WeaponRight" );
+		attackingItem = hitEvent.attackData.GetWeapon();
+		if( !( blockingItem ) || !( attackingItem ) )
+		{
+			return;
+		}
+		playerTarget = ( ( PlayerPuppet )( hitEvent.target ) );
+		if( !( playerTarget ) )
+		{
+			return;
+		}
+		playerDevelopmentData = PlayerDevelopmentSystem.GetData( playerTarget );
+		perkLevel = playerDevelopmentData.IsNewPerkBought( gamedataNewPerkType.Reflexes_Right_Milestone_2 );
+		if( perkLevel < 2 )
+		{
+			return;
+		}
+		if( !( ( ( WeaponObject )( blockingItem ) ).IsBlade() ) )
+		{
+			return;
+		}
+		computedDamageFactor = 0.0;
+		statsSystem = GameInstance.GetStatsSystem( playerTarget.GetGame() );
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( playerTarget.GetGame() );
+		targetID = playerTarget.GetEntityID();
+		currentStamina = statPoolsSystem.GetStatPoolValue( hitEvent.target.GetEntityID(), gamedataStatPoolType.Stamina, false );
+		isBulletTimeActive = ( playerDevelopmentData.IsNewPerkBought( gamedataNewPerkType.Reflexes_Right_Perk_2_3 ) > 0 ) && GameInstance.GetTimeSystem( playerTarget.GetGame() ).IsTimeDilationActive();
+		if( !( isBulletTimeActive ) )
+		{
+			meleeCostToBlock = statsSystem.GetStatValue( blockingItem.GetEntityID(), gamedataStatType.StaminaCostToBlock );
+			staminaReduction = meleeCostToBlock / 2.0;
+			newStamina = MaxF( currentStamina - staminaReduction, 0.0 );
+			if( newStamina <= 0.0 )
+			{
+				computedDamageFactor = TDB.GetFloat( T"Constants.DamageSystem.blockBreakPlayerDamageFactor", 0.5 );
+			}
+			PlayerStaminaHelpers.ModifyStamina( playerTarget, -( staminaReduction ) );
+			PlayerStaminaHelpers.OnPlayerBlock( playerTarget );
+		}
+		if( computedDamageFactor != 1.0 )
+		{
+			hitEvent.attackComputed.MultAttackValue( computedDamageFactor );
+		}
+		isDeflect = ( hitEvent.attackData.HasFlag( hitFlag.WasBulletDeflected ) && ( playerDevelopmentData.IsNewPerkBought( gamedataNewPerkType.Reflexes_Right_Perk_2_1 ) > 0 ) ) && ( currentStamina > ( statsSystem.GetStatValue( targetID, gamedataStatType.Stamina ) * statsSystem.GetStatValue( targetID, gamedataStatType.Reflexes_Right_Milestone_2_StaminaDeflectPerc ) ) );
+		if( hitEvent.attackData.HasFlag( hitFlag.WasBulletParried ) || isDeflect )
+		{
+			ProcessBulletDeflect( hitEvent, isBulletTimeActive, blockingItem );
+		}
+		else
+		{
+			GameObject.PlaySound( playerTarget, 'w_perk_lead_and_steel' );
+		}
+	}
+
+	private function ProcessBulletDeflect( hitEvent : gameHitEvent, isBulletTimeActive : Bool, blockingItem : weak< ItemObject > )
+	{
+		var player : PlayerPuppet;
+		var attackingItem : weak< ItemObject >;
+		var attackingObject : WeaponObject;
+		var target : GameObject;
+		var angleDist : EulerAngles;
+		var attack : Attack_GameEffect;
+		var attackContext : AttackInitContext;
+		var effect : EffectInstance;
+		var baseOffset : Float;
+		var offsetMult : Float;
+		var offset : Vector3;
+		var minOffset, maxOffset : Float;
+		var currentStaminaPerc : Float;
+		var exactPosition, position, forward : Vector4;
+		var muzzlePosition, slotPosition : Vector4;
+		player = ( ( PlayerPuppet )( hitEvent.target ) );
+		attackingItem = hitEvent.attackData.GetWeapon();
+		attackingObject = ( ( WeaponObject )( attackingItem ) );
+		baseOffset = TweakDBInterface.GetFloat( T"NewPerks.Reflexes_Right_Milestone_2.baseOffset", 0.0 );
+		offsetMult = TweakDBInterface.GetFloat( T"NewPerks.Reflexes_Right_Milestone_2.offsetMult", 0.0 );
+		WeaponObject.TriggerWeaponEffects( ( ( WeaponObject )( blockingItem ) ), gamedataFxAction.MeleeBlock );
+		if( hitEvent.attackData.HasFlag( hitFlag.WasBulletParried ) )
+		{
+			GameObject.PlaySound( player, 'w_melee_katana_impact_block' );
+		}
+		else
+		{
+			GameObject.PlaySound( player, 'w_melee_perks_katana_bullet_deflecting' );
+		}
+		muzzlePosition = blockingItem.GetWorldPosition();
+		if( isBulletTimeActive || hitEvent.attackData.HasFlag( hitFlag.WasBulletParried ) )
+		{
+			target = GameInstance.GetTargetingSystem( GetGameInstance() ).GetObjectClosestToCrosshair( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject(), angleDist, TSQ_EnemyNPC() );
+			if( target )
+			{
+				if( AIActionHelper.GetTargetSlotPosition( target, 'Chest', slotPosition ) )
+				{
+					exactPosition = slotPosition;
+				}
+				else
+				{
+					exactPosition = target.GetWorldPosition();
+				}
+				forward = exactPosition - player.GetWorldPosition();
+			}
+			else
+			{
+				GameInstance.GetTargetingSystem( player.GetGame() ).GetDefaultCrosshairData( player, exactPosition, forward );
+			}
+		}
+		else
+		{
+			GameInstance.GetTargetingSystem( player.GetGame() ).GetDefaultCrosshairData( player, exactPosition, forward );
+		}
+		currentStaminaPerc = GameInstance.GetStatPoolsSystem( player.GetGame() ).GetStatPoolValue( player.GetEntityID(), gamedataStatPoolType.Stamina, true ) / 100.0;
+		minOffset = baseOffset + ( offsetMult * ( 1.0 - currentStaminaPerc ) );
+		maxOffset = minOffset;
+		offset = GetRandomOffset( Vector3( -( minOffset ), -( minOffset ), -( minOffset ) ), Vector3( maxOffset, maxOffset, maxOffset ) );
+		position = exactPosition + Vector4.Vector3To4( offset );
+		attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.Reflexes_Right_Milestone_2_Deflect" );
+		if( isBulletTimeActive || hitEvent.attackData.HasFlag( hitFlag.WasBulletParried ) )
+		{
+			attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.Reflexes_Right_Milestone_2_ParryDeflect" );
+		}
+		attackContext.source = player;
+		attackContext.instigator = attackContext.source;
+		attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		effect = attack.PrepareAttack( player );
+		EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position );
+		EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.muzzlePosition, muzzlePosition );
+		EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.forward, Vector4.Normalize( forward ) );
+		EffectData.SetBool( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.playerOwnedWeapon, true );
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.fxPackage, attackingObject.GetFxPackage() );
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+		attack.StartAttack();
+	}
+
+	private static function GetRandomOffset( minOffset : Vector3, maxOffset : Vector3 ) : Vector3
+	{
+		var randomOffset : Vector3;
+		randomOffset.X = RandRangeF( minOffset.X, maxOffset.X );
+		randomOffset.Y = RandRangeF( minOffset.Y, maxOffset.Y );
+		randomOffset.Z = RandRangeF( minOffset.Z, maxOffset.Z );
+		return randomOffset;
 	}
 
 	private function ProcessLevelDifference( const hitEvent : gameHitEvent )
@@ -2222,7 +3220,7 @@ import final class DamageSystem extends IDamageSystem
 		var targetLevel : Float;
 		targetPuppet = ( ( NPCPuppet )( hitEvent.target ) );
 		targetHealth = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.Health );
-		if( targetPuppet.GetPuppetRarity().Type() != gamedataNPCRarity.Boss )
+		if( targetPuppet.GetNPCRarity() != gamedataNPCRarity.Boss && targetPuppet.GetNPCRarity() != gamedataNPCRarity.MaxTac )
 		{
 			statsSystem = GameInstance.GetStatsSystem( targetPuppet.GetGame() );
 			baseNPCHealth = GameInstance.GetStatsDataSystem( hitEvent.target.GetGame() ).GetValueFromCurve( 'puppet_powerLevelToHealth', 1.0, 'puppet_powerLevelToHealth' );
@@ -2246,134 +3244,12 @@ import final class DamageSystem extends IDamageSystem
 		}
 	}
 
-	private function PlayFinisherGameEffect( const hitEvent : gameHitEvent, const hasFromFront : Bool, const hasFromBack : Bool ) : Bool
-	{
-		var gameEffectInstance : EffectInstance;
-		var instigator : GameObject;
-		var attackData : AttackData;
-		var finisherName : CName;
-		var bodyTypeVarSetter : AnimWrapperWeightSetter;
-		var targetPuppet : gamePuppet;
-		var bodyType : CName;
-		attackData = hitEvent.attackData;
-		if( !( GetFinisherNameBasedOnWeapon( hitEvent, hasFromFront, hasFromBack, finisherName ) ) )
-		{
-			return false;
-		}
-		instigator = attackData.GetInstigator();
-		gameEffectInstance = GameInstance.GetGameEffectSystem( GetGameInstance() ).CreateEffectStatic( 'playFinisher', finisherName, instigator );
-		if( !( gameEffectInstance ) )
-		{
-			return false;
-		}
-		AnimationControllerComponent.PushEventToObjAndHeldItems( instigator, 'ForceReady' );
-		targetPuppet = ( ( gamePuppet )( hitEvent.target ) );
-		bodyType = targetPuppet.GetBodyType();
-		bodyTypeVarSetter = new AnimWrapperWeightSetter;
-		bodyTypeVarSetter.key = bodyType;
-		bodyTypeVarSetter.value = 1.0;
-		instigator.QueueEvent( bodyTypeVarSetter );
-		EffectData.SetVector( gameEffectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, hitEvent.target.GetWorldPosition() );
-		EffectData.SetEntity( gameEffectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.entity, hitEvent.target );
-		gameEffectInstance.Run();
-		AnimationControllerComponent.PushEventToObjAndHeldItems( instigator, 'ForceReady' );
-		SetCameraContext( instigator, 'WorkspotLocked' );
-		SetGameplayCameraParameters( instigator, "cameraFinishers" );
-		return true;
-	}
-
-	public function SetCameraContext( target : GameObject, paramsName : CName )
-	{
-		var setCameraParamsEvent : SetCameraParamsEvent;
-		setCameraParamsEvent = new SetCameraParamsEvent;
-		setCameraParamsEvent.paramsName = paramsName;
-		target.QueueEvent( setCameraParamsEvent );
-	}
-
-	public function SetGameplayCameraParameters( player : GameObject, tweakDBPath : String )
-	{
-		var cameraParameters : GameplayCameraData;
-		var animFeature : AnimFeature_CameraGameplay;
-		GetGameplayCameraParameters( cameraParameters, tweakDBPath );
-		animFeature = new AnimFeature_CameraGameplay;
-		animFeature.is_forward_offset = cameraParameters.is_forward_offset;
-		animFeature.forward_offset_value = cameraParameters.forward_offset_value;
-		animFeature.upperbody_pitch_weight = cameraParameters.upperbody_pitch_weight;
-		animFeature.upperbody_yaw_weight = cameraParameters.upperbody_yaw_weight;
-		animFeature.is_pitch_off = cameraParameters.is_pitch_off;
-		animFeature.is_yaw_off = cameraParameters.is_yaw_off;
-		AnimationControllerComponent.ApplyFeatureToReplicate( player, 'CameraGameplay', animFeature );
-	}
-
-	public function GetGameplayCameraParameters( out cameraParameters : GameplayCameraData, tweakDBPath : String )
-	{
-		cameraParameters = new GameplayCameraData;
-		cameraParameters.is_forward_offset = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "is_forward_offset" ), 0.0 );
-		cameraParameters.forward_offset_value = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "forward_offset_value" ), 0.0 );
-		cameraParameters.upperbody_pitch_weight = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "upperbody_pitch_weight" ), 0.0 );
-		cameraParameters.upperbody_yaw_weight = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "upperbody_yaw_weight" ), 0.0 );
-		cameraParameters.is_pitch_off = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "is_pitch_off" ), 0.0 );
-		cameraParameters.is_yaw_off = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "is_yaw_off" ), 0.0 );
-	}
-
-	private function GetFinisherNameBasedOnWeapon( const hitEvent : gameHitEvent, const hasFromFront : Bool, const hasFromBack : Bool, out finisherName : CName ) : Bool
-	{
-		var weapon : WeaponObject;
-		var weaponRecord : Item_Record;
-		var attackData : AttackData;
-		var angle : Float;
-		var finisher : String;
-		var weaponTags : array< CName >;
-		var i : Int32;
-		attackData = hitEvent.attackData;
-		finisherName = 'finisher_default';
-		weapon = attackData.GetWeapon();
-		if( !( weapon ) )
-		{
-			return false;
-		}
-		weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
-		if( !( weaponRecord ) )
-		{
-			return true;
-		}
-		finisherName = weaponRecord.ItemType().Name();
-		weaponTags = weaponRecord.Tags();
-		for( i = weaponTags.Size() - 1; i >= 0; i -= 1 )
-		{
-			if( GameInstance.GetGameEffectSystem( GetGameInstance() ).HasEffect( 'playFinisher', weaponTags[ i ] ) )
-			{
-				finisherName = weaponTags[ i ];
-				break;
-			}
-		}
-		if( ( ( finisherName == 'Wea_OneHandedClub' || finisherName == 'Wea_TwoHandedClub' ) || finisherName == 'Wea_Fists' ) || finisherName == 'Wea_Hammer' )
-		{
-			finisherName = 'Wea_Katana';
-		}
-		if( IsNameValid( finisherName ) )
-		{
-			angle = Vector4.GetAngleBetween( attackData.GetInstigator().GetWorldForward(), hitEvent.target.GetWorldForward() );
-			if( hasFromBack && ( AbsF( angle ) < 90.0 ) )
-			{
-				finisher = NameToString( finisherName );
-				finisher += "_Back";
-				finisherName = StringToName( finisher );
-				return true;
-			}
-			else if( hasFromFront && ( AbsF( angle ) >= 90.0 ) )
-			{
-				return true;
-			}
-		}
-		return false;
-	}
-
 	public import function RegisterListener( damageListener : ScriptedDamageSystemListener, registereeID : EntityID, callbackType : gameDamageCallbackType, optional damagePipelineType : DMGPipelineType );
 	public import function UnregisterListener( damageListener : ScriptedDamageSystemListener, registereeID : EntityID, callbackType : gameDamageCallbackType, optional damagePipelineType : DMGPipelineType );
 	public import function RegisterSyncListener( damageListener : ScriptedDamageSystemListener, registereeID : EntityID, callbackType : gameDamageCallbackType, stage : gameDamagePipelineStage, optional damagePipelineType : DMGPipelineType );
 	public import function UnregisterSyncListener( damageListener : ScriptedDamageSystemListener, registereeID : EntityID, callbackType : gameDamageCallbackType, stage : gameDamagePipelineStage, optional damagePipelineType : DMGPipelineType );
 	public import function ProcessSyncStageCallbacks( stage : gameDamagePipelineStage, hitEvent : gameHitEvent, damagePipelineType : DMGPipelineType );
+	public import function ProcessSyncStageMissCallbacks( missEvent : gameMissEvent );
 
 	private function SetTutorialFact( factName : CName )
 	{
@@ -2384,30 +3260,15 @@ import final class DamageSystem extends IDamageSystem
 
 }
 
-import enum gameDamageCallbackType
+importonly abstract class IDamageSystemListener extends IScriptable
 {
-	HitTriggered,
-	HitReceived,
-	PipelineProcessed,
-	COUNT,
-	INVALID,
 }
 
-import enum gameDamagePipelineStage
+import class ScriptedDamageSystemListener extends IDamageSystemListener
 {
-	PreProcess,
-	Process,
-	PostProcess,
-	COUNT,
-	INVALID,
+	protected virtual function OnHitTriggered( hitEvent : gameHitEvent );
+	protected virtual function OnMissTriggered( missEvent : gameMissEvent );
+	protected virtual function OnHitReceived( hitEvent : gameHitEvent );
+	protected virtual function OnPipelineProcessed( hitEvent : gameHitEvent );
 }
 
-import enum DMGPipelineType
-{
-	None,
-	Damage,
-	ProjectedDamage,
-	All,
-}
-
-import operator|( a : DMGPipelineType, b : DMGPipelineType ) : DMGPipelineType;

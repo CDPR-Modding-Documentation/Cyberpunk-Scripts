@@ -1,3 +1,93 @@
+class SetQuestTargetWasSeen extends Event
+{
+	var wasSeen : Bool;
+}
+
+class SetAnyTargetIsLocked extends Event
+{
+	var wasSeen : Bool;
+}
+
+class ForceIgnoreTargets extends ActionBool
+{
+	var Repeat : Bool;
+	var Attitude : EAIAttitude;
+
+	public override function GetBaseCost() : Int32
+	{
+		if( m_isQuickHack )
+		{
+			return super.GetBaseCost();
+		}
+		return 0;
+	}
+
+	public function SetProperties()
+	{
+		actionName = 'ForceIgnoreTargets';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ForceIgnoreTargets', true, 'LocKey#2241', 'LocKey#2241' );
+	}
+
+}
+
+class SetDeviceTagKillMode extends ActionBool
+{
+
+	public function SetProperties()
+	{
+		actionName = 'SetDeviceSupportMode';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, true, 'LocKey#363', 'LocKey#363' );
+	}
+
+	public override function GetTweakDBChoiceRecord() : String
+	{
+		if( TDBID.IsValid( m_objectActionID ) )
+		{
+			return super.GetTweakDBChoiceRecord();
+		}
+		else
+		{
+			return "SetDeviceSupportMode";
+		}
+	}
+
+	public const override function GetInteractionIcon() : weak< ChoiceCaptionIconPart_Record >
+	{
+		return TweakDBInterface.GetChoiceCaptionIconPartRecord( T"ChoiceCaptionParts.Aim" );
+	}
+
+}
+
+struct TargetingBehaviour
+{
+	var m_initialWakeState : ESensorDeviceWakeState;
+	default m_initialWakeState = ESensorDeviceWakeState.CLOSED;
+	instanceeditable var m_canRotate : Bool;
+	default m_canRotate = true;
+	instanceeditable var m_lostTargetLookAtTime : Float;
+	default m_lostTargetLookAtTime = 2f;
+	instanceeditable var m_lostTargetSearchTime : Float;
+	default m_lostTargetSearchTime = 10f;
+}
+
+struct DetectionParameters
+{
+	instanceeditable var m_canDetectIntruders : Bool;
+	default m_canDetectIntruders = true;
+	instanceeditable var m_timeToActionAfterSpot : Float;
+	default m_timeToActionAfterSpot = 2f;
+	[ tooltip = "add rotation to upper body to override forward" ]
+	instanceeditable var m_overrideRootRotation : Float;
+	default m_overrideRootRotation = 0.0f;
+	[ tooltip = " > 0 - rotate from to | =0 dont rotate | -1 rotate 360 left | -2 rotate 360 right" ]
+	instanceeditable var m_maxRotationAngle : Float;
+	default m_maxRotationAngle = 90.f;
+	instanceeditable var m_pitchAngle : Float;
+	default m_pitchAngle = -15.f;
+	var m_rotationSpeed : Float;
+	default m_rotationSpeed = 5.f;
+}
+
 class SensorDeviceController extends ExplosiveDeviceController
 {
 
@@ -90,6 +180,7 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 	private var m_questTargetSpotted : Bool;
 	private var m_isAnyTargetIsLocked : Bool;
 	protected editable var m_isPartOfPrevention : Bool;
+	protected editable var m_ignoreTargetTrackerComponent : Bool;
 
 	public const function GetBehaviourCanRotate() : Bool
 	{
@@ -192,6 +283,11 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 	public const function IsPartOfPrevention() : Bool
 	{
 		return m_isPartOfPrevention;
+	}
+
+	public const function IgnoreTargetTrackerComponent() : Bool
+	{
+		return m_ignoreTargetTrackerComponent;
 	}
 
 	public quest const function IsQuestTargetSpotted() : Bool
@@ -301,7 +397,7 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 		m_netrunnerTargetID = value;
 	}
 
-	public function SetLinkedStatusEffect( value : LinkedStatusEffect )
+	public function SetLinkedStatusEffect( const value : ref< LinkedStatusEffect > )
 	{
 		m_linkedStatusEffect = value;
 	}
@@ -445,6 +541,7 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 	{
 		var action : ForceIgnoreTargets;
 		action = new ForceIgnoreTargets;
+		action.Repeat = true;
 		action.clearanceLevel = DefaultActionsParametersHolder.GetTakeOverControl();
 		action.SetUp( this );
 		action.SetProperties();
@@ -740,7 +837,12 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 
 	public function OnForceIgnoreTargets( evt : ForceIgnoreTargets ) : EntityNotificationType
 	{
-		ExecutePSAction( ActionSetDeviceAttitude() );
+		var action : SetDeviceAttitude;
+		action = ActionSetDeviceAttitude();
+		action.Attitude = evt.Attitude;
+		action.Repeat = evt.Repeat;
+		action.SetDurationValue( evt.GetDurationTime() );
+		ExecutePSAction( action );
 		return EntityNotificationType.SendThisEventToEntity;
 	}
 
@@ -777,77 +879,16 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 
 	protected export function OnSetDeviceTagKillMode( evt : SetDeviceTagKillMode ) : EntityNotificationType
 	{
+		var action : SetDeviceAttitude;
 		SetIsInTagKillMode( true );
+		if( IsAttitudeFromContextHostile() )
+		{
+			action = ActionSetDeviceAttitude();
+			action.Attitude = EAIAttitude.AIA_Friendly;
+			action.IgnoreHostiles = true;
+			ExecutePSAction( action );
+		}
 		return EntityNotificationType.SendThisEventToEntity;
-	}
-
-	public const function DrawBetweenEntities( shouldDraw : Bool, focusModeOnly : Bool, fxResource : FxResource, masterID : EntityID, slaveID : EntityID, revealMaster : Bool, revealSlave : Bool, optional onlyRemoveWeakLink : Bool, optional isEyeContact : Bool )
-	{
-		var registerLinkRequest : RegisterNetworkLinkRequest;
-		var unregisterLinkRequest : UnregisterNetworkLinkBetweenTwoEntitiesRequest;
-		var unregisterLinkRequestByID : UnregisterNetworkLinksByIDRequest;
-		var newLink : SNetworkLinkData;
-		var masterPuppet : ScriptedPuppet;
-		var slavePuppet : ScriptedPuppet;
-		var currentID : EntityID;
-		newLink.slaveID = slaveID;
-		newLink.masterID = masterID;
-		if( shouldDraw )
-		{
-			masterPuppet = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetGameInstance(), masterID ) ) );
-			slavePuppet = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetGameInstance(), slaveID ) ) );
-			newLink.weakLink = isEyeContact;
-			if( masterPuppet != NULL )
-			{
-				newLink.masterPos = masterPuppet.GetWorldPosition();
-			}
-			if( slavePuppet != NULL )
-			{
-				newLink.slavePos = slavePuppet.GetWorldPosition();
-			}
-			newLink.linkType = ELinkType.NETWORK;
-			newLink.isDynamic = true;
-			newLink.fxResource = fxResource;
-			newLink.revealMaster = revealMaster;
-			newLink.revealSlave = revealSlave;
-			newLink.drawLink = true;
-			if( focusModeOnly )
-			{
-				newLink.isNetrunner = true;
-			}
-			else
-			{
-				newLink.isPing = true;
-			}
-			registerLinkRequest = new RegisterNetworkLinkRequest;
-			registerLinkRequest.linksData.PushBack( newLink );
-			GetNetworkSystem().QueueRequest( registerLinkRequest );
-		}
-		else
-		{
-			if( EntityID.IsDefined( masterID ) && EntityID.IsDefined( slaveID ) )
-			{
-				unregisterLinkRequest = new UnregisterNetworkLinkBetweenTwoEntitiesRequest;
-				unregisterLinkRequest.firstID = slaveID;
-				unregisterLinkRequest.secondID = masterID;
-				unregisterLinkRequest.onlyRemoveWeakLink = onlyRemoveWeakLink;
-				GetNetworkSystem().QueueRequest( unregisterLinkRequest );
-			}
-			else
-			{
-				if( EntityID.IsDefined( masterID ) )
-				{
-					currentID = masterID;
-				}
-				else if( EntityID.IsDefined( slaveID ) )
-				{
-					currentID = slaveID;
-				}
-				unregisterLinkRequestByID = new UnregisterNetworkLinksByIDRequest;
-				unregisterLinkRequestByID.ID = currentID;
-				GetNetworkSystem().QueueRequest( unregisterLinkRequestByID );
-			}
-		}
 	}
 
 	public function ClearLinkedStatusEffect()
@@ -858,93 +899,5 @@ class SensorDeviceControllerPS extends ExplosiveDeviceControllerPS
 		m_linkedStatusEffect.targetID = emptyID;
 	}
 
-}
-
-class SetQuestTargetWasSeen extends Event
-{
-	var wasSeen : Bool;
-}
-
-class SetAnyTargetIsLocked extends Event
-{
-	var wasSeen : Bool;
-}
-
-class ForceIgnoreTargets extends ActionBool
-{
-
-	public override function GetBaseCost() : Int32
-	{
-		if( m_isQuickHack )
-		{
-			return super.GetBaseCost();
-		}
-		return 0;
-	}
-
-	public function SetProperties()
-	{
-		actionName = 'ForceIgnoreTargets';
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ForceIgnoreTargets', true, 'LocKey#2241', 'LocKey#2241' );
-	}
-
-}
-
-class SetDeviceTagKillMode extends ActionBool
-{
-
-	public function SetProperties()
-	{
-		actionName = 'SetDeviceSupprotMode';
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, true, 'LocKey#363', 'LocKey#363' );
-	}
-
-	public override function GetTweakDBChoiceRecord() : String
-	{
-		if( TDBID.IsValid( m_objectActionID ) )
-		{
-			return super.GetTweakDBChoiceRecord();
-		}
-		else
-		{
-			return "SetDeviceSupprotMode";
-		}
-	}
-
-	public const override function GetInteractionIcon() : weak< ChoiceCaptionIconPart_Record >
-	{
-		return TweakDBInterface.GetChoiceCaptionIconPartRecord( T"ChoiceCaptionParts.Aim" );
-	}
-
-}
-
-struct TargetingBehaviour
-{
-	var m_initialWakeState : ESensorDeviceWakeState;
-	default m_initialWakeState = ESensorDeviceWakeState.CLOSED;
-	instanceeditable var m_canRotate : Bool;
-	default m_canRotate = true;
-	instanceeditable var m_lostTargetLookAtTime : Float;
-	default m_lostTargetLookAtTime = 2f;
-	instanceeditable var m_lostTargetSearchTime : Float;
-	default m_lostTargetSearchTime = 10f;
-}
-
-struct DetectionParameters
-{
-	instanceeditable var m_canDetectIntruders : Bool;
-	default m_canDetectIntruders = true;
-	instanceeditable var m_timeToActionAfterSpot : Float;
-	default m_timeToActionAfterSpot = 2f;
-	[ tooltip = "add rotation to upper body to override forward" ]
-	instanceeditable var m_overrideRootRotation : Float;
-	default m_overrideRootRotation = 0.0f;
-	[ tooltip = " > 0 - rotate from to | =0 dont rotate | -1 rotate 360 left | -2 rotate 360 right" ]
-	instanceeditable var m_maxRotationAngle : Float;
-	default m_maxRotationAngle = 90.f;
-	instanceeditable var m_pitchAngle : Float;
-	default m_pitchAngle = -15.f;
-	var m_rotationSpeed : Float;
-	default m_rotationSpeed = 5.f;
 }
 

@@ -12,6 +12,20 @@ class GodModeStatListener extends ScriptStatsListener
 
 }
 
+class HealthbarMemoryStatListener extends ScriptStatsListener
+{
+	var m_healthbar : weak< healthbarWidgetGameController >;
+
+	public override function OnStatChanged( ownerID : StatsObjectID, statType : gamedataStatType, diff : Float, total : Float )
+	{
+		if( m_healthbar != NULL )
+		{
+			m_healthbar.UpdateMemoryBarMaxStat( total );
+		}
+	}
+
+}
+
 class healthbarWidgetGameController extends inkHUDGameController
 {
 	private var m_bbPlayerStats : weak< IBlackboard >;
@@ -30,6 +44,7 @@ class healthbarWidgetGameController extends inkHUDGameController
 	private editable var m_healthBarPath : inkWidgetPath;
 	private editable var m_armorPath : inkWidgetPath;
 	private editable var m_armorBarPath : inkWidgetPath;
+	private editable var m_overshieldBarRef : inkWidgetRef;
 	private editable var m_expBar : inkWidgetRef;
 	private editable var m_expBarSpacer : inkWidgetRef;
 	private editable var m_levelUpArrow : inkWidgetRef;
@@ -46,6 +61,8 @@ class healthbarWidgetGameController extends inkHUDGameController
 	private editable var m_expTextLabel : inkTextRef;
 	private editable var m_lostHealthAggregationBar : inkWidgetRef;
 	private editable var m_levelUpRectangle : inkWidgetRef;
+	private editable var m_damegePreview : inkWidgetRef;
+	private editable var m_fullBar : inkWidgetRef;
 	private var m_healthController : weak< NameplateBarLogicController >;
 	private var m_armorController : weak< ProgressBarSimpleWidgetLogicController >;
 	private var m_RootWidget : weak< inkWidget >;
@@ -81,6 +98,7 @@ class healthbarWidgetGameController extends inkHUDGameController
 	private var m_combatModePSM : gamePSMCombat;
 	private var m_sceneTier : GameplayTier;
 	private var m_godModeStatListener : GodModeStatListener;
+	private var m_memoryStatListener : HealthbarMemoryStatListener;
 	private var m_playerStatsBlackboard : weak< IBlackboard >;
 	private var characterCurrentXPListener : CallbackHandle;
 	private var m_levelUpBlackboard : weak< IBlackboard >;
@@ -94,6 +112,22 @@ class healthbarWidgetGameController extends inkHUDGameController
 	private var m_memoryMaxCells : Int32;
 	private var m_pendingRequests : Int32;
 	private var m_spawnTokens : array< weak< inkAsyncSpawnRequest > >;
+	private var m_overshieldListener : OvershieldListener;
+	private var m_overshieldBarController : weak< NameplateBarLogicController >;
+	private var m_useOevershield : Bool;
+	private var m_currentOvershieldValue : Int32;
+	default m_currentOvershieldValue = 0;
+	private var m_currentOvershieldValuePercent : Float;
+	default m_currentOvershieldValuePercent = 0.f;
+	private var m_overclockListener : OverclockListener;
+	private var m_isInOverclockedState : Bool;
+	default m_isInOverclockedState = false;
+	private var m_pulseBar : PulseAnimation;
+	private var m_pulseText : PulseAnimation;
+	private var m_pulse : PulseAnimation;
+	private var m_healthMemoryJumpAnim : inkAnimProxy;
+	private var m_healthMemoryFlashAnim : inkAnimProxy;
+	private var m_healthbarWidget : weak< inkWidget >;
 
 	protected event OnInitialize()
 	{
@@ -103,6 +137,8 @@ class healthbarWidgetGameController extends inkHUDGameController
 		m_buffWidget = ( ( inkWidget )( SpawnFromExternal( inkCompoundRef.Get( m_buffsHolder ), R"base\gameplay\gui\widgets\healthbar\playerbuffbar.inkwidget", 'VertRoot' ) ) );
 		m_currentHealth = CeilF( GameInstance.GetStatPoolsSystem( m_playerObject.GetGame() ).GetStatPoolValue( GetPlayer( m_playerObject.GetGame() ).GetEntityID(), gamedataStatPoolType.Health, false ) );
 		m_playerDevelopmentSystem = ( ( PlayerDevelopmentSystem )( GameInstance.GetScriptableSystemsContainer( m_playerObject.GetGame() ).Get( 'PlayerDevelopmentSystem' ) ) );
+		m_useOevershield = PlayerDevelopmentSystem.GetData( m_playerObject ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Body_Central_Milestone_3 );
+		m_overshieldBarController = ( ( NameplateBarLogicController )( inkWidgetRef.GetController( m_overshieldBarRef ) ) );
 		m_HPBar = ( ( inkWidget )( GetWidget( m_healthPath ) ) );
 		m_armorBar = ( ( inkWidget )( GetWidget( m_armorPath ) ) );
 		m_healthController = ( ( NameplateBarLogicController )( GetController( m_healthBarPath ) ) );
@@ -134,6 +170,14 @@ class healthbarWidgetGameController extends inkHUDGameController
 		requestStatsEvent.Set( m_playerObject );
 		m_playerDevelopmentSystem.QueueRequest( requestStatsEvent );
 		m_gameInstance = GetPlayerControlledObject().GetGame();
+		m_healthbarWidget = m_healthController.GetRootWidget();
+		m_pulseBar = new PulseAnimation;
+		m_pulseText = new PulseAnimation;
+		m_pulse = new PulseAnimation;
+		m_pulseBar.Configure( inkWidgetRef.Get( m_damegePreview ), 1.0, 0.80000001, 0.30000001 );
+		m_pulseText.Configure( inkTextRef.Get( m_maxHealthTextPath ), 1.0, 0.1, 0.30000001 );
+		m_pulse.Configure( m_healthbarWidget, 1.0, 0.5, 0.60000002 );
+		inkWidgetRef.SetVisible( m_damegePreview, false );
 	}
 
 	protected event OnUninitialize()
@@ -183,6 +227,13 @@ class healthbarWidgetGameController extends inkHUDGameController
 			else
 			{
 				inkWidgetRef.SetVisible( m_levelUpRectangle, true );
+				m_overshieldListener = new OvershieldListener;
+				m_overshieldListener.BindHelathBar( this );
+				GameInstance.GetStatPoolsSystem( playerGameObject.GetGame() ).RequestRegisteringListener( playerGameObject.GetEntityID(), gamedataStatPoolType.Overshield, m_overshieldListener );
+				EvaluateOvershieldBarVisibility();
+				m_overclockListener = new OverclockListener;
+				m_overclockListener.BindHelathBar( this );
+				GameInstance.GetStatusEffectSystem( playerGameObject.GetGame() ).RegisterListener( playerGameObject.GetEntityID(), m_overclockListener );
 			}
 		}
 		else
@@ -197,6 +248,15 @@ class healthbarWidgetGameController extends inkHUDGameController
 		if( m_foldingAnimProxy )
 		{
 			m_foldingAnimProxy.Stop();
+		}
+		if( m_overshieldListener )
+		{
+			GameInstance.GetStatPoolsSystem( playerGameObject.GetGame() ).RequestUnregisteringListener( playerGameObject.GetEntityID(), gamedataStatPoolType.Overshield, m_overshieldListener );
+			m_overshieldListener = NULL;
+		}
+		if( m_overclockListener )
+		{
+			m_overclockListener = NULL;
 		}
 		m_foldingAnimProxy = PlayLibraryAnimation( 'fold' );
 	}
@@ -218,6 +278,10 @@ class healthbarWidgetGameController extends inkHUDGameController
 			m_godModeStatListener = new GodModeStatListener;
 			m_godModeStatListener.m_healthbar = this;
 			GameInstance.GetStatsSystem( playerObject.GetGame() ).RegisterListener( playerObject.GetEntityID(), m_godModeStatListener );
+			m_memoryStatListener = new HealthbarMemoryStatListener;
+			m_memoryStatListener.m_healthbar = this;
+			m_memoryStatListener.SetStatType( gamedataStatType.Memory );
+			GameInstance.GetStatsSystem( playerObject.GetGame() ).RegisterListener( playerObject.GetEntityID(), m_memoryStatListener );
 		}
 	}
 
@@ -236,6 +300,8 @@ class healthbarWidgetGameController extends inkHUDGameController
 				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.Combat, m_combatModeBlackboardId );
 				GameInstance.GetStatsSystem( playerObject.GetGame() ).UnregisterListener( playerObject.GetEntityID(), m_godModeStatListener );
 				m_godModeStatListener = NULL;
+				GameInstance.GetStatsSystem( playerObject.GetGame() ).UnregisterListener( playerObject.GetEntityID(), m_memoryStatListener );
+				m_memoryStatListener = NULL;
 			}
 		}
 	}
@@ -280,17 +346,19 @@ class healthbarWidgetGameController extends inkHUDGameController
 
 	private function SetHealthProgress( value : Float )
 	{
-		var percentHP : Float;
 		value = ClampF( value, 0.01, 1.0 );
-		percentHP = 100.0 * ( ( ( Float )( m_currentHealth ) ) / ( ( Float )( m_maximumHealth ) ) );
-		percentHP = ClampF( percentHP, 1.0, 100.0 );
 		m_healthController.SetNameplateBarProgress( value, m_previousHealth == m_currentHealth );
-		inkTextRef.SetText( m_healthTextPath, IntToString( m_currentHealth ) );
-		inkTextRef.SetText( m_maxHealthTextPath, IntToString( m_maximumHealth ) );
+		UpdateCurrentHealthText();
 		if( m_previousHealth > m_currentHealth )
 		{
 			StartDamageFallDelay();
 		}
+	}
+
+	private function UpdateCurrentHealthText()
+	{
+		inkTextRef.SetState( m_healthTextPath, ( ( m_currentOvershieldValue > 0 ) ? ( 'Overshield' ) : ( 'Default' ) ) );
+		inkTextRef.SetText( m_healthTextPath, IntToString( m_currentHealth + m_currentOvershieldValue ) );
 	}
 
 	protected event OnCharacterLevelUpdated( value : Int32 )
@@ -448,6 +516,17 @@ class healthbarWidgetGameController extends inkHUDGameController
 		UpdateQuickhacksMemoryBarSize( m_memoryMaxCells );
 	}
 
+	public function UpdateMemoryBarMaxStat( maxBars : Float )
+	{
+		var currentValue : Float;
+		m_memoryMaxCells = FloorF( maxBars );
+		currentValue = GameInstance.GetStatPoolsSystem( ( ( PlayerPuppet )( GetOwnerEntity() ) ).GetGame() ).GetStatPoolValue( GetPlayerControlledObject().GetEntityID(), gamedataStatPoolType.Memory );
+		m_memoryFillCells = ( ( ( Float )( m_memoryMaxCells ) ) * currentValue ) * 0.01;
+		m_usedQuickhacks = m_memoryMaxCells - FloorF( m_memoryFillCells );
+		m_quickhacksMemoryPercent = currentValue;
+		UpdateQuickhacksMemoryBarSize( m_memoryMaxCells );
+	}
+
 	private function IsCyberdeckEquipped() : Bool
 	{
 		var itemTags : array< CName >;
@@ -501,6 +580,58 @@ class healthbarWidgetGameController extends inkHUDGameController
 		inkTextRef.SetVisible( m_invulnerableTextPath, HelperHasGodMode() );
 	}
 
+	private function ShowOverclockedHealthbar()
+	{
+		if( m_isInOverclockedState )
+		{
+			GetRootWidget().SetState( 'Overclocked' );
+			m_pulse.Start();
+			inkWidgetRef.Get( m_fullBar ).SetEffectEnabled( inkEffectType.ScanlineWipe, 'ScanlineWipe_0', true );
+			inkWidgetRef.SetOpacity( m_levelUpArrow, 0.0 );
+			inkWidgetRef.SetOpacity( m_levelUpFrame, 0.0 );
+		}
+	}
+
+	protected event OnOverclockDamagePreview( e : OverclockDamagePreview )
+	{
+		var healthCost : Float;
+		var fullBarSize : Vector2;
+		var animOptions : inkAnimOptions;
+		if( e.IsHovering )
+		{
+			animOptions.loopInfinite = true;
+			animOptions.loopType = inkanimLoopType.Cycle;
+			m_healthMemoryJumpAnim = PlayLibraryAnimation( 'memorySelected', animOptions );
+			m_pulse.Stop();
+			m_pulseBar.Start();
+			m_pulseText.Start();
+			QuickHackableHelper.CanPayWithHealthInOverclockedState( m_playerObject, e.MemoryCost, healthCost );
+			inkTextRef.SetText( m_maxHealthTextPath, "-" + IntToString( ( ( Int32 )( healthCost ) ) ) );
+			inkTextRef.SetVisible( m_maxHealthTextPath, true );
+			healthCost = healthCost / ( ( Float )( m_currentHealth ) );
+			fullBarSize = inkWidgetRef.GetSize( m_fullBar );
+			inkWidgetRef.SetSize( m_damegePreview, Vector2( healthCost * fullBarSize.X, fullBarSize.Y + 6.0 ) );
+			inkWidgetRef.SetVisible( m_damegePreview, true );
+		}
+		else
+		{
+			m_healthMemoryJumpAnim.Stop();
+			m_pulseBar.Stop();
+			m_pulseText.Stop();
+			m_pulse.Start();
+			inkWidgetRef.SetVisible( m_damegePreview, false );
+			inkTextRef.SetVisible( m_maxHealthTextPath, false );
+		}
+		if( e.JustHacked )
+		{
+			if( m_healthMemoryFlashAnim.IsPlaying() )
+			{
+				m_healthMemoryFlashAnim.GotoStartAndStop();
+			}
+			m_healthMemoryFlashAnim = PlayLibraryAnimation( 'overclock_use' );
+		}
+	}
+
 	private function ComputeHealthBarVisibility()
 	{
 		var isMaxHP, areQuickhacksUsed, isMultiplayer : Bool;
@@ -510,12 +641,24 @@ class healthbarWidgetGameController extends inkHUDGameController
 		m_armorBar.SetVisible( isMultiplayer );
 		UpdateGodModeVisibility();
 		inkCompoundRef.SetVisible( m_quickhacksContainer, IsCyberdeckEquipped() );
+		if( !( m_isInOverclockedState ) )
+		{
+			inkWidgetRef.Get( m_fullBar ).SetEffectEnabled( inkEffectType.ScanlineWipe, 'ScanlineWipe_0', false );
+			GetRootWidget().SetState( 'Default' );
+			m_healthMemoryJumpAnim.Stop();
+			m_pulseBar.Stop();
+			m_pulseText.Stop();
+			m_pulse.Stop();
+		}
 		if( m_currentVisionPSM != gamePSMVision.Default )
 		{
-			HideRequest();
-			return;
+			if( !( m_isInOverclockedState ) )
+			{
+				HideRequest();
+				return;
+			}
 		}
-		if( ( ( ( ( !( isMaxHP ) || areQuickhacksUsed ) || isMultiplayer ) || m_combatModePSM == gamePSMCombat.InCombat ) || ( m_quickhacksMemoryPercent < 100.0 ) ) || m_buffsVisible )
+		if( ( ( ( ( ( !( isMaxHP ) || areQuickhacksUsed ) || isMultiplayer ) || m_combatModePSM == gamePSMCombat.InCombat ) || ( m_quickhacksMemoryPercent < 100.0 ) ) || m_buffsVisible ) || m_isInOverclockedState )
 		{
 			ShowRequest();
 		}
@@ -567,6 +710,41 @@ class healthbarWidgetGameController extends inkHUDGameController
 		fadeInterp.SetEndTransparency( 0.0 );
 		fadeInterp.SetDuration( 0.22 );
 		m_animHideTemp.AddInterpolator( fadeInterp );
+	}
+
+	public function UpdateOvershieldValue( newValue : Float, percToPoints : Float )
+	{
+		m_currentOvershieldValue = RoundF( newValue * percToPoints );
+		UpdateCurrentHealthText();
+		m_currentOvershieldValuePercent = ( ( Float )( m_currentOvershieldValue ) ) / ( ( Float )( m_maximumHealth ) );
+		m_overshieldBarController.SetNameplateBarProgress( m_currentOvershieldValuePercent, false );
+	}
+
+	public function EvaluateOvershieldBarVisibility()
+	{
+		m_useOevershield = PlayerDevelopmentSystem.GetData( m_playerObject ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Body_Central_Milestone_3 );
+		if( !( m_useOevershield ) )
+		{
+			m_currentOvershieldValue = 0;
+			m_currentOvershieldValuePercent = 0.0;
+		}
+		inkWidgetRef.SetVisible( m_overshieldBarRef, m_useOevershield && ( m_currentOvershieldValuePercent > 0.0 ) );
+	}
+
+	public function EvaluateHealthBarVisibility( isInOverclockedState : Bool )
+	{
+		var blackboard : IBlackboard;
+		if( m_playerObject )
+		{
+			blackboard = GameInstance.GetBlackboardSystem( m_playerObject.GetGame() ).Get( GetAllBlackboardDefs().UI_QuickSlotsData );
+			if( blackboard )
+			{
+				m_isInOverclockedState = isInOverclockedState;
+				blackboard.SetBool( GetAllBlackboardDefs().UI_QuickSlotsData.quickhackPanelKeepContext, isInOverclockedState );
+			}
+		}
+		ShowOverclockedHealthbar();
+		ComputeHealthBarVisibility();
 	}
 
 	protected event OnCombatStateChanged( value : Int32 )
@@ -632,5 +810,59 @@ class QuickhackBarController extends inkLogicController
 		}
 	}
 
+}
+
+class OvershieldListener extends ScriptStatPoolsListener
+{
+	private var m_healthBar : weak< healthbarWidgetGameController >;
+
+	public function BindHelathBar( bar : weak< healthbarWidgetGameController > )
+	{
+		m_healthBar = bar;
+	}
+
+	public override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		if( newValue != oldValue )
+		{
+			m_healthBar.UpdateOvershieldValue( newValue, percToPoints );
+		}
+		m_healthBar.EvaluateOvershieldBarVisibility();
+	}
+
+}
+
+class OverclockListener extends ScriptStatusEffectListener
+{
+	private var m_healthBar : weak< healthbarWidgetGameController >;
+
+	public function BindHelathBar( bar : weak< healthbarWidgetGameController > )
+	{
+		m_healthBar = bar;
+	}
+
+	public virtual function OnStatusEffectApplied( statusEffect : weak< StatusEffect_Record > )
+	{
+		if( statusEffect.GetID() == QuickHackableHelper.GetOverclockedStateTweakDBID() )
+		{
+			m_healthBar.EvaluateHealthBarVisibility( true );
+		}
+	}
+
+	public virtual function OnStatusEffectRemoved( statusEffect : weak< StatusEffect_Record > )
+	{
+		if( statusEffect.GetID() == QuickHackableHelper.GetOverclockedStateTweakDBID() )
+		{
+			m_healthBar.EvaluateHealthBarVisibility( false );
+		}
+	}
+
+}
+
+class OverclockDamagePreview extends Event
+{
+	var IsHovering : Bool;
+	var JustHacked : Bool;
+	var MemoryCost : Int32;
 }
 

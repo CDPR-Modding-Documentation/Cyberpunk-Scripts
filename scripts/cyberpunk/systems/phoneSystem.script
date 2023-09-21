@@ -1,3 +1,40 @@
+import enum questPhoneStatus
+{
+	Available,
+	NotAvailable,
+	Busy,
+	Minimized,
+}
+
+import enum questPhoneCallPhase
+{
+	Undefined,
+	IncomingCall,
+	StartCall,
+	EndCall,
+}
+
+import enum questPhoneCallMode
+{
+	Undefined,
+	Audio,
+	Video,
+}
+
+import enum questPhoneCallVisuals
+{
+	Default,
+	Somi,
+}
+
+import enum questPhoneTalkingState
+{
+	Ended,
+	Initializing,
+	Talking,
+	Rejected,
+}
+
 import class questSetPhoneStatusRequest extends ScriptableSystemRequest
 {
 	import var status : CName;
@@ -11,6 +48,8 @@ import class questTriggerCallRequest extends ScriptableSystemRequest
 	import var callMode : questPhoneCallMode;
 	import var isPlayerTriggered : Bool;
 	import var isRejectable : Bool;
+	import var showAvatar : Bool;
+	import var visuals : questPhoneCallVisuals;
 }
 
 import class questMinimizeCallRequest extends ScriptableSystemRequest
@@ -20,6 +59,7 @@ import class questMinimizeCallRequest extends ScriptableSystemRequest
 
 class UsePhoneRequest extends ScriptableSystemRequest
 {
+	var MessageToOpen : weak< JournalEntry >;
 }
 
 class PhoneTimeoutRequest extends ScriptableSystemRequest
@@ -37,20 +77,74 @@ class TalkingTriggerRequest extends ScriptableSystemRequest
 	var isPlayerCalling : Bool;
 	var contact : CName;
 	var state : questPhoneTalkingState;
+	var visuals : questPhoneCallVisuals;
+}
+
+class PhoneStatusEffectListener extends ScriptStatusEffectListener
+{
+	private var m_phoneSystem : weak< PhoneSystem >;
+
+	public function Init( system : PhoneSystem )
+	{
+		m_phoneSystem = system;
+	}
+
+	public export virtual function OnStatusEffectApplied( statusEffect : weak< StatusEffect_Record > )
+	{
+		m_phoneSystem.RefreshPhoneEnabled();
+	}
+
+	public export virtual function OnStatusEffectRemoved( statusEffect : weak< StatusEffect_Record > )
+	{
+		m_phoneSystem.RefreshPhoneEnabled();
+	}
+
+}
+
+class PhoneStatsListener extends ScriptStatsListener
+{
+	private var m_phoneSystem : weak< PhoneSystem >;
+
+	public function Init( system : PhoneSystem )
+	{
+		m_phoneSystem = system;
+	}
+
+	public override function OnStatChanged( ownerID : StatsObjectID, statType : gamedataStatType, diff : Float, total : Float )
+	{
+		m_phoneSystem.RefreshPhoneEnabled();
+	}
+
 }
 
 class PhoneSystem extends ScriptableSystem
 {
 	private var m_BlackboardSystem : BlackboardSystem;
 	private var m_Blackboard : weak< IBlackboard >;
+	private var m_PsmBlackboard : weak< IBlackboard >;
 	private var m_LastCallInformation : PhoneCallInformation;
+	private var m_StatusEffectsListener : PhoneStatusEffectListener;
+	private var m_StatsListener : PhoneStatsListener;
 	private var m_ContactsOpen : Bool;
 	default m_ContactsOpen = false;
-	private var ContactsOpenBBId : CallbackHandle;
+	private var m_PhoneVisibilityBBId : CallbackHandle;
+	private var m_ContactsOpenBBId : CallbackHandle;
+	private var m_HighLevelBBId : CallbackHandle;
+	private var m_CombatBBId : CallbackHandle;
+	private var m_SwimmingBBId : CallbackHandle;
+	private var m_IsContrDeviceBBId : CallbackHandle;
+	private var m_IsUIZoomDeviceBBId : CallbackHandle;
+	private var m_PlayerAttachedCallbackID : Uint32;
+	private var m_PlayerDetachedCallbackID : Uint32;
 
 	private function IsShowingMessage() : Bool
 	{
 		return m_Blackboard.GetBool( GetAllBlackboardDefs().UI_ComDevice.isDisplayingMessage );
+	}
+
+	private function IsPhoneOpened() : Bool
+	{
+		return m_Blackboard.GetBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive );
 	}
 
 	private export function OnSetPhoneStatus( request : questSetPhoneStatusRequest )
@@ -69,7 +163,7 @@ class PhoneSystem extends ScriptableSystem
 		}
 		if( ( IsNameValid( request.caller ) && request.caller != 'player' ) && request.caller != 'Player' )
 		{
-			if( shouldPlayIncomingCallSound )
+			if( shouldPlayIncomingCallSound && request.visuals == questPhoneCallVisuals.Default )
 			{
 				GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call' );
 			}
@@ -85,14 +179,14 @@ class PhoneSystem extends ScriptableSystem
 		}
 		if( IsNameValid( contactName ) )
 		{
-			TriggerCall( request.callMode, request.callMode == questPhoneCallMode.Audio, contactName, request.caller == 'Player' || request.caller == 'player', request.callPhase, request.isPlayerTriggered, request.isRejectable );
+			TriggerCall( request.callMode, request.callMode == questPhoneCallMode.Audio, contactName, request.caller == 'Player' || request.caller == 'player', request.callPhase, request.isPlayerTriggered, request.isRejectable, request.showAvatar, request.visuals );
 		}
 	}
 
-	private function TriggerCall( callMode : questPhoneCallMode, isAudio : Bool, contactName : CName, isPlayerCalling : Bool, callPhase : questPhoneCallPhase, isPlayerTriggered : Bool, optional isRejectable : Bool )
+	private function TriggerCall( callMode : questPhoneCallMode, isAudio : Bool, contactName : CName, isPlayerCalling : Bool, callPhase : questPhoneCallPhase, isPlayerTriggered : Bool, optional isRejectable : Bool, showAvatar : Bool, callVisuals : questPhoneCallVisuals )
 	{
 		var state : questPhoneTalkingState;
-		m_LastCallInformation = PhoneCallInformation( callMode, isAudio, contactName, isPlayerCalling, isPlayerTriggered, callPhase, isRejectable );
+		m_LastCallInformation = PhoneCallInformation( callMode, isAudio, contactName, isPlayerCalling, isPlayerTriggered, callPhase, isRejectable, showAvatar, callVisuals );
 		m_Blackboard.SetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation, m_LastCallInformation, true );
 		if( callPhase == questPhoneCallPhase.EndCall )
 		{
@@ -134,49 +228,54 @@ class PhoneSystem extends ScriptableSystem
 	{
 		if( m_LastCallInformation.callPhase == questPhoneCallPhase.IncomingCall )
 		{
-			TriggerCall( questPhoneCallMode.Undefined, m_LastCallInformation.isAudioCall, m_LastCallInformation.contactName, m_LastCallInformation.isPlayerCalling, questPhoneCallPhase.EndCall, m_LastCallInformation.isPlayerTriggered, m_LastCallInformation.isRejectable );
+			TriggerCall( questPhoneCallMode.Undefined, m_LastCallInformation.isAudioCall, m_LastCallInformation.contactName, m_LastCallInformation.isPlayerCalling, questPhoneCallPhase.EndCall, m_LastCallInformation.isPlayerTriggered, m_LastCallInformation.isRejectable, m_LastCallInformation.showAvatar, m_LastCallInformation.visuals );
 		}
 	}
 
 	private function OnUsePhone( request : UsePhoneRequest )
 	{
-		var psmBlackboard : IBlackboard;
 		var localPlayer : weak< GameObject >;
 		var notificationEvent : UIInGameNotificationEvent;
-		var tier : Int32;
-		tier = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel );
-		if( IsShowingMessage() )
+		var hash : Int32;
+		if( IsPhoneOpened() )
 		{
 			return;
 		}
 		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
-		psmBlackboard = GameInstance.GetBlackboardSystem( localPlayer.GetGame() ).GetLocalInstanced( localPlayer.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
 		if( m_LastCallInformation.callPhase == questPhoneCallPhase.IncomingCall )
 		{
 			if( m_LastCallInformation.isPlayerCalling )
 			{
 				GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_stop' );
-				TriggerCall( questPhoneCallMode.Undefined, m_LastCallInformation.isAudioCall, m_LastCallInformation.contactName, m_LastCallInformation.isPlayerCalling, questPhoneCallPhase.EndCall, m_LastCallInformation.isPlayerTriggered, m_LastCallInformation.isRejectable );
+				TriggerCall( questPhoneCallMode.Undefined, m_LastCallInformation.isAudioCall, m_LastCallInformation.contactName, m_LastCallInformation.isPlayerCalling, questPhoneCallPhase.EndCall, m_LastCallInformation.isPlayerTriggered, m_LastCallInformation.isRejectable, m_LastCallInformation.showAvatar, m_LastCallInformation.visuals );
 			}
 			else
 			{
-				GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_positive' );
+				if( m_LastCallInformation.visuals == questPhoneCallVisuals.Default )
+				{
+					GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_positive' );
+				}
 				GameInstance.GetAudioSystem( localPlayer.GetGame() ).Play( 'ui_phone_incoming_call_stop' );
 				SetPhoneFact( m_LastCallInformation.isPlayerCalling, m_LastCallInformation.contactName, questPhoneTalkingState.Talking );
 			}
 		}
-		else if( ( ( tier >= ( ( Int32 )( gamePSMHighLevel.SceneTier3 ) ) ) && ( tier <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'NoPhone' ) )
+		else if( !( IsPhoneEnabled() ) )
 		{
 			GameInstance.GetUISystem( localPlayer.GetGame() ).QueueEvent( new UIInGameNotificationRemoveEvent );
 			notificationEvent = new UIInGameNotificationEvent;
-			notificationEvent.m_notificationType = UIInGameNotificationType.ActionRestriction;
+			notificationEvent.m_notificationType = UIInGameNotificationType.CombatRestriction;
 			GameInstance.GetUISystem( localPlayer.GetGame() ).QueueEvent( notificationEvent );
 			return;
 		}
-		else if( m_LastCallInformation.callPhase == questPhoneCallPhase.Undefined || m_LastCallInformation.callPhase == questPhoneCallPhase.EndCall )
+		else
 		{
 			if( !( m_ContactsOpen ) )
 			{
+				if( request.MessageToOpen != NULL )
+				{
+					hash = GameInstance.GetJournalManager( localPlayer.GetGame() ).GetEntryHash( request.MessageToOpen );
+					m_Blackboard.SetInt( GetAllBlackboardDefs().UI_ComDevice.MessageToOpenHash, hash, true );
+				}
 				ToggleContacts( true );
 			}
 		}
@@ -192,11 +291,19 @@ class PhoneSystem extends ScriptableSystem
 		m_ContactsOpen = newState;
 	}
 
+	private function OnPhoneVisibilityChanged( newValue : Variant )
+	{
+		RefreshPhoneEnabled();
+	}
+
 	private export function OnTalkingTriggerRequest( request : TalkingTriggerRequest )
 	{
 		GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_initiation_call_stop' );
 		GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call_stop' );
-		GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call_positive' );
+		if( request.visuals == questPhoneCallVisuals.Default )
+		{
+			GameInstance.GetAudioSystem( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject().GetGame() ).Play( 'ui_phone_incoming_call_positive' );
+		}
 		SetPhoneFact( request.isPlayerCalling, request.contact, request.state );
 	}
 
@@ -226,15 +333,216 @@ class PhoneSystem extends ScriptableSystem
 	{
 		m_BlackboardSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
 		m_Blackboard = m_BlackboardSystem.Get( GetAllBlackboardDefs().UI_ComDevice );
-		ContactsOpenBBId = m_Blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, this, 'OnContactsStateChanged' );
+		m_ContactsOpenBBId = m_Blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, this, 'OnContactsStateChanged' );
+		m_PhoneVisibilityBBId = m_Blackboard.RegisterListenerVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneVisibility, this, 'OnPhoneVisibilityChanged' );
+		m_PlayerAttachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetAttachedCallback( this, 'PlayerAttachedCallback' );
 	}
 
 	private export override function OnDetach()
 	{
 		if( m_Blackboard )
 		{
-			m_Blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, ContactsOpenBBId );
+			m_Blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, m_ContactsOpenBBId );
+			m_Blackboard.UnregisterListenerVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneVisibility, m_PhoneVisibilityBBId );
 		}
+		GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetAttachedCallback( m_PlayerAttachedCallbackID );
+		PlayerDetached();
+	}
+
+	private function PlayerAttachedCallback( playerPuppet : GameObject )
+	{
+		m_PsmBlackboard = m_BlackboardSystem.GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( m_PsmBlackboard )
+		{
+			m_CombatBBId = m_PsmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, this, 'OnPhoneEnabledChangedInt' );
+			m_HighLevelBBId = m_PsmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel, this, 'OnPhoneEnabledChangedInt' );
+			m_SwimmingBBId = m_PsmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Swimming, this, 'OnPhoneEnabledChangedInt' );
+			m_IsContrDeviceBBId = m_PsmBlackboard.RegisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, this, 'OnPhoneEnabledChangedBool' );
+			m_IsUIZoomDeviceBBId = m_PsmBlackboard.RegisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.IsUIZoomDevice, this, 'OnPhoneEnabledChangedBool' );
+		}
+		m_StatusEffectsListener = new PhoneStatusEffectListener;
+		m_StatusEffectsListener.Init( this );
+		GameInstance.GetStatusEffectSystem( GetGameInstance() ).RegisterListener( playerPuppet.GetEntityID(), m_StatusEffectsListener );
+		m_StatsListener = new PhoneStatsListener;
+		m_StatsListener.Init( this );
+		GameInstance.GetStatsSystem( GetGameInstance() ).RegisterListener( playerPuppet.GetEntityID(), m_StatsListener );
+	}
+
+	private function PlayerDetached()
+	{
+		var localPlayer : weak< GameObject >;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( m_PsmBlackboard )
+		{
+			m_PsmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, m_CombatBBId );
+			m_PsmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel, m_HighLevelBBId );
+			m_PsmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Swimming, m_SwimmingBBId );
+			m_PsmBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, m_IsContrDeviceBBId );
+			m_PsmBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.IsUIZoomDevice, m_IsUIZoomDeviceBBId );
+		}
+		m_StatusEffectsListener = NULL;
+		if( localPlayer )
+		{
+			GameInstance.GetStatsSystem( GetGameInstance() ).UnregisterListener( localPlayer.GetEntityID(), m_StatsListener );
+		}
+	}
+
+	protected event OnPhoneEnabledChangedInt( value : Int32 )
+	{
+		RefreshPhoneEnabled();
+	}
+
+	protected event OnPhoneEnabledChangedBool( value : Bool )
+	{
+		RefreshPhoneEnabled();
+	}
+
+	public const function RefreshPhoneEnabled()
+	{
+		if( m_Blackboard )
+		{
+			m_Blackboard.SetBool( GetAllBlackboardDefs().UI_ComDevice.PhoneEnabled, IsPhoneEnabled() );
+		}
+	}
+
+	public const function IsPhoneEnabled() : Bool
+	{
+		var blocedByCombat : Bool;
+		var blockedByStatus : Bool;
+		var blockedByTier : Bool;
+		var blockedByBlackboard : Bool;
+		var blockedByHud : Bool;
+		var blockedByVisiblity : Bool;
+		var enabledByQuest : Bool;
+		var enabledByVisiblity : Bool;
+		blocedByCombat = IsBlockedByCombat();
+		blockedByStatus = IsBlockedByStatus();
+		blockedByTier = IsBlockedByTier();
+		blockedByBlackboard = IsBlockedByBlackboard();
+		blockedByHud = IsBlockedByHUD();
+		blockedByVisiblity = IsBlockedByVisiblity();
+		enabledByQuest = IsEnabledByQuestSystem();
+		enabledByVisiblity = IsEnabledByVisiblity();
+		if( blocedByCombat )
+		{
+			return false;
+		}
+		else if( enabledByQuest || enabledByVisiblity )
+		{
+			return true;
+		}
+		return ( ( ( !( blockedByTier ) && !( blockedByBlackboard ) ) && !( blockedByHud ) ) && !( blockedByVisiblity ) ) && !( blockedByStatus );
+	}
+
+	private const function IsBlockedByCombat() : Bool
+	{
+		var combat : Int32;
+		combat = m_PsmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat );
+		return combat == ( ( Int32 )( gamePSMCombat.InCombat ) );
+	}
+
+	private const function IsBlockedByStatus() : Bool
+	{
+		var localPlayer : weak< GameObject >;
+		var noPhone : Bool;
+		var interrupted : Bool;
+		var noCalling : Bool;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		noPhone = StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'NoPhone' );
+		interrupted = StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'PhoneInterrupted' );
+		noCalling = StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'PhoneNoCalling' );
+		return ( noPhone || interrupted ) && !( noCalling );
+	}
+
+	private const function IsBlockedByTier() : Bool
+	{
+		var tier : Int32;
+		tier = m_PsmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel );
+		return ( tier >= ( ( Int32 )( gamePSMHighLevel.SceneTier3 ) ) ) && ( tier <= ( ( Int32 )( gamePSMHighLevel.SceneTier5 ) ) );
+	}
+
+	private const function IsBlockedByBlackboard() : Bool
+	{
+		var localPlayer : weak< GameObject >;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( ( m_PsmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Swimming ) == ( ( Int32 )( gamePSMSwimming.Diving ) ) ) && !( GameInstance.GetStatsSystem( GetGameInstance() ).GetStatBoolValue( localPlayer.GetEntityID(), gamedataStatType.CanUsePhoneUnderWater ) ) )
+		{
+			return true;
+		}
+		if( m_PsmBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice ) || m_PsmBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsUIZoomDevice ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private const function IsEnabledByQuestSystem() : Bool
+	{
+		var questsSystem : weak< QuestsSystem >;
+		var isEnabled : Bool;
+		questsSystem = GameInstance.GetQuestsSystem( GetGameInstance() );
+		isEnabled = questsSystem.GetFact( 'q304_phone_in_car_on' );
+		return isEnabled;
+	}
+
+	private const function IsBlockedByHUD() : Bool
+	{
+		var localPlayer : weak< GameObject >;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		return StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'BlockAllHubMenu' );
+	}
+
+	private const function IsEnabledByVisiblity() : Bool
+	{
+		var vis : worlduiEntryVisibility;
+		vis = ( ( worlduiEntryVisibility )( m_Blackboard.GetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneVisibility ) ) );
+		return vis == worlduiEntryVisibility.ForceShow;
+	}
+
+	private const function IsBlockedByVisiblity() : Bool
+	{
+		var vis : worlduiEntryVisibility;
+		vis = ( ( worlduiEntryVisibility )( m_Blackboard.GetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneVisibility ) ) );
+		return vis == worlduiEntryVisibility.ForceHide;
+	}
+
+	public const function IsCallingEnabled() : Bool
+	{
+		var phoneEnabled : Bool;
+		var callingAvaliable : Bool;
+		var blockedByGameplay : Bool;
+		phoneEnabled = IsPhoneEnabled();
+		callingAvaliable = IsCallingAvaliable();
+		blockedByGameplay = IsCallingBlockedByStatus();
+		return ( phoneEnabled && callingAvaliable ) && !( blockedByGameplay );
+	}
+
+	private const function IsCallingAvaliable() : Bool
+	{
+		return m_LastCallInformation.callPhase == questPhoneCallPhase.Undefined || m_LastCallInformation.callPhase == questPhoneCallPhase.EndCall;
+	}
+
+	private const function IsCallingBlockedByStatus() : Bool
+	{
+		var localPlayer : weak< GameObject >;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		return StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'PhoneNoCalling' );
+	}
+
+	public const function IsTextingEnabled() : Bool
+	{
+		var phoneEnabled : Bool;
+		var blockedByStatus : Bool;
+		phoneEnabled = IsPhoneEnabled();
+		blockedByStatus = IsTextingBlockedByStatus();
+		return phoneEnabled && !( blockedByStatus );
+	}
+
+	private const function IsTextingBlockedByStatus() : Bool
+	{
+		var localPlayer : weak< GameObject >;
+		localPlayer = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		return StatusEffectSystem.ObjectHasStatusEffectWithTag( localPlayer, 'PhoneNoTexting' );
 	}
 
 	public const function IsPhoneAvailable() : Bool
@@ -258,36 +566,7 @@ importonly struct PhoneCallInformation
 	import var isPlayerTriggered : Bool;
 	import var callPhase : questPhoneCallPhase;
 	import var isRejectable : Bool;
-}
-
-import enum questPhoneStatus
-{
-	Available,
-	NotAvailable,
-	Busy,
-	Minimized,
-}
-
-import enum questPhoneCallPhase
-{
-	Undefined,
-	IncomingCall,
-	StartCall,
-	EndCall,
-}
-
-import enum questPhoneCallMode
-{
-	Undefined,
-	Audio,
-	Video,
-}
-
-import enum questPhoneTalkingState
-{
-	Ended,
-	Initializing,
-	Talking,
-	Rejected,
+	import var showAvatar : Bool;
+	import var visuals : questPhoneCallVisuals;
 }
 

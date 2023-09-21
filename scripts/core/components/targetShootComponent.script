@@ -1,3 +1,8 @@
+import class OverrideMissShotOffset extends Event
+{
+	import var overrideRecord : String;
+}
+
 struct TimeBetweenHitsParameters
 {
 	var baseCoefficient : Float;
@@ -9,13 +14,20 @@ struct TimeBetweenHitsParameters
 	var playersCountCoefficient : Float;
 	var coefficientMultiplier : Float;
 	var accuracyCoefficient : Float;
+	var coverCoefficient : Float;
+	var visionBlockerCoefficient : Float;
 }
 
 import class TargetShootComponent extends IComponent
 {
 	private import const function IsTimeBetweenHitsEnabled() : Bool;
-	private import const function GetLastHitTime() : Float;
+	private import const function IsDebugEnabled() : Bool;
+	public import const function GetPackageName() : String;
+	private import const function CalculateMissOffset( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPointWS : Vector4, maxSpread : Float, useForcedMissZOffset : Bool, forcedMissZOffset : Float, isInLowCover : Bool ) : Vector4;
 	private import function SetLastHitTime( value : Float );
+	private import const function GetLastHitTime() : Float;
+	private import function GetBasicGroupCoefficient( weaponOwner : weak< GameObject > ) : Float;
+	private import function InsertRecentHitter( weaponOwner : weak< GameObject > );
 
 	private const function GetValueFromCurve( curveName : CName, lookupValue : Float ) : Float
 	{
@@ -38,33 +50,31 @@ import class TargetShootComponent extends IComponent
 		return statsDataSystem.GetValueFromCurve( 'tbh_weapon_type_visibility_mults', lookupValue, curveName );
 	}
 
-	private import const function IsDebugEnabled() : Bool;
-
 	private const function GetGameObject() : GameObject
 	{
 		return ( ( GameObject )( GetEntity() ) );
 	}
 
-	public function HandleWeaponShoot( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPoint : Vector4, maxSpread : Float, coefficientMultiplier : Float, out miss : Bool ) : Vector4
+	public function HandleBeingShot( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPoint : Vector4, maxSpread : Float, coefficientMultiplier : Float, out miss : Bool ) : Vector4
 	{
 		var gameInstance : GameInstance;
 		var result : Vector4;
 		var weaponRecord : WeaponItem_Record;
-		var useForcedMissZOffset : Bool;
-		var forcedMissZOffset : Float;
-		var characterRecord : Character_Record;
 		gameInstance = GetGameObject().GetGame();
 		result = Vector4( 0.0, 0.0, 0.0, 0.0 );
-		useForcedMissZOffset = false;
-		forcedMissZOffset = 0.0;
 		if( !( IsTimeBetweenHitsEnabled() ) )
 		{
 			return result;
 		}
 		miss = false;
-		if( ShouldBeHit( weaponOwner, weapon, coefficientMultiplier ) )
+		weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
+		if( ShouldBeHit( weaponOwner, weapon, weaponRecord, coefficientMultiplier ) )
 		{
 			SetLastHitTime( EngineTime.ToFloat( GameInstance.GetSimTime( gameInstance ) ) );
+			if( GetGameObject().IsPlayer() )
+			{
+				InsertRecentHitter( weaponOwner );
+			}
 			if( IsDebugEnabled() )
 			{
 				GameInstance.GetDebugVisualizerSystem( gameInstance ).DrawWireSphere( shootAtPoint + result, 0.04, Color( 252, 3, 3, 255 ), 3.0 );
@@ -72,31 +82,47 @@ import class TargetShootComponent extends IComponent
 		}
 		else
 		{
-			if( ( ( ScriptedPuppet )( weaponOwner ) ) != NULL )
-			{
-				weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
-				characterRecord = TweakDBInterface.GetCharacterRecord( ( ( ScriptedPuppet )( weaponOwner ) ).GetRecordID() );
-				useForcedMissZOffset = weaponRecord.UseForcedTBHZOffset() && characterRecord.UseForcedTBHZOffset();
-				forcedMissZOffset = characterRecord.ForcedTBHZOffset();
-			}
-			result = CalculateMissOffset( weaponOwner, weapon, shootAtPoint, maxSpread, useForcedMissZOffset, forcedMissZOffset );
+			result = HandleMissed( weaponOwner, weapon, shootAtPoint, maxSpread );
 			miss = true;
-			if( IsDebugEnabled() )
-			{
-				GameInstance.GetDebugVisualizerSystem( gameInstance ).DrawWireSphere( shootAtPoint + result, 0.04, Color( 50, 168, 82, 255 ), 3.0 );
-			}
 		}
 		return result;
 	}
 
-	public function HandleWeaponShoot( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPoint : Vector4, maxSpread : Float, coefficientMultiplier : Float ) : Vector4
+	public function HandleBeingShot( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPoint : Vector4, maxSpread : Float, coefficientMultiplier : Float ) : Vector4
 	{
 		var tmp : Bool;
-		return HandleWeaponShoot( weaponOwner, weapon, shootAtPoint, maxSpread, coefficientMultiplier, tmp );
+		return HandleBeingShot( weaponOwner, weapon, shootAtPoint, maxSpread, coefficientMultiplier, tmp );
 	}
 
-	private import const function CalculateMissOffset( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPointWS : Vector4, maxSpread : Float, useForcedMissZOffset : Bool, forcedMissZOffset : Float ) : Vector4;
-	public import const function GetPackageName() : String;
+	private function HandleMissed( weaponOwner : weak< GameObject >, weapon : weak< WeaponObject >, shootAtPoint : Vector4, maxSpread : Float ) : Vector4
+	{
+		var weaponRecord : WeaponItem_Record;
+		var useForcedMissZOffset : Bool;
+		var forcedMissZOffset : Float;
+		var isInLowCover : Bool;
+		var characterRecord : Character_Record;
+		var scriptedPuppetOwner : ScriptedPuppet;
+		var result : Vector4;
+		useForcedMissZOffset = false;
+		forcedMissZOffset = 0.0;
+		isInLowCover = false;
+		result = Vector4( 0.0, 0.0, 0.0, 0.0 );
+		scriptedPuppetOwner = ( ( ScriptedPuppet )( weaponOwner ) );
+		weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
+		if( scriptedPuppetOwner )
+		{
+			characterRecord = TweakDBInterface.GetCharacterRecord( scriptedPuppetOwner.GetRecordID() );
+			useForcedMissZOffset = weaponRecord.UseForcedTBHZOffset() && characterRecord.UseForcedTBHZOffset();
+			forcedMissZOffset = characterRecord.ForcedTBHZOffset();
+			isInLowCover = AICoverHelper.GetCurrentCoverStance( scriptedPuppetOwner ) == 'Low';
+		}
+		result = CalculateMissOffset( weaponOwner, weapon, shootAtPoint, maxSpread, useForcedMissZOffset, forcedMissZOffset, isInLowCover );
+		if( IsDebugEnabled() )
+		{
+			GameInstance.GetDebugVisualizerSystem( GetGameObject().GetGame() ).DrawWireSphere( shootAtPoint + result, 0.04, Color( 50, 168, 82, 255 ), 3.0 );
+		}
+		return result;
+	}
 
 	private const function GetDifficultyLevelCoefficient() : Float
 	{
@@ -126,23 +152,14 @@ import class TargetShootComponent extends IComponent
 		return TDB.GetFloat( TDBID.Create( GetPackageName() + fieldName ), 1.0 );
 	}
 
-	private const function GetGroupCoefficient( weaponOwner : GameObject ) : Float
+	private const function GetHMGGroupMultiplier() : Float
 	{
-		var defaultValue : Float;
-		var squadMember : SquadMemberBaseComponent;
-		var squad : SquadScriptInterface;
-		defaultValue = 0.0;
-		squadMember = weaponOwner.GetSquadMemberComponent();
-		if( !( squadMember ) )
-		{
-			return defaultValue;
-		}
-		squad = squadMember.MySquad( AISquadType.Community );
-		if( !( squad ) )
-		{
-			return defaultValue;
-		}
-		return GetValueFromCurve( 'group_coefficient', ( ( Float )( ( ( Int32 )( squad.GetMembersCount() ) ) - 1 ) ) );
+		return TDB.GetFloat( TDBID.Create( GetPackageName() + ".HMGGroupMultiplier" ), 1.0 );
+	}
+
+	private function GetGroupCoefficient( weaponOwner : GameObject ) : Float
+	{
+		return GetValueFromCurve( 'rescaled_group_coefficient', GetBasicGroupCoefficient( weaponOwner ) );
 	}
 
 	private const function GetPlayersNumCoefficient( weaponOwner : GameObject ) : Float
@@ -200,11 +217,11 @@ import class TargetShootComponent extends IComponent
 		var heldItemType : gamedataItemType;
 		continuousLineOfSight = 0.0;
 		weaponOwner.GetSourceShootComponent().GetContinuousLineOfSightToTarget( target, continuousLineOfSight );
+		continuousLineOfSight *= visibilityThresholdCoefficient;
 		if( continuousLineOfSight == 0.0 )
 		{
 			return 0.0;
 		}
-		continuousLineOfSight *= visibilityThresholdCoefficient;
 		heldItemType = RPGManager.GetItemType( weapon.GetItemID() );
 		switch( heldItemType )
 		{
@@ -233,20 +250,46 @@ import class TargetShootComponent extends IComponent
 		}
 	}
 
-	private function CalculateTimeBetweenHits( params : TimeBetweenHitsParameters ) : Float
+	private const function GetCoverCoefficient( weaponOwner : GameObject, weaponRecord : WeaponItem_Record, target : GameObject ) : Float
 	{
-		return ( params.difficultyLevelCoefficient * params.accuracyCoefficient ) * ( ( ( ( params.baseCoefficient * params.baseSourceCoefficient ) * params.distanceCoefficient ) * params.visibilityCoefficient ) * params.playersCountCoefficient );
+		var fieldName : String;
+		if( weaponOwner.GetSourceShootComponent().CanSeeSecondaryPointOfTarget( target ) )
+		{
+			return 1.0;
+		}
+		if( weaponRecord.Evolution().Type() == gamedataWeaponEvolution.Smart )
+		{
+			fieldName = ".coverVsSmartWeaponsMultiplier";
+		}
+		else
+		{
+			fieldName = ".coverVsNormalWeaponsMultiplier";
+		}
+		return TDB.GetFloat( TDBID.Create( GetPackageName() + fieldName ), 1.0 );
 	}
 
-	private function ShouldBeHit( weaponOwner : GameObject, weapon : weak< WeaponObject >, visibilityThresholdCoefficient : Float ) : Bool
+	private const function GetVisionBlockersCoefficient( weaponOwner : GameObject, target : GameObject ) : Float
 	{
+		return weaponOwner.GetSourceShootComponent().GetLineOfSightTBHModifier( target );
+	}
+
+	private function CalculateTimeBetweenHits( const params : ref< TimeBetweenHitsParameters > ) : Float
+	{
+		return ( ( ( ( ( ( ( ( params.difficultyLevelCoefficient * params.baseCoefficient ) * params.baseSourceCoefficient ) * params.accuracyCoefficient ) * params.distanceCoefficient ) * params.visibilityCoefficient ) * params.playersCountCoefficient ) * params.groupCoefficient ) * params.coverCoefficient ) * params.visionBlockerCoefficient;
+	}
+
+	private function ShouldBeHit( weaponOwner : GameObject, weapon : weak< WeaponObject >, weaponRecord : WeaponItem_Record, visibilityThresholdCoefficient : Float ) : Bool
+	{
+		var timeSinceLastHit : Float;
 		var timeBetweenHits : Float;
 		var visibilityCollisionToTargetDist : Float;
+		var accuracy : Float;
 		var params : TimeBetweenHitsParameters;
 		var shouldBeHit : Bool;
 		var target : GameObject;
 		var gameInstance : GameInstance;
 		var statsSystem : StatsSystem;
+		var heldItemType : gamedataItemType;
 		target = GetGameObject();
 		gameInstance = target.GetGame();
 		statsSystem = GameInstance.GetStatsSystem( gameInstance );
@@ -271,33 +314,42 @@ import class TargetShootComponent extends IComponent
 			}
 			return false;
 		}
-		if( visibilityThresholdCoefficient == 0.0 )
+		accuracy = statsSystem.GetStatValue( weaponOwner.GetEntityID(), gamedataStatType.Accuracy );
+		if( accuracy == 0.0 )
 		{
-			params.visibilityCoefficient = visibilityThresholdCoefficient;
+			return false;
 		}
+		params.accuracyCoefficient = 1.0 / accuracy;
 		params.baseCoefficient = statsSystem.GetStatValue( target.GetEntityID(), gamedataStatType.TBHsBaseCoefficient );
 		params.baseSourceCoefficient = statsSystem.GetStatValue( weaponOwner.GetEntityID(), gamedataStatType.TBHsBaseSourceMultiplierCoefficient );
-		params.accuracyCoefficient = 1.0 / statsSystem.GetStatValue( weaponOwner.GetEntityID(), gamedataStatType.Accuracy );
 		params.difficultyLevelCoefficient = GetDifficultyLevelCoefficient();
 		params.distanceCoefficient = GetDistanceCoefficient( weapon, target.GetWorldPosition() );
 		if( params.distanceCoefficient == 0.0 )
 		{
 			return false;
 		}
-		params.groupCoefficient = GetGroupCoefficient( weaponOwner );
 		params.playersCountCoefficient = GetPlayersNumCoefficient( weaponOwner );
-		params.coefficientMultiplier = visibilityThresholdCoefficient;
+		params.groupCoefficient = ( ( target.IsPlayer() ) ? ( GetGroupCoefficient( weaponOwner ) ) : ( 1.0 ) );
+		params.coverCoefficient = ( ( target.IsPlayer() ) ? ( GetCoverCoefficient( weaponOwner, weaponRecord, target ) ) : ( 1.0 ) );
+		params.visionBlockerCoefficient = GetVisionBlockersCoefficient( weaponOwner, target );
+		heldItemType = RPGManager.GetItemType( weapon.GetItemID() );
+		if( heldItemType == gamedataItemType.Wea_HeavyMachineGun )
+		{
+			params.groupCoefficient = LerpF( GetHMGGroupMultiplier(), 1.0, params.groupCoefficient );
+		}
 		timeBetweenHits = CalculateTimeBetweenHits( params );
 		if( !( IsFinal() ) )
 		{
 			weaponOwner.GetSourceShootComponent().SetDebugParameters( params );
 		}
-		shouldBeHit = EngineTime.ToFloat( GameInstance.GetSimTime( gameInstance ) ) >= ( GetLastHitTime() + timeBetweenHits );
+		timeSinceLastHit = EngineTime.ToFloat( GameInstance.GetSimTime( gameInstance ) ) - GetLastHitTime();
+		shouldBeHit = timeSinceLastHit >= timeBetweenHits;
 		if( IsDebugEnabled() )
 		{
 			if( shouldBeHit )
 			{
 				GameInstance.GetDebugVisualizerSystem( gameInstance ).DrawText3D( weapon.GetWorldPosition(), FloatToString( timeBetweenHits ), Color( 245, 22, 49, 255 ), 0.69999999 );
+				GameInstance.GetDebugVisualizerSystem( gameInstance ).DrawText3D( target.GetWorldPosition() + Vector4( 0.0, 0.0, 1.79999995, 0.0 ), FloatToString( timeSinceLastHit ), Color( 245, 22, 49, 255 ), MinF( 0.69999999, timeSinceLastHit ) );
 			}
 			else
 			{

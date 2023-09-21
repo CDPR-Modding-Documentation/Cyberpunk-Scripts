@@ -1,0 +1,238 @@
+class TriggerAttackOnNearbyEnemiesEffector extends Effector
+{
+	var m_owner : weak< GameObject >;
+	var m_attackRecord : weak< Attack_Record >;
+	var m_targetHowManyEnemies : Int32;
+	var m_targetMaxDistance : Float;
+	var m_targetMinDistance : Float;
+	var m_gameInstance : GameInstance;
+	var m_playVFXOnHitTargets : CName;
+	var m_statusEffectRecord : weak< StatusEffect_Record >;
+	var m_enemySlotTransform : CName;
+	default m_enemySlotTransform = 'Chest';
+
+	protected export override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_gameInstance = game;
+		m_attackRecord = TDB.GetAttackRecord( TweakDBInterface.GetForeignKeyDefault( record + T".attackRecord" ) );
+		m_targetHowManyEnemies = TDB.GetInt( record + T".targetHowManyEnemies" );
+		m_targetMaxDistance = TDB.GetFloat( record + T".targetMaxDistance" );
+		m_targetMinDistance = TDB.GetFloat( record + T".targetMinDistance" );
+		m_playVFXOnHitTargets = TDB.GetCName( record + T".playVFXOnHitTargets" );
+		m_statusEffectRecord = TDB.GetStatusEffectRecord( TweakDBInterface.GetForeignKeyDefault( record + T".statusEffectRecord" ) );
+	}
+
+	protected override function RepeatedAction( owner : GameObject )
+	{
+		ActionOn( owner );
+	}
+
+	protected override function ActionOn( owner : GameObject )
+	{
+		var threats : array< weak< Entity > >;
+		var targets : array< TS_TargetPartInfo >;
+		var hitPrereqState : GenericHitPrereqState;
+		var hitevent : gameHitEvent;
+		var searchQuery : TargetSearchQuery;
+		var targetingComponent : TargetingComponent;
+		var i : Int32;
+		var effectAndDamageEventData : EffectAndDamageEventData;
+		var targetDistance : Float;
+		hitPrereqState = ( ( GenericHitPrereqState )( GetPrereqState() ) );
+		if( !( hitPrereqState ) )
+		{
+			return;
+		}
+		hitevent = hitPrereqState.GetHitEvent();
+		m_owner = owner;
+		if( !( ( ( ScriptedPuppet )( hitevent.target ) ) ) || hitevent.target.IsDead() )
+		{
+			return;
+		}
+		searchQuery.testedSet = TargetingSet.Complete;
+		searchQuery.searchFilter = TSF_NPC();
+		targetDistance = Vector4.Distance( hitevent.target.GetWorldPosition(), m_owner.GetWorldPosition() );
+		searchQuery.maxDistance = targetDistance + m_targetMaxDistance;
+		searchQuery.filterObjectByDistance = true;
+		searchQuery.includeSecondaryTargets = false;
+		searchQuery.ignoreInstigator = true;
+		GameInstance.GetTargetingSystem( m_gameInstance ).GetTargetParts( m_owner, searchQuery, targets );
+		for( i = 0; i < targets.Size(); i += 1 )
+		{
+			targetingComponent = TS_TargetPartInfo.GetComponent( targets[ i ] );
+			if( targetingComponent )
+			{
+				threats.PushBack( TS_TargetPartInfo.GetComponent( targets[ i ] ).GetEntity() );
+			}
+		}
+		effectAndDamageEventData = new EffectAndDamageEventData;
+		effectAndDamageEventData.hitevent = hitevent;
+		effectAndDamageEventData.threats = threats;
+		effectAndDamageEventData.effectorInstance = this;
+		GameInstance.GetDelaySystem( m_gameInstance ).QueueTask( hitevent.target, effectAndDamageEventData, 'HandleChainLightningEffectAndDamageTask', gameScriptTaskExecutionStage.PostPhysics );
+	}
+
+	public const function GetClosestEnemies( hitevent : gameHitEvent, threats : array< weak< Entity > >, out closestEnemies : array< ScriptedPuppet > )
+	{
+		var i, j : Int32;
+		var enemy : NPCPuppet;
+		var distance : Float;
+		var targetEnemies : array< NPCPuppet >;
+		var targetEnemiesDistances : array< Float >;
+		var closestEnemiesDistances : array< Float >;
+		var canRaycastBetweenTwoObjects : Bool;
+		var enemyChestWorldTransform : WorldTransform;
+		var enemyChestWorldPosition : Vector4;
+		var hitPosition : Vector4;
+		var hitOffset : Vector4;
+		var sqs : SpatialQueriesSystem;
+		sqs = GameInstance.GetSpatialQueriesSystem( m_gameInstance );
+		for( i = 0; i < threats.Size(); i += 1 )
+		{
+			enemy = ( ( NPCPuppet )( threats[ i ] ) );
+			if( ( !( enemy ) || !( enemy.IsActive() ) ) || ( enemy.GetEntityID() == m_owner.GetEntityID() ) )
+			{
+				continue;
+			}
+			distance = Vector4.Distance( hitevent.target.GetWorldPosition(), enemy.GetWorldPosition() );
+			if( ( !( targetEnemies.Contains( enemy ) ) && ( distance > m_targetMinDistance ) ) && ( distance < m_targetMaxDistance ) )
+			{
+				targetEnemies.PushBack( enemy );
+				targetEnemiesDistances.PushBack( distance );
+			}
+		}
+		for( i = 0; i < ( targetEnemiesDistances.Size() - 1 ); i += 1 )
+		{
+			for( j = 0; j < ( ( targetEnemiesDistances.Size() - i ) - 1 ); j += 1 )
+			{
+				if( targetEnemiesDistances[ j ] > targetEnemiesDistances[ ( j + 1 ) ] )
+				{
+					distance = targetEnemiesDistances[ j ];
+					enemy = targetEnemies[ j ];
+					targetEnemiesDistances[ j ] = targetEnemiesDistances[ j + 1 ];
+					targetEnemies[ j ] = targetEnemies[ j + 1 ];
+					targetEnemiesDistances[ j + 1 ] = distance;
+					targetEnemies[ j + 1 ] = enemy;
+				}
+			}
+		}
+		for( i = 0; i < targetEnemiesDistances.Size(); i += 1 )
+		{
+			enemy = targetEnemies[ i ];
+			if( ( closestEnemiesDistances.Size() < m_targetHowManyEnemies ) && enemy.GetSlotComponent().GetSlotTransform( m_enemySlotTransform, enemyChestWorldTransform ) )
+			{
+				hitOffset = Vector4.Normalize( enemy.GetWorldPosition() - hitevent.target.GetWorldPosition() ) * 0.5;
+				hitPosition = hitevent.hitPosition + hitOffset;
+				enemyChestWorldPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( enemyChestWorldTransform ) ) - hitOffset;
+				canRaycastBetweenTwoObjects = CanRaycastBetweenTwoPositions( sqs, hitPosition, enemyChestWorldPosition );
+				if( canRaycastBetweenTwoObjects )
+				{
+					closestEnemiesDistances.PushBack( targetEnemiesDistances[ i ] );
+					closestEnemies.PushBack( targetEnemies[ i ] );
+				}
+			}
+			else
+			{
+				break;
+			}
+		}
+	}
+
+	public const function SendEffectAndDamageToEnemies( hitevent : gameHitEvent, closestEnemies : array< ScriptedPuppet > )
+	{
+		var i : Int32;
+		var attack : Attack_GameEffect;
+		var enemy : ScriptedPuppet;
+		var effect : EffectInstance;
+		var attackContext : AttackInitContext;
+		var forwardDir : Vector4;
+		var distance : Float;
+		var enemyChestWorldTransform : WorldTransform;
+		var enemyChestWorldPosition : Vector4;
+		var hitPosition : Vector4;
+		GameObjectEffectHelper.StartEffectEvent( hitevent.target, m_playVFXOnHitTargets );
+		StatusEffectHelper.ApplyStatusEffect( hitevent.target, m_statusEffectRecord.GetID(), GameObject.GetTDBID( m_owner ) );
+		for( i = 0; i < closestEnemies.Size(); i += 1 )
+		{
+			enemy = closestEnemies[ i ];
+			attackContext.source = m_owner;
+			attackContext.record = m_attackRecord;
+			attackContext.instigator = m_owner;
+			attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+			effect = attack.PrepareAttack( m_owner );
+			enemy.GetSlotComponent().GetSlotTransform( m_enemySlotTransform, enemyChestWorldTransform );
+			enemyChestWorldPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( enemyChestWorldTransform ) );
+			hitPosition = hitevent.hitPosition + ( Vector4.Normalize( enemy.GetWorldPosition() - hitevent.target.GetWorldPosition() ) * 0.5 );
+			forwardDir = enemyChestWorldPosition - hitPosition;
+			distance = Vector4.Length( forwardDir );
+			forwardDir = Vector4.Normalize( forwardDir );
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, hitPosition );
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.forward, forwardDir );
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.range, distance );
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.raycastEnd, enemyChestWorldPosition );
+			effect.Run();
+			GameObjectEffectHelper.StartEffectEvent( enemy, m_playVFXOnHitTargets );
+			StatusEffectHelper.ApplyStatusEffect( enemy, m_statusEffectRecord.GetID(), GameObject.GetTDBID( m_owner ) );
+			SendHitEvent( hitevent, enemy, enemyChestWorldPosition );
+		}
+	}
+
+	private const function SendHitEvent( hitevent : gameHitEvent, enemy : ScriptedPuppet, enemyHitWorldPosition : Vector4 )
+	{
+		var newhitEvent : gameHitEvent;
+		var hitShapeData : HitShapeData;
+		var attackContext : AttackInitContext;
+		var attack : IAttack;
+		newhitEvent = new gameHitEvent;
+		newhitEvent.attackData = new AttackData;
+		newhitEvent.target = enemy;
+		attackContext.record = m_attackRecord;
+		attackContext.instigator = m_owner;
+		attackContext.source = m_owner;
+		attackContext.weapon = hitevent.attackData.GetWeapon();
+		attack = IAttack.Create( attackContext );
+		newhitEvent.attackData.SetAttackDefinition( attack );
+		newhitEvent.attackData.SetInstigator( m_owner );
+		newhitEvent.attackData.SetSource( m_owner );
+		newhitEvent.attackData.SetWeapon( hitevent.attackData.GetWeapon() );
+		newhitEvent.attackData.SetAttackTime( hitevent.attackData.GetAttackTime() );
+		newhitEvent.attackData.SetAttackType( m_attackRecord.AttackType().Type() );
+		AddHitFlags( newhitEvent.attackData );
+		hitShapeData.result.hitPositionEnter = enemyHitWorldPosition;
+		hitShapeData.result.hitPositionExit = enemyHitWorldPosition;
+		newhitEvent.hitRepresentationResult.hitShapes.PushBack( hitShapeData );
+		GameInstance.GetDamageSystem( m_gameInstance ).QueueHitEvent( newhitEvent, enemy );
+	}
+
+	private const function AddHitFlags( attackData : AttackData )
+	{
+		var i : Int32;
+		var hitFlags : array< String >;
+		var flag : hitFlag;
+		hitFlags = m_attackRecord.HitFlags();
+		for( i = 0; i < hitFlags.Size(); i += 1 )
+		{
+			flag = ( ( hitFlag )( ( ( Int32 )( EnumValueFromString( "hitFlag", hitFlags[ i ] ) ) ) ) );
+			attackData.AddFlag( flag, 'ChainLightning' );
+		}
+	}
+
+	private const function CanRaycastBetweenTwoPositions( spatialQueriesSystem : SpatialQueriesSystem, hitPosition1 : Vector4, hitPosition2 : Vector4 ) : Bool
+	{
+		var raycastResult : TraceResult;
+		var hitWorldStatic : Bool;
+		var hitWorldDynamic : Bool;
+		hitWorldStatic = spatialQueriesSystem.SyncRaycastByCollisionPreset( hitPosition1, hitPosition2, 'World Static', raycastResult, true );
+		hitWorldDynamic = spatialQueriesSystem.SyncRaycastByCollisionPreset( hitPosition1, hitPosition2, 'World Dynamic', raycastResult, , true );
+		return !( hitWorldStatic ) && !( hitWorldDynamic );
+	}
+
+}
+
+class EffectAndDamageEventData extends ScriptTaskData
+{
+	var hitevent : gameHitEvent;
+	var threats : array< weak< Entity > >;
+	var effectorInstance : TriggerAttackOnNearbyEnemiesEffector;
+}
+

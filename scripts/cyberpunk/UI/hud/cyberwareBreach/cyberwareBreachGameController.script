@@ -1,0 +1,282 @@
+import class gameaiCyberwareBreachGameController extends inkGameController
+{
+	public import function ResetCodeAnims();
+	public import function GotoEndAndStopMoveAnim( fireCallback : Bool );
+	public import function GotoEndAndStopSizeAnim( fireCallback : Bool );
+	public import function BeginMoveAnim( moveSpeed : Float );
+	public import function BeginSizeAnim( sizeSpeed : Float );
+	public import function GetMoveAnimPercent() : Float;
+	public import function GetSizeAnimPercent() : Float;
+	public import function UpdateHealthDepletion();
+
+	import var adjustedScreenPosition : Vector2;
+	import var maxHealth : Float;
+	import var currentHealth : Float;
+	import var lastHealth : Float;
+	private var m_currentSway : Vector2;
+	private editable var m_breachCanvasWRef : inkWidgetRef;
+	private editable var m_strokeFgRef : inkBorderRef;
+	private editable var m_strokeBgRef : inkBorderRef;
+	private editable var m_waveStrokeRef : inkBorderRef;
+	private editable var m_fillRef : inkWidgetRef;
+	private editable var m_textScaleWidgetRef : inkCompoundRef;
+	private editable var m_xTextRef : inkTextRef;
+	private editable var m_yTextRef : inkTextRef;
+	private editable var m_errorTextRef : inkTextRef;
+	[ category = "Control values" ][ tooltip = "Thickness of the border stroke, set dynamically and defined as % of the diamond radius ( 1.0 is 100% )" ]
+	private editable var m_strokeThicknessPercent : Float;
+	default m_strokeThicknessPercent = 0.02f;
+	[ category = "Control values" ]
+	private editable var m_minThickness : Float;
+	default m_minThickness = 4.f;
+	[ category = "Control values" ]
+	private editable var m_maxThickness : Float;
+	default m_maxThickness = 6.f;
+	[ category = "Control values" ]
+	private editable var m_minTextScale : Float;
+	default m_minTextScale = .1f;
+	[ category = "Control values" ]
+	private editable var m_maxTextScale : Float;
+	default m_maxTextScale = 1.f;
+	[ category = "Control values" ][ tooltip = "At what radius value the scale is set to maxTextScale (the lower the further away - 0.23 is very close, 0.07 is about a meter away)" ]
+	private editable var m_maxRadius : Float;
+	default m_maxRadius = 0.075f;
+	private var m_minRadiusForFluff : Float;
+	default m_minRadiusForFluff = 0.018f;
+	private var m_previousAlmostTimeout : Bool;
+	private var m_cwBreachCallbackHandle : CallbackHandle;
+	private var m_weaponSwayCallbackHandle : CallbackHandle;
+	private var m_introAnimationProxy : inkAnimProxy;
+	private var m_showAnimationProxy : inkAnimProxy;
+	private var m_timeoutAnimationProxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		RegisterBlackboardCallbacks();
+		GetRootWidget().SetVisible( false );
+		PlayLibraryAnimation( 'breach_animation' ).GotoEndAndStop();
+		m_previousAlmostTimeout = false;
+	}
+
+	protected event OnUninitialize()
+	{
+		UnregisterBlackboardCallbacks();
+	}
+
+	private function RegisterBlackboardCallbacks()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( ( ( GameObject )( GetOwnerEntity() ) ).GetGame() ).Get( GetAllBlackboardDefs().UIGameData );
+		m_cwBreachCallbackHandle = blackboard.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UIGameData.BreachUIParams, this, 'OnBreachDataChanged' );
+		m_weaponSwayCallbackHandle = blackboard.RegisterListenerVector2( GetAllBlackboardDefs().UIGameData.NormalizedWeaponSway, this, 'OnSway' );
+	}
+
+	private function UnregisterBlackboardCallbacks()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( ( ( GameObject )( GetOwnerEntity() ) ).GetGame() ).Get( GetAllBlackboardDefs().UIGameData );
+		if( m_cwBreachCallbackHandle )
+		{
+			blackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.BreachUIParams, m_cwBreachCallbackHandle );
+		}
+		if( m_weaponSwayCallbackHandle )
+		{
+			blackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UIGameData.NormalizedWeaponSway, m_weaponSwayCallbackHandle );
+		}
+	}
+
+	protected event OnBreachDataChanged( value : Variant )
+	{
+		var parameters : BreachUIParameters;
+		var newBreach : Bool;
+		parameters = ( ( BreachUIParameters )value );
+		if( !( parameters.tracking ) )
+		{
+			if( m_timeoutAnimationProxy && m_timeoutAnimationProxy.IsPlaying() )
+			{
+				m_timeoutAnimationProxy.GotoStartAndStop();
+				m_timeoutAnimationProxy = NULL;
+			}
+			GetRootWidget().SetVisible( false );
+			return 0;
+		}
+		UpdateState( parameters.visible );
+		newBreach = parameters.trackingChange == gameBreachUITrackingChange.StartedNew;
+		if( newBreach )
+		{
+			StopAllAnimations();
+			ResetCodeAnims();
+			PlayShowAnimation();
+		}
+		GetRootWidget().SetVisible( true );
+		ChangeScreenPosition( parameters.position );
+		ChangeScreenSize( parameters.radius );
+		ChangeHealth( parameters.health, parameters.maxHealth, !( newBreach ) );
+		ChangeFluff( parameters.position, parameters.radius );
+		if( parameters.almostTimeout && m_previousAlmostTimeout != parameters.almostTimeout )
+		{
+			PlayTimeoutAnimation();
+		}
+		m_previousAlmostTimeout = parameters.almostTimeout;
+	}
+
+	protected event OnSway( pos : Vector2 )
+	{
+		m_currentSway = pos;
+	}
+
+	private function UpdateState( visible : Bool )
+	{
+		GetRootWidget().SetState( ( ( visible ) ? ( 'Default' ) : ( 'Invisible' ) ) );
+	}
+
+	private function ChangeScreenPosition( screenPosition : Vector2 )
+	{
+		var translation : Vector2;
+		var rootSize : Vector2;
+		rootSize = GetRootWidget().GetSize();
+		translation.X = ( rootSize.X / 2.0 ) * screenPosition.X;
+		translation.Y = ( rootSize.Y / 2.0 ) * screenPosition.Y;
+		adjustedScreenPosition = Vector2( screenPosition.X, screenPosition.Y / ( rootSize.X / rootSize.Y ) );
+		inkWidgetRef.SetTranslation( m_breachCanvasWRef, translation );
+	}
+
+	private function ChangeScreenSize( radius : Float )
+	{
+		var rootSize : Vector2;
+		var size, thickness : Float;
+		var m_fill : weak< inkWidget >;
+		m_fill = inkWidgetRef.Get( m_fillRef );
+		rootSize = GetRootWidget().GetSize();
+		size = rootSize.X * radius;
+		inkWidgetRef.SetSize( m_breachCanvasWRef, Vector2( size, size ) );
+		thickness = ClampF( size * m_strokeThicknessPercent, m_minThickness, m_maxThickness );
+		inkBorderRef.SetThickness( m_strokeFgRef, thickness );
+		inkBorderRef.SetThickness( m_strokeBgRef, thickness );
+		inkBorderRef.SetThickness( m_waveStrokeRef, thickness * 2.5 );
+		m_fill.SetMargin( thickness, thickness, thickness, thickness );
+	}
+
+	private function ChangeHealth( health : Float, givenMaxHealth : Float, optional fireTransition : Bool )
+	{
+		var m_strokeFg : weak< inkWidget >;
+		m_strokeFg = inkBorderRef.Get( m_strokeFgRef );
+		lastHealth = currentHealth;
+		currentHealth = health;
+		maxHealth = givenMaxHealth;
+		m_strokeFg.SetEffectParamValue( inkEffectType.RadialWipe, 'RadialWipe_0', 'transition', currentHealth / maxHealth );
+		if( fireTransition )
+		{
+			UpdateHealthDepletion();
+		}
+	}
+
+	private function ChangeFluff( screenPosition : Vector2, radius : Float )
+	{
+		var scale : Float;
+		var fluffValues : Vector2;
+		var str : String;
+		if( radius <= m_minRadiusForFluff )
+		{
+			inkTextRef.SetVisible( m_xTextRef, false );
+			inkTextRef.SetVisible( m_yTextRef, false );
+			inkTextRef.SetVisible( m_errorTextRef, false );
+			return;
+		}
+		inkTextRef.SetVisible( m_xTextRef, true );
+		inkTextRef.SetVisible( m_yTextRef, true );
+		inkTextRef.SetVisible( m_errorTextRef, true );
+		scale = ClampF( radius / m_maxRadius, m_minTextScale, m_maxTextScale );
+		fluffValues.X = ClampF( 99.98999786 * ( ( screenPosition.X + 1.20000005 ) / 2.4000001 ), 0.0, 99.98999786 );
+		fluffValues.Y = ClampF( 99.98999786 * ( ( screenPosition.Y + 1.20000005 ) / 2.4000001 ), 0.0, 99.98999786 );
+		inkCompoundRef.SetScale( m_textScaleWidgetRef, Vector2( scale, scale ) );
+		str = ( ( fluffValues.X < 10.0 ) ? ( "0" ) : ( "" ) );
+		str += ( FloatToStringPrec( fluffValues.X, 2 ) + ( ( ( fluffValues.X == 0.0 ) ) ? ( ".00" ) : ( "" ) ) );
+		inkTextRef.SetText( m_xTextRef, str );
+		str = ( ( fluffValues.Y < 10.0 ) ? ( "0" ) : ( "" ) );
+		str += ( FloatToStringPrec( fluffValues.Y, 2 ) + ( ( ( fluffValues.Y == 0.0 ) ) ? ( ".00" ) : ( "" ) ) );
+		inkTextRef.SetText( m_yTextRef, str );
+	}
+
+	private function InterpolateValues( startValue : Float, endValue : Float, ratio : Float ) : Float
+	{
+		return ( startValue * ( 1.0 - ratio ) ) + ( endValue * ratio );
+	}
+
+	private function IsAnyIntroAnimPlaying( ignoreSizeAnim : Bool ) : Bool
+	{
+		return m_showAnimationProxy.IsPlaying();
+	}
+
+	private function PlayIntroAnimation()
+	{
+		if( m_introAnimationProxy && !( m_introAnimationProxy.IsFinished() ) )
+		{
+			m_introAnimationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_introAnimationProxy.Stop();
+			m_introAnimationProxy = NULL;
+		}
+		m_introAnimationProxy = PlayLibraryAnimation( 'breach_intro' );
+		m_introAnimationProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnIntroAnimationFinished' );
+	}
+
+	protected event OnIntroAnimationFinished( proxy : inkAnimProxy )
+	{
+		BeginMoveAnim( 1.0 );
+	}
+
+	private function PlayShowAnimation()
+	{
+		if( m_showAnimationProxy && !( m_showAnimationProxy.IsFinished() ) )
+		{
+			m_showAnimationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_showAnimationProxy.Stop();
+			m_showAnimationProxy = NULL;
+		}
+		m_showAnimationProxy = PlayLibraryAnimation( 'breach_animation' );
+	}
+
+	protected event OnShowAnimationFinished( proxy : inkAnimProxy )
+	{
+		BeginSizeAnim( 3.0 );
+	}
+
+	private function PlayTimeoutAnimation()
+	{
+		if( m_timeoutAnimationProxy && m_timeoutAnimationProxy.IsPlaying() )
+		{
+			m_timeoutAnimationProxy.GotoStartAndStop();
+			m_timeoutAnimationProxy = NULL;
+		}
+		m_timeoutAnimationProxy = PlayLibraryAnimation( 'breach_timed_out' );
+	}
+
+	private function StopAllAnimations()
+	{
+		if( m_introAnimationProxy && !( m_introAnimationProxy.IsFinished() ) )
+		{
+			m_introAnimationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_introAnimationProxy.GotoEndAndStop();
+			m_introAnimationProxy = NULL;
+		}
+		if( m_showAnimationProxy && !( m_showAnimationProxy.IsFinished() ) )
+		{
+			m_showAnimationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_showAnimationProxy.GotoEndAndStop();
+			m_showAnimationProxy = NULL;
+		}
+		if( m_timeoutAnimationProxy && !( m_timeoutAnimationProxy.IsFinished() ) )
+		{
+			m_timeoutAnimationProxy.GotoEndAndStop();
+			m_timeoutAnimationProxy = NULL;
+		}
+	}
+
+	protected event OnMoveAnimationFinished()
+	{
+		PlayShowAnimation();
+	}
+
+	protected event OnResizeAnimationFinished() {}
+}
+

@@ -1,3 +1,10 @@
+import enum ESlotState
+{
+	Taken,
+	Empty,
+	Available,
+}
+
 class ItemModificationSystem extends ScriptableSystem
 {
 	private var m_blackboard : weak< IBlackboard >;
@@ -26,42 +33,35 @@ class ItemModificationSystem extends ScriptableSystem
 	private function InstallItemPart( obj : GameObject, itemID : ItemID, partItemID : ItemID, optional slotID : TweakDBID ) : Bool
 	{
 		var ts : TransactionSystem;
-		var itemData : weak< gameItemData >;
+		var itemData : gameItemData;
 		var partInstallRequest : PartInstallRequest;
 		var partData : InnerItemData;
 		var itemType : gamedataItemType;
+		var previousItemType : gamedataItemType;
 		var previousPartID : ItemID;
 		var result : Bool;
-		var defaultSlotID : TweakDBID;
 		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
 		itemType = RPGManager.GetItemRecord( partItemID ).ItemType().Type();
 		itemData = ts.GetItemData( obj, itemID );
-		if( TweakDBInterface.GetAttachmentSlotRecord( slotID ) )
+		if( !( TweakDBInterface.GetAttachmentSlotRecord( slotID ) ) )
 		{
-			itemData.GetItemPart( partData, slotID );
-			previousPartID = InnerItemData.GetItemID( partData );
-			if( ItemID.IsValid( previousPartID ) )
-			{
-				RemovePartEquipGLPs( obj, previousPartID );
-			}
-			result = ts.ForcePartInSlot( obj, itemID, partItemID, slotID );
-			if( itemType == gamedataItemType.Prt_Program )
-			{
-				RemoveLowerShards( obj, itemID, partItemID );
-			}
-			if( ItemID.IsValid( previousPartID ) && ( RPGManager.GetItemType( previousPartID ) == gamedataItemType.Prt_Mod || RPGManager.IsClothingMod( previousPartID ) ) )
-			{
-				ts.RemoveItem( obj, previousPartID, 1 );
-			}
+			slotID = EquipmentSystem.GetPlacementSlot( partItemID );
 		}
-		else
+		itemData.GetItemPart( partData, slotID );
+		previousPartID = InnerItemData.GetItemID( partData );
+		if( ItemID.IsValid( previousPartID ) )
 		{
-			defaultSlotID = EquipmentSystem.GetPlacementSlot( partItemID );
-			result = ts.ForcePartInSlot( obj, itemID, partItemID, defaultSlotID );
-			if( itemType == gamedataItemType.Prt_Mod || RPGManager.IsClothingMod( itemType ) )
-			{
-				ts.RemoveItem( obj, partItemID, 1 );
-			}
+			RemovePartEquipGLPs( obj, previousPartID );
+		}
+		result = ts.ForcePartInSlot( obj, itemID, partItemID, slotID );
+		if( itemType == gamedataItemType.Prt_Program )
+		{
+			RemoveOtherShards( obj, itemID, partItemID );
+		}
+		previousItemType = RPGManager.GetItemType( previousPartID );
+		if( ItemID.IsValid( previousPartID ) && ( ( RPGManager.IsWeaponMod( previousPartID ) || previousItemType == gamedataItemType.CyberwareStatsShard ) || RPGManager.IsClothingMod( previousPartID ) ) )
+		{
+			ts.RemoveItem( obj, previousPartID, 1 );
 		}
 		if( result )
 		{
@@ -96,6 +96,7 @@ class ItemModificationSystem extends ScriptableSystem
 			partUninstallRequest.itemID = itemID;
 			partUninstallRequest.partID = removedPartID;
 			GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'EquipmentSystem' ).QueueRequest( partUninstallRequest );
+			GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'UIInventoryScriptableSystem' ).QueueRequest( partUninstallRequest );
 			SetPingTutorialFact( removedPartID, true, obj );
 			PlayerPuppet.ChacheQuickHackListCleanup( ( ( PlayerPuppet )( obj ) ) );
 			return removedPartID;
@@ -108,23 +109,20 @@ class ItemModificationSystem extends ScriptableSystem
 		}
 	}
 
-	private function RemoveLowerShards( obj : GameObject, item : ItemID, shardID : ItemID )
+	private function RemoveOtherShards( obj : GameObject, item : ItemID, shardID : ItemID )
 	{
 		var usedSlots : array< TweakDBID >;
 		var deckData : gameItemData;
 		var ts : TransactionSystem;
 		var i : Int32;
 		var partData : InnerItemData;
-		var instQuality, shardQuality : gamedataQuality;
 		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
 		ts.GetUsedSlotsOnItem( obj, item, usedSlots );
 		deckData = ts.GetItemData( obj, item );
 		for( i = 0; i < usedSlots.Size(); i += 1 )
 		{
 			deckData.GetItemPart( partData, usedSlots[ i ] );
-			instQuality = RPGManager.GetItemRecord( InnerItemData.GetItemID( partData ) ).Quality().Type();
-			shardQuality = RPGManager.GetItemRecord( shardID ).Quality().Type();
-			if( TweakDBInterface.GetCName( ItemID.GetTDBID( InnerItemData.GetItemID( partData ) ) + T".shardType", '' ) == TweakDBInterface.GetCName( ItemID.GetTDBID( shardID ) + T".shardType", '' ) && ( instQuality < shardQuality ) )
+			if( TweakDBInterface.GetCName( ItemID.GetTDBID( InnerItemData.GetItemID( partData ) ) + T".shardType", '' ) == TweakDBInterface.GetCName( ItemID.GetTDBID( shardID ) + T".shardType", '' ) && ( InnerItemData.GetItemID( partData ) != shardID ) )
 			{
 				RemoveItemPart( obj, item, usedSlots[ i ], false );
 			}
@@ -245,32 +243,52 @@ class ItemModificationSystem extends ScriptableSystem
 		return allParts;
 	}
 
-	public static function GetAllSlots( itemData : gameItemData ) : array< SPartSlots >
+	public static function GetAllSlotsFromItemData( itemData : weak< gameItemData > ) : array< SPartSlots >
 	{
 		var allParts : array< SPartSlots >;
 		var part : SPartSlots;
-		var attachments : array< weak< AttachmentSlot_Record > >;
-		var usedSlots : array< weak< SlotItemPartPreset_Record > >;
+		var emptySlots : array< TweakDBID >;
+		var usedSlots : array< TweakDBID >;
 		var i : Int32;
 		var partData : InnerItemData;
-		var partDatas : array< InnerItemData >;
-		RPGManager.GetItemRecord( itemData.GetID() ).SlotPartListPreset( usedSlots );
-		GetattachementFromBlueprint( RPGManager.GetItemRecord( itemData.GetID() ).Blueprint().RootElement(), attachments );
-		itemData.GetItemParts( partDatas );
+		itemData.GetEmptySlotsOnItem( emptySlots );
+		itemData.GetUsedSlotsOnItem( usedSlots );
 		for( i = 0; i < usedSlots.Size(); i += 1 )
 		{
-			itemData.GetItemPart( partData, usedSlots[ i ].Slot().GetID() );
+			itemData.GetItemPart( partData, usedSlots[ i ] );
 			part.status = ESlotState.Taken;
-			part.slotID = usedSlots[ i ].Slot().GetID();
-			part.installedPart = ItemID.FromTDBID( usedSlots[ i ].ItemPartPreset().GetID() );
+			part.slotID = usedSlots[ i ];
+			part.installedPart = InnerItemData.GetItemID( partData );
 			part.innerItemData = partData;
 			allParts.PushBack( part );
 		}
-		for( i = 0; i < attachments.Size(); i += 1 )
+		for( i = 0; i < emptySlots.Size(); i += 1 )
 		{
+			itemData.GetItemPart( partData, emptySlots[ i ] );
 			part.status = ESlotState.Empty;
-			part.slotID = attachments[ i ].GetID();
+			part.slotID = emptySlots[ i ];
 			part.installedPart = ItemID.None();
+			part.innerItemData = partData;
+			allParts.PushBack( part );
+		}
+		return allParts;
+	}
+
+	public static function GetSlotsForCyberdeckFromItemData( itemData : weak< gameItemData > ) : array< SPartSlots >
+	{
+		var allParts : array< SPartSlots >;
+		var part : SPartSlots;
+		var emptySlots : array< TweakDBID >;
+		var i : Int32;
+		var partData : InnerItemData;
+		itemData.GetEmptySlotsOnItem( emptySlots );
+		for( i = 0; i < emptySlots.Size(); i += 1 )
+		{
+			itemData.GetItemPart( partData, emptySlots[ i ] );
+			part.status = ESlotState.Empty;
+			part.slotID = emptySlots[ i ];
+			part.installedPart = ItemID.None();
+			part.innerItemData = partData;
 			allParts.PushBack( part );
 		}
 		return allParts;
@@ -288,30 +306,26 @@ class ItemModificationSystem extends ScriptableSystem
 		}
 	}
 
-	public static function HasBetterShardInstalled( obj : GameObject, cyberdeckID : ItemID, shardID : ItemID ) : Bool
+	public static function HasThisShardInstalled( obj : GameObject, cyberdeckID : ItemID, shardID : ItemID ) : Bool
 	{
 		var usedSlots : array< TweakDBID >;
 		var deckData : gameItemData;
 		var ts : TransactionSystem;
-		var i : Int32;
 		var partData : InnerItemData;
-		var instQuality, shardQuality : gamedataQuality;
-		var shardType : CName;
+		var i : Int32;
+		if( TweakDBInterface.GetCName( ItemID.GetTDBID( shardID ) + T".shardType", '' ) == '' )
+		{
+			return false;
+		}
 		ts = GameInstance.GetTransactionSystem( obj.GetGame() );
 		ts.GetUsedSlotsOnItem( obj, cyberdeckID, usedSlots );
 		deckData = ts.GetItemData( obj, cyberdeckID );
-		shardType = TweakDBInterface.GetCName( ItemID.GetTDBID( shardID ) + T".shardType", '' );
-		if( shardType != '' )
+		for( i = 0; i < usedSlots.Size(); i += 1 )
 		{
-			for( i = 0; i < usedSlots.Size(); i += 1 )
+			deckData.GetItemPart( partData, usedSlots[ i ] );
+			if( InnerItemData.GetItemID( partData ) == shardID )
 			{
-				deckData.GetItemPart( partData, usedSlots[ i ] );
-				instQuality = RPGManager.GetItemRecord( InnerItemData.GetItemID( partData ) ).Quality().Type();
-				shardQuality = RPGManager.GetItemRecord( shardID ).Quality().Type();
-				if( TweakDBInterface.GetCName( ItemID.GetTDBID( InnerItemData.GetItemID( partData ) ) + T".shardType", '' ) == shardType && ( shardQuality <= instQuality ) )
-				{
-					return true;
-				}
+				return true;
 			}
 		}
 		return false;
@@ -351,14 +365,15 @@ class ItemModificationSystem extends ScriptableSystem
 
 	private function SendCallback()
 	{
-		m_blackboard.SetVariant( GetAllBlackboardDefs().UI_ItemModSystem.ItemModSystemUpdated, true );
-		m_blackboard.SignalVariant( GetAllBlackboardDefs().UI_ItemModSystem.ItemModSystemUpdated );
+		m_blackboard.SetVariant( GetAllBlackboardDefs().UI_ItemModSystem.ItemModSystemUpdated, true, true );
 	}
 
 	private function OnInstallItemPart( request : InstallItemPart )
 	{
-		InstallItemPart( request.obj, request.baseItem, request.partToInstall, request.slotID );
-		SendCallback();
+		if( InstallItemPart( request.obj, request.baseItem, request.partToInstall, request.slotID ) )
+		{
+			SendCallback();
+		}
 	}
 
 	private function OnRemoveItemPart( request : RemoveItemPart )
@@ -431,12 +446,5 @@ importonly struct SPartSlots
 	import var installedPart : ItemID;
 	import var slotID : TweakDBID;
 	import var innerItemData : InnerItemData;
-}
-
-import enum ESlotState
-{
-	Taken,
-	Empty,
-	Available,
 }
 

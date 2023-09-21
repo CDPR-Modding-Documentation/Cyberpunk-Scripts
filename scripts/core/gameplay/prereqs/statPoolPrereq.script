@@ -4,59 +4,47 @@ class BaseStatPoolPrereqListener extends CustomValueStatPoolsListener
 	public virtual function RegisterState( state : PrereqState ) {}
 }
 
+class StatPoolPrereqListener extends BaseStatPoolPrereqListener
+{
+	protected var m_state : weak< StatPoolPrereqState >;
+
+	protected event OnStatPoolValueReached( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		m_state.StatPoolUpdate( oldValue, newValue );
+	}
+
+	public override function RegisterState( state : PrereqState )
+	{
+		m_state = ( ( StatPoolPrereqState )( state ) );
+	}
+
+	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		if( m_state.m_statpoolWasMissing )
+		{
+			m_state.m_statpoolWasMissing = false;
+			m_state.StatPoolUpdate( oldValue, newValue );
+		}
+	}
+
+}
+
 class StatPoolPrereqState extends PrereqState
 {
 	var m_statPoolListener : BaseStatPoolPrereqListener;
-	var m_inventoryCallback : StatPoolPrereqInventoryScriptCallback;
-	var m_inventoryListener : InventoryScriptListener;
 	var m_statpoolWasMissing : Bool;
+	var m_object : weak< GameObject >;
 	var m_statsObjID : StatsObjectID;
 
 	public virtual function StatPoolUpdate( oldValue : Float, newValue : Float )
 	{
 		var checkPassed : Bool;
 		const var prereq : StatPoolPrereq;
+		var valueToCheck : Float;
 		prereq = ( ( StatPoolPrereq )( GetPrereq() ) );
-		checkPassed = ProcessCompare( prereq.m_comparisonType, newValue, prereq.m_valueToCheck );
+		valueToCheck = RPGManager.CalculateStatModifiers( prereq.m_valueToCheck, m_object.GetGame(), m_object, m_statsObjID );
+		checkPassed = ProcessCompare( prereq.m_comparisonType, newValue, valueToCheck );
 		OnChanged( checkPassed );
-	}
-
-	public virtual function UpdateItemID( statsObjID : StatsObjectID )
-	{
-		var prereq : StatPoolPrereq;
-		var owner : GameObject;
-		var checkPassed : Bool;
-		var currentValue : Float;
-		owner = ( ( GameObject )( GetContext() ) );
-		prereq = ( ( StatPoolPrereq )( GetPrereq() ) );
-		if( !( StatsObjectID.IsDefined( m_statsObjID ) ) )
-		{
-			m_statsObjID = statsObjID;
-			if( GameInstance.GetStatPoolsSystem( owner.GetGame() ).IsStatPoolAdded( m_statsObjID, prereq.m_statPoolType ) )
-			{
-				currentValue = GameInstance.GetStatPoolsSystem( owner.GetGame() ).GetStatPoolValue( m_statsObjID, prereq.m_statPoolType, prereq.m_comparePercentage );
-				checkPassed = ProcessCompare( prereq.m_comparisonType, currentValue, prereq.m_valueToCheck );
-				OnChanged( checkPassed );
-			}
-			RegisterStatPoolListener( owner.GetGame(), prereq.m_statPoolType, prereq.m_valueToCheck );
-		}
-	}
-
-	public virtual function RegisterInventoryListener( game : GameInstance, owner : GameObject, itemTDBID : TweakDBID )
-	{
-		m_inventoryCallback = new StatPoolPrereqInventoryScriptCallback;
-		m_inventoryCallback.Init( itemTDBID, this );
-		m_inventoryListener = GameInstance.GetTransactionSystem( game ).RegisterInventoryListener( owner, m_inventoryCallback );
-	}
-
-	public virtual function UnregisterInventoryListener( game : GameInstance, owner : GameObject )
-	{
-		if( m_inventoryListener )
-		{
-			GameInstance.GetTransactionSystem( game ).UnregisterInventoryListener( owner, m_inventoryListener );
-		}
-		m_inventoryCallback = NULL;
-		m_statPoolListener = NULL;
 	}
 
 	public virtual function RegisterStatPoolListener( game : GameInstance, statPoolType : gamedataStatPoolType, valueToCheck : Float )
@@ -81,32 +69,54 @@ class StatPoolPrereqState extends PrereqState
 
 }
 
+enum ObjectToCheck
+{
+	Player = 0,
+	Weapon = 1,
+}
+
 class StatPoolPrereq extends IScriptablePrereq
 {
 	var m_statPoolType : gamedataStatPoolType;
-	var m_valueToCheck : Float;
+	var m_valueToCheck : array< weak< StatModifier_Record > >;
 	var m_comparisonType : EComparisonType;
 	var m_skipOnApply : Bool;
 	var m_comparePercentage : Bool;
-	var m_itemTDBID : TweakDBID;
-	var m_checkItem : Bool;
+	var m_objToCheck : ObjectToCheck;
 
 	protected const function GetStatsObjectID( owner : GameObject ) : StatsObjectID
 	{
-		var itemData : weak< gameItemData >;
-		if( m_checkItem )
+		var weapon : WeaponObject;
+		if( m_objToCheck == ObjectToCheck.Weapon )
 		{
-			if( TDBID.IsValid( m_itemTDBID ) )
+			weapon = ScriptedPuppet.GetActiveWeapon( owner );
+			if( !( weapon ) )
 			{
-				itemData = GameInstance.GetTransactionSystem( owner.GetGame() ).GetItemDataByTDBID( owner, m_itemTDBID );
-				return ( ( StatsObjectID )( itemData.GetID() ) );
+				return StatsObjectID();
 			}
-			return StatsObjectID();
+			return weapon.GetItemData().GetStatsObjectID();
 		}
 		else
 		{
 			return owner.GetEntityID();
 		}
+	}
+
+	protected const function GetObject( owner : GameObject ) : GameObject
+	{
+		if( m_objToCheck == ObjectToCheck.Weapon )
+		{
+			return ScriptedPuppet.GetActiveWeapon( owner );
+		}
+		else
+		{
+			return owner;
+		}
+	}
+
+	protected const function GetValueToCheck( state : StatPoolPrereqState ) : Float
+	{
+		return RPGManager.CalculateStatModifiers( m_valueToCheck, state.m_object.GetGame(), state.m_object, state.m_statsObjID );
 	}
 
 	protected export const override function OnRegister( state : PrereqState, game : GameInstance, context : IScriptable ) : Bool
@@ -115,15 +125,9 @@ class StatPoolPrereq extends IScriptablePrereq
 		var castedState : StatPoolPrereqState;
 		owner = ( ( GameObject )( context ) );
 		castedState = ( ( StatPoolPrereqState )( state ) );
+		castedState.m_object = GetObject( owner );
 		castedState.m_statsObjID = GetStatsObjectID( owner );
-		if( m_checkItem && !( StatsObjectID.IsDefined( castedState.m_statsObjID ) ) )
-		{
-			castedState.RegisterInventoryListener( game, owner, m_itemTDBID );
-		}
-		else
-		{
-			castedState.RegisterStatPoolListener( game, m_statPoolType, m_valueToCheck );
-		}
+		castedState.RegisterStatPoolListener( game, m_statPoolType, GetValueToCheck( castedState ) );
 		return false;
 	}
 
@@ -132,30 +136,32 @@ class StatPoolPrereq extends IScriptablePrereq
 		var castedState : StatPoolPrereqState;
 		castedState = ( ( StatPoolPrereqState )( state ) );
 		castedState.UnregisterStatPoolListener( game, m_statPoolType );
-		castedState.UnregisterInventoryListener( game, ( ( GameObject )( context ) ) );
 	}
 
 	protected export override function Initialize( recordID : TweakDBID )
 	{
 		var record : StatPoolPrereq_Record;
-		var itemObjectToCheckRec : weak< ItemObjectToCheck_Record >;
+		var objectToCheck : CName;
 		record = TweakDBInterface.GetStatPoolPrereqRecord( recordID );
 		m_statPoolType = ( ( gamedataStatPoolType )( ( ( Int32 )( EnumValueFromName( 'gamedataStatPoolType', record.StatPoolType() ) ) ) ) );
-		m_valueToCheck = record.ValueToCheck();
+		record.ValueToCheck( m_valueToCheck );
 		m_comparisonType = ( ( EComparisonType )( ( ( Int32 )( EnumValueFromName( 'EComparisonType', record.ComparisonType() ) ) ) ) );
 		m_skipOnApply = TweakDBInterface.GetBool( recordID + T".skipOnApply", false );
 		m_comparePercentage = TweakDBInterface.GetBool( recordID + T".comparePercentage", true );
-		itemObjectToCheckRec = ( ( ItemObjectToCheck_Record )( record.ObjectToCheck() ) );
-		if( itemObjectToCheckRec )
+		objectToCheck = record.ObjectToCheck();
+		if( objectToCheck == 'Weapon' )
 		{
-			m_checkItem = true;
-			m_itemTDBID = itemObjectToCheckRec.Item().GetID();
+			m_objToCheck = ObjectToCheck.Weapon;
+		}
+		else
+		{
+			m_objToCheck = ObjectToCheck.Player;
 		}
 	}
 
 	public const override function IsFulfilled( game : GameInstance, context : IScriptable ) : Bool
 	{
-		return CompareValues( GetStatsObjectID( ( ( GameObject )( context ) ) ), context );
+		return CompareValues( GetObject( ( ( GameObject )( context ) ) ), GetStatsObjectID( ( ( GameObject )( context ) ) ), context );
 	}
 
 	protected export const override function OnApplied( state : PrereqState, game : GameInstance, context : IScriptable )
@@ -169,7 +175,7 @@ class StatPoolPrereq extends IScriptablePrereq
 		castedState = ( ( StatPoolPrereqState )( state ) );
 		if( GameInstance.GetStatPoolsSystem( game ).IsStatPoolAdded( castedState.m_statsObjID, m_statPoolType ) )
 		{
-			result = CompareValues( castedState.m_statsObjID, context );
+			result = CompareValues( castedState.m_object, castedState.m_statsObjID, context );
 			castedState.OnChanged( result );
 		}
 		else
@@ -178,65 +184,19 @@ class StatPoolPrereq extends IScriptablePrereq
 		}
 	}
 
-	private const function CompareValues( statsObjID : StatsObjectID, context : IScriptable ) : Bool
+	protected const function CompareValues( object : weak< GameObject >, statsObjID : StatsObjectID, context : IScriptable ) : Bool
 	{
 		var currentValue : Float;
 		var owner : weak< GameObject >;
+		var valueToCheck : Float;
 		owner = ( ( GameObject )( context ) );
 		if( owner )
 		{
 			currentValue = GameInstance.GetStatPoolsSystem( owner.GetGame() ).GetStatPoolValue( statsObjID, m_statPoolType, m_comparePercentage );
-			return ProcessCompare( m_comparisonType, currentValue, m_valueToCheck );
+			valueToCheck = RPGManager.CalculateStatModifiers( m_valueToCheck, owner.GetGame(), object, statsObjID );
+			return ProcessCompare( m_comparisonType, currentValue, valueToCheck );
 		}
 		return false;
-	}
-
-}
-
-class StatPoolPrereqInventoryScriptCallback extends InventoryScriptCallback
-{
-	protected var m_itemTDBID : TweakDBID;
-	protected var m_state : weak< StatPoolPrereqState >;
-
-	public function Init( itemTDBID : TweakDBID, state : StatPoolPrereqState )
-	{
-		m_itemTDBID = itemTDBID;
-		m_state = state;
-	}
-
-	public override function OnItemAdded( item : ItemID, itemData : weak< gameItemData >, flaggedAsSilent : Bool )
-	{
-		var itemTDBID : TweakDBID;
-		itemTDBID = ItemID.GetTDBID( item );
-		if( itemTDBID == m_itemTDBID )
-		{
-			m_state.UpdateItemID( ( ( StatsObjectID )( item ) ) );
-		}
-	}
-
-}
-
-class StatPoolPrereqListener extends BaseStatPoolPrereqListener
-{
-	protected var m_state : weak< StatPoolPrereqState >;
-
-	protected event OnStatPoolValueReached( oldValue : Float, newValue : Float, percToPoints : Float )
-	{
-		m_state.StatPoolUpdate( oldValue, newValue );
-	}
-
-	public override function RegisterState( state : PrereqState )
-	{
-		m_state = ( ( StatPoolPrereqState )( state ) );
-	}
-
-	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
-	{
-		if( m_state.m_statpoolWasMissing )
-		{
-			m_state.m_statpoolWasMissing = false;
-			m_state.StatPoolUpdate( oldValue, newValue );
-		}
 	}
 
 }

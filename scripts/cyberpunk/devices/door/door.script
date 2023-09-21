@@ -1,3 +1,99 @@
+enum EDoorType
+{
+	NONE = 0,
+	INTERACTIVE = 1,
+	AUTOMATIC = 2,
+	PHYSICAL = 3,
+	REMOTELY_CONTROLLED = 4,
+}
+
+enum EDoorStatus
+{
+	SEALED = -2,
+	LOCKED = -1,
+	CLOSED = 0,
+	OPENED = 1,
+}
+
+enum EDoorOpeningType
+{
+	SLIDING_HORIZONTALLY = 0,
+	SLIDING_VERTICALLY = 1,
+	HINGED = 2,
+	GATE = 3,
+	HINGED_SIDE_ONE = 4,
+	HINGED_SIDE_TWO = 5,
+}
+
+enum EAnimationType
+{
+	REGULAR = 0,
+	TRANSFORM = 1,
+	TRANSFORM_TWO_SIDES = 2,
+	NONE = 3,
+}
+
+enum EDoorTriggerSide
+{
+	OUTSIDE = 0,
+	ONE = 1,
+	TWO = 2,
+}
+
+enum EDoorSkillcheckSide
+{
+	BOTH = 0,
+	ONE = 1,
+	TWO = 2,
+}
+
+class ChangeHalfLights extends Event
+{
+	var m_isAuthorization : Bool;
+}
+
+class AnimFeatureDoor extends AnimFeature
+{
+	editable var m_progress : Float;
+	editable var m_openingSpeed : Float;
+	editable var m_openingType : Int32;
+	editable var m_doorSide : Int32;
+	editable var m_malfunctioning : Int32;
+}
+
+struct LedColors
+{
+	var off : ScriptLightSettings;
+	var red : ScriptLightSettings;
+	var green : ScriptLightSettings;
+}
+
+struct DoorPersistentData
+{
+	var m_doorType : EDoorType;
+	var m_canPlayerToggleLockState : Bool;
+	var m_canPlayerToggleSealState : Bool;
+	var m_initialStatus : EDoorStatus;
+	var m_keycardName : TweakDBID;
+	var m_passcode : CName;
+}
+
+struct DoorResaveData
+{
+	var m_doorType : EDoorType;
+	var m_canPlayerToggleLockState : Bool;
+	var m_canPlayerToggleSealState : Bool;
+	var m_initialStatus : EDoorStatus;
+	var m_keycardName : TweakDBID;
+	var m_passcode : CName;
+}
+
+class DoorReplicatedState extends DeviceReplicatedState
+{
+	var m_isOpen : Bool;
+	var m_wasImmediateChange : Bool;
+}
+
 class Door extends InteractiveDevice
 {
 	default m_controllerTypeName = 'DoorController';
@@ -26,12 +122,10 @@ class Door extends InteractiveDevice
 	protected var m_portalLight2 : gameLightComponent;
 	protected var m_portalLight3 : gameLightComponent;
 	protected var m_portalLight4 : gameLightComponent;
-	protected var m_playerBlocker : ColliderComponent;
-	private var m_animFeatureDoor : AnimFeatureDoor;
+	private var m_playerBlocker : ColliderComponent;
+	protected var m_animFeatureDoor : AnimFeatureDoor;
 	private var m_isVisuallyOpened : Bool;
-	private var m_lastDoorSide : Int32;
-	private editable var m_bankToLoad_TEMP : String;
-	default m_bankToLoad_TEMP = "dev_door_sliding_generic";
+	protected var m_lastDoorSide : Int32;
 	protected var m_colors : LedColors;
 	protected var m_activeSkillcheckLights : array< gameLightComponent >;
 	protected var m_allActiveLights : array< gameLightComponent >;
@@ -46,12 +140,10 @@ class Door extends InteractiveDevice
 	default m_openingAudioStimRange = 0.0f;
 	protected editable var m_animationType : EAnimationType;
 	private var m_doorTriggerSide : EDoorTriggerSide;
-	private var m_whoOpened : weak< GameObject >;
+	protected var m_whoOpened : weak< GameObject >;
 	private var m_openedUsingForce : Bool;
 	private var m_illegalOpen : Bool;
 	private var m_audioForceOpen : Bool;
-	private var m_componentName : CName;
-	private var m_playerInWorkspot : weak< PlayerPuppet >;
 
 	protected function UpdateLightByTask()
 	{
@@ -229,7 +321,6 @@ class Door extends InteractiveDevice
 		m_playerBlocker = ( ( ColliderComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'player_blocker' ) ) );
 		if( m_offMeshConnectionComponent == NULL )
 		{
-			LogError( "OffMeshConnectionComponent is missing from a door entity." );
 		}
 		super.OnTakeControl( ri );
 		m_controller = ( ( DoorController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
@@ -261,7 +352,6 @@ class Door extends InteractiveDevice
 	protected event OnDetach()
 	{
 		super.OnDetach();
-		GameInstance.GetAudioSystem( GetGame() ).UnloadBank( m_bankToLoad_TEMP );
 	}
 
 	public const override function GetDevicePS() : DoorControllerPS
@@ -469,7 +559,7 @@ class Door extends InteractiveDevice
 		}
 		if( activator.IsPlayer() )
 		{
-			IsSomeoneAuthorizedNearby( authorizedActivator );
+			authorizedActivator = ClosestAuthorizedActiveEntityNearby();
 			if( ps.GetDoorType() == EDoorType.REMOTELY_CONTROLLED && !( ps.IsLiftDoor() ) )
 			{
 				return false;
@@ -495,7 +585,7 @@ class Door extends InteractiveDevice
 			}
 			else
 			{
-				if( ps.GetDoorType() == EDoorType.AUTOMATIC || ps.IsLiftDoor() )
+				if( ( !( ps.IsLiftDoor() ) && ps.GetDoorType() == EDoorType.AUTOMATIC ) || ps.IsLiftDoorAndAtThisFloor() )
 				{
 					if( ps.IsLogicallyClosed() || ( authorizedActivator != NULL ) )
 					{
@@ -642,35 +732,21 @@ class Door extends InteractiveDevice
 		}
 	}
 
-	protected function AuthorizeUsers( usersToAuthorize : array< Entity > ) : Bool
+	protected function IsSomeoneAuthorizedNearby() : Bool
 	{
-		var i : Int32;
-		var ps : DoorControllerPS;
-		ps = GetDevicePS();
-		for( i = 0; i < usersToAuthorize.Size(); i += 1 )
-		{
-			if( ps.IsUserAuthorized( usersToAuthorize[ i ].GetEntityID() ) )
-			{
-				if( ( ( ( PlayerPuppet )( usersToAuthorize[ i ] ) ) && ps.IsDeviceSecured() ) && ps.IsTriggerValid( ps.GetDoorAuthorizationSide() ) )
-				{
-					ps.ResolveSkillchecks();
-					UpdateDeviceState();
-				}
-				NotifyParents();
-				return true;
-			}
-		}
-		return false;
+		return ClosestAuthorizedActiveEntityNearby() != NULL;
 	}
 
-	protected function AuthorizeUsers( usersToAuthorize : array< Entity >, out firstAuthorized : GameObject ) : Bool
+	protected function ClosestAuthorizedActiveEntityNearby() : GameObject
 	{
+		var usersToAuthorize : array< Entity >;
 		var i : Int32;
 		var ps : DoorControllerPS;
+		usersToAuthorize = m_triggerComponent.GetOverlappingEntities();
 		ps = GetDevicePS();
 		for( i = 0; i < usersToAuthorize.Size(); i += 1 )
 		{
-			if( ps.IsUserAuthorized( usersToAuthorize[ i ].GetEntityID() ) )
+			if( ScriptedPuppet.IsActive( ( ( weak< weak< GameObject > > )( usersToAuthorize[ i ] ) ) ) && ps.IsUserAuthorized( usersToAuthorize[ i ].GetEntityID() ) )
 			{
 				if( ( ( PlayerPuppet )( usersToAuthorize[ i ] ) ) && ps.IsDeviceSecured() )
 				{
@@ -682,25 +758,10 @@ class Door extends InteractiveDevice
 					}
 				}
 				NotifyParents();
-				firstAuthorized = ( ( GameObject )( usersToAuthorize[ i ] ) );
-				return true;
+				return ( ( GameObject )( usersToAuthorize[ i ] ) );
 			}
 		}
-		return false;
-	}
-
-	protected function IsSomeoneAuthorizedNearby() : Bool
-	{
-		var listToAuthorize : array< Entity >;
-		listToAuthorize = m_triggerComponent.GetOverlappingEntities();
-		return AuthorizeUsers( listToAuthorize );
-	}
-
-	protected function IsSomeoneAuthorizedNearby( out firstAuthorized : GameObject ) : Bool
-	{
-		var listToAuthorize : array< Entity >;
-		listToAuthorize = m_triggerComponent.GetOverlappingEntities();
-		return AuthorizeUsers( listToAuthorize, firstAuthorized );
+		return NULL;
 	}
 
 	protected event OnAuthorizeUser( evt : AuthorizeUser )
@@ -885,13 +946,31 @@ class Door extends InteractiveDevice
 		UpdateDeviceState();
 	}
 
+	protected event OnQuestForceClose( evt : QuestForceClose )
+	{
+		MoveDoor( false, false, evt.GetValue() );
+	}
+
 	protected event OnQuestForceCloseImmediate( evt : QuestForceCloseImmediate )
 	{
-		if( !( m_playerBlocker.IsEnabled() ) )
+		EnablePlayerBlocker();
+		MoveDoor( GetDevicePS().IsOpen(), false );
+	}
+
+	protected function EnablePlayerBlocker()
+	{
+		if( m_playerBlocker && !( m_playerBlocker.IsEnabled() ) )
 		{
 			m_playerBlocker.Toggle( true );
 		}
-		MoveDoor( GetDevicePS().IsOpen(), false );
+	}
+
+	protected function DisablePlayerBlocker()
+	{
+		if( m_playerBlocker && m_playerBlocker.IsEnabled() )
+		{
+			m_playerBlocker.Toggle( false );
+		}
 	}
 
 	protected event OnQuestForceOpenScene( evt : QuestForceOpenScene )
@@ -980,25 +1059,31 @@ class Door extends InteractiveDevice
 		GetDevicePS().OnDoorCollision();
 	}
 
-	private function MoveDoor( shouldBeOpened : Bool, immediate : Bool ) : Bool
+	private function MoveDoor( shouldBeOpened : Bool, immediate : Bool, optional movingSpeedMultiplier : Float ) : Bool
 	{
 		var replicatedState : DoorReplicatedState;
 		var deviceBusy : SetBusyEvent;
 		var reactionData : stimInvestigateData;
 		var broadcaster : StimBroadcasterComponent;
 		var ps : DoorControllerPS;
+		var movingTime : Float;
+		deviceBusy = new SetBusyEvent;
 		ps = GetDevicePS();
 		ps.SetIsBusy( true );
-		deviceBusy = new SetBusyEvent;
+		if( movingSpeedMultiplier == 0.0 )
+		{
+			movingSpeedMultiplier = 1.0;
+		}
+		movingTime = GetOpeningTime() / movingSpeedMultiplier;
 		if( m_animationType == EAnimationType.REGULAR )
 		{
-			RefreshAnimOpenDoor( shouldBeOpened, immediate );
+			RefreshAnimOpenDoor( shouldBeOpened, immediate, movingSpeedMultiplier );
 		}
 		else
 		{
-			RefreshTransformAnimOpenDoor( shouldBeOpened, immediate );
+			RefreshTransformAnimOpenDoor( shouldBeOpened, immediate, movingSpeedMultiplier );
 		}
-		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, deviceBusy, ps.GetOpeningTime() );
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, deviceBusy, movingTime );
 		if( !( immediate ) )
 		{
 			PlayDoorMovementSound( shouldBeOpened, m_audioForceOpen );
@@ -1008,18 +1093,22 @@ class Door extends InteractiveDevice
 		{
 			GameInstance.GetAudioSystem( GetGame() ).OpenAcousticPortal( this );
 			DisableOccluder();
-			if( m_playerBlocker && m_playerBlocker.IsEnabled() )
-			{
-				m_playerBlocker.Toggle( false );
-			}
+			DisablePlayerBlocker();
 		}
 		else
 		{
 			GameInstance.GetAudioSystem( GetGame() ).CloseAcousticPortal( this );
-			EnableOccluder();
-			if( ( m_playerBlocker && ps.IsLocked() ) && !( m_playerBlocker.IsEnabled() ) )
+			if( immediate )
 			{
-				m_playerBlocker.Toggle( true );
+				EnableOccluderInstanly();
+			}
+			else
+			{
+				EnableOccluderWithDelay( movingTime );
+				if( ps.IsLocked() )
+				{
+					EnablePlayerBlocker();
+				}
 			}
 		}
 		if( ( shouldBeOpened && m_whoOpened ) && m_whoOpened.IsPlayer() )
@@ -1030,18 +1119,7 @@ class Door extends InteractiveDevice
 				m_illegalOpen = false;
 			}
 			broadcaster = GetStimBroadcasterComponent();
-			if( broadcaster )
-			{
-				if( m_openedUsingForce )
-				{
-					broadcaster.TriggerSingleBroadcast( this, gamedataStimType.OpeningDoor, m_forceOpeningAudioStimRange, reactionData );
-				}
-				else
-				{
-					broadcaster.AddActiveStimuli( this, gamedataStimType.OpeningDoor, 2.0, m_forceOpeningAudioStimRange, reactionData, true );
-					broadcaster.TriggerSingleBroadcast( this, gamedataStimType.OpeningDoor, m_openingAudioStimRange, reactionData );
-				}
-			}
+			TriggerMoveDoorStimBroadcaster( broadcaster, reactionData );
 		}
 		m_openedUsingForce = false;
 		m_audioForceOpen = false;
@@ -1056,6 +1134,27 @@ class Door extends InteractiveDevice
 		RefreshInteraction( gamedeviceRequestType.Direct, GetPlayer( GetGame() ) );
 		NotifyParents();
 		return true;
+	}
+
+	protected virtual function TriggerMoveDoorStimBroadcaster( broadcaster : StimBroadcasterComponent, reactionData : stimInvestigateData )
+	{
+		if( broadcaster )
+		{
+			if( m_openedUsingForce )
+			{
+				broadcaster.TriggerSingleBroadcast( this, gamedataStimType.OpeningDoor, m_forceOpeningAudioStimRange, reactionData );
+			}
+			else
+			{
+				broadcaster.AddActiveStimuli( this, gamedataStimType.OpeningDoor, 2.0, m_forceOpeningAudioStimRange, reactionData, true );
+				broadcaster.TriggerSingleBroadcast( this, gamedataStimType.OpeningDoor, m_openingAudioStimRange, reactionData );
+			}
+		}
+	}
+
+	protected virtual function GetOpeningTime() : Float
+	{
+		return GetDevicePS().GetOpeningTime();
 	}
 
 	protected event OnSetBusyEvent( evt : SetBusyEvent )
@@ -1074,25 +1173,27 @@ class Door extends InteractiveDevice
 		}
 	}
 
-	protected function EnableOccluder()
+	protected function EnableOccluderWithDelay( delay : Float )
 	{
 		var e : OccluderEnableEvent;
 		e = new OccluderEnableEvent;
-		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, e, GetDevicePS().GetOpeningTime() );
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, e, delay );
+	}
+
+	protected function EnableOccluderInstanly()
+	{
+		if( m_occluder )
+		{
+			m_occluder.Toggle( true );
+		}
 	}
 
 	protected event OnOccluderEnable( evt : OccluderEnableEvent )
 	{
 		if( GetDevicePS().IsClosed() )
 		{
-			if( m_occluder )
-			{
-				m_occluder.Toggle( true );
-			}
-			if( m_playerBlocker && m_playerBlocker.IsEnabled() )
-			{
-				m_playerBlocker.Toggle( false );
-			}
+			EnableOccluderInstanly();
+			DisablePlayerBlocker();
 		}
 	}
 
@@ -1115,6 +1216,10 @@ class Door extends InteractiveDevice
 			m_portalLight4.ToggleLight( on );
 		}
 	}
+
+
+	private var m_componentName : CName;
+	private var m_playerInWorkspot : weak< PlayerPuppet >;
 
 	protected override function EnterWorkspot( activator : GameObject, optional freeCamera : Bool, optional componentName : CName, optional deviceData : CName )
 	{
@@ -1181,13 +1286,18 @@ class Door extends InteractiveDevice
 			}
 			else
 			{
-				GameObject.PlayMetadataEvent( this, 'open' );
+				PlayOpenDoorSound();
 			}
 		}
 		else
 		{
 			GameObject.PlayMetadataEvent( this, 'close' );
 		}
+	}
+
+	protected virtual function PlayOpenDoorSound()
+	{
+		GameObject.PlayMetadataEvent( this, 'open' );
 	}
 
 	protected override function ExecuteDeviceStateOperation()
@@ -1203,34 +1313,51 @@ class Door extends InteractiveDevice
 		}
 	}
 
-	private function RefreshAnimOpenDoor( shouldBeOpened : Bool, immediate : Bool )
+	private function RefreshAnimOpenDoor( shouldBeOpened : Bool, immediate : Bool, animSpeedMultiplier : Float )
 	{
 		if( !( m_animFeatureDoor ) )
 		{
 			m_animFeatureDoor = new AnimFeatureDoor;
 		}
+		m_animFeatureDoor.m_openingSpeed = GetOpeningSpeed() * animSpeedMultiplier;
+		m_animFeatureDoor.m_malfunctioning = ( ( Int32 )( EMalfunctioningType.NONE ) );
 		if( shouldBeOpened && ( m_animFeatureDoor.m_progress == 0.0 ) )
 		{
-			m_animFeatureDoor.m_progress = 1.0;
-			m_lastDoorSide = ( ( Int32 )( GetDoorTriggerSide( GetPlayerEntity() ) ) );
+			SetupOpenDoorAnimationFeatures();
 		}
 		else if( !( shouldBeOpened ) && ( m_animFeatureDoor.m_progress == 1.0 ) )
 		{
 			m_animFeatureDoor.m_progress = 0.0;
 		}
-		m_animFeatureDoor.m_openingSpeed = GetDevicePS().GetOpeningSpeed() * ( ( immediate ) ? ( 1000.0 ) : ( 1.0 ) );
 		m_animFeatureDoor.m_doorSide = m_lastDoorSide;
+		if( immediate )
+		{
+			m_animFeatureDoor.m_openingSpeed *= 1000.0;
+		}
 		AnimationControllerComponent.ApplyFeature( this, 'door', m_animFeatureDoor );
 	}
 
-	private function RefreshTransformAnimOpenDoor( shouldBeOpened : Bool, immediate : Bool )
+	protected virtual function SetupOpenDoorAnimationFeatures()
+	{
+		m_animFeatureDoor.m_progress = 1.0;
+		m_lastDoorSide = ( ( Int32 )( GetDoorTriggerSide( GetPlayerEntity() ) ) );
+	}
+
+	protected virtual function GetOpeningSpeed() : Float
+	{
+		var openingSpeed : Float;
+		openingSpeed = GetDevicePS().GetOpeningSpeed();
+		return ( ( openingSpeed == 0.0 ) ? ( 1.0 ) : ( openingSpeed ) );
+	}
+
+	private function RefreshTransformAnimOpenDoor( shouldBeOpened : Bool, immediate : Bool, animSpeedMultiplier : Float )
 	{
 		var playEvent : gameTransformAnimationPlayEvent;
 		var skipEvent : gameTransformAnimationSkipEvent;
 		var resetEvent : gameTransformAnimationResetEvent;
 		var openingSpeed : Float;
 		var animName : CName;
-		openingSpeed = ( ( GetDevicePS().GetOpeningSpeed() == 0.0 ) ? ( 1.0 ) : ( GetDevicePS().GetOpeningSpeed() ) );
+		openingSpeed = GetOpeningSpeed() * animSpeedMultiplier;
 		animName = GetProperTransformAnimName();
 		if( !( immediate ) )
 		{
@@ -1418,7 +1545,7 @@ class Door extends InteractiveDevice
 	{
 		if( m_terminalNetrunner1 )
 		{
-			if( IsConnectedToBackdoorDevice() && GetDevicePS().IsSideOneActive() )
+			if( IsConnectedToBackdoorDevice() || GetDevicePS().ExposeQuickHakcsIfNotConnnectedToAP() )
 			{
 				if( !( m_terminalNetrunner1.IsEnabled() ) )
 				{
@@ -1439,7 +1566,7 @@ class Door extends InteractiveDevice
 		}
 		if( m_terminalNetrunner2 )
 		{
-			if( IsConnectedToBackdoorDevice() && GetDevicePS().IsSideTwoActive() )
+			if( IsConnectedToBackdoorDevice() || GetDevicePS().ExposeQuickHakcsIfNotConnnectedToAP() )
 			{
 				if( !( m_terminalNetrunner2.IsEnabled() ) )
 				{
@@ -1548,7 +1675,7 @@ class Door extends InteractiveDevice
 		return EGameplayRole.OpenPath;
 	}
 
-	public const override function DeterminGameplayRoleMappinVisuaState( data : SDeviceMappinData ) : EMappinVisualState
+	public const override function DeterminGameplayRoleMappinVisuaState( const data : ref< SDeviceMappinData > ) : EMappinVisualState
 	{
 		if( ( !( GetDevicePS().IsDisabled() ) && GetNetworkSystem().QuickHacksExposedByDefault() ) && HasAnyActiveQuickHackVulnerabilities() )
 		{
@@ -1664,52 +1791,6 @@ class Door extends InteractiveDevice
 
 }
 
-class ChangeHalfLights extends Event
-{
-	var m_isAuthorization : Bool;
-}
-
-class AnimFeatureDoor extends AnimFeature
-{
-	editable var m_progress : Float;
-	editable var m_openingSpeed : Float;
-	editable var m_openingType : Int32;
-	editable var m_doorSide : Int32;
-}
-
-struct LedColors
-{
-	var off : ScriptLightSettings;
-	var red : ScriptLightSettings;
-	var green : ScriptLightSettings;
-}
-
-struct DoorPersistentData
-{
-	var m_doorType : EDoorType;
-	var m_canPlayerToggleLockState : Bool;
-	var m_canPlayerToggleSealState : Bool;
-	var m_initialStatus : EDoorStatus;
-	var m_keycardName : TweakDBID;
-	var m_passcode : CName;
-}
-
-struct DoorResaveData
-{
-	var m_doorType : EDoorType;
-	var m_canPlayerToggleLockState : Bool;
-	var m_canPlayerToggleSealState : Bool;
-	var m_initialStatus : EDoorStatus;
-	var m_keycardName : TweakDBID;
-	var m_passcode : CName;
-}
-
-class DoorReplicatedState extends DeviceReplicatedState
-{
-	var m_isOpen : Bool;
-	var m_wasImmediateChange : Bool;
-}
-
 class DoorColliderEnableEvent extends Event
 {
 }
@@ -1725,54 +1806,5 @@ class OccluderEnableEvent extends Event
 
 class SetBusyEvent extends Event
 {
-}
-
-enum EDoorType
-{
-	NONE = 0,
-	INTERACTIVE = 1,
-	AUTOMATIC = 2,
-	PHYSICAL = 3,
-	REMOTELY_CONTROLLED = 4,
-}
-
-enum EDoorStatus
-{
-	SEALED = -2,
-	LOCKED = -1,
-	CLOSED = 0,
-	OPENED = 1,
-}
-
-enum EDoorOpeningType
-{
-	SLIDING_HORIZONTALLY = 0,
-	SLIDING_VERTICALLY = 1,
-	HINGED = 2,
-	GATE = 3,
-	HINGED_SIDE_ONE = 4,
-	HINGED_SIDE_TWO = 5,
-}
-
-enum EAnimationType
-{
-	REGULAR = 0,
-	TRANSFORM = 1,
-	TRANSFORM_TWO_SIDES = 2,
-	NONE = 3,
-}
-
-enum EDoorTriggerSide
-{
-	OUTSIDE = 0,
-	ONE = 1,
-	TWO = 2,
-}
-
-enum EDoorSkillcheckSide
-{
-	BOTH = 0,
-	ONE = 1,
-	TWO = 2,
 }
 

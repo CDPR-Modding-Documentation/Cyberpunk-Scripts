@@ -1,0 +1,254 @@
+importonly final class BreachComponent extends IPlacedComponent
+{
+	public import function GetRadius() : Float;
+	public import function GetMeleeRadius() : Float;
+	public import function GetPosition() : Vector4;
+	public import function GetMaxHealth() : Float;
+	public import function GetAttachedWeakspot() : weak< WeakspotObject >;
+}
+
+importonly final class BreachControllerComponent extends IComponent
+{
+	public import function GetPreviouslyTrackedBreach() : weak< BreachComponent >;
+	public import function DestroyPreviouslyTrackedBreach();
+}
+
+import final class BreachFinderComponent extends IComponent
+{
+	var m_owner : weak< GameObject >;
+	var m_audioSystem : AudioSystem;
+	var m_statsSystem : StatsSystem;
+	var m_hitCount : Int32;
+	var m_almostTimeout : Bool;
+	default m_almostTimeout = false;
+	var m_breachDurationMin : Float;
+	var m_breachDurationMax : Float;
+	var m_breachDurationIncreasePerStreak : Float;
+	var m_breachDurationIncreaseForAnyStreak : Float;
+	var m_breachDurationIncreaseOnFirstLookat : Float;
+	var m_breachDurationIncreaseOnFirstHit : Float;
+	var m_breachCooldownMin : Float;
+	var m_breachCooldownMax : Float;
+	var m_breachCooldownDecreasePerStreak : Float;
+	var m_onBreachDestroyedAttackRecord : Attack_GameEffect_Record;
+	var m_onBreachDestroyedHealthToDamage : Float;
+	var m_onBreachDestroyedHealthToDamageBoss : Float;
+	var m_desiredBreachDuration : Float;
+	default m_desiredBreachDuration = 0.f;
+	var m_cooldownAfterBreach : Float;
+	default m_cooldownAfterBreach = 0.f;
+
+	public import function IsTrackedBreachHit( hitEvent : gameHitEvent, isMeleeAttack : Bool, isBulletExplosion : Bool ) : Bool;
+	public import function OnTrackedBreachDamaged( damage : Float );
+	public import function CanTrackedBreachBeKilledByDamage( damage : Float ) : Bool;
+	public import function GetTrackedBreachComponent() : weak< BreachComponent >;
+	public import function GetTrackedBreachPuppet() : weak< gamePuppet >;
+
+	public function Init( owner : weak< GameObject > )
+	{
+		m_owner = owner;
+		m_audioSystem = GameInstance.GetAudioSystem( m_owner.GetGame() );
+		m_statsSystem = GameInstance.GetStatsSystem( m_owner.GetGame() );
+		m_breachDurationMin = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachDurationMin", 5.0 );
+		m_breachDurationMax = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachDurationMax", 6.0 );
+		m_breachDurationIncreasePerStreak = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachDurationIncreasePerStreak", 10.0 );
+		m_breachDurationIncreaseForAnyStreak = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachDurationIncreaseForAnyStreak", 2.0 );
+		m_breachDurationIncreaseOnFirstLookat = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachDurationIncreaseOnFirstLookat", 4.0 );
+		m_breachDurationIncreaseOnFirstHit = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachDurationIncreaseOnFirstHit", 4.0 );
+		m_breachCooldownMin = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachCooldownMin", 7.0 );
+		m_breachCooldownMax = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachCooldownMax", 15.0 );
+		m_breachCooldownDecreasePerStreak = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.breachCooldownDecreasePerStreak", 10.0 );
+		m_onBreachDestroyedAttackRecord = TweakDBInterface.GetAttack_GameEffectRecord( T"Attacks.BreachEMPExplosion" );
+		m_onBreachDestroyedHealthToDamage = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.explosionDamageHealthPercentage", 100.0 );
+		m_onBreachDestroyedHealthToDamageBoss = TweakDBInterface.GetFloat( T"NewPerks.CyberwareBreachParams.explosionDamageHealthPercentageBoss", 100.0 );
+	}
+
+	public function GetBreachStreak() : Float
+	{
+		var streak : Float;
+		streak = m_statsSystem.GetStatValue( m_owner.GetEntityID(), gamedataStatType.BreachStreakBuffBonus );
+		if( streak < 5.0 )
+		{
+			return streak;
+		}
+		return 2.0 * streak;
+	}
+
+	public static function TryProcessBreachHit( hitEvent : gameHitEvent, isHeadshot : Bool, optional checkOnly : Bool ) : Bool
+	{
+		var isRanged : Bool;
+		var isMelee : Bool;
+		var player : PlayerPuppet;
+		var breachFinder : BreachFinderComponent;
+		isRanged = AttackData.IsRangedOrDirectOrThrown( hitEvent.attackData.GetAttackType() );
+		isMelee = AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) || AttackData.IsWhip( hitEvent.attackData.GetAttackType() );
+		if( !( isMelee ) && !( isRanged ) )
+		{
+			return false;
+		}
+		if( isHeadshot )
+		{
+			return false;
+		}
+		if( !( hitEvent.attackData.GetWeapon() ) )
+		{
+			return false;
+		}
+		player = ( ( PlayerPuppet )( hitEvent.attackData.GetInstigator() ) );
+		if( !( player ) )
+		{
+			return false;
+		}
+		breachFinder = player.GetBreachFinderComponent();
+		if( !( breachFinder ) )
+		{
+			return false;
+		}
+		if( !( breachFinder.IsTrackedBreachHit( hitEvent, isMelee, hitEvent.attackData.HasFlag( hitFlag.BulletExplosion ) ) ) )
+		{
+			return false;
+		}
+		if( !( checkOnly ) )
+		{
+			breachFinder.ProcessBreachHit( hitEvent );
+		}
+		return true;
+	}
+
+	private function ProcessBreachHit( hitEvent : gameHitEvent )
+	{
+		hitEvent.attackData.AddFlag( hitFlag.CriticalHit, 'ProcessBreachHit' );
+		hitEvent.attackData.AddFlag( hitFlag.WeakspotHit, 'ProcessBreachHit' );
+		hitEvent.attackData.AddFlag( hitFlag.BreachHit, 'ProcessBreachHit' );
+		if( !( hitEvent.projectionPipeline ) )
+		{
+			m_hitCount += 1;
+			if( m_hitCount == 1 )
+			{
+				OnFirstBreachHit();
+			}
+		}
+	}
+
+	public export function OnFirstBreachLookat()
+	{
+		if( !( m_almostTimeout ) )
+		{
+			m_desiredBreachDuration += m_breachDurationIncreaseOnFirstLookat;
+		}
+	}
+
+	private function OnFirstBreachHit()
+	{
+		if( !( m_almostTimeout ) )
+		{
+			m_desiredBreachDuration += m_breachDurationIncreaseOnFirstHit;
+		}
+	}
+
+	protected event OnDamageDealt( evt : gameTargetDamageEvent )
+	{
+		if( ( !( evt.attackData.HasFlag( hitFlag.BreachHit ) ) || !( evt.target ) ) || ( evt.damage <= 0.0 ) )
+		{
+			return false;
+		}
+		OnTrackedBreachDamaged( evt.damage );
+	}
+
+	public export function OnBreachDestroyed()
+	{
+		var breachComponent : BreachComponent;
+		var breachPuppet : NPCPuppet;
+		breachComponent = GetTrackedBreachComponent();
+		breachPuppet = ( ( NPCPuppet )( GetTrackedBreachPuppet() ) );
+		if( ( breachComponent && breachPuppet ) && m_owner )
+		{
+			SpawnFinalAttack( m_owner, m_onBreachDestroyedAttackRecord, breachComponent, breachPuppet );
+		}
+		if( PlayerDevelopmentSystem.GetData( m_owner ).IsNewPerkBought( gamedataNewPerkType.Espionage_Right_Perk_1_1 ) > 0 )
+		{
+			StatusEffectHelper.ApplyStatusEffect( m_owner, T"BaseStatusEffect.CyberwareBreachStreak", m_owner.GetEntityID() );
+		}
+		m_hitCount = 0;
+	}
+
+	private function SpawnFinalAttack( instigator : weak< GameObject >, attackRecord : Attack_GameEffect_Record, breach : BreachComponent, puppet : NPCPuppet )
+	{
+		var position : Vector4;
+		var breachMaxHealth : Float;
+		var breachMaxHealthToDamage : Float;
+		var attackContext : AttackInitContext;
+		var attack : Attack_GameEffect;
+		var effect : EffectInstance;
+		var statMods : array< gameStatModifierData >;
+		position = breach.GetPosition();
+		breachMaxHealth = breach.GetMaxHealth();
+		if( breachMaxHealth <= 0.0 )
+		{
+			return;
+		}
+		breachMaxHealthToDamage = ( ( puppet.GetNPCRarity() == gamedataNPCRarity.Boss || puppet.GetNPCRarity() == gamedataNPCRarity.MaxTac ) ? ( m_onBreachDestroyedHealthToDamageBoss ) : ( m_onBreachDestroyedHealthToDamage ) );
+		attackContext.record = attackRecord;
+		attackContext.instigator = instigator;
+		attackContext.source = instigator;
+		attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		attack.AddStatModifier( RPGManager.CreateStatModifier( gamedataStatType.ElectricDamage, gameStatModifierType.Additive, ( breachMaxHealth * breachMaxHealthToDamage ) / 100.0 ) );
+		attack.GetStatModList( statMods );
+		effect = attack.PrepareAttack( instigator );
+		EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.range, attackRecord.Range() );
+		EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, attackRecord.Range() );
+		EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position );
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attackStatModList, statMods );
+		attack.StartAttack();
+		m_audioSystem.PlayShockwave( TDB.GetCName( T"rumble.world.heavy_slow" ), position );
+	}
+
+	public export function OnStartedTrackingBreach()
+	{
+		var streak : Float;
+		streak = GetBreachStreak();
+		m_desiredBreachDuration = ( 1.0 + ( ( streak * m_breachDurationIncreasePerStreak ) / 100.0 ) ) * RandRangeF( m_breachDurationMin, m_breachDurationMax );
+		if( streak > 0.0 )
+		{
+			m_desiredBreachDuration += m_breachDurationIncreaseForAnyStreak;
+		}
+		m_hitCount = 0;
+		m_almostTimeout = false;
+		GameObject.PlaySoundEvent( m_owner, 'ui_gmpl_perk_cw_breach' );
+	}
+
+	public export function OnStoppedTrackingBreach()
+	{
+		m_cooldownAfterBreach = ( 1.0 - ( ( GetBreachStreak() * m_breachCooldownDecreasePerStreak ) / 100.0 ) ) * RandRangeF( m_breachCooldownMin, m_breachCooldownMax );
+		m_cooldownAfterBreach = MaxF( m_cooldownAfterBreach, 0.5 );
+	}
+
+	public export function ShouldStartTrackingBreach( timeSinceLastBreach : Float ) : Bool
+	{
+		return timeSinceLastBreach >= m_cooldownAfterBreach;
+	}
+
+	public export function GetCooldownAfterBreach() : Float
+	{
+		return m_cooldownAfterBreach;
+	}
+
+	public export function ShouldStopTrackingBreach( currentBreachDuration : Float ) : Bool
+	{
+		return currentBreachDuration >= m_desiredBreachDuration;
+	}
+
+	public export function IsAlmostBreachTimeout( currentBreachDuration : Float ) : Bool
+	{
+		m_almostTimeout = ( currentBreachDuration + 0.94999999 ) >= m_desiredBreachDuration;
+		return m_almostTimeout;
+	}
+
+	public export function GetDesiredBreachDuration() : Float
+	{
+		return m_desiredBreachDuration;
+	}
+
+}
+

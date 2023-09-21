@@ -1,0 +1,1244 @@
+enum BunkerSystems
+{
+	ALPHA = 0,
+	BRAVO = 1,
+	SIERRA = 2,
+	VICTOR = 3,
+	MAX = 4,
+}
+
+enum OpeningGateScreenState
+{
+	Unknown = 0,
+	Idle = 1,
+	Loop = 2,
+	Open = 3,
+	Result = 4,
+}
+
+struct BunkerSystemsFactsSet
+{
+	editable var ALPHA_FACT : CName;
+	default ALPHA_FACT = 'q305_server_01_offline';
+	editable var BRAVO_FACT : CName;
+	default BRAVO_FACT = 'q305_server_02_offline';
+	editable var SIERRA_FACT : CName;
+	default SIERRA_FACT = 'q305_server_backup_01_offline';
+	editable var VICTOR_FACT : CName;
+	default VICTOR_FACT = 'q305_server_backup_02_offline';
+}
+
+importonly class gameuiBaseBunkerComputerGameController extends inkGameController
+{
+	protected import function ListenToFact( fact : CName );
+	protected import function AddTimer( timerName : CName, time : Float );
+	protected import function ResetTimer( timerName : CName );
+}
+
+class BaseBunkerComputerGameController extends gameuiBaseBunkerComputerGameController
+{
+	editable var m_factsSet : BunkerSystemsFactsSet;
+	editable var m_gateClosedFact : CName;
+	default m_gateClosedFact = 'q305_gate_closed';
+
+	protected function GetGame() : GameInstance
+	{
+		var gameInstance : GameInstance;
+		var gameObject : GameObject;
+		gameObject = ( ( GameObject )( GetOwnerEntity() ) );
+		if( gameObject )
+		{
+			gameInstance = gameObject.GetGame();
+		}
+		return gameInstance;
+	}
+
+	protected function SetStatusOffline( controller : weak< inkLogicController >, fact : CName )
+	{
+		SetStatusOffline( controller, GetFact( GetGame(), fact ) > 0 );
+	}
+
+	protected function SetStatusOffline( controller : weak< inkLogicController >, isOffline : Bool )
+	{
+		var isGateClosed : Bool;
+		var statusController : SystemStatusLogicController;
+		isGateClosed = GetFact( GetGame(), m_gateClosedFact ) > 0;
+		statusController = ( ( SystemStatusLogicController )( controller ) );
+		if( statusController )
+		{
+			statusController.SetOffline( isOffline, isGateClosed );
+		}
+	}
+
+	protected function GetCurrentSystem() : BunkerSystems
+	{
+		var sysIndex : Int32;
+		var system : BunkerSystems;
+		sysIndex = GetFact( GetGame(), 'q305_server_index' );
+		system = BunkerSystems.MAX;
+		if( ( sysIndex >= 0 ) && ( sysIndex < ( ( Int32 )( BunkerSystems.MAX ) ) ) )
+		{
+			system = ( ( BunkerSystems )( sysIndex ) );
+		}
+		return system;
+	}
+
+	protected function GetCurrentSystemFact( factsSet : ref< BunkerSystemsFactsSet > ) : CName
+	{
+		var system : BunkerSystems;
+		var fact : CName;
+		system = GetCurrentSystem();
+		if( system != BunkerSystems.MAX )
+		{
+			switch( system )
+			{
+				case BunkerSystems.ALPHA:
+					fact = factsSet.ALPHA_FACT;
+				break;
+				case BunkerSystems.BRAVO:
+					fact = factsSet.BRAVO_FACT;
+				break;
+				case BunkerSystems.SIERRA:
+					fact = factsSet.SIERRA_FACT;
+				break;
+				case BunkerSystems.VICTOR:
+					fact = factsSet.VICTOR_FACT;
+				break;
+			}
+		}
+		return fact;
+	}
+
+}
+
+class StatusScreenGameController extends BaseBunkerComputerGameController
+{
+	protected editable var m_alphaSys : inkWidgetRef;
+	protected editable var m_bravoSys : inkWidgetRef;
+	protected editable var m_sierraSys : inkWidgetRef;
+	protected editable var m_victorSys : inkWidgetRef;
+	protected editable var m_sierraBackupSys : inkWidgetRef;
+	protected editable var m_victorBackupSys : inkWidgetRef;
+
+	protected event OnInitialize()
+	{
+		UpdateStatus();
+	}
+
+	protected function UpdateStatus()
+	{
+		var isAlphaOffline : Bool;
+		var isBravoOffline : Bool;
+		isAlphaOffline = GetFact( GetGame(), m_factsSet.ALPHA_FACT ) > 0;
+		isBravoOffline = GetFact( GetGame(), m_factsSet.BRAVO_FACT ) > 0;
+		SetStatusOffline( inkWidgetRef.GetController( m_alphaSys ), isAlphaOffline );
+		SetStatusOffline( inkWidgetRef.GetController( m_bravoSys ), isBravoOffline );
+		SetStatusOffline( inkWidgetRef.GetController( m_sierraSys ), m_factsSet.SIERRA_FACT );
+		SetStatusOffline( inkWidgetRef.GetController( m_victorSys ), m_factsSet.VICTOR_FACT );
+		inkWidgetRef.SetVisible( m_sierraBackupSys, !( isAlphaOffline ) || !( isBravoOffline ) );
+		inkWidgetRef.SetVisible( m_victorBackupSys, !( isAlphaOffline ) || !( isBravoOffline ) );
+		inkWidgetRef.SetVisible( m_sierraSys, isAlphaOffline && isBravoOffline );
+		inkWidgetRef.SetVisible( m_victorSys, isAlphaOffline && isBravoOffline );
+	}
+
+}
+
+class SystemStatusLogicController extends inkLogicController
+{
+	editable var m_onlineRoot : inkWidgetRef;
+	editable var m_offlineRoot : inkWidgetRef;
+	editable var m_onlineIco : inkWidgetRef;
+	editable var m_offlineIco : inkWidgetRef;
+	editable var m_sysIndicator : inkWidgetRef;
+	editable var m_statusBackground : inkWidgetRef;
+	editable var m_statusBackgroundProxy : inkAnimProxy;
+	editable var m_stateAnimName : CName;
+	const editable var m_widgetsToColor : array< inkWidgetRef >;
+	const editable var m_textStatuses : array< inkTextRef >;
+
+	protected event OnInitialize()
+	{
+		GetRootWidget().SetVisible( false );
+		PlayStateAnim( inkWidgetRef.Get( m_onlineIco ), inkWidgetRef.Get( m_sysIndicator ), inkWidgetRef.Get( m_offlineIco ) );
+	}
+
+	public function SetOffline( offline : Bool, isGateClosed : Bool )
+	{
+		var i, count : Int32;
+		var offlineName, onlineName : CName;
+		offlineName = 'Offline';
+		onlineName = 'Online';
+		inkWidgetRef.SetVisible( m_onlineRoot, !( offline ) );
+		inkWidgetRef.SetVisible( m_offlineRoot, offline );
+		count = m_widgetsToColor.Size();
+		for( i = 0; i < count; i = i + 1 )
+		{
+			inkWidgetRef.SetState( m_widgetsToColor[ i ], ( ( offline ) ? ( offlineName ) : ( onlineName ) ) );
+		}
+		count = m_textStatuses.Size();
+		for( i = 0; i < count; i = i + 1 )
+		{
+			inkTextRef.SetLocalizedTextScript( m_textStatuses[ i ], ( ( offline ) ? ( "LocKey#93580" ) : ( "LocKey#93579" ) ) );
+		}
+		m_statusBackgroundProxy.Stop();
+		if( isGateClosed && !( offline ) )
+		{
+			m_statusBackgroundProxy = PlayStateAnim( inkWidgetRef.Get( m_statusBackground ), NULL, NULL );
+		}
+		GetRootWidget().SetVisible( true );
+	}
+
+	private function PlayStateAnim( target1 : inkWidget, target2 : inkWidget, target3 : inkWidget ) : inkAnimProxy
+	{
+		var targets : inkWidgetsSet;
+		var playbackOptions : inkAnimOptions;
+		if( m_stateAnimName != '' )
+		{
+			targets = new inkWidgetsSet;
+			if( target1 )
+			{
+				targets.Select( target1 );
+			}
+			if( target2 )
+			{
+				targets.Select( target2 );
+			}
+			if( target3 )
+			{
+				targets.Select( target3 );
+			}
+			playbackOptions.loopType = inkanimLoopType.Cycle;
+			playbackOptions.loopInfinite = true;
+			return PlayLibraryAnimationOnTargets( m_stateAnimName, targets, playbackOptions );
+		}
+		return NULL;
+	}
+
+}
+
+class GateStatusLogicController extends inkLogicController
+{
+	editable var m_textStatus : inkTextRef;
+
+	public function PrepareToOpen()
+	{
+		inkTextRef.SetLocalizedTextScript( m_textStatus, "LocKey#93596" );
+	}
+
+	public function SetGateState( unlocked : Bool, showState : Bool )
+	{
+		if( showState )
+		{
+			inkTextRef.SetLocalizedTextScript( m_textStatus, ( ( unlocked ) ? ( "LocKey#93597" ) : ( "LocKey#93598" ) ) );
+		}
+	}
+
+}
+
+struct SoundFxFactsSet extends BunkerSystemsFactsSet
+{
+	default ALPHA_FACT = 'q305_server_01_opening_sfx';
+	default BRAVO_FACT = 'q305_server_02_opening_sfx';
+	default SIERRA_FACT = 'q305_server_backup_01_opening_sfx';
+	default VICTOR_FACT = 'q305_server_backup_02_opening_sfx';
+}
+
+class OpeningGateScreenGameController extends BaseBunkerComputerGameController
+{
+	editable var m_systemConsole : inkWidgetRef;
+	editable var m_gateScheme : inkWidgetRef;
+	editable var m_backButton : inkWidgetRef;
+	editable var m_idleAnimName : CName;
+	default m_idleAnimName = 'idle_state';
+	editable var m_loopAnimName : CName;
+	default m_loopAnimName = 'loop_state';
+	editable var m_failureAnimName : CName;
+	default m_failureAnimName = 'failure_state';
+	editable var m_successAnimName : CName;
+	default m_successAnimName = 'success_state';
+	editable var m_failurePopupIntroAnimName : CName;
+	default m_failurePopupIntroAnimName = 'popup2_intro';
+	editable var m_successPopupIntroAnimName : CName;
+	default m_successPopupIntroAnimName = 'popup1_intro';
+	editable var m_failurePopupAnimName : CName;
+	default m_failurePopupAnimName = 'popup2_loop';
+	editable var m_successPopupAnimName : CName;
+	default m_successPopupAnimName = 'popup1_loop';
+	editable var m_gateIsOpenedFact : CName;
+	default m_gateIsOpenedFact = 'q305_open_the_gate';
+	editable var m_gateChainBeginningFact : CName;
+	default m_gateChainBeginningFact = 'Q305_gate_chain_beginning';
+	editable var m_gotoLoopDelay : Float;
+	default m_gotoLoopDelay = 2.5f;
+	editable var m_goBackDelay : Float;
+	default m_goBackDelay = 6.f;
+	var m_isGateOpened : Bool;
+	var m_systemsStatus : array< Bool >;
+	var m_currentLoopIndex : Int32;
+	var m_currentSystemIndex : Int32;
+	var m_phasesCount : Int32;
+	default m_phasesCount = 3;
+	var m_state : OpeningGateScreenState;
+	default m_state = OpeningGateScreenState.Unknown;
+	var m_idleAnimProxy : inkAnimProxy;
+	var m_loopAnimProxy : inkAnimProxy;
+	var m_resultAnimProxy : inkAnimProxy;
+	var m_resultPopupIntroAnimProxy : inkAnimProxy;
+	var m_resultPopupAnimProxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		var gameInstance : GameInstance;
+		gameInstance = GetGame();
+		m_systemsStatus.PushBack( GetFact( gameInstance, m_factsSet.ALPHA_FACT ) > 0 );
+		m_systemsStatus.PushBack( GetFact( gameInstance, m_factsSet.BRAVO_FACT ) > 0 );
+		m_systemsStatus.PushBack( GetFact( gameInstance, m_factsSet.SIERRA_FACT ) > 0 );
+		m_systemsStatus.PushBack( GetFact( gameInstance, m_factsSet.VICTOR_FACT ) > 0 );
+		m_isGateOpened = GetFact( gameInstance, m_gateIsOpenedFact ) > 0;
+		if( !( m_isGateOpened ) && CanGateBeOpened() )
+		{
+			SetFactValue( gameInstance, m_gateChainBeginningFact, 1 );
+		}
+		AddTimer( 'GotoLoop', m_gotoLoopDelay );
+		SetState( OpeningGateScreenState.Idle );
+	}
+
+	protected event OnUninitialize()
+	{
+		LeaveState( m_state );
+	}
+
+	protected event OnTimer( timerName : CName )
+	{
+		var webPageController : WebPage;
+		if( timerName == 'GotoLoop' )
+		{
+			ResetTimer( 'GotoLoop' );
+			SetState( OpeningGateScreenState.Loop );
+		}
+		else if( timerName == 'GoBack' )
+		{
+			webPageController = ( ( WebPage )( GetRootWidget().GetController() ) );
+			webPageController.ActivateCanvasLink( inkWidgetRef.Get( m_backButton ) );
+		}
+	}
+
+	public function SetState( state : OpeningGateScreenState )
+	{
+		if( m_state != state )
+		{
+			LeaveState( m_state );
+			m_state = state;
+			GotoState( m_state );
+		}
+	}
+
+	public function LeaveState( state : OpeningGateScreenState )
+	{
+		switch( state )
+		{
+			case OpeningGateScreenState.Idle:
+				LeaveStateIdle();
+			break;
+			case OpeningGateScreenState.Loop:
+				LeaveStateLoop();
+			break;
+			case OpeningGateScreenState.Open:
+				LeaveStateOpen();
+			break;
+			case OpeningGateScreenState.Result:
+				LeaveStateResult();
+			break;
+		}
+	}
+
+	public function GotoState( state : OpeningGateScreenState )
+	{
+		switch( state )
+		{
+			case OpeningGateScreenState.Idle:
+				GotoStateIdle();
+			break;
+			case OpeningGateScreenState.Loop:
+				GotoStateLoop();
+			break;
+			case OpeningGateScreenState.Open:
+				GotoStateOpen();
+			break;
+			case OpeningGateScreenState.Result:
+				GotoStateResult();
+			break;
+		}
+	}
+
+	public function GotoStateIdle()
+	{
+		var playbackOptions : inkAnimOptions;
+		var controller : SystemConsoleLogicController;
+		controller = ( ( SystemConsoleLogicController )( inkWidgetRef.GetController( m_systemConsole ) ) );
+		if( controller )
+		{
+			controller.InitSystems( m_systemsStatus, m_isGateOpened );
+		}
+		if( !( m_isGateOpened ) )
+		{
+			playbackOptions.loopType = inkanimLoopType.Cycle;
+			playbackOptions.loopInfinite = true;
+			if( m_idleAnimName != '' )
+			{
+				m_idleAnimProxy = PlayLibraryAnimation( m_idleAnimName, playbackOptions );
+			}
+		}
+		else
+		{
+			SetState( OpeningGateScreenState.Result );
+		}
+	}
+
+	public function LeaveStateIdle()
+	{
+		m_idleAnimProxy.GotoEndAndStop();
+	}
+
+	public function GotoStateLoop()
+	{
+		var i, count : Int32;
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		m_currentLoopIndex = 0;
+		m_currentSystemIndex = 0;
+		PrepareToOpen();
+		if( m_loopAnimName != '' )
+		{
+			m_loopAnimProxy = PlayLibraryAnimation( m_loopAnimName, playbackOptions );
+			m_loopAnimProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnEndLoop' );
+		}
+		if( !( m_loopAnimProxy ) )
+		{
+			count = m_systemsStatus.Size() * m_phasesCount;
+			for( i = 0; i < count; i = i + 1 )
+			{
+				TryToOpen();
+			}
+		}
+	}
+
+	public function LeaveStateLoop()
+	{
+		m_loopAnimProxy.UnregisterFromAllCallbacks( inkanimEventType.OnEndLoop );
+		m_loopAnimProxy.Stop();
+	}
+
+	protected event OnEndLoop( proxy : inkAnimProxy )
+	{
+		TryToOpen();
+	}
+
+	public function PrepareToOpen()
+	{
+		var sysConsoleController : SystemConsoleLogicController;
+		sysConsoleController = ( ( SystemConsoleLogicController )( inkWidgetRef.GetController( m_systemConsole ) ) );
+		if( sysConsoleController )
+		{
+			sysConsoleController.PrepareToOpen( ( ( BunkerSystems )( m_currentSystemIndex ) ) );
+		}
+	}
+
+	public function TryToOpen()
+	{
+		var sysConsoleController : SystemConsoleLogicController;
+		var phase : Int32;
+		var unlocked : Bool;
+		phase = m_currentLoopIndex % m_phasesCount;
+		if( phase == 0 )
+		{
+			sysConsoleController = ( ( SystemConsoleLogicController )( inkWidgetRef.GetController( m_systemConsole ) ) );
+			if( sysConsoleController )
+			{
+				sysConsoleController.SetGateState( ( ( BunkerSystems )( m_currentSystemIndex ) ), m_systemsStatus[ m_currentSystemIndex ] );
+			}
+		}
+		else if( phase == 2 )
+		{
+			unlocked = m_systemsStatus[ m_currentSystemIndex ];
+			m_currentSystemIndex = m_currentSystemIndex + 1;
+			if( !( unlocked ) )
+			{
+				SetState( OpeningGateScreenState.Result );
+			}
+			else
+			{
+				PrepareToOpen();
+				if( ( ( BunkerSystems )( m_currentSystemIndex ) ) == BunkerSystems.MAX )
+				{
+					SetState( OpeningGateScreenState.Open );
+				}
+			}
+		}
+		m_currentLoopIndex = m_currentLoopIndex + 1;
+	}
+
+	public function GotoStateOpen()
+	{
+		var gateSchemeController : GateSchemeLogicController;
+		gateSchemeController = ( ( GateSchemeLogicController )( inkWidgetRef.GetController( m_gateScheme ) ) );
+		if( gateSchemeController )
+		{
+			gateSchemeController.RegisterToCallback( 'JobIsDone', this, 'OnJobIsDone' );
+			gateSchemeController.OpenGate( GetGame() );
+		}
+	}
+
+	public function LeaveStateOpen()
+	{
+		var gateSchemeController : GateSchemeLogicController;
+		gateSchemeController = ( ( GateSchemeLogicController )( inkWidgetRef.GetController( m_gateScheme ) ) );
+		if( gateSchemeController )
+		{
+			gateSchemeController.UnregisterFromCallback( 'JobIsDone', this, 'OnJobIsDone' );
+		}
+	}
+
+	protected event OnJobIsDone( target : weak< inkWidget > )
+	{
+		SetState( OpeningGateScreenState.Result );
+	}
+
+	public function GotoStateResult()
+	{
+		var canGateBeOpened : Bool;
+		var animName : CName;
+		var popupIntroAnimName : CName;
+		var popupAnimName : CName;
+		var playbackOptions : inkAnimOptions;
+		canGateBeOpened = CanGateBeOpened();
+		animName = ( ( canGateBeOpened ) ? ( m_successAnimName ) : ( m_failureAnimName ) );
+		popupIntroAnimName = ( ( canGateBeOpened ) ? ( m_successPopupIntroAnimName ) : ( m_failurePopupIntroAnimName ) );
+		popupAnimName = ( ( canGateBeOpened ) ? ( m_successPopupAnimName ) : ( m_failurePopupAnimName ) );
+		playbackOptions.executionDelay = 2.0;
+		if( popupIntroAnimName != '' )
+		{
+			m_resultPopupIntroAnimProxy = PlayLibraryAnimation( popupIntroAnimName, playbackOptions );
+		}
+		playbackOptions.executionDelay = 0.0;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		if( animName != '' )
+		{
+			m_resultAnimProxy = PlayLibraryAnimation( animName, playbackOptions );
+		}
+		if( popupAnimName != '' )
+		{
+			m_resultPopupAnimProxy = PlayLibraryAnimation( popupAnimName, playbackOptions );
+		}
+		if( !( canGateBeOpened ) )
+		{
+			AddTimer( 'GoBack', m_goBackDelay );
+		}
+		else
+		{
+			SetFactValue( GetGame(), m_gateIsOpenedFact, 1 );
+		}
+	}
+
+	public function LeaveStateResult()
+	{
+		m_resultAnimProxy.Stop();
+		m_resultPopupAnimProxy.Stop();
+		m_resultPopupIntroAnimProxy.Stop();
+	}
+
+	public const function CanGateBeOpened() : Bool
+	{
+		var i, count : Int32;
+		count = m_systemsStatus.Size();
+		for( i = 0; i < count; i = i + 1 )
+		{
+			if( !( m_systemsStatus[ i ] ) )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+}
+
+class SystemConsoleLogicController extends inkLogicController
+{
+	editable var m_alphaSys : inkWidgetRef;
+	editable var m_bravoSys : inkWidgetRef;
+	editable var m_sierraSys : inkWidgetRef;
+	editable var m_victorSys : inkWidgetRef;
+
+	public function InitSystems( systemsStatus : array< Bool >, isGateOpened : Bool )
+	{
+		var controller : GateStatusLogicController;
+		SetStatusOffline( inkWidgetRef.GetController( m_alphaSys ), systemsStatus[ ( ( Int32 )( BunkerSystems.ALPHA ) ) ] );
+		SetStatusOffline( inkWidgetRef.GetController( m_bravoSys ), systemsStatus[ ( ( Int32 )( BunkerSystems.BRAVO ) ) ] );
+		SetStatusOffline( inkWidgetRef.GetController( m_sierraSys ), systemsStatus[ ( ( Int32 )( BunkerSystems.SIERRA ) ) ] );
+		SetStatusOffline( inkWidgetRef.GetController( m_victorSys ), systemsStatus[ ( ( Int32 )( BunkerSystems.VICTOR ) ) ] );
+		controller = ( ( GateStatusLogicController )( inkWidgetRef.GetControllerByType( m_alphaSys, 'GateStatusLogicController' ) ) );
+		SetGateState( controller, isGateOpened, false );
+		controller = ( ( GateStatusLogicController )( inkWidgetRef.GetControllerByType( m_bravoSys, 'GateStatusLogicController' ) ) );
+		SetGateState( controller, isGateOpened, false );
+		controller = ( ( GateStatusLogicController )( inkWidgetRef.GetControllerByType( m_sierraSys, 'GateStatusLogicController' ) ) );
+		SetGateState( controller, isGateOpened, false );
+		controller = ( ( GateStatusLogicController )( inkWidgetRef.GetControllerByType( m_victorSys, 'GateStatusLogicController' ) ) );
+		SetGateState( controller, isGateOpened, false );
+	}
+
+	public function PrepareToOpen( system : BunkerSystems )
+	{
+		var controller : GateStatusLogicController;
+		var checkState, defaultState : CName;
+		controller = GetGateStatusLogicController( system );
+		checkState = 'Check';
+		defaultState = 'Default';
+		if( controller )
+		{
+			controller.PrepareToOpen();
+		}
+		inkWidgetRef.SetState( m_alphaSys, ( ( system == BunkerSystems.ALPHA ) ? ( checkState ) : ( defaultState ) ) );
+		inkWidgetRef.SetState( m_bravoSys, ( ( system == BunkerSystems.BRAVO ) ? ( checkState ) : ( defaultState ) ) );
+		inkWidgetRef.SetState( m_sierraSys, ( ( system == BunkerSystems.SIERRA ) ? ( checkState ) : ( defaultState ) ) );
+		inkWidgetRef.SetState( m_victorSys, ( ( system == BunkerSystems.VICTOR ) ? ( checkState ) : ( defaultState ) ) );
+	}
+
+	public function SetGateState( system : BunkerSystems, unlocked : Bool )
+	{
+		var widget : weak< inkWidget >;
+		var style : CName;
+		widget = GetSystemWidget( system );
+		style = ( ( unlocked ) ? ( 'Green' ) : ( 'Red' ) );
+		widget.SetState( style );
+		SetGateState( GetGateStatusLogicController( widget ), unlocked, true );
+	}
+
+	public function GetSystemWidget( system : BunkerSystems ) : weak< inkWidget >
+	{
+		var widget : weak< inkWidget >;
+		if( system == BunkerSystems.ALPHA )
+		{
+			widget = inkWidgetRef.Get( m_alphaSys );
+		}
+		else if( system == BunkerSystems.BRAVO )
+		{
+			widget = inkWidgetRef.Get( m_bravoSys );
+		}
+		else if( system == BunkerSystems.SIERRA )
+		{
+			widget = inkWidgetRef.Get( m_sierraSys );
+		}
+		else if( system == BunkerSystems.VICTOR )
+		{
+			widget = inkWidgetRef.Get( m_victorSys );
+		}
+		return widget;
+	}
+
+	public function GetGateStatusLogicController( system : BunkerSystems ) : GateStatusLogicController
+	{
+		var widget : weak< inkWidget >;
+		var controller : GateStatusLogicController;
+		widget = GetSystemWidget( system );
+		if( widget )
+		{
+			controller = ( ( GateStatusLogicController )( widget.GetControllerByType( 'GateStatusLogicController' ) ) );
+		}
+		return controller;
+	}
+
+	public function GetGateStatusLogicController( system : weak< inkWidget > ) : GateStatusLogicController
+	{
+		var controller : GateStatusLogicController;
+		if( system )
+		{
+			controller = ( ( GateStatusLogicController )( system.GetControllerByType( 'GateStatusLogicController' ) ) );
+		}
+		return controller;
+	}
+
+	public function SetGateState( controller : GateStatusLogicController, unlocked : Bool, showState : Bool )
+	{
+		if( controller )
+		{
+			controller.SetGateState( unlocked, showState );
+		}
+	}
+
+	public function SetStatusOffline( controller : weak< inkLogicController >, value : Bool )
+	{
+		var statusController : SystemStatusLogicController;
+		statusController = ( ( SystemStatusLogicController )( controller ) );
+		if( statusController )
+		{
+			statusController.SetOffline( value, true );
+		}
+	}
+
+}
+
+class GateSchemeLogicController extends inkLogicController
+{
+	editable var m_sfxFactsSet : SoundFxFactsSet;
+	editable var m_tube1 : inkWidgetRef;
+	editable var m_tube2 : inkWidgetRef;
+	editable var m_tube3 : inkWidgetRef;
+	editable var m_tube4 : inkWidgetRef;
+	editable var m_tube5 : inkWidgetRef;
+	editable var m_tube6 : inkWidgetRef;
+	editable var m_tube7 : inkWidgetRef;
+	editable var m_tube8 : inkWidgetRef;
+	editable var m_OpeningGateLeftAnimName : CName;
+	default m_OpeningGateLeftAnimName = 'logic_controller_left';
+	editable var m_OpeningGateRightAnimName : CName;
+	default m_OpeningGateRightAnimName = 'logic_controller_right';
+	var m_currentSystemIndex : Int32;
+	var m_gameInstance : GameInstance;
+
+	public function OpenGate( gameInstance : GameInstance )
+	{
+		m_gameInstance = gameInstance;
+		m_currentSystemIndex = 0;
+		DoOpenGate( ( ( BunkerSystems )( m_currentSystemIndex ) ) );
+	}
+
+	public function DoOpenGate( system : BunkerSystems )
+	{
+		var animName, factName : CName;
+		var proxy : inkAnimProxy;
+		var onlineName : CName;
+		var targets : inkWidgetsSet;
+		onlineName = 'Online';
+		targets = new inkWidgetsSet;
+		if( ( ( BunkerSystems )( m_currentSystemIndex ) ) == BunkerSystems.MAX )
+		{
+			CallCustomCallback( 'JobIsDone' );
+		}
+		else
+		{
+			switch( system )
+			{
+				case BunkerSystems.ALPHA:
+					targets.Select( inkWidgetRef.Get( m_tube1 ) ).Select( inkWidgetRef.Get( m_tube2 ) );
+				inkWidgetRef.SetState( m_tube1, onlineName );
+				inkWidgetRef.SetState( m_tube2, onlineName );
+				animName = m_OpeningGateLeftAnimName;
+				factName = m_sfxFactsSet.ALPHA_FACT;
+				break;
+				case BunkerSystems.BRAVO:
+					targets.Select( inkWidgetRef.Get( m_tube3 ) ).Select( inkWidgetRef.Get( m_tube4 ) );
+				inkWidgetRef.SetState( m_tube3, onlineName );
+				inkWidgetRef.SetState( m_tube4, onlineName );
+				animName = m_OpeningGateLeftAnimName;
+				factName = m_sfxFactsSet.BRAVO_FACT;
+				break;
+				case BunkerSystems.SIERRA:
+					targets.Select( inkWidgetRef.Get( m_tube5 ) ).Select( inkWidgetRef.Get( m_tube6 ) );
+				inkWidgetRef.SetState( m_tube5, onlineName );
+				inkWidgetRef.SetState( m_tube6, onlineName );
+				animName = m_OpeningGateRightAnimName;
+				factName = m_sfxFactsSet.SIERRA_FACT;
+				break;
+				case BunkerSystems.VICTOR:
+					targets.Select( inkWidgetRef.Get( m_tube7 ) ).Select( inkWidgetRef.Get( m_tube8 ) );
+				inkWidgetRef.SetState( m_tube7, onlineName );
+				inkWidgetRef.SetState( m_tube8, onlineName );
+				animName = m_OpeningGateRightAnimName;
+				factName = m_sfxFactsSet.VICTOR_FACT;
+				break;
+			}
+			if( animName != '' )
+			{
+				proxy = PlayLibraryAnimationOnTargets( animName, targets );
+				proxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnAnimationFinished' );
+			}
+			if( factName != '' )
+			{
+				SetFactValue( m_gameInstance, factName, 1 );
+			}
+		}
+	}
+
+	protected event OnAnimationFinished( proxy : inkAnimProxy )
+	{
+		proxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnAnimationFinished' );
+		m_currentSystemIndex = m_currentSystemIndex + 1;
+		DoOpenGate( ( ( BunkerSystems )( m_currentSystemIndex ) ) );
+	}
+
+}
+
+class DatatermLoginGameController extends BaseBunkerComputerGameController
+{
+	editable var m_loopAnimName : CName;
+	editable var m_alphaSys : inkWidgetRef;
+	editable var m_bravoSys : inkWidgetRef;
+	editable var m_sierraSys : inkWidgetRef;
+	editable var m_victorSys : inkWidgetRef;
+
+	protected event OnInitialize()
+	{
+		var playbackOptions : inkAnimOptions;
+		var system : BunkerSystems;
+		system = GetCurrentSystem();
+		inkWidgetRef.SetVisible( m_alphaSys, system == BunkerSystems.ALPHA );
+		inkWidgetRef.SetVisible( m_bravoSys, system == BunkerSystems.BRAVO );
+		inkWidgetRef.SetVisible( m_sierraSys, system == BunkerSystems.SIERRA );
+		inkWidgetRef.SetVisible( m_victorSys, system == BunkerSystems.VICTOR );
+		if( m_loopAnimName != '' )
+		{
+			playbackOptions.loopType = inkanimLoopType.Cycle;
+			playbackOptions.loopInfinite = true;
+			PlayLibraryAnimation( m_loopAnimName, playbackOptions );
+		}
+	}
+
+}
+
+struct AuthorizationFactsSet extends BunkerSystemsFactsSet
+{
+	default ALPHA_FACT = 'q305_server_01_authorization_needed';
+	default BRAVO_FACT = 'q305_server_02_authorization_needed';
+	default SIERRA_FACT = 'q305_backup_server_01_authorization_needed';
+	default VICTOR_FACT = 'q305_backup_server_02_authorization_needed';
+}
+
+struct AttemptedToStopFactsSet extends BunkerSystemsFactsSet
+{
+	default BRAVO_FACT = 'q305_attempted_to_stop_server_02';
+}
+
+class DatatermDetailGameController extends BaseBunkerComputerGameController
+{
+	editable var m_authFactsSet : AuthorizationFactsSet;
+	editable var m_attemptedFactsSet : AttemptedToStopFactsSet;
+	editable var m_systemStatusHeaderPannel : inkWidgetRef;
+	editable var m_systemStatusLeftPannel : inkWidgetRef;
+	editable var m_systemStatusRightPannel : inkWidgetRef;
+	editable var m_loopAnimName : CName;
+	default m_loopAnimName = 'loop';
+	editable var m_popup01Counter : Int32;
+	default m_popup01Counter = 3;
+	editable var m_popup02Counter : Int32;
+	default m_popup02Counter = 2;
+	editable var m_popup01LoopAnimName : CName;
+	default m_popup01LoopAnimName = 'pop1_loop';
+	editable var m_popup02LoopAnimName : CName;
+	default m_popup02LoopAnimName = 'pop2_loop';
+	editable var m_popup031LoopAnimName : CName;
+	default m_popup031LoopAnimName = 'pop3_loop_01';
+	editable var m_popup032LoopAnimName : CName;
+	default m_popup032LoopAnimName = 'pop3_loop_02';
+	editable var m_popup04LoopAnimName : CName;
+	default m_popup04LoopAnimName = 'pop4_loop';
+	editable var m_popup05LoopAnimName : CName;
+	default m_popup05LoopAnimName = 'pop5_loop';
+	editable var m_shutdownButton : inkWidgetRef;
+	editable var m_transitionToMinigame : inkWidgetRef;
+	var m_popup01LoopAnimProxy : inkAnimProxy;
+	var m_isAuthStep : Bool;
+	var m_isHackingStep : Bool;
+	var m_isPostHackingStep : Bool;
+	var m_isOffline : Bool;
+	var m_isAttemptedToStop : Bool;
+
+	protected event OnInitialize()
+	{
+		var loopAnimProxy : inkAnimProxy;
+		var playbackOptions : inkAnimOptions;
+		var fact : CName;
+		fact = GetCurrentSystemFact( m_factsSet );
+		if( fact != '' )
+		{
+			m_isOffline = GetFact( GetGame(), fact ) > 0;
+			SetStatusOffline( inkWidgetRef.GetController( m_systemStatusHeaderPannel ), m_isOffline );
+			SetStatusOffline( inkWidgetRef.GetController( m_systemStatusLeftPannel ), m_isOffline );
+			SetStatusOffline( inkWidgetRef.GetController( m_systemStatusRightPannel ), m_isOffline );
+		}
+		fact = GetCurrentSystemFact( ( ( BunkerSystemsFactsSet )( m_authFactsSet ) ) );
+		if( fact != '' )
+		{
+			m_isAuthStep = GetFact( GetGame(), fact ) == 1;
+			m_isHackingStep = GetFact( GetGame(), fact ) == 2;
+			m_isPostHackingStep = GetFact( GetGame(), fact ) == 3;
+		}
+		fact = GetCurrentSystemFact( ( ( BunkerSystemsFactsSet )( m_attemptedFactsSet ) ) );
+		if( fact != '' )
+		{
+			m_isAttemptedToStop = GetFact( GetGame(), fact ) == 1;
+		}
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		if( m_loopAnimName != '' )
+		{
+			loopAnimProxy = PlayLibraryAnimation( m_loopAnimName, playbackOptions );
+		}
+		if( m_isOffline )
+		{
+			ShowPopup04();
+		}
+		else if( m_isAuthStep )
+		{
+			ShowPopup02();
+		}
+		else if( m_isAttemptedToStop )
+		{
+			ShowPopup05();
+		}
+		else if( m_isHackingStep )
+		{
+			ShowPopup031();
+		}
+		else if( m_isPostHackingStep )
+		{
+			ShowPopup032();
+		}
+		else
+		{
+			if( !( loopAnimProxy ) )
+			{
+				m_popup01Counter = 0;
+				OnEndLoop( NULL );
+			}
+			else
+			{
+				loopAnimProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnEndLoop' );
+			}
+		}
+	}
+
+	protected event OnEndLoop( proxy : inkAnimProxy )
+	{
+		var playbackOptions : inkAnimOptions;
+		m_popup01Counter = m_popup01Counter - 1;
+		if( m_popup01Counter <= 0 )
+		{
+			if( proxy )
+			{
+				proxy.UnregisterFromAllCallbacks( inkanimEventType.OnEndLoop );
+			}
+			if( m_popup01LoopAnimName != '' )
+			{
+				playbackOptions.loopType = inkanimLoopType.Cycle;
+				playbackOptions.loopInfinite = true;
+				m_popup01LoopAnimProxy = PlayLibraryAnimation( m_popup01LoopAnimName, playbackOptions );
+			}
+			inkWidgetRef.RegisterToCallback( m_shutdownButton, 'OnRelease', this, 'OnShutdownButtonClicked' );
+		}
+	}
+
+	protected event OnShutdownButtonClicked( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) )
+		{
+			inkWidgetRef.SetInteractive( m_shutdownButton, false );
+			m_popup01LoopAnimProxy.Stop();
+			ShowPopup02();
+		}
+	}
+
+	public function ShowPopup02()
+	{
+		var popup02LoopAnimProxy : inkAnimProxy;
+		var playbackOptions : inkAnimOptions;
+		if( m_popup02LoopAnimName != '' )
+		{
+			playbackOptions.loopType = inkanimLoopType.Cycle;
+			playbackOptions.loopInfinite = true;
+			popup02LoopAnimProxy = PlayLibraryAnimation( m_popup02LoopAnimName, playbackOptions );
+		}
+		if( !( m_isAuthStep ) )
+		{
+			if( !( popup02LoopAnimProxy ) )
+			{
+				m_popup02Counter = 0;
+				OnPopup02LoopAnimFinished( NULL );
+			}
+			else
+			{
+				popup02LoopAnimProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnPopup02LoopAnimFinished' );
+			}
+		}
+	}
+
+	protected event OnPopup02LoopAnimFinished( proxy : inkAnimProxy )
+	{
+		var fact : CName;
+		m_popup02Counter = m_popup02Counter - 1;
+		if( m_popup02Counter <= 0 )
+		{
+			if( proxy )
+			{
+				proxy.UnregisterFromAllCallbacks( inkanimEventType.OnEndLoop );
+			}
+			fact = GetCurrentSystemFact( ( ( BunkerSystemsFactsSet )( m_authFactsSet ) ) );
+			if( fact != '' )
+			{
+				SetFactValue( GetGame(), fact, 1 );
+			}
+		}
+	}
+
+	public function ShowPopup031()
+	{
+		var popup03LoopProxy : inkAnimProxy;
+		if( m_popup031LoopAnimName != '' )
+		{
+			popup03LoopProxy = PlayLibraryAnimation( m_popup031LoopAnimName );
+			popup03LoopProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPopup031LoopAnimFinished' );
+		}
+	}
+
+	protected event OnPopup031LoopAnimFinished( proxy : inkAnimProxy )
+	{
+		var webPageController : WebPage;
+		webPageController = ( ( WebPage )( GetRootWidget().GetController() ) );
+		if( proxy )
+		{
+			proxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		}
+		webPageController.ActivateCanvasLink( inkWidgetRef.Get( m_transitionToMinigame ) );
+	}
+
+	public function ShowPopup032()
+	{
+		var popup03LoopProxy : inkAnimProxy;
+		if( m_popup032LoopAnimName != '' )
+		{
+			popup03LoopProxy = PlayLibraryAnimation( m_popup032LoopAnimName );
+			popup03LoopProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPopup032LoopAnimFinished' );
+		}
+	}
+
+	protected event OnPopup032LoopAnimFinished( proxy : inkAnimProxy )
+	{
+		if( proxy )
+		{
+			proxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		}
+	}
+
+	public function ShowPopup04()
+	{
+		var playbackOptions : inkAnimOptions;
+		if( m_popup04LoopAnimName != '' )
+		{
+			playbackOptions.loopType = inkanimLoopType.Cycle;
+			playbackOptions.loopInfinite = true;
+			PlayLibraryAnimation( m_popup04LoopAnimName, playbackOptions );
+		}
+	}
+
+	public function ShowPopup05()
+	{
+		var playbackOptions : inkAnimOptions;
+		if( m_popup05LoopAnimName != '' )
+		{
+			playbackOptions.loopType = inkanimLoopType.Cycle;
+			playbackOptions.loopInfinite = true;
+			PlayLibraryAnimation( m_popup05LoopAnimName, playbackOptions );
+		}
+	}
+
+}
+
+class BunkerComputerButtonController extends LinkController
+{
+	editable var m_usePopupDefault : Bool;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+		GetRootWidget().SetState( ( ( m_usePopupDefault ) ? ( 'Popup_Default' ) : ( 'Default' ) ) );
+	}
+
+	protected event OnButtonStateChanged( controller : weak< inkButtonController >, oldState : inkEButtonState, newState : inkEButtonState )
+	{
+		var widget : inkWidget;
+		widget = GetRootWidget();
+		switch( newState )
+		{
+			case inkEButtonState.Normal:
+				widget.SetState( ( ( m_usePopupDefault ) ? ( 'Popup_Default' ) : ( 'Default' ) ) );
+			break;
+			case inkEButtonState.Hover:
+			case inkEButtonState.Press:
+				widget.SetState( 'Hover' );
+			break;
+			case inkEButtonState.Disabled:
+				widget.SetState( 'Default' );
+			break;
+		}
+	}
+
+}
+
+class BunkerMapObject extends GameObject
+{
+	[ category = "HUD Manager" ]
+	instanceeditable var m_mapIndex : Int32;
+}
+
+class BunkerMapGameController extends StatusScreenGameController
+{
+	editable var m_mapPosition01 : inkWidgetRef;
+	editable var m_mapPosition02 : inkWidgetRef;
+	editable var m_mapPosition03 : inkWidgetRef;
+
+	protected event OnInitialize()
+	{
+		ListenToFact( m_factsSet.ALPHA_FACT );
+		ListenToFact( m_factsSet.BRAVO_FACT );
+		ListenToFact( m_factsSet.SIERRA_FACT );
+		ListenToFact( m_factsSet.VICTOR_FACT );
+		ListenToFact( m_gateClosedFact );
+		InitMapPosition();
+		super.OnInitialize();
+	}
+
+	protected event OnFactChanged( fact : CName, value : Int32 )
+	{
+		UpdateStatus();
+	}
+
+	public function InitMapPosition()
+	{
+		var bunkerMapObject : BunkerMapObject;
+		var index : Int32;
+		bunkerMapObject = ( ( BunkerMapObject )( GetOwnerEntity() ) );
+		if( bunkerMapObject )
+		{
+			index = bunkerMapObject.m_mapIndex;
+		}
+		inkWidgetRef.SetVisible( m_mapPosition01, index == 1 );
+		inkWidgetRef.SetVisible( m_mapPosition02, index == 2 );
+		inkWidgetRef.SetVisible( m_mapPosition03, index == 3 );
+	}
+
+}
+
+class BunkerComputerController extends ComputerController
+{
+
+	public const override function GetPS() : BunkerComputerControllerPS
+	{
+		return ( ( BunkerComputerControllerPS )( GetBasePS() ) );
+	}
+
+}
+
+class BunkerComputerControllerPS extends ComputerControllerPS
+{
+
+	public override function OnToggleZoomInteraction( evt : ToggleZoomInteraction ) : EntityNotificationType
+	{
+		OnQuestMinigameRequest();
+		SetDeviceID();
+		return super.OnToggleZoomInteraction( evt );
+	}
+
+	public override function OnQuestForceCameraZoom( evt : QuestForceCameraZoom ) : EntityNotificationType
+	{
+		if( ( ( Bool )evt.prop.first ) )
+		{
+			OnQuestMinigameRequest();
+			SetDeviceID();
+		}
+		return super.OnQuestForceCameraZoom( evt );
+	}
+
+	private function SetDeviceID()
+	{
+		var bb : IBlackboard;
+		var entityID : EntityID;
+		entityID = PersistentID.ExtractEntityID( GetID() );
+		bb = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().HackingMinigame );
+		bb.SetEntityID( GetAllBlackboardDefs().HackingMinigame.DeviceID, entityID );
+	}
+
+}
+
+class OuterBunkerComputerEntranceGameController extends gameuiBaseBunkerComputerGameController
+{
+	editable var m_harvestIntroAnimName : CName;
+	default m_harvestIntroAnimName = 'data_harvest_intro';
+	editable var m_harvestLoop1AnimName : CName;
+	default m_harvestLoop1AnimName = 'data_harvest_part_02_loop';
+	editable var m_harvestLoop2AnimName : CName;
+	default m_harvestLoop2AnimName = 'data_harvest_loop';
+	editable var m_harvestLoop3AnimName : CName;
+	default m_harvestLoop3AnimName = 'data_harvest_part_04_loop';
+	editable var m_harvestOutroAnimName : CName;
+	default m_harvestOutroAnimName = 'data_harvest_outro';
+
+	protected function GetGame() : GameInstance
+	{
+		var gameInstance : GameInstance;
+		var gameObject : GameObject;
+		gameObject = ( ( GameObject )( GetOwnerEntity() ) );
+		if( gameObject )
+		{
+			gameInstance = gameObject.GetGame();
+		}
+		return gameInstance;
+	}
+
+	protected event OnInitialize()
+	{
+		var animProxy : inkAnimProxy;
+		var step : Int32;
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		step = GetFact( GetGame(), 'Q305_dvc_computer_entrance_step' );
+		if( step == 2 )
+		{
+			if( m_harvestIntroAnimName != '' )
+			{
+				animProxy = PlayLibraryAnimation( m_harvestIntroAnimName );
+				animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnIntroAnimFinished' );
+			}
+		}
+		else if( step == 3 )
+		{
+			if( m_harvestLoop2AnimName != '' )
+			{
+				PlayLibraryAnimation( m_harvestLoop2AnimName, playbackOptions );
+			}
+		}
+		else if( step == 4 )
+		{
+			if( m_harvestLoop3AnimName != '' )
+			{
+				PlayLibraryAnimation( m_harvestLoop3AnimName, playbackOptions );
+			}
+		}
+		else if( step == 5 )
+		{
+			if( m_harvestOutroAnimName != '' )
+			{
+				PlayLibraryAnimation( m_harvestOutroAnimName );
+			}
+		}
+	}
+
+	protected event OnIntroAnimFinished( proxy : inkAnimProxy )
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		if( proxy )
+		{
+			proxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		}
+		if( m_harvestLoop1AnimName != '' )
+		{
+			PlayLibraryAnimation( m_harvestLoop1AnimName, playbackOptions );
+		}
+	}
+
+}
+

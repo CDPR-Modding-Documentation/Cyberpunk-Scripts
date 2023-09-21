@@ -5,16 +5,27 @@ class Vendor
 	private persistent var m_tweakID : TweakDBID;
 	private persistent var m_lastInteractionTime : Float;
 	private persistent var m_stock : array< SItemStack >;
+	private persistent var m_newItems : array< TweakDBID >;
+	private persistent var m_soldItems : SoldItemsCache;
 	private persistent var m_priceMultiplier : Float;
 	default m_priceMultiplier = 1;
 	private persistent var m_vendorPersistentID : PersistentID;
 	private var m_stockInit : Bool;
 	default m_stockInit = false;
+	private var m_playerHacksInit : Bool;
+	default m_playerHacksInit = false;
 	private var m_inventoryInit : Bool;
 	default m_inventoryInit = false;
+	private var m_isAttached : Bool;
 	private var m_inventoryReinitWithPlayerStats : Bool;
 	default m_inventoryReinitWithPlayerStats = false;
 	private var m_vendorRecord : weak< Vendor_Record >;
+	private var m_playerHacks : array< ItemID >;
+
+	private constexpr static function ShouldDiscardQualityForNewCWs() : Bool
+	{
+		return true;
+	}
 
 	public function Initialize( gameInstance : GameInstance, vendorID : TweakDBID, vendorObject : GameObject )
 	{
@@ -22,22 +33,45 @@ class Vendor
 		m_tweakID = vendorID;
 		m_vendorObject = vendorObject;
 		m_vendorRecord = TweakDBInterface.GetVendorRecord( m_tweakID );
+		InitPlayerHacks();
 	}
 
 	public function OnAttach( owner : weak< GameObject > )
 	{
+		var uiSystem : UISystem;
+		var attachedEvent : UIVendorAttachedEvent;
 		m_vendorObject = owner;
 		m_vendorPersistentID = owner.GetPersistentID();
 		m_vendorRecord = TweakDBInterface.GetVendorRecord( m_tweakID );
 		m_inventoryInit = false;
 		m_inventoryReinitWithPlayerStats = false;
+		m_isAttached = true;
+		if( !( m_soldItems ) )
+		{
+			m_soldItems = new SoldItemsCache;
+		}
+		uiSystem = GameInstance.GetUISystem( m_gameInstance );
+		attachedEvent = new UIVendorAttachedEvent;
+		attachedEvent.vendorObject = m_vendorObject;
+		attachedEvent.vendorID = m_tweakID;
+		uiSystem.QueueEvent( attachedEvent );
 	}
 
-	public function OnRestored( gameInstance : GameInstance )
+	public function OnDeattach( owner : weak< GameObject > )
+	{
+		m_isAttached = false;
+	}
+
+	public function OnRestored( gameInstance : GameInstance, forceReinit : Bool )
 	{
 		m_gameInstance = gameInstance;
-		m_stockInit = m_stock.Size() > 0;
+		m_stockInit = ( m_stock.Size() > 0 ) && !( forceReinit );
 		m_vendorRecord = TweakDBInterface.GetVendorRecord( m_tweakID );
+	}
+
+	public function IsAttached() : Bool
+	{
+		return m_isAttached;
 	}
 
 	public function GetStock() : array< SItemStack >
@@ -54,11 +88,19 @@ class Vendor
 		}
 	}
 
-	public constexpr static function GetMaxItemStacksPerVendor( optional useAlternativeCyberware : Bool ) : Int32
+	private function InitPlayerHacks()
 	{
-		if( useAlternativeCyberware )
+		if( GetVendorType() == gamedataVendorType.Tech || GetVendorType() == gamedataVendorType.SkillTrainer )
 		{
-			return 80;
+			LoadPlayerHacks();
+		}
+	}
+
+	public constexpr static function GetMaxItemStacksPerVendor( optional useIncreasedLimit : Bool ) : Int32
+	{
+		if( useIncreasedLimit )
+		{
+			return 1000;
 		}
 		else
 		{
@@ -100,6 +142,16 @@ class Vendor
 		return m_priceMultiplier;
 	}
 
+	public const function GetLastInteractionTime() : Float
+	{
+		return m_lastInteractionTime;
+	}
+
+	public const function GetSoldItems() : SoldItemsCache
+	{
+		return m_soldItems;
+	}
+
 	public function GetItemsForSale( checkPlayerCanBuy : Bool ) : array< SItemStack >
 	{
 		var i : Int32;
@@ -108,27 +160,30 @@ class Vendor
 		var canBuy : Bool;
 		var craftingSystem : CraftingSystem;
 		var playerCraftBook : CraftBook;
+		var itemStack : SItemStack;
 		craftingSystem = CraftingSystem.GetInstance( m_gameInstance );
 		playerCraftBook = craftingSystem.GetPlayerCraftBook();
 		LazyInitStock();
 		FillVendorInventory( true );
+		LoadPlayerHacks();
 		for( i = 0; i < m_stock.Size(); i += 1 )
 		{
-			tags = RPGManager.GetItemRecord( m_stock[ i ].itemID ).Tags();
-			if( !( tags.Contains( 'Cyberware' ) ) && !( tags.Contains( 'Recipe' ) ) )
+			itemStack = m_stock[ i ];
+			tags = RPGManager.GetItemRecord( itemStack.itemID ).Tags();
+			if( ( !( tags.Contains( 'Cyberware' ) ) && !( tags.Contains( 'Recipe' ) ) ) && ( itemStack.itemID != MarketSystem.Money() ) )
 			{
-				canBuy = !( checkPlayerCanBuy ) || PlayerCanBuy( m_stock[ i ] );
+				canBuy = !( checkPlayerCanBuy ) || PlayerCanBuy( itemStack );
 				if( canBuy )
 				{
-					availableItems.PushBack( m_stock[ i ] );
+					availableItems.PushBack( itemStack );
 				}
 			}
-			else if( tags.Contains( 'Recipe' ) && !( craftingSystem.IsRecipeKnown( ItemID.GetTDBID( m_stock[ i ].itemID ), playerCraftBook ) ) )
+			else if( tags.Contains( 'Recipe' ) && !( craftingSystem.IsRecipeKnown( ItemID.GetTDBID( itemStack.itemID ), playerCraftBook ) ) )
 			{
-				canBuy = !( checkPlayerCanBuy ) || PlayerCanBuy( m_stock[ i ] );
+				canBuy = !( checkPlayerCanBuy ) || PlayerCanBuy( itemStack );
 				if( canBuy )
 				{
-					availableItems.PushBack( m_stock[ i ] );
+					availableItems.PushBack( itemStack );
 				}
 			}
 		}
@@ -169,6 +224,23 @@ class Vendor
 		return availableItems;
 	}
 
+	public function GetAllStockForSale( checkPlayerCanBuy : Bool ) : array< SItemStack >
+	{
+		var stockForSale, tempStacks : array< SItemStack >;
+		var i : Int32;
+		tempStacks = GetItemsForSale( checkPlayerCanBuy );
+		for( i = 0; i < tempStacks.Size(); i += 1 )
+		{
+			stockForSale.PushBack( tempStacks[ i ] );
+		}
+		tempStacks = GetCyberwareForSale( checkPlayerCanBuy );
+		for( i = 0; i < tempStacks.Size(); i += 1 )
+		{
+			stockForSale.PushBack( tempStacks[ i ] );
+		}
+		return stockForSale;
+	}
+
 	public function GetItemsPlayerCanSell( allowQuestItems : Bool, excludeEquipped : Bool ) : array< SItemStack >
 	{
 		var playerItems : array< weak< gameItemData > >;
@@ -190,6 +262,12 @@ class Vendor
 
 	public function OnVendorMenuOpen()
 	{
+		var questsSystem : QuestsSystem;
+		if( ( m_lastInteractionTime == 0.0 ) && GetVendorType() == gamedataVendorType.RipperDoc )
+		{
+			questsSystem = GameInstance.GetQuestsSystem( m_gameInstance );
+			questsSystem.SetFact( 'number_of_ripperdocs_visited', questsSystem.GetFact( 'number_of_ripperdocs_visited' ) + 1 );
+		}
 		LazyInitStock();
 		FillVendorInventory( true );
 		if( !( m_inventoryReinitWithPlayerStats ) )
@@ -223,7 +301,7 @@ class Vendor
 		{
 			filterTags.Remove( 'Quest' );
 		}
-		inverseFilterTags = TDB.GetCNameArray( m_vendorRecord.GetID() + T".customerInverseFilterTags" );
+		inverseFilterTags = m_vendorRecord.CustomerInverseFilterTags();
 		player = GetPlayer( m_gameInstance );
 		itemData = GameInstance.GetTransactionSystem( m_gameInstance ).GetItemData( player, itemID );
 		if( excludeEquipped && EquipmentSystem.GetInstance( player ).IsEquipped( player, itemID ) )
@@ -261,19 +339,30 @@ class Vendor
 		var i : Int32;
 		var viewPrereqs : array< weak< IPrereq_Record > >;
 		var availablePrereq : weak< IPrereq_Record >;
-		var vendorItem : weak< VendorItem_Record >;
+		var vendorWare : weak< VendorWare_Record >;
 		var itemData : weak< gameItemData >;
-		vendorItem = TweakDBInterface.GetVendorItemRecord( itemStack.vendorItemID );
-		vendorItem.GenerationPrereqs( viewPrereqs );
-		if( RPGManager.CheckPrereqs( viewPrereqs, GetPlayer( m_gameInstance ) ) )
+		var isInInventory : Bool;
+		var isInStash : Bool;
+		var tags, tags2 : array< CName >;
+		var player : GameObject;
+		var playerItems : array< weak< gameItemData > >;
+		var idToCheck : ItemID;
+		vendorWare = TweakDBInterface.GetVendorWareRecord( itemStack.vendorItemID );
+		if( !( vendorWare ) )
+		{
+			return true;
+		}
+		idToCheck = itemStack.itemID;
+		player = GetPlayer( m_gameInstance );
+		vendorWare.GenerationPrereqs( viewPrereqs );
+		if( RPGManager.CheckPrereqs( viewPrereqs, player ) )
 		{
 			filterTags = m_vendorRecord.VendorFilterTags();
-			itemData = GameInstance.GetTransactionSystem( m_gameInstance ).GetItemData( m_vendorObject, itemStack.itemID );
-			availablePrereq = vendorItem.AvailabilityPrereq();
-			itemStack.requirement = RPGManager.GetStockItemRequirement( m_gameInstance, vendorItem, ( ( StatsObjectID )( itemStack.itemID ) ) );
+			itemData = GameInstance.GetTransactionSystem( m_gameInstance ).GetItemData( m_vendorObject, idToCheck );
+			availablePrereq = vendorWare.AvailabilityPrereq();
 			if( availablePrereq )
 			{
-				itemStack.isAvailable = RPGManager.CheckPrereq( availablePrereq, GetPlayer( m_gameInstance ) );
+				itemStack.isAvailable = RPGManager.CheckPrereq( availablePrereq, player );
 			}
 			for( i = 0; i < filterTags.Size(); i += 1 )
 			{
@@ -282,9 +371,114 @@ class Vendor
 					return false;
 				}
 			}
+			tags = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( idToCheck ) ).Tags();
+			if( tags.Contains( 'IconicWeapon' ) )
+			{
+				GameInstance.GetTransactionSystem( m_gameInstance ).GetItemList( player, playerItems );
+				for( i = 0; i < playerItems.Size(); i += 1 )
+				{
+					tags2 = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( playerItems[ i ].GetID() ) ).Tags();
+					if( !( tags2.Contains( 'IconicWeapon' ) ) )
+					{
+						continue;
+					}
+					if( playerItems[ i ].GetID() == idToCheck )
+					{
+						isInInventory = true;
+						break;
+					}
+					else if( ItemID.GetTDBID( playerItems[ i ].GetID() ) == ItemID.GetTDBID( itemData.GetID() ) )
+					{
+						isInInventory = true;
+						break;
+					}
+				}
+				isInStash = Stash.IsInStash( player, itemData.GetID() );
+				if( isInInventory || isInStash )
+				{
+					return false;
+				}
+			}
+			else if( tags.Contains( 'SoftwareShard' ) )
+			{
+				for( i = 0; i < m_playerHacks.Size(); i += 1 )
+				{
+					if( ItemID.GetTDBID( m_playerHacks[ i ] ) == ItemID.GetTDBID( idToCheck ) )
+					{
+						return false;
+					}
+				}
+			}
+			else if( tags.Contains( 'Grenade' ) )
+			{
+				return CompareWithPlayerGrenadesQuality( itemStack );
+			}
+			else if( tags.Contains( 'Medical' ) )
+			{
+				return CompareWithPlayerHealingItemsQuality( itemStack );
+			}
 			return true;
 		}
 		return false;
+	}
+
+	private const function CompareWithPlayerGrenadesQuality( itemStack : ref< SItemStack > ) : Bool
+	{
+		var bestGrenadeQuality : Int32;
+		var currentGrenadeQuality : Int32;
+		var tags : array< CName >;
+		var tag : CName;
+		var player : GameObject;
+		var playerItems : array< weak< gameItemData > >;
+		var i : Int32;
+		var qualityRecord : Quality_Record;
+		tags = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemStack.itemID ) ).Tags();
+		player = GetPlayer( m_gameInstance );
+		tag = ConsumablesChargesHelper.GetConsumableTag( tags );
+		GameInstance.GetTransactionSystem( m_gameInstance ).GetItemListByTag( player, tag, playerItems );
+		for( i = 0; i < playerItems.Size(); i += 1 )
+		{
+			qualityRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( playerItems[ i ].GetID() ) ).Quality();
+			currentGrenadeQuality = qualityRecord.Value();
+			if( currentGrenadeQuality > bestGrenadeQuality )
+			{
+				bestGrenadeQuality = currentGrenadeQuality;
+			}
+		}
+		return bestGrenadeQuality < TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemStack.itemID ) ).Quality().Value();
+	}
+
+	private const function CompareWithPlayerHealingItemsQuality( itemStack : ref< SItemStack > ) : Bool
+	{
+		var bestHealingItemQuality : Int32;
+		var currentHealingItemQuality : Int32;
+		var tags : array< CName >;
+		var tag : CName;
+		var player : GameObject;
+		var playerItems : array< weak< gameItemData > >;
+		var i : Int32;
+		var qualityRecord : Quality_Record;
+		tags = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemStack.itemID ) ).Tags();
+		player = GetPlayer( m_gameInstance );
+		if( tags.Contains( 'Injector' ) )
+		{
+			tag = 'Injector';
+		}
+		else if( tags.Contains( 'Inhaler' ) )
+		{
+			tag = 'Inhaler';
+		}
+		GameInstance.GetTransactionSystem( m_gameInstance ).GetItemListByTag( player, tag, playerItems );
+		for( i = 0; i < playerItems.Size(); i += 1 )
+		{
+			qualityRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( playerItems[ i ].GetID() ) ).Quality();
+			currentHealingItemQuality = qualityRecord.Value();
+			if( currentHealingItemQuality > bestHealingItemQuality )
+			{
+				bestHealingItemQuality = currentHealingItemQuality;
+			}
+		}
+		return bestHealingItemQuality < TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemStack.itemID ) ).Quality().Value();
 	}
 
 	private function FillVendorInventory( allowRegeneration : Bool )
@@ -294,12 +488,18 @@ class Vendor
 		var itemData : weak< gameItemData >;
 		var powerLevelMod : gameStatModifierData;
 		var forceQuality : CName;
-		var qualityMod : gameStatModifierData;
 		var itemRecord : weak< Item_Record >;
 		var statsSystem : StatsSystem;
 		var ownerNPC : NPCPuppet;
 		var prevInvItemList : array< weak< gameItemData > >;
 		var exclucedItemTags : array< CName >;
+		var playerPowerLevel : Float;
+		var itemLevel : Float;
+		var noPlusModMax : gameStatModifierData;
+		var noPlusModBelowMax : gameStatModifierData;
+		var currentMaxTier : Float;
+		var maxTierMod : gameStatModifierData;
+		var purchasedMod : gameStatModifierData;
 		if( allowRegeneration && ShouldRegenerateStock() )
 		{
 			RegenerateStock();
@@ -335,19 +535,31 @@ class Vendor
 				itemData = transactionSystem.GetItemData( m_vendorObject, m_stock[ i ].itemID );
 				if( !( itemRecord.IsSingleInstance() ) && !( itemData.HasTag( 'Cyberware' ) ) )
 				{
+					playerPowerLevel = statsSystem.GetStatValue( GetPlayer( m_gameInstance ).GetEntityID(), gamedataStatType.PowerLevel );
+					if( itemData.HasTag( 'IconicWeapon' ) )
+					{
+						itemLevel = GameInstance.GetStatsDataSystem( m_vendorObject.GetGame() ).GetValueFromCurve( 'quality_curves', playerPowerLevel, 'iconic_level_at_vendor_to_player_level' );
+					}
+					else
+					{
+						itemLevel = playerPowerLevel;
+					}
 					statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.PowerLevel, true );
-					powerLevelMod = RPGManager.CreateStatModifier( gamedataStatType.PowerLevel, gameStatModifierType.Additive, ( ( Float )( m_stock[ i ].powerLevel ) ) / 100.0 );
+					powerLevelMod = RPGManager.CreateStatModifier( gamedataStatType.PowerLevel, gameStatModifierType.Additive, itemLevel );
 					statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), powerLevelMod );
+					currentMaxTier = statsSystem.GetStatValue( GetPlayer( m_gameInstance ).GetEntityID(), gamedataStatType.MaxQuality );
+					maxTierMod = RPGManager.CreateStatModifier( gamedataStatType.MaxQualityWhenLooted, gameStatModifierType.Additive, currentMaxTier );
+					statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), maxTierMod );
+					noPlusModMax = RPGManager.CreateStatModifier( gamedataStatType.RollForPlusOnMaxQuality, gameStatModifierType.Multiplier, 0.0 );
+					statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), noPlusModMax );
+					noPlusModBelowMax = RPGManager.CreateStatModifier( gamedataStatType.RollForPlusBelowMaxQuality, gameStatModifierType.Multiplier, 0.0 );
+					statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), noPlusModBelowMax );
+					purchasedMod = RPGManager.CreateStatModifier( gamedataStatType.ItemPurchasedAtVendor, gameStatModifierType.Additive, 1.0 );
+					statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), purchasedMod );
 					forceQuality = TweakDBInterface.GetCName( m_stock[ i ].vendorItemID + T".forceQuality", '' );
 					if( IsNameValid( forceQuality ) )
 					{
-						RPGManager.ForceItemQuality( m_vendorObject, itemData, forceQuality );
-					}
-					else if( RPGManager.GetItemRecord( m_stock[ i ].itemID ).Quality().Type() == gamedataQuality.Random && ( itemData.GetStatValueByType( gamedataStatType.Quality ) == 0.0 ) )
-					{
-						statsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.Quality, true );
-						qualityMod = RPGManager.CreateStatModifier( gamedataStatType.Quality, gameStatModifierType.Additive, 1.0 );
-						statsSystem.AddSavedModifier( itemData.GetStatsObjectID(), qualityMod );
+						RPGManager.ForceItemTier( m_vendorObject, itemData, forceQuality );
 					}
 				}
 			}
@@ -357,43 +569,63 @@ class Vendor
 	private function InitializeStock()
 	{
 		var i : Int32;
-		var j : Int32;
 		var itemPool : array< weak< VendorItem_Record > >;
-		var itemStacks : array< SItemStack >;
+		var queryPool : array< weak< VendorItemQuery_Record > >;
 		var player : PlayerPuppet;
+		var tweakID : TweakDBID;
 		player = GetPlayer( m_gameInstance );
 		m_stockInit = true;
-		if( GameInstance.GetTransactionSystem( m_gameInstance ).UseAlternativeCyberware() && ( m_vendorRecord.GetItemStock2Count() > 0 ) )
-		{
-			m_vendorRecord.ItemStock2( itemPool );
-		}
-		else
-		{
-			m_vendorRecord.ItemStock( itemPool );
-		}
+		m_stock.Clear();
+		m_vendorRecord.ItemStock( itemPool );
+		m_vendorRecord.ItemQueries( queryPool );
 		for( i = 0; i < itemPool.Size(); i += 1 )
 		{
-			itemStacks = CreateStacksFromVendorItem( itemPool[ i ], player );
-			for( j = 0; j < itemStacks.Size(); j += 1 )
+			CreateStacksFromVendorItem( m_stock, itemPool[ i ], player );
+		}
+		for( i = 0; i < queryPool.Size(); i += 1 )
+		{
+			CreateStacksFromVendorItemQuery( m_stock, queryPool[ i ], player );
+		}
+		for( i = 0; i < m_stock.Size(); i += 1 )
+		{
+			tweakID = ItemID.GetTDBID( m_stock[ i ].itemID );
+			if( !( m_newItems.Contains( tweakID ) ) )
 			{
-				m_stock.PushBack( itemStacks[ j ] );
+				m_newItems.PushBack( tweakID );
 			}
 		}
+	}
+
+	private function LoadPlayerHacks()
+	{
+		var playerHacks : array< ItemID >;
+		var playerHacksGameData : array< weak< gameItemData > >;
+		var player : GameObject;
+		var i : Int32;
+		player = GetPlayer( m_gameInstance );
+		GameInstance.GetTransactionSystem( m_gameInstance ).GetItemListByTag( player, 'SoftwareShard', playerHacksGameData );
+		playerHacks = PlayerPuppet.GetPlayerQuickHackInCyberDeck( ( ( PlayerPuppet )( player ) ) );
+		for( i = 0; i < playerHacksGameData.Size(); i += 1 )
+		{
+			playerHacks.PushBack( playerHacksGameData[ i ].GetID() );
+		}
+		m_playerHacks = playerHacks;
 	}
 
 	private function RegenerateStock()
 	{
 		var i : Int32;
-		var j, circularIndex, itemPoolIndex, itemPoolSize : Int32;
+		var j, randIndex, itemPoolIndex, itemPoolSize, stockLimit : Int32;
 		var itemPool : array< weak< VendorItem_Record > >;
+		var queryPool : array< weak< VendorItemQuery_Record > >;
 		var itemStacks : array< SItemStack >;
 		var newStock : array< SItemStack >;
-		var dynamicStock : array< SItemStack >;
-		var continueLoop : Bool;
-		var useAlternativeCyberware : Bool;
+		var availableIndexes : array< Int32 >;
 		var player : PlayerPuppet;
 		player = GetPlayer( m_gameInstance );
 		LazyInitStock();
+		m_vendorRecord.ItemStock( itemPool );
+		m_vendorRecord.ItemQueries( queryPool );
 		for( i = 0; i < m_stock.Size(); i += 1 )
 		{
 			if( !( ShouldRegenerateItem( ItemID.GetTDBID( m_stock[ i ].itemID ) ) ) )
@@ -401,119 +633,248 @@ class Vendor
 				newStock.PushBack( m_stock[ i ] );
 			}
 		}
-		useAlternativeCyberware = GameInstance.GetTransactionSystem( m_gameInstance ).UseAlternativeCyberware();
-		dynamicStock = CreateDynamicStockFromPlayerProgression( GetPlayer( m_gameInstance ) );
-		for( i = 0; ( i < dynamicStock.Size() ) && ( newStock.Size() < GetMaxItemStacksPerVendor( useAlternativeCyberware ) ); i += 1 )
-		{
-			newStock.PushBack( dynamicStock[ i ] );
-		}
-		if( useAlternativeCyberware && ( m_vendorRecord.GetItemStock2Count() > 0 ) )
-		{
-			m_vendorRecord.ItemStock2( itemPool );
-		}
-		else
-		{
-			m_vendorRecord.ItemStock( itemPool );
-		}
+		stockLimit = GetMaxItemStacksPerVendor();
+		stockLimit = GetMaxItemStacksPerVendor( true );
+		CreateDynamicStockFromPlayerProgression( newStock, GetPlayer( m_gameInstance ) );
 		for( i = itemPool.Size() - 1; i >= 0; i -= 1 )
 		{
 			if( AlwaysInStock( itemPool[ i ].Item().GetID() ) )
 			{
-				itemStacks = CreateStacksFromVendorItem( itemPool[ i ], player );
-				for( j = 0; j < itemStacks.Size(); j += 1 )
-				{
-					newStock.PushBack( itemStacks[ j ] );
-				}
+				CreateStacksFromVendorItem( newStock, itemPool[ i ], player );
 				itemPool.Erase( i );
 			}
 		}
-		itemPoolSize = itemPool.Size();
+		itemPoolSize = itemPool.Size() + queryPool.Size();
+		for( i = 0; i < itemPoolSize; i += 1 )
+		{
+			availableIndexes.PushBack( i );
+		}
 		if( itemPoolSize > 0 )
 		{
-			continueLoop = newStock.Size() < GetMaxItemStacksPerVendor( useAlternativeCyberware );
-			circularIndex = RandRange( 0, itemPoolSize );
-			for( i = 0; ( i < itemPoolSize ) && continueLoop; i += 1 )
+			i = 0;
+			while( ( i < itemPoolSize ) && ( newStock.Size() < stockLimit ) )
 			{
-				itemPoolIndex = circularIndex % itemPoolSize;
-				if( ShouldRegenerateItem( itemPool[ itemPoolIndex ].Item().GetID() ) )
+				itemStacks.Clear();
+				randIndex = RandRange( 0, availableIndexes.Size() );
+				itemPoolIndex = availableIndexes[ randIndex ];
+				availableIndexes.EraseFast( randIndex );
+				if( itemPoolIndex >= itemPool.Size() )
 				{
-					itemStacks = CreateStacksFromVendorItem( itemPool[ itemPoolIndex ], player );
-					for( j = 0; ( j < itemStacks.Size() ) && continueLoop; j += 1 )
+					itemPoolIndex -= itemPool.Size();
+					CreateStacksFromVendorItemQuery( itemStacks, queryPool[ itemPoolIndex ], player );
+				}
+				else
+				{
+					CreateStacksFromVendorItem( itemStacks, itemPool[ itemPoolIndex ], player );
+				}
+				if( itemStacks.Size() > 0 )
+				{
+					j = 0;
+					while( ( j < itemStacks.Size() ) && ( newStock.Size() < stockLimit ) )
 					{
-						newStock.PushBack( itemStacks[ j ] );
-						continueLoop = newStock.Size() < GetMaxItemStacksPerVendor( useAlternativeCyberware );
+						if( ShouldRegenerateItem( ItemID.GetTDBID( itemStacks[ j ].itemID ) ) )
+						{
+							newStock.PushBack( itemStacks[ j ] );
+						}
+						j += 1;
 					}
 				}
-				circularIndex += 1;
+				i += 1;
 			}
 		}
+		UpdateNewItems( newStock );
 		m_stock = newStock;
 	}
 
-	private function CreateStacksFromVendorItem( vendorItem : weak< VendorItem_Record >, player : PlayerPuppet ) : array< SItemStack >
+	private function UpdateNewItems( const newStock : ref< array< SItemStack > > )
 	{
-		var i : Int32;
+		var i, j : Int32;
+		var itemTweakDBID : TweakDBID;
+		var matchFound : Bool;
+		var oldCWs : array< CName >;
+		var cyberwareType : CName;
+		i = 0;
+		while( i < m_newItems.Size() )
+		{
+			matchFound = false;
+			for( j = 0; j < newStock.Size(); j += 1 )
+			{
+				if( m_newItems[ i ] == newStock[ j ].itemID )
+				{
+					matchFound = true;
+					break;
+				}
+			}
+			if( matchFound )
+			{
+				i += 1;
+			}
+			else
+			{
+				m_newItems.EraseFast( i );
+			}
+		}
+		if( ShouldDiscardQualityForNewCWs() )
+		{
+			for( i = 0; i < m_stock.Size(); i += 1 )
+			{
+				cyberwareType = TweakDBInterface.GetCName( ItemID.GetTDBID( newStock[ i ].itemID ) + T".cyberwareType", '' );
+				if( cyberwareType != '' )
+				{
+					oldCWs.PushBack( cyberwareType );
+				}
+			}
+		}
+		for( i = 0; i < newStock.Size(); i += 1 )
+		{
+			matchFound = false;
+			itemTweakDBID = ItemID.GetTDBID( newStock[ i ].itemID );
+			cyberwareType = TweakDBInterface.GetCName( itemTweakDBID + T".cyberwareType", '' );
+			if( ShouldDiscardQualityForNewCWs() && cyberwareType != '' )
+			{
+				for( j = 0; j < oldCWs.Size(); j += 1 )
+				{
+					if( oldCWs[ j ] == cyberwareType )
+					{
+						matchFound = true;
+						break;
+					}
+				}
+			}
+			else
+			{
+				for( j = 0; j < m_stock.Size(); j += 1 )
+				{
+					if( ItemID.GetTDBID( m_stock[ j ].itemID ) == itemTweakDBID )
+					{
+						matchFound = true;
+						break;
+					}
+				}
+			}
+			if( !( matchFound ) && !( m_newItems.Contains( itemTweakDBID ) ) )
+			{
+				m_newItems.PushBack( itemTweakDBID );
+			}
+		}
+	}
+
+	private function CalculateQuantityForStack( vendorWare : VendorWare_Record, player : PlayerPuppet ) : Int32
+	{
 		var quantityMods : array< weak< StatModifier_Record > >;
 		var quantity : Int32;
-		var itemStack : SItemStack;
-		var outputStacks : array< SItemStack >;
+		quantity = 1;
+		vendorWare.Quantity( quantityMods );
+		if( ( quantityMods.Size() > 0 ) && m_vendorObject )
+		{
+			quantity = RoundF( RPGManager.CalculateStatModifiers( quantityMods, m_gameInstance, player, m_vendorObject.GetEntityID() ) );
+			quantityMods.Clear();
+		}
+		return quantity;
+	}
+
+	private function InitSingleItemStack( out itemStack : SItemStack, itemRecord : Item_Record, itemID : ItemID )
+	{
 		var randomPowerLevel : Float;
-		var isQuest : Bool;
+		if( !( itemRecord.TagsContains( 'Quest' ) ) )
+		{
+			randomPowerLevel = MathHelper.RandFromNormalDist( GameInstance.GetStatsSystem( m_gameInstance ).GetStatValue( GetPlayer( m_gameInstance ).GetEntityID(), gamedataStatType.PowerLevel ), 1.0 );
+			itemStack.powerLevel = RoundF( randomPowerLevel * 100.0 );
+		}
+		if( itemRecord.UsesVariants() )
+		{
+			itemStack.itemID = ItemID.FromTDBID( itemRecord.GetID() );
+		}
+		else
+		{
+			itemStack.itemID = itemID;
+		}
+	}
+
+	private function CreateStacksFromVendorItemQuery( out outputStack : array< SItemStack >, vendorItemQuery : weak< VendorItemQuery_Record >, player : PlayerPuppet )
+	{
+		var i, j : Int32;
+		var quantity : Int32;
+		var itemStack : SItemStack;
+		var queryResults : array< Item_Record >;
+		var itemRecord : Item_Record;
+		var itemID : ItemID;
+		var excludedItems : array< TweakDBID >;
+		if( vendorItemQuery.UniquesOnly() )
+		{
+			for( i = 0; i < outputStack.Size(); i += 1 )
+			{
+				excludedItems.PushBack( ItemID.GetTDBID( outputStack[ i ].itemID ) );
+			}
+		}
+		itemStack.vendorItemID = vendorItemQuery.GetID();
+		itemStack.requirement = RPGManager.GetVendorWareRequirement( m_gameInstance, vendorItemQuery, ( ( StatsObjectID )( itemStack.itemID ) ) );
+		GameInstance.GetTransactionSystem( m_gameInstance ).RunItemArrayQuery( queryResults, vendorItemQuery.Query().GetID(), excludedItems, vendorItemQuery.UniquesOnly(), player );
+		for( i = 0; i < queryResults.Size(); i += 1 )
+		{
+			quantity = CalculateQuantityForStack( vendorItemQuery, player );
+			if( quantity < 1 )
+			{
+				continue;
+			}
+			itemRecord = queryResults[ i ];
+			itemID = ItemID.FromTDBID( itemRecord.GetID() );
+			if( !( itemRecord.IsSingleInstance() ) )
+			{
+				quantity = ( ( vendorItemQuery.UniquesOnly() ) ? ( 1 ) : ( quantity ) );
+				for( j = 0; j < quantity; j += 1 )
+				{
+					InitSingleItemStack( itemStack, itemRecord, itemID );
+					outputStack.PushBack( itemStack );
+				}
+			}
+			else
+			{
+				itemStack.quantity = quantity;
+				itemStack.itemID = itemID;
+				outputStack.PushBack( itemStack );
+			}
+		}
+	}
+
+	private function CreateStacksFromVendorItem( out outputStacks : array< SItemStack >, vendorItem : weak< VendorItem_Record >, player : PlayerPuppet )
+	{
+		var i : Int32;
+		var quantity : Int32;
+		var itemStack : SItemStack;
 		var itemRecord : Item_Record;
 		var itemID : ItemID;
 		itemRecord = TweakDBInterface.GetItemRecord( vendorItem.Item().GetID() );
 		itemID = ItemID.FromTDBID( vendorItem.Item().GetID() );
-		vendorItem.Quantity( quantityMods );
-		quantity = 1;
-		if( ( quantityMods.Size() > 0 ) && m_vendorObject )
-		{
-			quantity = RoundF( RPGManager.CalculateStatModifiers( quantityMods, m_gameInstance, player, m_vendorObject.GetEntityID() ) );
-		}
+		quantity = CalculateQuantityForStack( vendorItem, player );
 		if( quantity > 0 )
 		{
+			itemStack.vendorItemID = vendorItem.GetID();
+			itemStack.requirement = RPGManager.GetVendorWareRequirement( m_gameInstance, vendorItem, ( ( StatsObjectID )( itemStack.itemID ) ) );
 			if( !( itemRecord.IsSingleInstance() ) )
 			{
-				isQuest = itemRecord.TagsContains( 'Quest' );
 				for( i = 0; i < quantity; i += 1 )
 				{
-					itemStack.vendorItemID = vendorItem.GetID();
-					if( !( isQuest ) )
-					{
-						randomPowerLevel = MathHelper.RandFromNormalDist( GameInstance.GetStatsSystem( m_gameInstance ).GetStatValue( GetPlayer( m_gameInstance ).GetEntityID(), gamedataStatType.PowerLevel ), 1.0 );
-						itemStack.powerLevel = RoundF( randomPowerLevel * 100.0 );
-					}
-					if( itemRecord.UsesVariants() )
-					{
-						itemStack.itemID = ItemID.FromTDBID( vendorItem.Item().GetID() );
-					}
-					else
-					{
-						itemStack.itemID = itemID;
-					}
+					InitSingleItemStack( itemStack, itemRecord, itemID );
 					outputStacks.PushBack( itemStack );
 				}
 			}
 			else
 			{
-				itemStack.vendorItemID = vendorItem.GetID();
 				itemStack.quantity = quantity;
 				itemStack.itemID = itemID;
 				outputStacks.PushBack( itemStack );
 			}
 		}
-		quantityMods.Clear();
-		return outputStacks;
 	}
 
-	private function CreateDynamicStockFromPlayerProgression( player : weak< GameObject > ) : array< SItemStack >
+	private function CreateDynamicStockFromPlayerProgression( out outputStacks : array< SItemStack >, player : weak< GameObject > )
 	{
-		var i, j : Int32;
+		var i : Int32;
 		var PDS : PlayerDevelopmentSystem;
 		var dominatingProficiency : gamedataProficiencyType;
 		var vendorType : gamedataVendorType;
 		var vendorItems : array< weak< VendorItem_Record > >;
-		var items : array< SItemStack >;
-		var returnTable : array< SItemStack >;
 		var recordID : TweakDBID;
 		PDS = PlayerDevelopmentSystem.GetInstance( player );
 		dominatingProficiency = PDS.GetDominatingCombatProficiency( player );
@@ -525,13 +886,8 @@ class Vendor
 		}
 		for( i = 0; i < vendorItems.Size(); i += 1 )
 		{
-			items = CreateStacksFromVendorItem( vendorItems[ i ], ( ( PlayerPuppet )( player ) ) );
-			for( j = 0; j < items.Size(); j += 1 )
-			{
-				returnTable.PushBack( items[ j ] );
-			}
+			CreateStacksFromVendorItem( outputStacks, vendorItems[ i ], ( ( PlayerPuppet )( player ) ) );
 		}
-		return returnTable;
 	}
 
 	protected virtual function ShouldRegenerateStock() : Bool
@@ -558,6 +914,10 @@ class Vendor
 	{
 		var tags : array< CName >;
 		tags = TweakDBInterface.GetItemRecord( itemTDBID ).Tags();
+		if( tags.Contains( 'OnlyOnceInStore' ) )
+		{
+			return false;
+		}
 		return !( tags.Contains( 'Quest' ) );
 	}
 
@@ -568,14 +928,14 @@ class Vendor
 		return tags.Contains( 'Currency' ) || tags.Contains( 'Ammo' );
 	}
 
-	public function SellItemToVendor( itemStack : SItemStack, requestId : Int32 )
+	public function SellItemToVendor( const itemStack : ref< SItemStack >, requestId : Int32 )
 	{
 		var itemsStack : array< SItemStack >;
 		itemsStack.PushBack( itemStack );
 		SellItemsToVendor( itemsStack, requestId );
 	}
 
-	public function SellItemsToVendor( itemsStack : array< SItemStack >, requestId : Int32 )
+	public function SellItemsToVendor( const itemsStack : ref< array< SItemStack > >, requestId : Int32 )
 	{
 		var itemTransaction : SItemTransaction;
 		var moneyStack : SItemStack;
@@ -583,6 +943,7 @@ class Vendor
 		var itemsSoldEvent : UIVendorItemsSoldEvent;
 		var playerPuppet : PlayerPuppet;
 		var i, limit : Int32;
+		var itemData : weak< gameItemData >;
 		uiSystem = GameInstance.GetUISystem( m_gameInstance );
 		playerPuppet = GetPlayer( m_gameInstance );
 		itemsSoldEvent = new UIVendorItemsSoldEvent;
@@ -590,28 +951,31 @@ class Vendor
 		for( i = 0, limit = itemsStack.Size(); i < limit; i += 1 )
 		{
 			itemTransaction.itemStack = itemsStack[ i ];
-			itemTransaction.pricePerItem = RPGManager.CalculateSellPrice( m_vendorObject.GetGame(), m_vendorObject, itemsStack[ i ].itemID );
+			itemData = GameInstance.GetTransactionSystem( m_gameInstance ).GetItemData( playerPuppet, itemTransaction.itemStack.itemID );
+			RPGManager.ReturnRetrievableWeaponMods( itemData, playerPuppet );
+			itemTransaction.pricePerItem = RPGManager.CalculateSellPrice( m_vendorObject.GetGame(), m_vendorObject, itemTransaction.itemStack.itemID );
 			if( PerformItemTransfer( m_vendorObject, playerPuppet, itemTransaction ) )
 			{
 				AddItemsToStock( itemTransaction.itemStack );
 				moneyStack.itemID = MarketSystem.Money();
 				moneyStack.quantity = itemTransaction.pricePerItem * itemTransaction.itemStack.quantity;
 				RemoveItemsFromStock( moneyStack );
-				itemsSoldEvent.itemsID.PushBack( itemsStack[ i ].itemID );
+				m_soldItems.AddItem( itemTransaction.itemStack.itemID, itemsStack[ i ].quantity, itemTransaction.pricePerItem );
+				itemsSoldEvent.itemsID.PushBack( itemTransaction.itemStack.itemID );
 				itemsSoldEvent.quantity.PushBack( itemsStack[ i ].quantity );
 			}
 		}
 		uiSystem.QueueEvent( itemsSoldEvent );
 	}
 
-	public function BuyItemFromVendor( itemStack : SItemStack, requestId : Int32 )
+	public function BuyItemFromVendor( const itemStack : ref< SItemStack >, requestId : Int32 )
 	{
 		var itemsStack : array< SItemStack >;
 		itemsStack.PushBack( itemStack );
 		BuyItemsFromVendor( itemsStack, requestId );
 	}
 
-	public function BuyItemsFromVendor( itemsStack : array< SItemStack >, requestId : Int32 )
+	public function BuyItemsFromVendor( const itemsStack : ref< array< SItemStack > >, requestId : Int32 )
 	{
 		var itemTransaction : SItemTransaction;
 		var moneyStack : SItemStack;
@@ -637,6 +1001,7 @@ class Vendor
 				moneyStack.itemID = MarketSystem.Money();
 				moneyStack.quantity = itemTransaction.pricePerItem * itemTransaction.itemStack.quantity;
 				AddItemsToStock( moneyStack );
+				m_soldItems.RemoveItem( itemsStack[ i ].itemID, itemsStack[ i ].quantity );
 				itemsBoughtEvent.itemsID.PushBack( itemsStack[ i ].itemID );
 				itemsBoughtEvent.quantity.PushBack( itemsStack[ i ].quantity );
 			}
@@ -644,14 +1009,14 @@ class Vendor
 		uiSystem.QueueEvent( itemsBoughtEvent );
 	}
 
-	public function BuybackItemFromVendor( itemStack : SItemStack, requestId : Int32 )
+	public function BuybackItemFromVendor( const itemStack : ref< SItemStack >, requestId : Int32 )
 	{
 		var itemsStack : array< SItemStack >;
 		itemsStack.PushBack( itemStack );
 		BuybackItemsFromVendor( itemsStack, requestId );
 	}
 
-	public function BuybackItemsFromVendor( itemsStack : array< SItemStack >, requestId : Int32 )
+	public function BuybackItemsFromVendor( const itemsStack : ref< array< SItemStack > >, requestId : Int32 )
 	{
 		var itemTransaction : SItemTransaction;
 		var moneyStack : SItemStack;
@@ -677,6 +1042,7 @@ class Vendor
 				moneyStack.itemID = MarketSystem.Money();
 				moneyStack.quantity = itemTransaction.pricePerItem * itemTransaction.itemStack.quantity;
 				AddItemsToStock( moneyStack );
+				m_soldItems.RemoveItem( itemsStack[ i ].itemID, itemsStack[ i ].quantity );
 				itemsBoughtEvent.itemsID.PushBack( itemsStack[ i ].itemID );
 				itemsBoughtEvent.quantity.PushBack( itemsStack[ i ].quantity );
 			}
@@ -703,6 +1069,28 @@ class Vendor
 		}
 	}
 
+	public function DispenseItemStackFromVendor( position : Vector4, itemID : ItemID, amount : Int32, optional bypassStock : Bool )
+	{
+		var itemStack : SItemStack;
+		var dropInstructions : array< DropInstruction >;
+		if( !( ItemID.IsValid( itemID ) ) || ( amount <= 0 ) )
+		{
+			return;
+		}
+		LazyInitStock();
+		if( m_stock.Size() > 0 )
+		{
+			itemStack.itemID = itemID;
+			itemStack.quantity = amount;
+			if( RemoveItemsFromStock( itemStack ) || bypassStock )
+			{
+				dropInstructions.PushBack( DropInstruction.Create( itemID, amount ) );
+				GameInstance.GetTransactionSystem( m_gameInstance ).GiveItem( m_vendorObject, itemID, amount );
+				GameInstance.GetLootManager( m_gameInstance ).SpawnItemDropOfManyItems( m_vendorObject, dropInstructions, , position );
+			}
+		}
+	}
+
 	private function GetRandomStockItem() : ItemID
 	{
 		var i : Int32;
@@ -719,7 +1107,7 @@ class Vendor
 		return weightedList[ RandRange( 0, weightedList.Size() ) ];
 	}
 
-	private function PerformItemTransfer( buyer : weak< GameObject >, seller : weak< GameObject >, itemTransaction : SItemTransaction ) : Bool
+	private function PerformItemTransfer( buyer : weak< GameObject >, seller : weak< GameObject >, const itemTransaction : ref< SItemTransaction > ) : Bool
 	{
 		var uiSystem : UISystem;
 		var transactionSystem : TransactionSystem;
@@ -741,7 +1129,6 @@ class Vendor
 		sellerHasEnoughItems = sellerItemQuantity >= itemTransaction.itemStack.quantity;
 		if( sellerItemQuantity == 0 )
 		{
-			LogError( ( "[Vendor] Trying to sell item: " + TDBID.ToStringDEBUG( ItemID.GetTDBID( itemTransaction.itemStack.itemID ) ) ) + " with quantity 0" );
 			return false;
 		}
 		if( !( buyerHasEnoughMoney ) )
@@ -770,7 +1157,7 @@ class Vendor
 		return true;
 	}
 
-	public function AddItemsToStock( itemStack : SItemStack )
+	public function AddItemsToStock( const itemStack : ref< SItemStack > )
 	{
 		var itemIndex : Int32;
 		itemIndex = GetItemIndex( itemStack.itemID );
@@ -784,7 +1171,7 @@ class Vendor
 		}
 	}
 
-	private function RemoveItemsFromStock( itemStack : SItemStack ) : Bool
+	private function RemoveItemsFromStock( const itemStack : ref< SItemStack > ) : Bool
 	{
 		var itemIndex : Int32;
 		var currentQuantity : Int32;
@@ -819,6 +1206,75 @@ class Vendor
 			}
 		}
 		return -1;
+	}
+
+	public function ItemInspected( itemTDBID : TweakDBID )
+	{
+		var cyberwareType : CName;
+		var i : Int32;
+		cyberwareType = TweakDBInterface.GetCName( itemTDBID + T".cyberwareType", '' );
+		if( ShouldDiscardQualityForNewCWs() && cyberwareType != '' )
+		{
+			i = 0;
+			while( i < m_newItems.Size() )
+			{
+				if( cyberwareType == TweakDBInterface.GetCName( m_newItems[ i ] + T".cyberwareType", '' ) )
+				{
+					m_newItems.EraseFast( i );
+				}
+				else
+				{
+					i += 1;
+				}
+			}
+		}
+		else
+		{
+			m_newItems.Remove( itemTDBID );
+		}
+	}
+
+	public function IsNewItem( itemTDBID : TweakDBID ) : Bool
+	{
+		return m_newItems.Contains( itemTDBID );
+	}
+
+	public function GetNewItems() : array< TweakDBID >
+	{
+		return m_newItems;
+	}
+
+	public function DoesEquipAreaContainNewItems( area : gamedataEquipmentArea, checkPlayerCanBuy : Bool ) : Bool
+	{
+		var i, j : Int32;
+		var stockForSale : array< SItemStack >;
+		var areaMatch : Bool;
+		if( checkPlayerCanBuy )
+		{
+			stockForSale = GetAllStockForSale( true );
+		}
+		for( i = 0; i < m_newItems.Size(); i += 1 )
+		{
+			areaMatch = TweakDBInterface.GetItemRecord( m_newItems[ i ] ).EquipArea().Type() == area;
+			if( checkPlayerCanBuy )
+			{
+				for( j = 0; j < stockForSale.Size(); j += 1 )
+				{
+					if( ( ItemID.GetTDBID( stockForSale[ j ].itemID ) == m_newItems[ i ] ) && areaMatch )
+					{
+						return true;
+					}
+				}
+			}
+			else
+			{
+				if( areaMatch )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 }

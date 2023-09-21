@@ -16,12 +16,14 @@ class DamageManager
 		attackType = attackData.GetAttackType();
 		if( !( GetScriptedPuppetTarget( hitEvent ) ) )
 		{
-			LogAI( "No scripted puppet has been found /!\" );
 			return;
 		}
 		if( ( hitEvent.hitRepresentationResult.hitShapes.Size() > 0 ) && DamageSystemHelper.IsProtectionLayer( DamageSystemHelper.GetHitShape( hitEvent ) ) )
 		{
-			attackData.AddFlag( hitFlag.DamageNullified, 'ProtectionLayer' );
+			if( !( attackData.GetAttackType() == gamedataAttackType.Hack && DamageSystemHelper.DoQuickHacksPierceProtection( DamageSystemHelper.GetHitShape( hitEvent ) ) ) )
+			{
+				attackData.AddFlag( hitFlag.DamageNullified, 'ProtectionLayer' );
+			}
 		}
 		if( attackData.GetWeapon() && ( GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( attackData.GetWeapon().GetEntityID(), gamedataStatType.CanSilentKill ) > 0.0 ) )
 		{
@@ -34,7 +36,7 @@ class DamageManager
 				attackData.AddFlag( hitFlag.StealthHit, 'Player attacked from out of combat' );
 			}
 		}
-		if( ( AttackData.IsBullet( attackType ) || AttackData.IsMelee( attackType ) ) || AttackData.IsStrongMelee( attackType ) )
+		if( ( AttackData.IsRangedOrDirect( attackType ) || AttackData.IsMelee( attackType ) ) || AttackData.IsStrongMelee( attackType ) )
 		{
 			if( ownerStatsSystem.GetStatValue( attackData.GetInstigator().GetEntityID(), gamedataStatType.CanForceDismbember ) > 0.0 )
 			{
@@ -52,7 +54,7 @@ class DamageManager
 		if( statPoolSystem.HasActiveStatPool( attackData.GetWeapon().GetEntityID(), gamedataStatPoolType.WeaponCharge ) )
 		{
 			chargeVal = statPoolSystem.GetStatPoolValue( attackData.GetWeapon().GetEntityID(), gamedataStatPoolType.WeaponCharge, false );
-			if( RPGManager.GetWeaponEvolution( attackData.GetWeapon().GetItemID() ) == gamedataWeaponEvolution.Tech && ( chargeVal >= 50.0 ) )
+			if( RPGManager.GetWeaponEvolution( attackData.GetWeapon().GetItemID() ) == gamedataWeaponEvolution.Tech && ( chargeVal >= attackData.GetWeapon().GetMaxChargeTreshold() ) )
 			{
 				attackData.AddFlag( hitFlag.WeaponFullyCharged, 'Charge Weapon' );
 			}
@@ -61,18 +63,62 @@ class DamageManager
 				attackData.AddFlag( hitFlag.WeaponFullyCharged, 'Charge Weapon' );
 			}
 		}
-		if( !( AttackData.IsBullet( attackType ) ) && !( AttackData.IsExplosion( attackType ) ) )
+		if( !( AttackData.IsExplosion( attackType ) ) )
 		{
 			ProcessDefensiveState( hitEvent );
+		}
+		if( hitEvent.target.IsPlayer() && GameInstance.GetStatPoolsSystem( hitEvent.target.GetGame() ).HasStatPoolValueReachedMin( hitEvent.target.GetEntityID(), gamedataStatPoolType.SandevistanCharge ) )
+		{
+			StatusEffectHelper.RemoveStatusEffect( hitEvent.target, T"BaseStatusEffect.NoSandevistanGlitch" );
+			StatusEffectHelper.RemoveStatusEffect( hitEvent.target, T"BaseStatusEffect.NoCooldownedSandevistanGlitch" );
 		}
 		return;
 	}
 
-	public static function IsValidDirectionToDefendMeleeAttack( attackerForward : Vector4, defenderForward : Vector4 ) : Bool
+	public static function IsValidDirectionToDefendMeleeAttack( attackerForward : Vector4, defenderForward : Vector4, optional kerenzikov : Bool ) : Bool
 	{
-		var finalHitDirection : Float;
-		finalHitDirection = Vector4.GetAngleBetween( attackerForward, defenderForward );
-		return finalHitDirection < 180.0;
+		var angle : Float;
+		var meleeMaxDefendAngle : Float;
+		angle = Vector4.GetAngleBetween( attackerForward, defenderForward );
+		meleeMaxDefendAngle = ( ( kerenzikov ) ? ( TDB.GetFloat( T"player.melee.meleeMaxDefendAngleKerenzikov", 90.0 ) ) : ( TDB.GetFloat( T"player.melee.meleeMaxDefendAngle", 45.0 ) ) );
+		if( ( angle <= 180.0 ) && ( angle > ( 180.0 - meleeMaxDefendAngle ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private static function CanBlockBullet( hitEvent : gameHitEvent ) : Bool
+	{
+		var defenderWeapon : WeaponObject;
+		var cameraForward : Vector4;
+		defenderWeapon = GameObject.GetActiveWeapon( hitEvent.target );
+		if( !( defenderWeapon ) )
+		{
+			return false;
+		}
+		if( !( defenderWeapon.IsBlade() ) )
+		{
+			return false;
+		}
+		if( !( AttackData.IsRangedOnly( hitEvent.attackData.GetAttackType() ) ) )
+		{
+			return false;
+		}
+		if( PlayerDevelopmentSystem.GetData( hitEvent.target ).IsNewPerkBought( gamedataNewPerkType.Reflexes_Right_Milestone_2 ) < 2 )
+		{
+			return false;
+		}
+		cameraForward = GameInstance.GetCameraSystem( hitEvent.target.GetGame() ).GetActiveCameraForward();
+		if( !( IsValidDirectionToDefendMeleeAttack( hitEvent.hitDirection, cameraForward ) ) )
+		{
+			return false;
+		}
+		if( AbsF( Vector4.GetAngleDegAroundAxis( hitEvent.target.GetWorldForward(), cameraForward, hitEvent.target.GetWorldUp() ) ) > TDB.GetFloat( T"player.melee.maxLookbackDefendAngle", 150.0 ) )
+		{
+			return false;
+		}
+		return true;
 	}
 
 	private static function ProcessDefensiveState( hitEvent : gameHitEvent )
@@ -81,57 +127,103 @@ class DamageManager
 		var targetID : StatsObjectID;
 		var targetPuppet : weak< ScriptedPuppet >;
 		var aiComponent : AIHumanComponent;
+		var hitReactionComponent : HitReactionComponent;
 		var statSystem : StatsSystem;
 		var hitAIEvent : AIEvent;
 		var attackType : gamedataAttackType;
-		var attackSource : weak< GameObject >;
+		var instigator : weak< GameObject >;
+		var currentStamina : Float;
+		var totalStamina : Float;
+		var hasStaminaToDeflect : Bool;
+		var dodgingWithKerenzikov : Bool;
+		var dodgingFromAnyDirection : Bool;
+		var meleeAttackRecord : Attack_Melee_Record;
 		attackData = hitEvent.attackData;
 		targetID = hitEvent.target.GetEntityID();
 		targetPuppet = ( ( weak< weak< ScriptedPuppet > > )( hitEvent.target ) );
 		aiComponent = targetPuppet.GetAIControllerComponent();
-		attackSource = attackData.GetSource();
-		hitAIEvent = new AIEvent;
+		hitReactionComponent = targetPuppet.GetHitReactionComponent();
 		statSystem = GameInstance.GetStatsSystem( hitEvent.target.GetGame() );
-		if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) )
+		hitAIEvent = new AIEvent;
+		instigator = attackData.GetInstigator();
+		currentStamina = GameInstance.GetStatPoolsSystem( targetPuppet.GetGame() ).GetStatPoolValue( targetID, gamedataStatPoolType.Stamina, false );
+		dodgingWithKerenzikov = ( ( !( targetPuppet.IsPlayer() ) && hitReactionComponent ) && hitReactionComponent.GetHasKerenzikov() ) && !( hitReactionComponent.GetCanBlock() );
+		dodgingFromAnyDirection = dodgingWithKerenzikov && StatusEffectSystem.ObjectHasStatusEffect( targetPuppet, T"BaseStatusEffect.ForceAllowAnyDirectionDodge" );
+		if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) && ( dodgingFromAnyDirection || IsValidDirectionToDefendMeleeAttack( instigator.GetWorldForward(), hitEvent.target.GetWorldForward(), dodgingWithKerenzikov ) ) )
 		{
-			if( IsValidDirectionToDefendMeleeAttack( attackSource.GetWorldForward(), hitEvent.target.GetWorldForward() ) )
+			attackType = attackData.GetAttackType();
+			meleeAttackRecord = ( ( Attack_Melee_Record )( attackData.GetAttackDefinition().GetRecord() ) );
+			if( ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) && attackType != gamedataAttackType.QuickMelee ) && ( targetPuppet.IsPlayer() || aiComponent.GetActionBlackboard().GetBool( GetAllBlackboardDefs().AIAction.attackParried ) ) )
 			{
-				attackType = attackData.GetAttackType();
-				if( ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) && attackType != gamedataAttackType.QuickMelee ) && ( targetPuppet.IsPlayer() || aiComponent.GetActionBlackboard().GetBool( GetAllBlackboardDefs().AIAction.attackParried ) ) )
+				attackData.AddFlag( hitFlag.WasDeflected, 'Parry' );
+				attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Parry' );
+				AnimationControllerComponent.PushEvent( instigator, 'myAttackParried' );
+				hitAIEvent.name = 'MyAttackParried';
+				instigator.QueueEvent( hitAIEvent );
+				if( hitEvent.target.IsPlayer() )
 				{
-					attackData.AddFlag( hitFlag.WasDeflected, 'Parry' );
-					attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Parry' );
-					AnimationControllerComponent.PushEvent( attackSource, 'myAttackParried' );
-					hitAIEvent.name = 'MyAttackParried';
-					attackSource.QueueEvent( hitAIEvent );
-					if( hitEvent.target.IsPlayer() )
-					{
-						SendNameEventToPSM( 'successfulDeflect', hitEvent );
-					}
+					SendNameEventToPSM( 'successfulDeflect', hitEvent );
 				}
-				else if( aiComponent.GetActionBlackboard().GetBool( GetAllBlackboardDefs().AIAction.attackBlocked ) || ( targetPuppet.IsPlayer() && ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsBlocking ) == 1.0 ) || ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) && attackType == gamedataAttackType.QuickMelee ) ) ) )
+			}
+			else if( aiComponent.GetActionBlackboard().GetBool( GetAllBlackboardDefs().AIAction.attackBlocked ) || ( targetPuppet.IsPlayer() && ( ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsBlocking ) == 1.0 ) && ( meleeAttackRecord && !( meleeAttackRecord.CanSkipBlock() ) ) ) || ( ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) && attackType == gamedataAttackType.QuickMelee ) ) ) )
+			{
+				attackData.AddFlag( hitFlag.WasBlocked, 'Block' );
+				attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Block' );
+				AnimationControllerComponent.PushEvent( instigator, 'myAttackBlocked' );
+				ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( instigator ) ), 'BlockSignal', 0.30000001 );
+				hitAIEvent.name = 'MyAttackBlocked';
+				instigator.QueueEvent( hitAIEvent );
+				DealStaminaDamage( hitEvent, targetID, statSystem );
+			}
+			else
+			{
+				ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( instigator ) ), 'HitSignal', 0.30000001 );
+				hitAIEvent.name = 'MyAttackHit';
+				instigator.QueueEvent( hitAIEvent );
+			}
+		}
+		else if( ( currentStamina > 0.0 ) && CanBlockBullet( hitEvent ) )
+		{
+			if( ( statSystem.GetStatValue( targetID, gamedataStatType.IsBlocking ) == 1.0 ) || ( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 ) )
+			{
+				totalStamina = GameInstance.GetStatsSystem( targetPuppet.GetGame() ).GetStatValue( targetID, gamedataStatType.Stamina );
+				hasStaminaToDeflect = currentStamina > ( totalStamina * statSystem.GetStatValue( targetID, gamedataStatType.Reflexes_Right_Milestone_2_StaminaDeflectPerc ) );
+				if( ( PlayerDevelopmentSystem.GetData( hitEvent.target ).IsNewPerkBought( gamedataNewPerkType.Reflexes_Right_Perk_2_1 ) > 0 ) && hasStaminaToDeflect )
 				{
-					attackData.AddFlag( hitFlag.WasBlocked, 'Block' );
-					attackData.AddFlag( hitFlag.DontShowDamageFloater, 'Block' );
-					AnimationControllerComponent.PushEvent( attackSource, 'myAttackBlocked' );
-					ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( attackSource ) ), 'BlockSignal', 0.30000001 );
-					hitAIEvent.name = 'MyAttackBlocked';
-					attackSource.QueueEvent( hitAIEvent );
-					DealStaminaDamage( hitEvent, targetID, statSystem );
+					if( statSystem.GetStatValue( targetID, gamedataStatType.IsBlocking ) == 1.0 )
+					{
+						attackData.AddFlag( hitFlag.WasBulletDeflected, 'BulletDeflect' );
+					}
+					else if( statSystem.GetStatValue( targetID, gamedataStatType.IsDeflecting ) == 1.0 )
+					{
+						attackData.AddFlag( hitFlag.WasBulletParried, 'BulletParry' );
+					}
+					attackData.AddFlag( hitFlag.DontShowDamageFloater, 'BulletDeflect' );
 				}
 				else
 				{
-					ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( attackSource ) ), 'HitSignal', 0.30000001 );
-					hitAIEvent.name = 'MyAttackHit';
-					attackSource.QueueEvent( hitAIEvent );
+					attackData.AddFlag( hitFlag.WasBlocked, 'BulletBlock' );
+					attackData.AddFlag( hitFlag.WasBulletBlocked, 'BulletBlock' );
+					attackData.AddFlag( hitFlag.DontShowDamageFloater, 'BulletBlock' );
+					AnimationControllerComponent.PushEvent( instigator, 'myAttackBlocked' );
+					ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( instigator ) ), 'BlockSignal', 0.30000001 );
+					hitAIEvent.name = 'MyAttackBlocked';
+					instigator.QueueEvent( hitAIEvent );
+					DealStaminaDamage( hitEvent, targetID, statSystem );
 				}
+			}
+			else
+			{
+				ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( instigator ) ), 'HitSignal', 0.30000001 );
+				hitAIEvent.name = 'MyAttackHit';
+				instigator.QueueEvent( hitAIEvent );
 			}
 		}
 		else
 		{
-			ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( attackSource ) ), 'HitSignal', 0.30000001 );
+			ScriptedPuppet.SendActionSignal( ( ( NPCPuppet )( instigator ) ), 'HitSignal', 0.30000001 );
 			hitAIEvent.name = 'MyAttackHit';
-			attackSource.QueueEvent( hitAIEvent );
+			instigator.QueueEvent( hitAIEvent );
 		}
 	}
 
@@ -156,29 +248,31 @@ class DamageManager
 	public static function CalculateSourceModifiers( hitEvent : gameHitEvent )
 	{
 		var targetPuppet : ScriptedPuppet;
+		var instigator : GameObject;
 		var tempStat : Float;
 		targetPuppet = ( ( ScriptedPuppet )( hitEvent.target ) );
-		if( ScriptedPuppet.IsMechanical( targetPuppet ) || hitEvent.target.IsTurret() )
+		instigator = hitEvent.attackData.GetInstigator();
+		if( targetPuppet.IsMechanical() || targetPuppet.IsTurret() )
 		{
-			tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstMechanicals );
+			tempStat = StatsSystemHelper.GetStatValue( instigator, gamedataStatType.BonusDamageAgainstMechanicals );
 			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 			{
 				hitEvent.attackComputed.MultAttackValue( 1.0 + tempStat );
 			}
 		}
-		if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Boss )
+		if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Boss || targetPuppet.GetNPCRarity() == gamedataNPCRarity.MaxTac )
 		{
-			tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstBosses );
+			tempStat = StatsSystemHelper.GetStatValue( instigator, gamedataStatType.BonusDamageAgainstBosses );
 			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 			{
 				hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
 			}
 		}
-		if( hitEvent.attackData.GetInstigator().IsPlayer() )
+		if( instigator.IsPlayer() )
 		{
 			if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Elite )
 			{
-				tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstElites );
+				tempStat = StatsSystemHelper.GetStatValue( instigator, gamedataStatType.BonusDamageAgainstElites );
 				if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 				{
 					hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
@@ -186,15 +280,15 @@ class DamageManager
 			}
 			else if( targetPuppet.GetNPCRarity() == gamedataNPCRarity.Rare )
 			{
-				tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BonusDamageAgainstRares );
+				tempStat = StatsSystemHelper.GetStatValue( instigator, gamedataStatType.BonusDamageAgainstRares );
 				if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 				{
 					hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
 				}
 			}
-			if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) && StatusEffectSystem.ObjectHasStatusEffect( hitEvent.attackData.GetInstigator(), T"BaseStatusEffect.BerserkPlayerBuff" ) )
+			if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) && StatusEffectSystem.ObjectHasStatusEffect( instigator, T"BaseStatusEffect.BerserkPlayerBuff" ) )
 			{
-				tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.attackData.GetInstigator().GetEntityID(), gamedataStatType.BerserkMeleeDamageBonus );
+				tempStat = StatsSystemHelper.GetStatValue( instigator, gamedataStatType.BerserkMeleeDamageBonus );
 				if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 				{
 					hitEvent.attackComputed.MultAttackValue( 1.0 + ( tempStat * 0.01 ) );
@@ -205,34 +299,48 @@ class DamageManager
 
 	public static function CalculateTargetModifiers( hitEvent : gameHitEvent )
 	{
+		var attackType : gamedataAttackType;
 		var tempStat : Float;
-		if( AttackData.IsExplosion( hitEvent.attackData.GetAttackType() ) )
+		attackType = hitEvent.attackData.GetAttackType();
+		if( AttackData.IsExplosion( attackType ) || hitEvent.attackData.HasFlag( hitFlag.BreachExplosion ) )
 		{
-			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionExplosion );
+			tempStat = StatsSystemHelper.GetStatValue( hitEvent.target, gamedataStatType.DamageReductionExplosion );
 			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 			{
 				hitEvent.attackComputed.MultAttackValue( 1.0 - tempStat );
 			}
 		}
-		if( AttackData.IsDoT( hitEvent.attackData.GetAttackType() ) )
+		if( hitEvent.attackData.HasFlag( hitFlag.BulletExplosion ) )
 		{
-			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionDamageOverTime );
+			tempStat = StatsSystemHelper.GetStatValue( hitEvent.target, gamedataStatType.DamageReductionBulletExplosion );
+			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
+			{
+				hitEvent.attackComputed.MultAttackValue( 1.0 - tempStat );
+				if( tempStat == 1.0 )
+				{
+					hitEvent.attackData.AddFlag( hitFlag.DontShowDamageFloater, 'BulletExplosionInvulnerability' );
+				}
+			}
+		}
+		if( AttackData.IsDoT( hitEvent.attackData ) )
+		{
+			tempStat = StatsSystemHelper.GetStatValue( hitEvent.target, gamedataStatType.DamageReductionDamageOverTime );
 			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 			{
 				hitEvent.attackComputed.MultAttackValue( 1.0 - tempStat );
 			}
 		}
-		if( AttackData.IsMelee( hitEvent.attackData.GetAttackType() ) )
+		if( AttackData.IsMelee( attackType ) )
 		{
-			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionMelee );
+			tempStat = StatsSystemHelper.GetStatValue( hitEvent.target, gamedataStatType.DamageReductionMelee );
 			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 			{
 				hitEvent.attackComputed.MultAttackValue( 1.0 - ( tempStat / 100.0 ) );
 			}
 		}
-		if( AttackData.IsHack( hitEvent.attackData.GetAttackType() ) )
+		if( AttackData.IsHack( attackType ) )
 		{
-			tempStat = tempStat = GameInstance.GetStatsSystem( hitEvent.target.GetGame() ).GetStatValue( hitEvent.target.GetEntityID(), gamedataStatType.DamageReductionQuickhacks );
+			tempStat = StatsSystemHelper.GetStatValue( hitEvent.target, gamedataStatType.DamageReductionQuickhacks );
 			if( !( FloatIsEqual( tempStat, 0.0 ) ) )
 			{
 				hitEvent.attackComputed.MultAttackValue( 1.0 - ( tempStat / 100.0 ) );

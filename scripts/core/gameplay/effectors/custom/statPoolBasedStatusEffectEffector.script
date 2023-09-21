@@ -1,0 +1,216 @@
+class StatPoolBasedStatusEffectEffectorListener extends ScriptStatPoolsListener
+{
+	var m_effector : weak< StatPoolBasedStatusEffectEffector >;
+
+	public override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		m_effector.UpdateWithStatPoolValue( newValue, percToPoints );
+	}
+
+}
+
+class StatPoolBasedStatusEffectEffector extends Effector
+{
+	private var m_statPool : gamedataStatPoolType;
+	private var m_statusEffectID : TweakDBID;
+	private var m_statPoolStep : Float;
+	private var m_stepUsesPercent : Bool;
+	private var m_startingThreshold : Float;
+	private var m_thresholdUsesPercent : Bool;
+	private var m_minStacks : Int32;
+	private var m_maxStacks : Int32;
+	private var m_inverted : Bool;
+	private var m_roundUpwards : Bool;
+	private var m_dontRemoveStacks : Bool;
+	private var m_targetOfStatPoolCheck : String;
+	private var m_listener : StatPoolBasedStatusEffectEffectorListener;
+	private var m_currentStacks : Int32;
+	private var m_realMaxStacks : Int32;
+	private var m_statPoolRecordID : TweakDBID;
+	private var m_gameInstance : GameInstance;
+	private var m_ownerID : EntityID;
+	private var m_checkStatPoolOnWeapon : Bool;
+	private var m_ownerWeaponID : EntityID;
+
+	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		var statPoolRecord : StatPool_Record;
+		m_gameInstance = game;
+		m_statPoolRecordID = TDB.GetForeignKey( record + T".statPool" );
+		statPoolRecord = TweakDBInterface.GetStatPoolRecord( m_statPoolRecordID );
+		if( statPoolRecord )
+		{
+			m_statPool = statPoolRecord.StatPoolType();
+		}
+		else
+		{
+			m_statPool = gamedataStatPoolType.Invalid;
+		}
+		m_statusEffectID = TDB.GetForeignKey( record + T".statusEffect" );
+		m_statPoolStep = TDB.GetFloat( record + T".statPoolStep" );
+		m_stepUsesPercent = TDB.GetBool( record + T".stepUsesPercent" );
+		m_startingThreshold = TDB.GetFloat( record + T".startingThreshold" );
+		m_thresholdUsesPercent = TDB.GetBool( record + T".thresholdUsesPercent" );
+		m_minStacks = Max( TDB.GetInt( record + T".minStacks" ), 0 );
+		m_maxStacks = Max( TDB.GetInt( record + T".maxStacks" ), 0 );
+		m_inverted = TDB.GetBool( record + T".inverted" );
+		m_roundUpwards = TDB.GetBool( record + T".roundUpwards" );
+		m_dontRemoveStacks = TDB.GetBool( record + T".dontRemoveStacks" );
+		m_targetOfStatPoolCheck = TDB.GetString( record + T".targetOfStatPoolCheck" );
+		if( m_targetOfStatPoolCheck == "Weapon" )
+		{
+			m_checkStatPoolOnWeapon = true;
+		}
+	}
+
+	protected override function Uninitialize( game : GameInstance )
+	{
+		Clear();
+	}
+
+	protected export override function ActionOn( owner : GameObject )
+	{
+		var statPoolsSystem : StatPoolsSystem;
+		var statusEffectRecord : StatusEffect_Record;
+		var statusEffectMaxStacksModifiers : array< weak< StatModifier_Record > >;
+		var statusEffectMaxStacks : Int32;
+		var targetOfStatPoolCheckID : EntityID;
+		var checkedWeapon : WeaponObject;
+		if( m_statPool == gamedataStatPoolType.Invalid )
+		{
+			return;
+		}
+		m_ownerID = owner.GetEntityID();
+		statPoolsSystem = GameInstance.GetStatPoolsSystem( m_gameInstance );
+		if( m_checkStatPoolOnWeapon )
+		{
+			checkedWeapon = GameObject.GetActiveWeapon( owner );
+			if( !( checkedWeapon ) )
+			{
+				return;
+			}
+			m_ownerWeaponID = checkedWeapon.GetEntityID();
+			targetOfStatPoolCheckID = m_ownerWeaponID;
+		}
+		else
+		{
+			targetOfStatPoolCheckID = m_ownerID;
+		}
+		if( !( statPoolsSystem.IsStatPoolAdded( targetOfStatPoolCheckID, m_statPool ) ) )
+		{
+			statPoolsSystem.RequestAddingStatPool( targetOfStatPoolCheckID, m_statPoolRecordID );
+		}
+		if( !( statPoolsSystem.HasActiveStatPool( targetOfStatPoolCheckID, m_statPool ) ) )
+		{
+			statPoolsSystem.RequestMarkingStatPoolActive( targetOfStatPoolCheckID, m_statPool );
+		}
+		statusEffectRecord = TweakDBInterface.GetStatusEffectRecord( m_statusEffectID );
+		if( statusEffectRecord )
+		{
+			statusEffectRecord.MaxStacksHandle().StatModifiers( statusEffectMaxStacksModifiers );
+			statusEffectMaxStacks = FloorF( GameInstance.GetStatsSystem( m_gameInstance ).CalculateModifierListValue( m_ownerID, statusEffectMaxStacksModifiers ) );
+		}
+		if( statusEffectMaxStacks == 0 )
+		{
+			return;
+		}
+		if( ( statusEffectMaxStacks < 0 ) || ( m_maxStacks <= 0 ) )
+		{
+			m_realMaxStacks = Max( statusEffectMaxStacks, m_maxStacks );
+		}
+		else
+		{
+			m_realMaxStacks = Min( statusEffectMaxStacks, m_maxStacks );
+		}
+		m_listener = new StatPoolBasedStatusEffectEffectorListener;
+		m_listener.m_effector = this;
+		statPoolsSystem.RequestRegisteringListener( targetOfStatPoolCheckID, m_statPool, m_listener );
+		UpdateWithStatPoolValue( statPoolsSystem.GetStatPoolValue( targetOfStatPoolCheckID, m_statPool, true ), statPoolsSystem.GetStatPoolMaxPointValue( targetOfStatPoolCheckID, m_statPool ) / 100.0 );
+	}
+
+	protected export override function ActionOff( owner : GameObject )
+	{
+		Clear();
+	}
+
+	public function UpdateWithStatPoolValue( newPercValue : Float, percToPoints : Float )
+	{
+		var newStacks, stacksChange : Int32;
+		var percValueAfterThreshold, tempStacksValue : Float;
+		if( ( ( m_statPoolStep <= 0.0 ) || ( percToPoints <= 0.0 ) ) || !( TDBID.IsValid( m_statusEffectID ) ) )
+		{
+			return;
+		}
+		if( !( m_inverted ) )
+		{
+			percValueAfterThreshold = ( ( m_thresholdUsesPercent ) ? ( newPercValue - m_startingThreshold ) : ( newPercValue - ( m_startingThreshold / percToPoints ) ) );
+		}
+		else
+		{
+			percValueAfterThreshold = ( ( m_thresholdUsesPercent ) ? ( m_startingThreshold - newPercValue ) : ( ( m_startingThreshold / percToPoints ) - newPercValue ) );
+		}
+		if( percValueAfterThreshold < 0.0 )
+		{
+			newStacks = 0;
+		}
+		else
+		{
+			tempStacksValue = ( ( m_stepUsesPercent ) ? ( percValueAfterThreshold / m_statPoolStep ) : ( ( percValueAfterThreshold / m_statPoolStep ) * percToPoints ) );
+			if( m_roundUpwards )
+			{
+				newStacks = CeilF( tempStacksValue ) + m_minStacks;
+			}
+			else
+			{
+				newStacks = FloorF( tempStacksValue ) + m_minStacks;
+			}
+		}
+		if( m_realMaxStacks > 0 )
+		{
+			newStacks = Min( newStacks, m_realMaxStacks );
+		}
+		stacksChange = newStacks - m_currentStacks;
+		if( stacksChange == 0 )
+		{
+			return;
+		}
+		m_currentStacks = newStacks;
+		ProcessStacksChange( stacksChange );
+	}
+
+	private function ProcessStacksChange( stacksChange : Int32 )
+	{
+		if( stacksChange > 0 )
+		{
+			GameInstance.GetStatusEffectSystem( m_gameInstance ).ApplyStatusEffect( m_ownerID, m_statusEffectID, TDBID.None(), m_ownerID, ( ( Uint32 )( stacksChange ) ), Vector4.EmptyVector(), false );
+		}
+		else if( !( m_dontRemoveStacks ) )
+		{
+			GameInstance.GetStatusEffectSystem( m_gameInstance ).RemoveStatusEffect( m_ownerID, m_statusEffectID, ( ( Uint32 )( Abs( stacksChange ) ) ) );
+		}
+	}
+
+	private function Clear()
+	{
+		if( m_statPool == gamedataStatPoolType.Invalid )
+		{
+			return;
+		}
+		if( m_listener )
+		{
+			if( m_checkStatPoolOnWeapon )
+			{
+				GameInstance.GetStatPoolsSystem( m_gameInstance ).RequestUnregisteringListener( m_ownerWeaponID, m_statPool, m_listener );
+			}
+			else
+			{
+				GameInstance.GetStatPoolsSystem( m_gameInstance ).RequestUnregisteringListener( m_ownerID, m_statPool, m_listener );
+			}
+			m_listener = NULL;
+		}
+		ProcessStacksChange( -( m_currentStacks ) );
+		m_currentStacks = 0;
+	}
+
+}
+

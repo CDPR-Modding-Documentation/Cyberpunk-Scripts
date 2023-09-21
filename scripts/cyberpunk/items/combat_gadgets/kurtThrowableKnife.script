@@ -1,0 +1,373 @@
+class ThrowableKnifeNPC extends BaseProjectile
+{
+	private var m_visualComponent : IComponent;
+	private var m_resourceLibraryComponent : ResourceLibraryComponent;
+	private var m_weapon : weak< WeaponObject >;
+	private var m_attack_record : Attack_Record;
+	private var m_explosionRadius : Float;
+	private var m_tweakRecord : Grenade_Record;
+	private var m_isActive : Bool;
+	private var m_hasHitWater : Bool;
+	private var m_projectileStopped : Bool;
+	private var m_desiredLifetime : Float;
+	private var m_waterHeight : Float;
+	private var m_deactivationDepth : Float;
+	private var m_waterImpulseRadius : Float;
+	private var m_waterImpulseStrength : Float;
+	private var m_dbgCurrentLifetime : Float;
+	protected var m_projectileCollisionEvaluator : ThrowingMeleeCollisionEvaluator;
+
+	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
+	{
+		super.OnRequestComponents( ri );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'MeshComponent', 'IComponent', true );
+	}
+
+	protected event OnTakeControl( ri : EntityResolveComponentsInterface )
+	{
+		super.OnTakeControl( ri );
+		m_visualComponent = EntityResolveComponentsInterface.GetComponent( ri, 'MeshComponent' );
+		m_projectileComponent = ( ( ProjectileComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'projectileComponent' ) ) );
+		m_resourceLibraryComponent = ( ( ResourceLibraryComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ResourceLibrary' ) ) );
+	}
+
+	public function GetInitialVelocity( isQuickThrow : Bool ) : Float
+	{
+		var initialVelocity : Float;
+		var tweakRecord : Grenade_Record;
+		tweakRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) );
+		if( !( isQuickThrow ) )
+		{
+			initialVelocity = tweakRecord.DeliveryMethod().InitialVelocity();
+		}
+		else
+		{
+			initialVelocity = tweakRecord.DeliveryMethod().InitialQuickThrowVelocity();
+		}
+		return initialVelocity;
+	}
+
+	public function GetAccelerationZ() : Float
+	{
+		var tweakRecord : Grenade_Record;
+		tweakRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) );
+		return tweakRecord.DeliveryMethod().AccelerationZ();
+	}
+
+	public function isFollowingKnife() : Bool
+	{
+		return TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) ).TagsContains( 'following' );
+	}
+
+	protected event OnProjectileInitialize( eventData : gameprojectileSetUpEvent )
+	{
+		var attack : IAttack;
+		super.OnProjectileInitialize( eventData );
+		m_tweakRecord = TweakDBInterface.GetGrenadeRecord( ItemID.GetTDBID( GetItemID() ) );
+		m_projectileStopped = false;
+		m_isActive = true;
+		m_hasHitWater = false;
+		m_waterHeight = 0.0;
+		m_deactivationDepth = GetProjectileTweakDBFloatParameter( "deactivationDepth" );
+		m_waterImpulseRadius = GetProjectileTweakDBFloatParameter( "waterImpulseRadius" );
+		m_waterImpulseStrength = GetProjectileTweakDBFloatParameter( "waterImpulseStrength" );
+		m_user = eventData.owner;
+		m_weapon = ( ( WeaponObject )( eventData.weapon ) );
+		attack = m_weapon.GetCurrentAttack();
+		m_attack_record = attack.GetRecord();
+		m_desiredLifetime = TDB.GetFloat( T"projectile.npc_throwable_knife_params.lifetime", -1.0 );
+		m_projectileCollisionEvaluator = new ThrowingMeleeCollisionEvaluator;
+		m_projectileComponent.SetCollisionEvaluator( m_projectileCollisionEvaluator );
+	}
+
+	protected event OnShoot( eventData : gameprojectileShootEvent )
+	{
+		var effectBlackboard : worldEffectBlackboard;
+		effectBlackboard = new worldEffectBlackboard;
+		effectBlackboard.SetValueUnclamped( 'trailFxScale', m_projectileComponent.GetTrailVFXScale() );
+		GameObjectEffectHelper.StartEffectEvent( this, 'trail_chemical', true, effectBlackboard );
+		Reset();
+	}
+
+	protected event OnShootTarget( eventData : gameprojectileShootTargetEvent )
+	{
+		OnShoot( eventData );
+	}
+
+	private function Reset()
+	{
+		m_visualComponent.Toggle( true );
+		InitializeRotation();
+		m_dbgCurrentLifetime = 0.0;
+		ReleaseKnifeWithDelay( m_desiredLifetime );
+	}
+
+	protected event OnCollision( eventData : gameprojectileHitEvent )
+	{
+		var hitInstance : gameprojectileHitInstance;
+		var effect : FxResource;
+		var effectTransform : WorldTransform;
+		var hitEvent : gameprojectileHitEvent;
+		var hasHitPlayer : Bool;
+		var hasHitNPC : Bool;
+		var hasHitDrone : Bool;
+		var i : Int32;
+		var adHocAnimEvent : AdHocAnimationEvent;
+		if( !( m_isActive ) )
+		{
+			return false;
+		}
+		for( i = 0; i < eventData.hitInstances.Size(); i += 1 )
+		{
+			hitInstance = eventData.hitInstances[ i ];
+			if( hitInstance.isWaterSurfaceImpact )
+			{
+				m_hasHitWater = true;
+				m_waterHeight = hitInstance.position.Z;
+				effect = m_resourceLibraryComponent.GetResource( 'splash_effect' );
+				if( FxResource.IsValid( effect ) )
+				{
+					WorldTransform.SetPosition( effectTransform, hitInstance.position );
+					GameInstance.GetFxSystem( GetGame() ).SpawnEffect( effect, effectTransform );
+				}
+				RenderingSystem.AddWaterImpulse( hitInstance.position, m_waterImpulseRadius, m_waterImpulseStrength );
+				continue;
+			}
+			if( !( m_hasHitWater ) || ( ( hitInstance.position.Z - m_waterHeight ) > m_deactivationDepth ) )
+			{
+				if( !( m_projectileStopped ) )
+				{
+					hitEvent = new gameprojectileHitEvent;
+					hitEvent.hitInstances.PushBack( hitInstance );
+					ProjectileHit( hitEvent );
+				}
+				if( m_projectileCollisionEvaluator.ProjectileStopAndStick() )
+				{
+					m_projectileStopped = true;
+				}
+				hasHitNPC = GetObject( hitInstance ).IsNPC();
+				hasHitDrone = GetObject( hitInstance ).IsDrone();
+				hasHitPlayer = GetObject( hitInstance ).IsPlayer();
+				if( ( !( hasHitNPC ) && !( hasHitDrone ) ) && !( hasHitPlayer ) )
+				{
+					TriggerSingleStimuli( hitInstance, gamedataStimType.SoundDistraction );
+				}
+				if( hasHitPlayer )
+				{
+					SpawnAttack( m_tweakRecord.NpcHitReactionAttack(), 10.0, , , GetWorldPosition() );
+					m_visualComponent.Toggle( false );
+					adHocAnimEvent = new AdHocAnimationEvent;
+					adHocAnimEvent.animationIndex = 5;
+					adHocAnimEvent.animationDuration = 2.33299994;
+					adHocAnimEvent.useBothHands = true;
+					adHocAnimEvent.unequipWeapon = false;
+					GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().QueueEvent( adHocAnimEvent );
+				}
+			}
+			break;
+		}
+	}
+
+	protected event OnTick( eventData : gameprojectileTickEvent )
+	{
+		var currentPosition : Vector4;
+		m_dbgCurrentLifetime += eventData.deltaTime;
+		if( m_isActive && m_hasHitWater )
+		{
+			currentPosition = GetWorldPosition();
+			if( ( currentPosition.Z - m_waterHeight ) <= m_deactivationDepth )
+			{
+				DeactivateAndSink();
+			}
+		}
+		m_projectileComponent.LogDebugVariable( 'Lifetime', FloatToString( m_dbgCurrentLifetime ) );
+	}
+
+	private function InitializeRotation()
+	{
+		var rotationAxis : Vector4;
+		var rotationSpeed : Float;
+		rotationAxis = Vector4( -1.0, 0.0, 0.0, 0.0 );
+		rotationSpeed = 3600.0;
+		m_projectileComponent.ToggleAxisRotation( true );
+		m_projectileComponent.AddAxisRotation( rotationAxis, rotationSpeed );
+	}
+
+	protected function SpawnAttack( attackRecord : Attack_Record, optional range : Float, optional duration : Float, optional hitNormal : Vector4, optional position : Vector4, optional vfxOffset : Vector4 ) : EffectInstance
+	{
+		var attack : Attack_GameEffect;
+		var effect : EffectInstance;
+		var attackContext : AttackInitContext;
+		var statMods : array< gameStatModifierData >;
+		var hitCooldown : Float;
+		attackContext.record = attackRecord;
+		attackContext.instigator = m_user;
+		attackContext.source = this;
+		attack = ( ( Attack_GameEffect )( IAttack.Create( attackContext ) ) );
+		attack.GetStatModList( statMods );
+		effect = attack.PrepareAttack( m_user );
+		if( range > 0.0 )
+		{
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.range, range );
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, range );
+		}
+		if( !( Vector4.IsZero( position ) ) )
+		{
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, position );
+		}
+		else
+		{
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, GetWorldPosition() );
+		}
+		if( duration > 0.0 )
+		{
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.duration, duration );
+		}
+		hitCooldown = TDB.GetFloat( ItemID.GetTDBID( GetItemID() ) + T".effectCooldown", 0.0 );
+		if( hitCooldown > 0.0 )
+		{
+			EffectData.SetFloat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.hitCooldown, hitCooldown );
+		}
+		if( !( Vector4.IsZero( hitNormal ) ) )
+		{
+			EffectData.SetQuat( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.rotation, Quaternion.BuildFromDirectionVector( hitNormal, Vector4( 0.0, 0.0, 1.0, 0.0 ) ) );
+		}
+		if( !( Vector4.IsZero( vfxOffset ) ) )
+		{
+			EffectData.SetVector( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.vfxOffset, vfxOffset );
+		}
+		EffectData.SetVariant( effect.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.attack, ( ( IAttack )( attack ) ) );
+		attack.StartAttack();
+		return effect;
+	}
+
+	protected function ReleaseKnife()
+	{
+		var despawnRequest : GrenadeDespawnRequestEvent;
+		m_projectileComponent.ClearTrajectories();
+		despawnRequest = new GrenadeDespawnRequestEvent;
+		QueueEvent( despawnRequest );
+		Release();
+	}
+
+	protected function ReleaseKnifeWithDelay( delay : Float )
+	{
+		var requestEvent : GrenadeReleaseRequestEvent;
+		requestEvent = new GrenadeReleaseRequestEvent;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, requestEvent, delay );
+	}
+
+	protected event OnReleaseRequestEvent( evt : GrenadeReleaseRequestEvent )
+	{
+		ReleaseKnife();
+	}
+
+	protected event OnDespawnRequest( evt : GrenadeDespawnRequestEvent )
+	{
+		var transactionSystem : TransactionSystem;
+		transactionSystem = GameInstance.GetTransactionSystem( GetGame() );
+		transactionSystem.ReleaseItem( GetOwner(), this );
+	}
+
+	protected function DeactivateAndSink()
+	{
+		var parabolicTrajectoryParams : ParabolicTrajectoryParams;
+		m_isActive = false;
+		parabolicTrajectoryParams = ParabolicTrajectoryParams.GetAccelVelParabolicParams( Vector4( 0.0, 0.0, -0.2, 0.0 ), 0.2, 0.40000001 );
+		m_projectileComponent.ClearTrajectories();
+		m_projectileComponent.AddParabolic( parabolicTrajectoryParams );
+	}
+
+}
+
+class KurtTakedownKnifeLanded extends AIbehaviorconditionScript
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		SetUpdateInterval( context, RandomizeOffsetForUpdateInterval( 0.2 ) );
+	}
+
+	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		var target : weak< GameObject >;
+		var targetAffected : Bool;
+		target = GameInstance.GetPlayerSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetLocalPlayerControlledGameObject();
+		targetAffected = StatusEffectSystem.ObjectHasStatusEffect( target, T"BaseStatusEffect.KurtTakedownKnifeStatusEffect" );
+		if( target && target.IsPlayer() )
+		{
+			return targetAffected;
+		}
+		return false;
+	}
+
+}
+
+class KurtMeleeTakedownCooldownActive extends AIbehaviorconditionScript
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		SetUpdateInterval( context, RandomizeOffsetForUpdateInterval( 0.2 ) );
+	}
+
+	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		var target : weak< GameObject >;
+		var targetAffected : Bool;
+		target = GameInstance.GetPlayerSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetLocalPlayerControlledGameObject();
+		targetAffected = StatusEffectSystem.ObjectHasStatusEffect( target, T"BaseStatusEffect.KurtMeleeTakedownCooldownSE" );
+		if( target && target.IsPlayer() )
+		{
+			return targetAffected;
+		}
+		return false;
+	}
+
+}
+
+class ForceKurtStatusEffect extends AIbehaviortaskScript
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var target : weak< GameObject >;
+		target = GameInstance.GetPlayerSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetLocalPlayerControlledGameObject();
+		if( target && target.IsPlayer() )
+		{
+			StatusEffectHelper.ApplyStatusEffect( target, T"BaseStatusEffect.TakedownsUnequipWeapons", 0.0 );
+		}
+	}
+
+}
+
+class ForcePlayerLookat_Kurt extends AIbehaviortaskScript
+{
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var target : weak< GameObject >;
+		var localAimRequest : AimRequest;
+		var lookAtTarget : Vector4;
+		target = GameInstance.GetPlayerSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetLocalPlayerControlledGameObject();
+		lookAtTarget = target.GetWorldPosition() + Vector4( 0.0, 1.0, 0.0, 0.0 );
+		localAimRequest.lookAtTarget = lookAtTarget;
+		localAimRequest.duration = 0.1;
+		localAimRequest.easeIn = false;
+		localAimRequest.easeOut = false;
+		localAimRequest.precision = 0.01;
+		localAimRequest.adjustPitch = true;
+		localAimRequest.adjustYaw = true;
+		localAimRequest.checkRange = false;
+		localAimRequest.endOnCameraInputApplied = true;
+		localAimRequest.endOnTargetReached = false;
+		localAimRequest.processAsInput = true;
+		if( target && target.IsPlayer() )
+		{
+			GameInstance.GetTargetingSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).BreakAimSnap( GetPlayer( ScriptExecutionContext.GetOwner( context ).GetGame() ) );
+			GameInstance.GetTargetingSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).LookAt( GetPlayer( ScriptExecutionContext.GetOwner( context ).GetGame() ), localAimRequest );
+		}
+	}
+
+}
+

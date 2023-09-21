@@ -133,7 +133,10 @@ class SetDeviceInvestigationData extends AIbehaviortaskScript
 		listener = activeReactionData.stimTarget;
 		SetInvestigationStateOnListener( listener, true );
 		listener.QueueEvent( communicationEvent );
-		ForceVisionAppearance( ownerPuppet, GetDistractionHighlightData( ownerPuppet ) );
+		if( activeReactionData.stimType != gamedataStimType.CarAlarm )
+		{
+			ForceVisionAppearance( ownerPuppet, GetDistractionHighlightData( ownerPuppet ) );
+		}
 		ScriptExecutionContext.SetArgumentVector( context, 'CustomWorldPosition', investigateData.distrationPoint );
 	}
 
@@ -258,25 +261,34 @@ class TriggerCombatAgainstStimTarget extends AIbehaviortaskScript
 
 	protected export override function Activate( context : ScriptExecutionContext )
 	{
+		var puppet : ScriptedPuppet;
+		var stimReactionComp : ReactionManagerComponent;
 		var activeReactionData : AIReactionData;
 		var investigateData : stimInvestigateData;
 		var target : weak< GameObject >;
 		var stimTarget : weak< GameObject >;
 		var targetPuppet : weak< ScriptedPuppet >;
 		var mountInfo : MountingInfo;
-		activeReactionData = GetPuppet( context ).GetStimReactionComponent().GetActiveReactionData();
-		if( !( activeReactionData ) )
-		{
-			activeReactionData = GetPuppet( context ).GetStimReactionComponent().GetDesiredReactionData();
-		}
+		puppet = GetPuppet( context );
+		stimReactionComp = puppet.GetStimReactionComponent();
+		activeReactionData = stimReactionComp.GetActiveOrDesiredReactionData();
+		stimReactionComp.LogStart( EReactLogSource.BehaviorCombatTrigger, "TriggerCombatAgainstStimTarget attempt" );
 		if( activeReactionData )
 		{
 			investigateData = activeReactionData.stimInvestigateData;
 		}
-		stimTarget = ScriptExecutionContext.GetArgumentObject( context, 'StimTarget' );
+		if( puppet.GetNPCType() == gamedataNPCType.Cerberus )
+		{
+			stimTarget = ScriptExecutionContext.GetArgumentObject( context, 'Player' );
+		}
+		else
+		{
+			stimTarget = ScriptExecutionContext.GetArgumentObject( context, 'StimTarget' );
+		}
 		if( investigateData.attackInstigator )
 		{
 			target = ( ( GameObject )( investigateData.attackInstigator ) );
+			stimReactionComp.LogInfo( "target taken from attack instigator" );
 		}
 		else
 		{
@@ -284,23 +296,34 @@ class TriggerCombatAgainstStimTarget extends AIbehaviortaskScript
 		}
 		if( !( target ) )
 		{
+			stimReactionComp.LogFailure( "no target to start combat with" );
 			return;
 		}
 		targetPuppet = ( ( ScriptedPuppet )( target ) );
 		if( targetPuppet && ScriptedPuppet.IsPlayerCompanion( targetPuppet ) )
 		{
+			stimReactionComp.LogFailure( "can not start combat with player companion" );
 			return;
 		}
 		if( GameObject.IsVehicle( target ) )
 		{
-			mountInfo = GameInstance.GetMountingFacility( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetMountingInfoSingleWithObjects( , target );
-			target = ( ( GameObject )( GameInstance.FindEntityByID( ScriptExecutionContext.GetOwner( context ).GetGame(), mountInfo.childId ) ) );
+			mountInfo = GameInstance.GetMountingFacility( puppet.GetGame() ).GetMountingInfoSingleWithObjects( , target );
+			target = ( ( GameObject )( GameInstance.FindEntityByID( puppet.GetGame(), mountInfo.childId ) ) );
+			targetPuppet = ( ( ScriptedPuppet )( target ) );
+			stimReactionComp.LogInfo( "reevaluated target from vehicle driver" );
 		}
-		if( !( AIActionHelper.TryChangingAttitudeToHostile( GetPuppet( context ), target ) ) )
+		if( stimReactionComp.ShouldIgnoreCombatStim( activeReactionData.stimType, targetPuppet, targetPuppet, activeReactionData.stimSource, true ) )
 		{
+			stimReactionComp.LogFailure( "combat stim explicitely ignored" );
 			return;
 		}
-		TargetTrackingExtension.InjectThreat( GetPuppet( context ), target );
+		if( !( AIActionHelper.TryChangingAttitudeToHostile( puppet, target ) ) )
+		{
+			stimReactionComp.LogFailure( "failed changing attitude to hostile" );
+			return;
+		}
+		TargetTrackingExtension.InjectThreat( puppet, target );
+		stimReactionComp.LogSuccess( "injected threat" );
 	}
 
 }
@@ -487,6 +510,102 @@ class SetExplosionInstigatorPositionAsStimSource extends AIbehaviortaskScript
 				ScriptExecutionContext.SetArgumentVector( context, 'StimSource', investigateData.attackInstigatorPosition );
 			}
 		}
+	}
+
+}
+
+class UpdateWhistlePosition extends AIbehaviortaskScript
+{
+	protected virtual function SetTarget( context : ScriptExecutionContext, target : weak< GameObject > );
+	protected virtual function SetPosition( context : ScriptExecutionContext, position : Vector4 );
+
+	public static function TryGetDesiredWhistlePosition( owner : GameObject, playerPosition : Vector4, out position : Vector4, out proxy : GameObject ) : Bool
+	{
+		var whistleEffects : array< StatusEffect >;
+		var navigationSystem : AINavigationSystem;
+		var query : AINavigationSystemQuery;
+		var queryId : Uint32;
+		var worldPosition : WorldPosition;
+		var navResult : AINavigationSystemResult;
+		StatusEffectHelper.GetAppliedEffectsWithTag( owner, 'Whistle', whistleEffects );
+		if( whistleEffects.Size() == 0 )
+		{
+			return false;
+		}
+		if( EntityID.IsDefined( whistleEffects[ 0 ].GetProxyEntityID() ) )
+		{
+			proxy = ( ( GameObject )( GameInstance.FindEntityByID( owner.GetGame(), whistleEffects[ 0 ].GetProxyEntityID() ) ) );
+		}
+		if( proxy && StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'WhistleGoToCamera' ) )
+		{
+			position = proxy.GetWorldPosition();
+		}
+		else
+		{
+			proxy = NULL;
+			position = playerPosition;
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( owner, 'WhistleTurnAway' ) )
+		{
+			position = ( 2.0 * owner.GetWorldPosition() ) - position;
+			return true;
+		}
+		navigationSystem = GameInstance.GetAINavigationSystem( owner.GetGame() );
+		AIPositionSpec.SetEntity( query.source, owner );
+		WorldPosition.SetVector4( worldPosition, position );
+		AIPositionSpec.SetWorldPosition( query.target, worldPosition );
+		queryId = navigationSystem.StartPathfinding( query );
+		navigationSystem.GetResult( queryId, navResult );
+		navigationSystem.StopPathfinding( queryId );
+		if( navResult.hasClosestReachablePoint )
+		{
+			position = WorldPosition.ToVector4( navResult.closestReachablePoint );
+		}
+		return true;
+	}
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var owner : ScriptedPuppet;
+		var player : GameObject;
+		var proxy : GameObject;
+		var position : Vector4;
+		owner = GetPuppet( context );
+		player = GameInstance.GetPlayerSystem( owner.GetGame() ).GetLocalPlayerControlledGameObject();
+		if( !( TryGetDesiredWhistlePosition( owner, player.GetWorldPosition(), position, proxy ) ) )
+		{
+			return;
+		}
+		SetTarget( context, ( ( proxy ) ? ( proxy ) : ( player ) ) );
+		SetPosition( context, position );
+	}
+
+}
+
+class UpdateWhistleStimSource extends UpdateWhistlePosition
+{
+
+	protected override function SetTarget( context : ScriptExecutionContext, target : weak< GameObject > )
+	{
+		ScriptExecutionContext.SetArgumentObject( context, 'StimTarget', target );
+	}
+
+	protected override function SetPosition( context : ScriptExecutionContext, position : Vector4 )
+	{
+		ScriptExecutionContext.SetArgumentVector( context, 'StimSource', position );
+	}
+
+}
+
+class UpdateWhistleCustomWorldPosition extends UpdateWhistlePosition
+{
+	editable inlined var m_outPositionArgument : AIArgumentMapping;
+
+	protected override function SetTarget( context : ScriptExecutionContext, target : weak< GameObject > ) {}
+
+	protected override function SetPosition( context : ScriptExecutionContext, position : Vector4 )
+	{
+		ScriptExecutionContext.SetMappingValue( context, m_outPositionArgument, position );
 	}
 
 }
@@ -689,6 +808,112 @@ class ResetReprimandEscalation extends AIbehaviortaskScript
 		AnimationControllerComponent.ApplyFeature( ScriptExecutionContext.GetOwner( context ), 'ReprimandAnim', m_AnimFeature_Reprimand, 5.0 );
 	}
 
+}
+
+function GetItemTypeFromContext( context : ScriptExecutionContext ) : Int32
+{
+	var itemsToEquip : array< NPCItemToEquip >;
+	var BBoard : IBlackboard;
+	var itemRecord : weak< Item_Record >;
+	var itemObject : ItemObject;
+	var itemEnumNumber : Int32;
+	BBoard = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetAIControllerComponent().GetActionBlackboard();
+	itemsToEquip = ( ( array< NPCItemToEquip > )( BBoard.GetVariant( GetAllBlackboardDefs().AIAction.ownerItemsToEquip ) ) );
+	itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemsToEquip[ 0 ].itemID ) );
+	if( !( itemRecord ) )
+	{
+		itemObject = GameInstance.GetTransactionSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetItemInSlot( ScriptExecutionContext.GetOwner( context ), T"AttachmentSlots.WeaponRight" );
+		if( itemObject )
+		{
+			itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemObject.GetItemID() ) );
+		}
+	}
+	itemEnumNumber = itemRecord.ItemType().AnimFeatureIndex();
+	switch( itemRecord.ItemType().Type() )
+	{
+		case gamedataItemType.Wea_LightMachineGun:
+			itemEnumNumber = 2;
+		break;
+		case gamedataItemType.Wea_HeavyMachineGun:
+			itemEnumNumber = 2;
+		break;
+		case gamedataItemType.Wea_SubmachineGun:
+			itemEnumNumber = 3;
+		break;
+		case gamedataItemType.Wea_Rifle:
+			itemEnumNumber = 4;
+		break;
+		case gamedataItemType.Wea_PrecisionRifle:
+			itemEnumNumber = 4;
+		break;
+		case gamedataItemType.Wea_SniperRifle:
+			itemEnumNumber = 4;
+		break;
+		case gamedataItemType.Wea_AssaultRifle:
+			itemEnumNumber = 4;
+		break;
+		case gamedataItemType.Wea_Shotgun:
+			itemEnumNumber = 4;
+		break;
+		case gamedataItemType.Wea_ShotgunDual:
+			itemEnumNumber = 4;
+		break;
+		case gamedataItemType.Wea_Handgun:
+			itemEnumNumber = 6;
+		break;
+		case gamedataItemType.Wea_Revolver:
+			itemEnumNumber = 6;
+		break;
+		case gamedataItemType.Wea_Katana:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Sword:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Knife:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_LongBlade:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Melee:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_OneHandedClub:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_ShortBlade:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Hammer:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Fists:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_TwoHandedClub:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Axe:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Chainsword:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Wea_Machete:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Cyb_MantisBlades:
+			itemEnumNumber = 5;
+		break;
+		case gamedataItemType.Cyb_StrongArms:
+			itemEnumNumber = 5;
+		break;
+		default:
+			itemEnumNumber = 7;
+		break;
+	}
+	return itemEnumNumber;
 }
 
 class ReprimandStartAnimFeature extends AIbehaviortaskScript
@@ -937,108 +1162,5 @@ class CrowdWalkAwayAfterCombat extends AIbehaviortaskScript
 		}
 	}
 
-}
-
-function GetItemTypeFromContext( context : ScriptExecutionContext ) : Int32
-{
-	var itemsToEquip : array< NPCItemToEquip >;
-	var BBoard : IBlackboard;
-	var itemRecord : weak< Item_Record >;
-	var itemObject : ItemObject;
-	var itemEnumNumber : Int32;
-	BBoard = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetAIControllerComponent().GetActionBlackboard();
-	itemsToEquip = ( ( array< NPCItemToEquip > )( BBoard.GetVariant( GetAllBlackboardDefs().AIAction.ownerItemsToEquip ) ) );
-	itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemsToEquip[ 0 ].itemID ) );
-	if( !( itemRecord ) )
-	{
-		itemObject = GameInstance.GetTransactionSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetItemInSlot( ScriptExecutionContext.GetOwner( context ), T"AttachmentSlots.WeaponRight" );
-		if( itemObject )
-		{
-			itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemObject.GetItemID() ) );
-		}
-	}
-	itemEnumNumber = itemRecord.ItemType().AnimFeatureIndex();
-	switch( itemRecord.ItemType().Type() )
-	{
-		case gamedataItemType.Wea_LightMachineGun:
-			itemEnumNumber = 2;
-		break;
-		case gamedataItemType.Wea_HeavyMachineGun:
-			itemEnumNumber = 2;
-		break;
-		case gamedataItemType.Wea_SubmachineGun:
-			itemEnumNumber = 3;
-		break;
-		case gamedataItemType.Wea_Rifle:
-			itemEnumNumber = 4;
-		break;
-		case gamedataItemType.Wea_PrecisionRifle:
-			itemEnumNumber = 4;
-		break;
-		case gamedataItemType.Wea_SniperRifle:
-			itemEnumNumber = 4;
-		break;
-		case gamedataItemType.Wea_AssaultRifle:
-			itemEnumNumber = 4;
-		break;
-		case gamedataItemType.Wea_Shotgun:
-			itemEnumNumber = 4;
-		break;
-		case gamedataItemType.Wea_ShotgunDual:
-			itemEnumNumber = 4;
-		break;
-		case gamedataItemType.Wea_Handgun:
-			itemEnumNumber = 6;
-		break;
-		case gamedataItemType.Wea_Revolver:
-			itemEnumNumber = 6;
-		break;
-		case gamedataItemType.Wea_Katana:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Knife:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_LongBlade:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Melee:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_OneHandedClub:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_ShortBlade:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Hammer:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Fists:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_TwoHandedClub:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Axe:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Chainsword:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Wea_Machete:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Cyb_MantisBlades:
-			itemEnumNumber = 5;
-		break;
-		case gamedataItemType.Cyb_StrongArms:
-			itemEnumNumber = 5;
-		break;
-		default:
-			itemEnumNumber = 7;
-		break;
-	}
-	return itemEnumNumber;
 }
 

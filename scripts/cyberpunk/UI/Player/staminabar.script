@@ -5,25 +5,35 @@ class StaminabarWidgetGameController extends inkHUDGameController
 	private editable var m_staminaStatusTextPath : inkTextRef;
 	private var m_bbPSceneTierEventId : CallbackHandle;
 	private var m_bbPStaminaPSMEventId : CallbackHandle;
+	private var m_bbAreaZoneEventId : CallbackHandle;
+	private var m_combatModeListener : CallbackHandle;
 	private var m_staminaController : weak< NameplateBarLogicController >;
 	private var m_RootWidget : weak< inkWidget >;
-	private var m_animLongFade : inkAnimDef;
-	private var m_animHideStaminaProxy : inkAnimProxy;
-	private var m_currentStamina : Float;
-	default m_currentStamina = 100.f;
+	private var m_currentBarValue : Float;
+	default m_currentBarValue = 100.f;
+	private var m_currentStatPool : gamedataStatPoolType;
 	private var m_sceneTier : GameplayTier;
 	default m_sceneTier = GameplayTier.Tier1_FullGameplay;
 	private var m_staminaState : gamePSMStamina;
 	default m_staminaState = gamePSMStamina.Rested;
+	private var m_zoneState : gamePSMZones;
 	private var m_staminaPoolListener : StaminaPoolListener;
+	private var m_statsSystem : StatsSystem;
+	private var m_forceHidden : Bool;
+	default m_forceHidden = false;
+	private var m_staminaRatioEnterCondition : Float;
+	private var m_pulse : PulseAnimation;
+	private var m_playerPuppet : weak< GameObject >;
 
 	protected event OnInitialize()
 	{
-		m_RootWidget = ( ( inkWidget )( GetRootWidget() ) );
+		m_RootWidget = GetRootWidget();
 		m_RootWidget.SetVisible( false );
 		m_staminaController = ( ( NameplateBarLogicController )( inkWidgetRef.GetController( m_staminaControllerRef ) ) );
+		m_currentStatPool = gamedataStatPoolType.Stamina;
 		m_staminaPoolListener = new StaminaPoolListener;
 		m_staminaPoolListener.BindStaminaBar( this );
+		m_staminaRatioEnterCondition = TDB.GetFloat( T"playerStateMachineStamina.exhausted.staminaRatioEnterCondition", 0.0 );
 		CreateAnimations();
 		EvaluateStaminaBarVisibility();
 	}
@@ -38,10 +48,13 @@ class StaminabarWidgetGameController extends inkHUDGameController
 
 	protected event OnPlayerAttach( playerGameObject : GameObject )
 	{
+		m_playerPuppet = playerGameObject;
 		RegisterPSMListeners( playerGameObject );
+		m_statsSystem = GameInstance.GetStatsSystem( playerGameObject.GetGame() );
 		m_staminaPoolListener = new StaminaPoolListener;
 		m_staminaPoolListener.BindStaminaBar( this );
 		GameInstance.GetStatPoolsSystem( playerGameObject.GetGame() ).RequestRegisteringListener( playerGameObject.GetEntityID(), gamedataStatPoolType.Stamina, m_staminaPoolListener );
+		playerGameObject.RegisterInputListener( this, 'HolsterWeapon' );
 	}
 
 	protected event OnPlayerDetach( playerGameObject : GameObject )
@@ -52,6 +65,7 @@ class StaminabarWidgetGameController extends inkHUDGameController
 			m_staminaPoolListener = NULL;
 		}
 		UnregisterPSMListeners( playerGameObject );
+		playerGameObject.UnregisterInputListener( this );
 	}
 
 	protected function RegisterPSMListeners( playerPuppet : GameObject )
@@ -68,6 +82,8 @@ class StaminabarWidgetGameController extends inkHUDGameController
 				m_staminaState = ( ( gamePSMStamina )( playerStateMachineBlackboard.GetInt( playerSMDef.Stamina ) ) );
 				m_bbPSceneTierEventId = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.SceneTier, this, 'OnSceneTierChange' );
 				m_bbPStaminaPSMEventId = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.Stamina, this, 'OnStaminaPSMChange' );
+				m_bbAreaZoneEventId = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.Zones, this, 'OnZoneChange' );
+				m_combatModeListener = playerStateMachineBlackboard.RegisterListenerInt( playerSMDef.Combat, this, 'OnCombatStateChanged' );
 			}
 		}
 	}
@@ -84,24 +100,56 @@ class StaminabarWidgetGameController extends inkHUDGameController
 			{
 				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.SceneTier, m_bbPSceneTierEventId );
 				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.Stamina, m_bbPStaminaPSMEventId );
+				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.Zones, m_bbAreaZoneEventId );
+				playerStateMachineBlackboard.UnregisterDelayedListener( playerSMDef.Combat, m_combatModeListener );
 			}
 		}
 	}
 
-	public function UpdateStaminaValue( oldValue : Float, newValue : Float, percToPoints : Float )
+	public function UpdateStaminaValue( oldValue : Float, newValue : Float, percToPoints : Float, statPoolType : gamedataStatPoolType )
 	{
-		m_currentStamina = newValue;
-		if( m_staminaState == gamePSMStamina.Exhausted )
+		m_currentBarValue = newValue / 100.0;
+		if( m_currentBarValue <= m_staminaRatioEnterCondition )
 		{
-			inkWidgetRef.SetOpacity( m_staminaControllerRef, 0.5 );
+			if( m_currentBarValue < 0.2 )
+			{
+				m_pulse.Configure( inkWidgetRef.Get( m_staminaControllerRef ), 1.0, 0.1, 0.2 );
+			}
+			else
+			{
+				m_pulse.Configure( inkWidgetRef.Get( m_staminaControllerRef ), 1.0, 0.1, m_currentBarValue );
+			}
+			m_pulse.Start( false );
+		}
+		else if( m_currentBarValue >= 0.85000002 )
+		{
+			m_pulse.Stop();
 		}
 		else
 		{
-			inkWidgetRef.SetOpacity( m_staminaControllerRef, 1.0 );
+			m_pulse.Stop();
 		}
-		m_staminaController.SetNameplateBarProgress( newValue / 100.0, false );
+		m_staminaController.SetNameplateBarProgress( m_currentBarValue, false );
 		inkTextRef.SetTextFromParts( m_staminaPercTextPath, IntToString( ( ( Int32 )( newValue ) ) ), "Common-Characters-Percetage", "" );
 		UpdateStaminaLevelWarningFluffTexts( m_staminaState );
+		EvaluateStaminaBarVisibility();
+	}
+
+	protected event OnFocusedCoolPerkActive( evt : FocusPerkTriggerd )
+	{
+		var playbackOptions : inkAnimOptions;
+		if( evt.isActive )
+		{
+			PlayLibraryAnimation( 'perk_intro' );
+			m_RootWidget.SetState( 'Focused' );
+			m_RootWidget.SetOpacity( 1.0 );
+		}
+		else
+		{
+			m_RootWidget.SetState( 'Default' );
+			playbackOptions.playReversed = true;
+			PlayLibraryAnimation( 'perk_intro', playbackOptions );
+		}
 	}
 
 	public function UpdateStaminaLevelWarningFluffTexts( staminaState : gamePSMStamina )
@@ -118,7 +166,6 @@ class StaminabarWidgetGameController extends inkHUDGameController
 
 	public function EvaluateStaminaBarVisibility()
 	{
-		var animFade : inkAnimDef;
 		switch( m_sceneTier )
 		{
 			case GameplayTier.Tier1_FullGameplay:
@@ -130,50 +177,47 @@ class StaminabarWidgetGameController extends inkHUDGameController
 		}
 		if( ShouldHide() )
 		{
-			animFade = m_animLongFade;
 			m_RootWidget.SetVisible( false );
-			if( m_RootWidget.IsVisible() && ( !( m_animHideStaminaProxy ) || !( m_animHideStaminaProxy.IsPlaying() ) ) )
-			{
-				m_animHideStaminaProxy = m_RootWidget.PlayAnimation( animFade );
-				m_animHideStaminaProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnStaminaHideAnimationFinished' );
-			}
 		}
 		else
 		{
-			if( m_animHideStaminaProxy && m_animHideStaminaProxy.IsPlaying() )
-			{
-				m_animHideStaminaProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnStaminaHideAnimationFinished' );
-				m_animHideStaminaProxy.Stop();
-			}
-			m_RootWidget.SetOpacity( 1.0 );
 			m_RootWidget.SetVisible( true );
 		}
+		m_RootWidget.SetOpacity( 1.04999995 - m_currentBarValue );
 	}
 
 	private function ShouldHide() : Bool
 	{
-		var isMaxStamina : Bool;
+		var isMaxBar : Bool;
 		var isMultiplayer : Bool;
-		isMaxStamina = m_currentStamina >= 100.0;
+		var isInCombat : Bool;
+		var isInHostileArea : Bool;
+		if( m_forceHidden )
+		{
+			return true;
+		}
+		isMaxBar = m_currentBarValue >= 1.0;
 		isMultiplayer = IsPlayingMultiplayer();
-		return ( isMaxStamina && !( isMultiplayer ) ) || ( m_sceneTier == GameplayTier.Tier4_FPPCinematic || m_sceneTier == GameplayTier.Tier5_Cinematic );
+		isInCombat = IsInCombat();
+		isInHostileArea = m_zoneState == gamePSMZones.Restricted || m_zoneState == gamePSMZones.Dangerous;
+		return ( ( ( !( isInHostileArea ) && !( isInCombat ) ) && isMaxBar ) && !( isMultiplayer ) ) || ( m_sceneTier == GameplayTier.Tier4_FPPCinematic || m_sceneTier == GameplayTier.Tier5_Cinematic );
 	}
 
-	protected event OnStaminaHideAnimationFinished( anim : inkAnimProxy )
+	private function IsInCombat() : Bool
 	{
-		m_RootWidget.SetVisible( false );
+		var player : PlayerPuppet;
+		player = ( ( PlayerPuppet )( GetOwnerEntity() ) );
+		return player.IsInCombat();
+	}
+
+	protected event OnCombatStateChanged( value : Int32 )
+	{
+		EvaluateStaminaBarVisibility();
 	}
 
 	private function CreateAnimations()
 	{
-		var fadeInterp : inkAnimTransparency;
-		m_animLongFade = new inkAnimDef;
-		fadeInterp = new inkAnimTransparency;
-		fadeInterp.SetStartDelay( 10.0 );
-		fadeInterp.SetStartTransparency( 1.0 );
-		fadeInterp.SetEndTransparency( 0.0 );
-		fadeInterp.SetDuration( 0.34999999 );
-		m_animLongFade.AddInterpolator( fadeInterp );
+		m_pulse = new PulseAnimation;
 	}
 
 	protected event OnSceneTierChange( argTier : Int32 )
@@ -187,6 +231,12 @@ class StaminabarWidgetGameController extends inkHUDGameController
 		m_staminaState = ( ( gamePSMStamina )( arg ) );
 	}
 
+	protected event OnZoneChange( arg : Int32 )
+	{
+		m_zoneState = ( ( gamePSMZones )( arg ) );
+		EvaluateStaminaBarVisibility();
+	}
+
 	protected event OnForceHide()
 	{
 		EvaluateStaminaBarVisibility();
@@ -195,6 +245,14 @@ class StaminabarWidgetGameController extends inkHUDGameController
 	protected event OnForceTierVisibility( tierVisibility : Bool )
 	{
 		EvaluateStaminaBarVisibility();
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		if( ListenerAction.GetName( action ) == 'HolsterWeapon' && ListenerAction.IsButtonJustPressed( action ) )
+		{
+			m_forceHidden = !( m_forceHidden );
+		}
 	}
 
 }
@@ -210,9 +268,13 @@ class StaminaPoolListener extends ScriptStatPoolsListener
 
 	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
 	{
-		m_staminaBar.UpdateStaminaValue( oldValue, newValue, percToPoints );
-		m_staminaBar.EvaluateStaminaBarVisibility();
+		m_staminaBar.UpdateStaminaValue( oldValue, newValue, percToPoints, gamedataStatPoolType.Stamina );
 	}
 
+}
+
+class FocusPerkTriggerd extends Event
+{
+	var isActive : Bool;
 }
 

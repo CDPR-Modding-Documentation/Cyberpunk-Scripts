@@ -1,16 +1,23 @@
-importonly class EquipRequest extends PlayerScriptableSystemRequest
+implicit cast ( hotkey : EHotkey ) : Int32
 {
-	import var itemID : ItemID;
-	import var slotIndex : Int32;
-	import var addToInventory : Bool;
-	import var equipToCurrentActiveSlot : Bool;
+	return ( ( Int32 )( hotkey ) );
 }
 
-class UnequipRequest extends PlayerScriptableSystemRequest
+import enum EHotkey
 {
-	var areaType : gamedataEquipmentArea;
-	var slotIndex : Int32;
-	default slotIndex = -1;
+	INVALID,
+	DPAD_UP,
+	DPAD_DOWN,
+	DPAD_RIGHT,
+	RB,
+	LBRB,
+}
+
+enum EHotkeyRequestType
+{
+	Assign = 0,
+	Cycle = 1,
+	Restore = 2,
 }
 
 class AssignHotkeyIfEmptySlot extends PlayerScriptableSystemRequest
@@ -162,7 +169,12 @@ class Hotkey
 		return false;
 	}
 
-	private function SetScope( itemTypes : array< gamedataItemType > )
+	public const function IsCompatible( equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		return hotkey == EHotkey.LBRB && equipmentArea == gamedataEquipmentArea.SystemReplacementCW;
+	}
+
+	public function SetScope( const itemTypes : ref< array< gamedataItemType > > )
 	{
 		scope = itemTypes;
 	}
@@ -174,6 +186,11 @@ class Hotkey
 		return scope.Contains( type );
 	}
 
+	public static function IsCompatible( hotkey : EHotkey, equipmentArea : gamedataEquipmentArea ) : Bool
+	{
+		return hotkey == EHotkey.LBRB && equipmentArea == gamedataEquipmentArea.SystemReplacementCW;
+	}
+
 	public static function GetScope( hotkey : EHotkey ) : array< gamedataItemType >
 	{
 		var scope : array< gamedataItemType >;
@@ -181,6 +198,7 @@ class Hotkey
 		{
 			scope.PushBack( gamedataItemType.Con_Inhaler );
 			scope.PushBack( gamedataItemType.Con_Injector );
+			scope.PushBack( gamedataItemType.Cyb_HealingAbility );
 		}
 		else if( hotkey == EHotkey.RB )
 		{
@@ -189,6 +207,11 @@ class Hotkey
 			scope.PushBack( gamedataItemType.Gad_Grenade );
 		}
 		return scope;
+	}
+
+	public static function ItemTypeMustBeEquipped( itemType : gamedataItemType ) : Bool
+	{
+		return ( itemType == gamedataItemType.Cyb_Ability || itemType == gamedataItemType.Cyb_HealingAbility ) || itemType == gamedataItemType.Cyb_Launcher;
 	}
 
 }
@@ -205,6 +228,19 @@ struct HotkeyManager
 		hotkeysCount = ( ( Int32 )( EnumGetMax( 'EHotkey' ) ) );
 		hotkeysCount += 1;
 		for( hotkeyIndex = 0; hotkeyIndex < hotkeysCount; hotkeyIndex += 1 )
+		{
+			freshHotkey = Hotkey.Construct( ( ( EHotkey )( hotkeyIndex ) ) );
+			hotkeys.PushBack( freshHotkey );
+		}
+	}
+
+	public static function AddMissingHotkeys( hotkeys : ref< array< Hotkey > > )
+	{
+		var hotkeysCount : Int32;
+		var freshHotkey : Hotkey;
+		var hotkeyIndex : Int32;
+		hotkeysCount = ( ( Int32 )( EnumGetMax( 'EHotkey' ) ) ) + 1;
+		for( hotkeyIndex = hotkeys.Size(); hotkeyIndex < hotkeysCount; hotkeyIndex += 1 )
 		{
 			freshHotkey = Hotkey.Construct( ( ( EHotkey )( hotkeyIndex ) ) );
 			hotkeys.PushBack( freshHotkey );
@@ -231,7 +267,7 @@ struct HotkeyManager
 		itemData = RPGManager.GetItemData( owner.GetGame(), owner, itemID );
 		for( i = 0; i < hotkeys.Size(); i += 1 )
 		{
-			if( hotkeys[ i ].IsCompatible( itemData.GetItemType() ) )
+			if( hotkeys[ i ].IsCompatible( itemData.GetItemType() ) || hotkeys[ i ].IsCompatible( EquipmentSystem.GetEquipAreaType( itemData.GetID() ) ) )
 			{
 				return hotkeys[ i ].GetHotkey();
 			}
@@ -282,11 +318,23 @@ class EquipmentSystemPlayerData
 
 	public function OnAttach()
 	{
+		var scope : array< gamedataItemType >;
 		if( ( ( PlayerPuppet )( m_owner ) ) )
 		{
 			if( m_hotkeys.Size() == 0 )
 			{
 				HotkeyManager.InitializeHotkeys( m_hotkeys );
+			}
+			else if( m_hotkeys.Size() < ( ( ( Int32 )( EnumGetMax( 'EHotkey' ) ) ) + 1 ) )
+			{
+				HotkeyManager.AddMissingHotkeys( m_hotkeys );
+			}
+			TryFillCyberwareHotkey();
+			scope = m_hotkeys[ 0 ].GetScope();
+			if( !( scope.Contains( gamedataItemType.Cyb_HealingAbility ) ) )
+			{
+				scope.PushBack( gamedataItemType.Cyb_HealingAbility );
+				m_hotkeys[ 0 ].SetScope( scope );
 			}
 			m_inventoryManager = new InventoryDataManagerV2;
 			m_inventoryManager.Initialize( ( ( PlayerPuppet )( m_owner ) ) );
@@ -309,12 +357,16 @@ class EquipmentSystemPlayerData
 	{
 		var i : Int32;
 		var j : Int32;
+		var areaSize : Int32;
+		var slotsSize : Int32;
 		var transactionSystem : TransactionSystem;
 		var currentItem : ItemID;
 		var itemRecord : Item_Record;
+		var itemData : gameItemData;
 		var playerControlledObject : GameObject;
 		var currentEquipmentArea : gamedataEquipmentArea;
 		var placementSlot : TweakDBID;
+		var currEquipSlot : SEquipSlot;
 		InitializeEquipmentAreaIndexCache();
 		playerControlledObject = GameInstance.GetPlayerSystem( m_owner.GetGame() ).GetLocalPlayerControlledGameObject();
 		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
@@ -323,12 +375,17 @@ class EquipmentSystemPlayerData
 			return;
 		}
 		m_wardrobeSystem = GameInstance.GetWardrobeSystem( m_owner.GetGame() );
-		for( i = 0; i < m_equipment.equipAreas.Size(); i += 1 )
+		UnequipFootwearAudio();
+		UnequipOutfitFootwearAudio();
+		UnequipAllFoleyAudio();
+		for( i = 0, areaSize = m_equipment.equipAreas.Size(); i < areaSize; i += 1 )
 		{
+			RestoreEquipSlotsData( m_equipment.equipAreas[ i ] );
 			currentEquipmentArea = m_equipment.equipAreas[ i ].areaType;
-			for( j = 0; j < m_equipment.equipAreas[ i ].equipSlots.Size(); j += 1 )
+			for( j = 0, slotsSize = m_equipment.equipAreas[ i ].equipSlots.Size(); j < slotsSize; j += 1 )
 			{
-				currentItem = m_equipment.equipAreas[ i ].equipSlots[ j ].itemID;
+				currEquipSlot = m_equipment.equipAreas[ i ].equipSlots[ j ];
+				currentItem = currEquipSlot.itemID;
 				if( ItemID.IsValid( currentItem ) )
 				{
 					itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( currentItem ) );
@@ -337,14 +394,30 @@ class EquipmentSystemPlayerData
 					{
 						continue;
 					}
-					ApplyEquipGLPs( currentItem );
+					if( itemRecord.EquipArea().Type() != gamedataEquipmentArea.Consumable )
+					{
+						ApplyEquipGLPs( currentItem );
+						ApplySlotGLPs( currEquipSlot.slotID );
+					}
 					if( itemRecord.EquipArea().Type() == gamedataEquipmentArea.SystemReplacementCW )
+					{
+						transactionSystem.AddItemToSlot( m_owner, placementSlot, currentItem );
+					}
+					if( itemRecord.EquipArea().Type() == gamedataEquipmentArea.PersonalLink )
 					{
 						transactionSystem.AddItemToSlot( m_owner, placementSlot, currentItem );
 					}
 					if( itemRecord.ItemCategory().Type() == gamedataItemCategory.Clothing )
 					{
 						AddItemToSlot( transactionSystem, placementSlot, currentItem, currentEquipmentArea );
+					}
+					else if( itemRecord.UsesVariants() )
+					{
+						itemData = RPGManager.GetItemData( m_owner.GetGame(), m_owner, currentItem );
+						if( itemData )
+						{
+							itemData.AddStatsOnEquip( m_owner );
+						}
 					}
 					if( m_owner == playerControlledObject )
 					{
@@ -364,6 +437,7 @@ class EquipmentSystemPlayerData
 			}
 		}
 		HotkeysOnRestore();
+		UpdateWeaponWheel();
 	}
 
 	public function HotkeysOnRestore()
@@ -378,6 +452,31 @@ class EquipmentSystemPlayerData
 			if( ItemID.IsValid( item ) )
 			{
 				transactionSystem.OnItemAddedToEquipmentSlot( m_owner, item );
+				if( RPGManager.GetItemCategory( item ) == gamedataItemCategory.Consumable )
+				{
+					ApplyEquipGLPs( item );
+				}
+			}
+		}
+	}
+
+	private function TryFillCyberwareHotkey()
+	{
+		var i : Int32;
+		var item : ItemID;
+		for( i = 0; i < m_hotkeys.Size(); i += 1 )
+		{
+			if( m_hotkeys[ i ].GetHotkey() != EHotkey.LBRB )
+			{
+				continue;
+			}
+			if( !( ItemID.IsValid( m_hotkeys[ i ].GetItemID() ) ) )
+			{
+				item = GetActiveItem( gamedataEquipmentArea.SystemReplacementCW );
+				if( ItemID.IsValid( item ) )
+				{
+					AssignItemToHotkey( item, EHotkey.LBRB );
+				}
 			}
 		}
 	}
@@ -419,31 +518,93 @@ class EquipmentSystemPlayerData
 		return m_slotActiveItemsInHands;
 	}
 
+	private function GetPlayerEquipmentAreas( out list : array< weak< EquipmentArea_Record > > )
+	{
+		return TweakDBInterface.GetCharacterRecord( m_owner.GetRecordID() ).EquipmentAreas( list );
+	}
+
+	private function GetEquipAreaRecordByType( areaType : gamedataEquipmentArea ) : EquipmentArea_Record
+	{
+		var list : array< weak< EquipmentArea_Record > >;
+		var i, size : Int32;
+		var retVal : EquipmentArea_Record;
+		GetPlayerEquipmentAreas( list );
+		for( i = 0, size = list.Size(); i < size; i += 1 )
+		{
+			retVal = list[ i ];
+			if( retVal.Type() == areaType )
+			{
+				return retVal;
+			}
+		}
+		return NULL;
+	}
+
 	private function InitializeEquipment()
 	{
-		var ownerRecord : Character_Record;
 		var equipAreas : array< weak< EquipmentArea_Record > >;
-		var i : Int32;
-		ownerRecord = TweakDBInterface.GetCharacterRecord( m_owner.GetRecordID() );
-		ownerRecord.EquipmentAreas( equipAreas );
-		for( i = 0; i < equipAreas.Size(); i += 1 )
+		var equipArea : SEquipArea;
+		var i, size : Int32;
+		var equipAreaRecord : EquipmentArea_Record;
+		GetPlayerEquipmentAreas( equipAreas );
+		for( i = 0, size = equipAreas.Size(); i < size; i += 1 )
 		{
-			InitializeEquipmentArea( equipAreas[ i ] );
+			equipArea = SEquipArea();
+			equipAreaRecord = equipAreas[ i ];
+			equipArea.areaType = equipAreaRecord.Type();
+			equipArea.activeIndex = 0;
+			InitializeEquipmentArea( equipAreaRecord, equipArea );
+			m_equipment.equipAreas.PushBack( equipArea );
 		}
 	}
 
-	private function InitializeEquipmentArea( equipAreaRecord : EquipmentArea_Record )
+	private function InitializeEquipmentArea( equipAreaRecord : EquipmentArea_Record, out equipArea : SEquipArea )
 	{
-		var equipArea : SEquipArea;
+		var equipSlotRecords : array< weak< EquipSlot_Record > >;
+		equipAreaRecord.EquipSlots( equipSlotRecords );
+		InitializeEquipSlotsFromRecords( equipSlotRecords, equipArea.equipSlots );
+	}
+
+	private function InitializeEquipSlotsFromRecords( slotRecords : array< weak< EquipSlot_Record > >, out equipSlots : array< SEquipSlot > )
+	{
 		var equipSlot : SEquipSlot;
-		var i : Int32;
-		equipArea.areaType = equipAreaRecord.Type();
-		equipArea.activeIndex = 0;
-		for( i = 0; i < equipAreaRecord.NumberOfEquipSlots(); i += 1 )
+		var i, size : Int32;
+		for( i = 0, size = slotRecords.Size(); i < size; i += 1 )
 		{
-			equipArea.equipSlots.PushBack( equipSlot );
+			equipSlot = SEquipSlot();
+			InitializeEquipSlotFromRecord( slotRecords[ i ], equipSlot );
+			if( equipSlots.Size() > i )
+			{
+				if( equipSlot.unlockPrereq.IsFulfilled( m_owner.GetGame(), m_owner ) )
+				{
+					equipSlot.itemID = equipSlots[ i ].itemID;
+				}
+				equipSlots[ i ] = equipSlot;
+			}
+			else
+			{
+				equipSlots.PushBack( equipSlot );
+			}
 		}
-		m_equipment.equipAreas.PushBack( equipArea );
+	}
+
+	private function InitializeEquipSlotFromRecord( slotRecord : EquipSlot_Record, out equipSlot : SEquipSlot )
+	{
+		var equipPrereqID : TweakDBID;
+		equipPrereqID = slotRecord.UnlockPrereqRecord().GetID();
+		if( TDBID.IsValid( equipPrereqID ) )
+		{
+			equipSlot.unlockPrereq = IPrereq.CreatePrereq( equipPrereqID );
+		}
+		equipSlot.visibleWhenLocked = slotRecord.VisibleWhenLocked();
+		equipSlot.slotID = slotRecord.GetID();
+	}
+
+	private function RestoreEquipSlotsData( out equipArea : SEquipArea )
+	{
+		var areaRecord : weak< EquipmentArea_Record >;
+		areaRecord = GetEquipAreaRecordByType( equipArea.areaType );
+		InitializeEquipmentArea( areaRecord, equipArea );
 	}
 
 	private function InitializeEquipmentAreaIndexCache()
@@ -496,7 +657,7 @@ class EquipmentSystemPlayerData
 		return m_clothingVisualsInfo.Size() == 0;
 	}
 
-	private function CreateSlotInfo( area : gamedataEquipmentArea, slot : String, visualTag : CName ) : SSlotInfo
+	private function CreateSlotInfo( area : gamedataEquipmentArea, const slot : ref< String >, visualTag : CName ) : SSlotInfo
 	{
 		var slotInfo : SSlotInfo;
 		slotInfo.areaType = area;
@@ -524,6 +685,7 @@ class EquipmentSystemPlayerData
 		var equipAtIndex : Int32;
 		var equipArea : SEquipArea;
 		var equipAreaType : gamedataEquipmentArea;
+		var equipSlot : SEquipSlot;
 		if( ItemID.IsValid( itemID ) && !( IsEquipped( itemID ) ) )
 		{
 			equipAreaType = EquipmentSystem.GetEquipAreaType( itemID );
@@ -531,7 +693,8 @@ class EquipmentSystemPlayerData
 			equipArea = m_equipment.equipAreas[ equipAreaIndex ];
 			for( i = 0; i < equipArea.equipSlots.Size(); i += 1 )
 			{
-				if( !( ItemID.IsValid( equipArea.equipSlots[ i ].itemID ) ) )
+				equipSlot = equipArea.equipSlots[ i ];
+				if( !( IsSlotLocked( equipSlot, false ) ) && !( ItemID.IsValid( equipSlot.itemID ) ) )
 				{
 					EquipItem( itemID, i, blockActiveSlotsUpdate, forceEquipWeapon );
 					return;
@@ -558,23 +721,27 @@ class EquipmentSystemPlayerData
 		var transactionSystem : TransactionSystem;
 		var placementSlot : TweakDBID;
 		var weaponRecord : WeaponItem_Record;
-		var itemData : weak< gameItemData >;
+		var itemData : gameItemData;
 		var cyberwareType : CName;
 		var currentItem : ItemID;
-		var currentItemData : weak< gameItemData >;
+		var currentItemData : gameItemData;
+		var itemRecord : Item_Record;
+		var equipSlot : SEquipSlot;
 		itemData = RPGManager.GetItemData( m_owner.GetGame(), m_owner, itemID );
 		if( !( IsEquippable( itemData ) ) )
 		{
 			return;
 		}
-		if( RPGManager.GetItemRecord( itemID ).ItemType().Type() == gamedataItemType.Cyb_StrongArms )
+		itemRecord = RPGManager.GetItemRecord( itemID );
+		if( itemRecord.ItemType().Type() == gamedataItemType.Cyb_StrongArms )
 		{
 			HandleStrongArmsEquip( itemID );
 		}
 		equipmentArea = EquipmentSystem.GetEquipAreaType( itemID );
 		equipAreaIndex = GetEquipAreaIndex( equipmentArea );
 		equipArea = m_equipment.equipAreas[ equipAreaIndex ];
-		currentItem = m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].itemID;
+		equipSlot = equipArea.equipSlots[ slotIndex ];
+		currentItem = equipSlot.itemID;
 		currentItemData = RPGManager.GetItemData( m_owner.GetGame(), m_owner, currentItem );
 		if( currentItemData && currentItemData.HasTag( 'UnequipBlocked' ) )
 		{
@@ -584,14 +751,15 @@ class EquipmentSystemPlayerData
 		{
 			UnequipWardrobeSet();
 		}
+		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
 		m_equipPending = true;
-		if( ( ( IsItemOfCategory( itemID, gamedataItemCategory.Weapon ) && ( equipArea.activeIndex == slotIndex ) ) && CheckWeaponAgainstGameplayRestrictions( itemID ) ) && !( blockActiveSlotsUpdate ) )
+		if( ( ( IsItemOfCategory( itemID, gamedataItemCategory.Weapon ) && ( equipArea.activeIndex == slotIndex ) ) && CheckWeaponAgainstGameplayRestrictions( itemID, true ) ) && !( blockActiveSlotsUpdate ) )
 		{
 			SetSlotActiveItem( EquipmentManipulationRequestSlot.Right, itemID );
 			SetLastUsedItem( itemID );
 			SendPSMWeaponManipulationRequest( EquipmentManipulationRequestType.Equip, EquipmentManipulationRequestSlot.Right, gameEquipAnimationType.Default );
 		}
-		else if( ( IsItemOfCategory( itemID, gamedataItemCategory.Weapon ) && forceEquipWeapon ) && CheckWeaponAgainstGameplayRestrictions( itemID ) )
+		else if( ( IsItemOfCategory( itemID, gamedataItemCategory.Weapon ) && forceEquipWeapon ) && CheckWeaponAgainstGameplayRestrictions( itemID, true ) )
 		{
 			m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].itemID = itemID;
 			SetSlotActiveItem( EquipmentManipulationRequestSlot.Right, itemID );
@@ -616,9 +784,8 @@ class EquipmentSystemPlayerData
 		}
 		m_equipPending = false;
 		m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].itemID = itemID;
-		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
 		placementSlot = GetPlacementSlot( equipAreaIndex, slotIndex );
-		if( ( placementSlot == T"AttachmentSlots.WeaponRight" ) || ( placementSlot == T"AttachmentSlots.WeaponLeft" ) )
+		if( itemRecord.ItemType().Type() != gamedataItemType.Cyb_MantisBlades && ( ( placementSlot == T"AttachmentSlots.WeaponRight" ) || ( placementSlot == T"AttachmentSlots.WeaponLeft" ) ) )
 		{
 			weaponRecord = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( itemID ) );
 			if( weaponRecord && weaponRecord.HolsteredItem() )
@@ -635,6 +802,7 @@ class EquipmentSystemPlayerData
 			}
 		}
 		ApplyEquipGLPs( itemID );
+		ApplySlotGLPs( equipSlot.slotID );
 		if( itemData.UsesVariants() )
 		{
 			itemData.AddStatsOnEquip( m_owner );
@@ -645,7 +813,7 @@ class EquipmentSystemPlayerData
 		SendPaperdollUpdate( m_equipment.equipAreas[ equipAreaIndex ], true, placementSlot, slotIndex, true );
 		for( i = 0; i < m_hotkeys.Size(); i += 1 )
 		{
-			if( m_hotkeys[ i ].IsCompatible( itemData.GetItemType() ) )
+			if( m_hotkeys[ i ].IsCompatible( itemData.GetItemType() ) || m_hotkeys[ i ].IsCompatible( EquipmentSystem.GetEquipAreaType( itemData.GetID() ) ) )
 			{
 				AssignItemToHotkey( itemData.GetID(), m_hotkeys[ i ].GetHotkey() );
 			}
@@ -709,7 +877,7 @@ class EquipmentSystemPlayerData
 		return transactionSystem.AddItemToSlot( m_owner, GetPlacementSlotByAreaType( area ), previewItem );
 	}
 
-	private function SendPaperdollUpdate( area : SEquipArea, equipped : Bool, slot : TweakDBID, optional slotindex : Int32, optional ignoreSlot : Bool, optional force : Bool )
+	private function SendPaperdollUpdate( const area : ref< SEquipArea >, equipped : Bool, slot : TweakDBID, optional slotindex : Int32, optional ignoreSlot : Bool, optional force : Bool )
 	{
 		var paperdollEquipData : SPaperdollEquipData;
 		paperdollEquipData.equipArea = area;
@@ -724,35 +892,67 @@ class EquipmentSystemPlayerData
 
 	private function SendEquipAudioEvents( itemID : ItemID )
 	{
-		var audioEventFootwear : AudioEvent;
 		var audioEventFoley : AudioEvent;
+		var audioSystem : AudioSystem;
 		audioEventFoley = new AudioEvent;
 		audioEventFoley.eventName = 'equipItem';
 		audioEventFoley.nameData = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ).AppearanceName();
 		m_owner.QueueEvent( audioEventFoley );
 		if( RPGManager.GetItemType( itemID ) == gamedataItemType.Clo_Feet )
 		{
-			audioEventFootwear = new AudioEvent;
-			audioEventFootwear.eventName = 'equipFootwear';
-			audioEventFootwear.nameData = RPGManager.GetItemRecord( itemID ).MovementSound().AudioMovementName();
-			m_owner.QueueEvent( audioEventFootwear );
+			audioSystem = GameInstance.GetAudioSystem( m_owner.GetGame() );
+			audioSystem.EquipNewFootwearByPlayer( itemID );
 		}
+		if( RPGManager.GetItemType( itemID ) == gamedataItemType.Clo_Outfit )
+		{
+			audioSystem = GameInstance.GetAudioSystem( m_owner.GetGame() );
+			audioSystem.EquipNewOutfitByPlayer( itemID );
+		}
+	}
+
+	private function UnequipFootwearAudio()
+	{
+		var unequipFootwearEvent : AudioEvent;
+		unequipFootwearEvent = new AudioEvent;
+		unequipFootwearEvent.eventName = 'equipFootwear';
+		unequipFootwearEvent.nameData = 'None';
+		m_owner.QueueEvent( unequipFootwearEvent );
+	}
+
+	private function UnequipOutfitFootwearAudio()
+	{
+		var unequipFootwearEvent : AudioEvent;
+		unequipFootwearEvent = new AudioEvent;
+		unequipFootwearEvent.eventName = 'equipOutfitFootwear';
+		unequipFootwearEvent.nameData = 'None';
+		m_owner.QueueEvent( unequipFootwearEvent );
+	}
+
+	private function UnequipAllFoleyAudio()
+	{
+		var unequipAllFoleyEvent : AudioEvent;
+		unequipAllFoleyEvent = new AudioEvent;
+		unequipAllFoleyEvent.eventName = 'unequipAll';
+		unequipAllFoleyEvent.nameData = 'None';
+		m_owner.QueueEvent( unequipAllFoleyEvent );
 	}
 
 	private function SendUnequipAudioEvents( itemID : ItemID )
 	{
-		var audioEventFootwear : AudioEvent;
 		var audioEventFoley : AudioEvent;
+		var audioSystem : AudioSystem;
 		audioEventFoley = new AudioEvent;
 		audioEventFoley.eventName = 'unequipItem';
 		audioEventFoley.nameData = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) ).AppearanceName();
 		m_owner.QueueEvent( audioEventFoley );
 		if( RPGManager.GetItemType( itemID ) == gamedataItemType.Clo_Feet )
 		{
-			audioEventFootwear = new AudioEvent;
-			audioEventFootwear.eventName = 'equipFootwear';
-			audioEventFootwear.nameData = 'None';
-			m_owner.QueueEvent( audioEventFootwear );
+			UnequipFootwearAudio();
+		}
+		if( RPGManager.GetItemType( itemID ) == gamedataItemType.Clo_Outfit )
+		{
+			audioSystem = GameInstance.GetAudioSystem( m_owner.GetGame() );
+			audioSystem.UnequipOutfitByPlayer( itemID );
 		}
 	}
 
@@ -1235,20 +1435,30 @@ class EquipmentSystemPlayerData
 	{
 		var item : ItemID;
 		var ts : TransactionSystem;
+		var underwearHidden : Bool;
 		item = GetActiveItem( gamedataEquipmentArea.UnderwearTop );
+		underwearHidden = true;
 		if( IsBuildCensored() )
 		{
 			if( ItemID.IsValid( item ) )
 			{
 				return IsSlotHidden( gamedataEquipmentArea.UnderwearTop );
 			}
+			if( IsVisualSetActive() && !( IsVisualSetUnequipInTransition() ) )
+			{
+				underwearHidden = !( ShouldUnderwearTopBeVisibleInSet() );
+			}
+			else if( !( ItemID.IsValid( GetVisualItemInSlot( gamedataEquipmentArea.InnerChest ) ) ) && !( IsVisualTagActive( 'hide_T1' ) ) )
+			{
+				underwearHidden = false;
+			}
 			else
 			{
-				if( ShouldUnderwearTopBeVisible( ItemID.None() ) )
-				{
-					UnderwearTopEquipFailsafe();
-				}
+				underwearHidden = true;
 			}
+			UnderwearTopEquipFailsafe();
+			m_clothingVisualsInfo[ GetVisualSlotIndex( gamedataEquipmentArea.UnderwearTop ) ].isHidden = underwearHidden;
+			return underwearHidden;
 		}
 		else
 		{
@@ -1796,17 +2006,17 @@ class EquipmentSystemPlayerData
 		{
 			return false;
 		}
-		statsSys = GameInstance.GetStatsSystem( m_owner.GetGame() );
-		ownerLevel = statsSys.GetStatValue( m_owner.GetEntityID(), gamedataStatType.Level );
-		itemLevel = ( ( Float )( FloorF( itemData.GetStatValueByType( gamedataStatType.Level ) ) ) );
-		if( !( CheckEquipPrereqs( itemData.GetID(), itemData.GetVariant() ) ) )
-		{
-			return false;
-		}
 		if( RPGManager.IsItemBroken( itemData ) )
 		{
 			return false;
 		}
+		if( !( CheckEquipPrereqs( itemData.GetID(), itemData.GetVariant() ) ) )
+		{
+			return false;
+		}
+		statsSys = GameInstance.GetStatsSystem( m_owner.GetGame() );
+		ownerLevel = statsSys.GetStatValue( m_owner.GetEntityID(), gamedataStatType.Level );
+		itemLevel = ( ( Float )( FloorF( itemData.GetStatValueByType( gamedataStatType.Level ) ) ) );
 		return ownerLevel >= itemLevel;
 	}
 
@@ -1862,17 +2072,30 @@ class EquipmentSystemPlayerData
 		var i : Int32;
 		hotkey = GetHotkeyTypeFromItemID( currentItem );
 		currentItemType = RPGManager.GetItemType( currentItem );
-		if( currentItemType == gamedataItemType.Cyb_Launcher )
+		if( currentItemType == gamedataItemType.Cyb_Launcher || currentItemType == gamedataItemType.Cyb_Ability )
 		{
-			currentItemType = gamedataItemType.Gad_Grenade;
+			m_inventoryManager.GetPlayerItemsIDsByType( gamedataItemType.Gad_Grenade, sameTypeItems );
 		}
-		m_inventoryManager.GetPlayerItemsIDsByType( currentItemType, sameTypeItems );
+		else if( currentItemType == gamedataItemType.Cyb_HealingAbility )
+		{
+			m_inventoryManager.GetPlayerItemsIDsByType( gamedataItemType.Con_Inhaler, sameTypeItems );
+			m_inventoryManager.GetPlayerItemsIDsByType( gamedataItemType.Con_Injector, sameTypeItems );
+		}
+		else
+		{
+			m_inventoryManager.GetPlayerItemsIDsByType( currentItemType, sameTypeItems );
+		}
 		if( sameTypeItems.Size() > 0 )
 		{
 			for( i = 0; i < sameTypeItems.Size(); i += 1 )
 			{
 				if( sameTypeItems[ i ] == currentItem )
 				{
+					if( sameTypeItems.Size() == 1 )
+					{
+						ClearItemFromHotkey( hotkey );
+						return false;
+					}
 					newHotkeyItem = GetNextItemInList( sameTypeItems, i );
 					if( ItemID.IsValid( newHotkeyItem ) )
 					{
@@ -1935,15 +2158,25 @@ class EquipmentSystemPlayerData
 
 	public function AssignItemToHotkey( newID : ItemID, hotkey : EHotkey )
 	{
+		var oldID : ItemID;
 		var transactionSystem : TransactionSystem;
+		oldID = m_hotkeys[ ( ( Int32 )( hotkey ) ) ].GetItemID();
 		if( hotkey != EHotkey.INVALID )
 		{
-			if( newID != m_hotkeys[ ( ( Int32 )( hotkey ) ) ].GetItemID() )
+			if( newID != oldID )
 			{
 				transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
-				transactionSystem.OnItemRemovedFromEquipmentSlot( m_owner, m_hotkeys[ ( ( Int32 )( hotkey ) ) ].GetItemID() );
+				transactionSystem.OnItemRemovedFromEquipmentSlot( m_owner, oldID );
 				transactionSystem.OnItemAddedToEquipmentSlot( m_owner, newID );
+				if( RPGManager.GetItemCategory( oldID ) == gamedataItemCategory.Consumable )
+				{
+					RemoveEquipGLPs( oldID );
+				}
 				m_hotkeys[ ( ( Int32 )( hotkey ) ) ].StoreItem( newID );
+				if( RPGManager.GetItemCategory( newID ) == gamedataItemCategory.Consumable )
+				{
+					ApplyEquipGLPs( newID );
+				}
 				SyncHotkeyData( hotkey );
 			}
 		}
@@ -1951,8 +2184,14 @@ class EquipmentSystemPlayerData
 
 	public function ClearItemFromHotkey( hotkey : EHotkey )
 	{
+		var oldID : ItemID;
+		oldID = m_hotkeys[ ( ( Int32 )( hotkey ) ) ].GetItemID();
 		if( hotkey != EHotkey.INVALID )
 		{
+			if( RPGManager.GetItemCategory( oldID ) == gamedataItemCategory.Consumable )
+			{
+				RemoveEquipGLPs( oldID );
+			}
 			m_hotkeys[ ( ( Int32 )( hotkey ) ) ].StoreItem( ItemID.None() );
 			SyncHotkeyData( hotkey );
 		}
@@ -1976,7 +2215,7 @@ class EquipmentSystemPlayerData
 		type = RPGManager.GetItemType( itemID );
 		for( i = 0; i < m_hotkeys.Size(); i += 1 )
 		{
-			if( m_hotkeys[ i ].IsEmpty() && m_hotkeys[ i ].IsCompatible( type ) )
+			if( m_hotkeys[ i ].IsEmpty() && ( m_hotkeys[ i ].IsCompatible( type ) || m_hotkeys[ i ].IsCompatible( EquipmentSystem.GetEquipAreaType( itemID ) ) ) )
 			{
 				hotkey = m_hotkeys[ i ].GetHotkey();
 				return true;
@@ -1986,7 +2225,7 @@ class EquipmentSystemPlayerData
 		return false;
 	}
 
-	private function GetNextItemInList( arr : array< ItemID >, fromIndex : Int32 ) : ItemID
+	private function GetNextItemInList( const arr : ref< array< ItemID > >, fromIndex : Int32 ) : ItemID
 	{
 		if( ( fromIndex > ( arr.Size() - 1 ) ) || ( fromIndex < 0 ) )
 		{
@@ -2005,7 +2244,6 @@ class EquipmentSystemPlayerData
 	private function UnequipItem( itemID : ItemID )
 	{
 		var equipAreaIndex : Int32;
-		Log( " UnequipItem " + TDBID.ToStringDEBUG( ItemID.GetTDBID( itemID ) ) );
 		if( IsEquipped( itemID ) )
 		{
 			equipAreaIndex = GetEquipAreaIndex( EquipmentSystem.GetEquipAreaType( itemID ) );
@@ -2013,7 +2251,7 @@ class EquipmentSystemPlayerData
 		}
 	}
 
-	private function UnequipItem( equipAreaIndex : Int32, optional slotIndex : Int32 )
+	private function UnequipItem( equipAreaIndex : Int32, slotIndex : Int32, optional forceRemove : Bool )
 	{
 		var currentItem : ItemID;
 		var transactionSystem : TransactionSystem;
@@ -2021,26 +2259,41 @@ class EquipmentSystemPlayerData
 		var unequipNotifyEvent : AudioNotifyItemUnequippedEvent;
 		var equipArea : SEquipArea;
 		var currentItemRecord : Item_Record;
-		var itemData : gameItemData;
+		var itemData : weak< gameItemData >;
 		var visualItemID : ItemID;
-		Log( ( ( " UnequipItem " + IntToString( equipAreaIndex ) ) + " " ) + IntToString( slotIndex ) );
 		currentItem = m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].itemID;
 		equipArea = GetEquipAreaFromItemID( currentItem );
 		currentItemRecord = RPGManager.GetItemRecord( currentItem );
 		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
 		itemData = RPGManager.GetItemData( m_owner.GetGame(), m_owner, currentItem );
-		if( itemData && itemData.HasTag( 'UnequipBlocked' ) )
+		if( ( !( forceRemove ) && itemData ) && itemData.HasTag( 'UnequipBlocked' ) )
 		{
 			return;
 		}
+		if( equipArea.areaType == gamedataEquipmentArea.SystemReplacementCW )
+		{
+			AssignItemToHotkey( ItemID.None(), EHotkey.LBRB );
+		}
+		if( RPGManager.GetItemType( currentItem ) == gamedataItemType.Cyb_Ability )
+		{
+			AssignNextValidItemToHotkey( GetItemIDFromHotkey( EHotkey.RB ) );
+		}
+		else if( RPGManager.GetItemType( currentItem ) == gamedataItemType.Cyb_HealingAbility )
+		{
+			AssignNextValidItemToHotkey( GetItemIDFromHotkey( EHotkey.DPAD_UP ) );
+		}
 		if( IsItemOfCategory( currentItem, gamedataItemCategory.Weapon ) && ( equipArea.activeIndex == slotIndex ) )
 		{
-			if( currentItem != GetActiveHeavyWeapon() )
+			if( ( currentItem != GetActiveHeavyWeapon() ) && ( currentItem == GetSlotActiveItem( GetRequestSlotFromItemID( currentItem ) ) ) )
 			{
 				CreateUnequipWeaponManipulationRequest();
 			}
 			placementSlot = GetPlacementSlot( equipAreaIndex, slotIndex );
 			m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].itemID = ItemID.None();
+			if( ( PlayerDevelopmentSystem.GetData( m_owner ).IsNewPerkBought( gamedataNewPerkType.Espionage_Central_Milestone_1 ) > 0 ) && RPGManager.GetItemType( currentItem ) == gamedataItemType.Cyb_NanoWires )
+			{
+				UnequipCyberwareParts( itemData );
+			}
 		}
 		else if( ( IsItemOfCategory( currentItem, gamedataItemCategory.Gadget ) || RPGManager.GetItemType( currentItem ) == gamedataItemType.Cyb_Launcher ) && ( equipArea.activeIndex == slotIndex ) )
 		{
@@ -2072,21 +2325,22 @@ class EquipmentSystemPlayerData
 					transactionSystem.AddItemToSlot( m_owner, placementSlot, transactionSystem.CreatePreviewItemID( visualItemID ), true );
 				}
 			}
+			RemoveSlotGLPs( m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].slotID );
 			m_equipment.equipAreas[ equipAreaIndex ].equipSlots[ slotIndex ].itemID = ItemID.None();
 			RemoveEquipGLPs( currentItem );
-			if( itemData.UsesVariants() )
-			{
-				itemData.SubtractStatsOnUnequip( m_owner );
-			}
 			SendUnequipAudioEvents( currentItem );
 			if( IsItemOfCategory( currentItem, gamedataItemCategory.Cyberware ) && IsItemConstructed( currentItem ) )
 			{
-				ManageCyberwareFragments( currentItem );
+				UnequipCyberwareParts( itemData );
 			}
 		}
 		if( ItemID.IsValid( currentItem ) && RPGManager.GetItemRecord( currentItem ).ItemType().Type() == gamedataItemType.Cyb_StrongArms )
 		{
 			HandleStrongArmsUnequip();
+		}
+		if( itemData.UsesVariants() )
+		{
+			itemData.SubtractStatsOnUnequip( m_owner );
 		}
 		UpdateWeaponWheel();
 		UpdateQuickWheel();
@@ -2118,16 +2372,28 @@ class EquipmentSystemPlayerData
 		GameInstance.GetTransactionSystem( m_owner.GetGame() ).RemoveItem( m_owner, GetBaseFistsItemID(), 1 );
 	}
 
-	private function ManageCyberwareFragments( itemID : ItemID )
+	private function UnequipCyberwareParts( cyberwareData : weak< gameItemData > )
 	{
 		var i : Int32;
 		var transactionSystem : TransactionSystem;
 		var usedSlots : array< TweakDBID >;
+		var partData : InnerItemData;
+		var staticData : weak< Item_Record >;
 		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
-		transactionSystem.GetUsedSlotsOnItem( m_owner, itemID, usedSlots );
+		transactionSystem.GetUsedSlotsOnItem( m_owner, cyberwareData.GetID(), usedSlots );
 		for( i = 0; i < usedSlots.Size(); i += 1 )
 		{
-			transactionSystem.RemovePart( m_owner, itemID, usedSlots[ i ] );
+			if( usedSlots[ i ] == T"AttachmentSlots.StatsShardSlot" )
+			{
+				continue;
+			}
+			cyberwareData.GetItemPart( partData, usedSlots[ i ] );
+			staticData = InnerItemData.GetStaticData( partData );
+			if( staticData && staticData.TagsContains( 'DummyPart' ) )
+			{
+				continue;
+			}
+			transactionSystem.RemovePart( m_owner, cyberwareData.GetID(), usedSlots[ i ] );
 		}
 	}
 
@@ -2156,16 +2422,16 @@ class EquipmentSystemPlayerData
 
 	private function ApplyEquipGLPs( itemID : ItemID )
 	{
+		var gameplayLogicPackageSystem : GameplayLogicPackageSystem;
 		var itemRecord : Item_Record;
 		var packages : array< weak< GameplayLogicPackage_Record > >;
+		var itemData : gameItemData;
+		var itemParts : array< InnerItemData >;
 		var i : Int32;
 		var j : Int32;
-		var itemData : weak< gameItemData >;
-		var itemParts : array< InnerItemData >;
-		var gameplayLogicPackageSystem : GameplayLogicPackageSystem;
-		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
-		itemRecord.OnEquip( packages );
 		gameplayLogicPackageSystem = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		packages = GetItemGLPs( ItemID.GetTDBID( itemID ) );
 		itemData = GameInstance.GetTransactionSystem( m_owner.GetGame() ).GetItemData( m_owner, itemID );
 		for( i = 0; i < packages.Size(); i += 1 )
 		{
@@ -2187,21 +2453,22 @@ class EquipmentSystemPlayerData
 
 	private function RemoveEquipGLPs( itemID : ItemID )
 	{
+		var gameplayLogicPackageSystem : GameplayLogicPackageSystem;
 		var itemRecord : Item_Record;
 		var packages : array< weak< GameplayLogicPackage_Record > >;
+		var itemData : gameItemData;
+		var itemParts : array< InnerItemData >;
 		var i : Int32;
 		var j : Int32;
-		var itemData : weak< gameItemData >;
-		var itemParts : array< InnerItemData >;
-		var gameplayLogicPackageSystem : GameplayLogicPackageSystem;
-		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
-		itemRecord.OnEquip( packages );
 		gameplayLogicPackageSystem = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		packages = GetItemGLPs( ItemID.GetTDBID( itemID ) );
+		itemData = GameInstance.GetTransactionSystem( m_owner.GetGame() ).GetItemData( m_owner, itemID );
 		for( i = 0; i < packages.Size(); i += 1 )
 		{
 			gameplayLogicPackageSystem.RemovePackage( m_owner, packages[ i ].GetID() );
 		}
-		itemData = GameInstance.GetTransactionSystem( m_owner.GetGame() ).GetItemData( m_owner, itemID );
+		packages.Clear();
 		if( itemData )
 		{
 			itemData.GetItemParts( itemParts );
@@ -2219,6 +2486,50 @@ class EquipmentSystemPlayerData
 				gameplayLogicPackageSystem.RemovePackage( m_owner, packages[ j ].GetID() );
 			}
 		}
+	}
+
+	private function ApplySlotGLPs( equipSlotID : TweakDBID )
+	{
+		var gameplayLogicPackageSystem : GameplayLogicPackageSystem;
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		var i : Int32;
+		gameplayLogicPackageSystem = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		packages = GetSlotGLPs( equipSlotID );
+		for( i = 0; i < packages.Size(); i += 1 )
+		{
+			gameplayLogicPackageSystem.ApplyPackage( m_owner, m_owner, packages[ i ].GetID() );
+		}
+	}
+
+	private function RemoveSlotGLPs( equipSlotID : TweakDBID )
+	{
+		var gameplayLogicPackageSystem : GameplayLogicPackageSystem;
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		var i : Int32;
+		gameplayLogicPackageSystem = GameInstance.GetGameplayLogicPackageSystem( m_owner.GetGame() );
+		packages = GetSlotGLPs( equipSlotID );
+		for( i = 0; i < packages.Size(); i += 1 )
+		{
+			gameplayLogicPackageSystem.RemovePackage( m_owner, packages[ i ].GetID() );
+		}
+	}
+
+	private function GetSlotGLPs( equipSlotID : TweakDBID ) : array< weak< GameplayLogicPackage_Record > >
+	{
+		var slotRecord : EquipSlot_Record;
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		slotRecord = TweakDBInterface.GetEquipSlotRecord( equipSlotID );
+		slotRecord.OnInsertion( packages );
+		return packages;
+	}
+
+	private function GetItemGLPs( itemID : TweakDBID ) : array< weak< GameplayLogicPackage_Record > >
+	{
+		var itemRecord : Item_Record;
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		itemRecord = TweakDBInterface.GetItemRecord( itemID );
+		itemRecord.OnEquip( packages );
+		return packages;
 	}
 
 	public function GetLastUsedItemID( lastUsedWeaponType : ELastUsed ) : ItemID
@@ -2325,11 +2636,11 @@ class EquipmentSystemPlayerData
 	{
 		var slotsStruct : SSlotActiveItems;
 		slotsStruct = GetSlotActiveItemStruct();
-		if( ItemID.GetTDBID( slotsStruct.rightHandItem ) == ItemID.GetTDBID( item ) )
+		if( slotsStruct.rightHandItem == item )
 		{
 			m_slotActiveItemsInHands.rightHandItem = ItemID.None();
 		}
-		if( ItemID.GetTDBID( slotsStruct.leftHandItem ) == ItemID.GetTDBID( item ) )
+		if( slotsStruct.leftHandItem == item )
 		{
 			m_slotActiveItemsInHands.leftHandItem = ItemID.None();
 		}
@@ -2471,7 +2782,7 @@ class EquipmentSystemPlayerData
 		}
 	}
 
-	private function SaveEquipmentSet( setName : String, setType : EEquipmentSetType )
+	private function SaveEquipmentSet( const setName : ref< String >, setType : EEquipmentSetType )
 	{
 		var equipmentSet : SEquipmentSet;
 		var areasToSave : array< gamedataEquipmentArea >;
@@ -2511,7 +2822,7 @@ class EquipmentSystemPlayerData
 		}
 	}
 
-	private function LoadEquipmentSet( setName : String )
+	private function LoadEquipmentSet( const setName : ref< String > )
 	{
 		var i, j, slotIndex : Int32;
 		var equipmentSet : SEquipmentSet;
@@ -2536,7 +2847,7 @@ class EquipmentSystemPlayerData
 		ClearLastUsedStruct();
 	}
 
-	private function DeleteEquipmentSet( setName : String )
+	private function DeleteEquipmentSet( const setName : ref< String > )
 	{
 		var i : Int32;
 		var equipmentSet : SEquipmentSet;
@@ -2625,7 +2936,7 @@ class EquipmentSystemPlayerData
 		return GetNextActiveItemIndex( equipAreaIndex, requiredTags );
 	}
 
-	private const function GetNextActiveItemIndex( equipAreaIndex : Int32, requiredTags : array< CName > ) : Int32
+	private const function GetNextActiveItemIndex( equipAreaIndex : Int32, const requiredTags : ref< array< CName > > ) : Int32
 	{
 		var nextIndex : Int32;
 		var numSlots : Int32;
@@ -2646,7 +2957,7 @@ class EquipmentSystemPlayerData
 		return 0;
 	}
 
-	private const function CheckTagsInItem( itemID : ItemID, requiredTags : array< CName > ) : Bool
+	private const function CheckTagsInItem( itemID : ItemID, const requiredTags : ref< array< CName > > ) : Bool
 	{
 		var tagNo : Int32;
 		var itemTags : array< CName >;
@@ -2695,13 +3006,11 @@ class EquipmentSystemPlayerData
 				{
 					if( equipSlots[ j ].itemID == itemID )
 					{
-						Log( ( ( " GetSlotIndex " + TDBID.ToStringDEBUG( ItemID.GetTDBID( itemID ) ) ) + " result " ) + j );
 						return j;
 					}
 				}
 			}
 		}
-		Log( ( " GetSlotIndex " + TDBID.ToStringDEBUG( ItemID.GetTDBID( itemID ) ) ) + " result not found" );
 		return -1;
 	}
 
@@ -2719,14 +3028,38 @@ class EquipmentSystemPlayerData
 				{
 					if( equipSlots[ j ].itemID == itemID )
 					{
-						Log( ( ( " GetSlotIndex " + TDBID.ToStringDEBUG( ItemID.GetTDBID( itemID ) ) ) + " result " ) + j );
 						return j;
 					}
 				}
 			}
 		}
-		Log( ( " GetSlotIndex " + TDBID.ToStringDEBUG( ItemID.GetTDBID( itemID ) ) ) + " result not found" );
 		return -1;
+	}
+
+	public const function IsSlotLocked( equipAreaType : gamedataEquipmentArea, index : Int32, out visibleWhenLocked : Bool ) : Bool
+	{
+		var retVal : Bool;
+		var i : Int32;
+		var equipSlots : array< SEquipSlot >;
+		retVal = false;
+		i = GetEquipAreaIndex( equipAreaType );
+		if( i >= 0 )
+		{
+			equipSlots = m_equipment.equipAreas[ i ].equipSlots;
+			if( index < equipSlots.Size() )
+			{
+				retVal = IsSlotLocked( equipSlots[ index ], visibleWhenLocked );
+			}
+		}
+		return retVal;
+	}
+
+	private const function IsSlotLocked( slot : SEquipSlot, out visibleWhenLocked : Bool ) : Bool
+	{
+		var retVal : Bool;
+		retVal = !( slot.unlockPrereq.IsFulfilled( m_owner.GetGame(), m_owner ) );
+		visibleWhenLocked = slot.visibleWhenLocked;
+		return retVal;
 	}
 
 	private const function GetOwnerGender() : CName
@@ -2755,9 +3088,27 @@ class EquipmentSystemPlayerData
 		return m_equipment.equipAreas[ GetEquipAreaIndex( areaType ) ].equipSlots[ slotIndex ].itemID;
 	}
 
-	public const function GetNumberOfSlots( areaType : gamedataEquipmentArea ) : Int32
+	public const function GetNumberOfSlots( areaType : gamedataEquipmentArea, optional includeLocked : Bool ) : Int32
 	{
-		return m_equipment.equipAreas[ GetEquipAreaIndex( areaType ) ].equipSlots.Size();
+		var slots : array< SEquipSlot >;
+		var i, size, retVal : Int32;
+		retVal = 0;
+		slots = m_equipment.equipAreas[ GetEquipAreaIndex( areaType ) ].equipSlots;
+		if( includeLocked )
+		{
+			retVal = slots.Size();
+		}
+		else
+		{
+			for( i = 0, size = slots.Size(); i < size; i += 1 )
+			{
+				if( !( IsSlotLocked( slots[ i ], false ) ) )
+				{
+					retVal += 1;
+				}
+			}
+		}
+		return retVal;
 	}
 
 	public const function GetNumberOfItemsInEquipmentArea( areaType : gamedataEquipmentArea ) : Int32
@@ -2867,6 +3218,14 @@ class EquipmentSystemPlayerData
 		{
 			requiredTags.PushBack( WeaponObject.GetOneHandedRangedWeaponTag() );
 		}
+		else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatFirearms' ) )
+		{
+			requiredTags.PushBack( WeaponObject.GetDriverCombatRangedWeaponTag() );
+		}
+		else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatBikeWeapons' ) )
+		{
+			requiredTags.PushBack( WeaponObject.GetDriverCombatBikeWeaponTag() );
+		}
 		return GetItemInEquipSlot( weaponWheelEquipArea, GetNextActiveItemIndex( GetEquipAreaIndex( weaponWheelEquipArea ), requiredTags ) );
 	}
 
@@ -2932,6 +3291,22 @@ class EquipmentSystemPlayerData
 		return cyberwareList;
 	}
 
+	public const function GetAllCyberwareEquipmentAreas() : array< gamedataEquipmentArea >
+	{
+		var equipmentAreas : array< gamedataEquipmentArea >;
+		equipmentAreas.PushBack( gamedataEquipmentArea.SystemReplacementCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.FrontalCortexCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.EyesCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.MusculoskeletalSystemCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.NervousSystemCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.CardiovascularSystemCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.IntegumentarySystemCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.ArmsCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.LegsCW );
+		equipmentAreas.PushBack( gamedataEquipmentArea.HandsCW );
+		return equipmentAreas;
+	}
+
 	public const function GetActiveMeleeWare() : ItemID
 	{
 		var moduleID : ItemID;
@@ -2956,50 +3331,70 @@ class EquipmentSystemPlayerData
 
 	public const function IsEquipped( item : ItemID ) : Bool
 	{
-		Log( " IsEquipped " + TDBID.ToStringDEBUG( ItemID.GetTDBID( item ) ) );
 		return GetSlotIndex( item ) >= 0;
 	}
 
 	public const function IsEquipped( item : ItemID, equipmentArea : gamedataEquipmentArea ) : Bool
 	{
-		Log( " IsEquipped " + TDBID.ToStringDEBUG( ItemID.GetTDBID( item ) ) );
 		return GetSlotIndex( item, equipmentArea ) >= 0;
 	}
 
-	public const function PrintEquipment()
+	public const function IsSideUpgradeEquipped( itemID : ItemID ) : Bool
 	{
-		var i, j : Int32;
-		var equipArea : SEquipArea;
-		var equipSlot : SEquipSlot;
+		var sideUpgradeRecord : Item_Record;
 		var itemRecord : Item_Record;
-		var activeString : String;
-		var itemString : String;
-		var areaString : String;
-		for( i = 0; i < m_equipment.equipAreas.Size(); i += 1 )
+		var retVal : Bool;
+		var i : Int32;
+		var returnArray : array< SEquipSlot >;
+		retVal = false;
+		if( RPGManager.CyberwareHasSideUpgrade( itemID, sideUpgradeRecord ) )
 		{
-			equipArea = m_equipment.equipAreas[ i ];
-			areaString = EnumValueToString( "gamedataEquipmentArea", ( ( Int32 )( equipArea.areaType ) ) );
-			Log( "	" + areaString );
-			for( j = 0; j < equipArea.equipSlots.Size(); j += 1 )
+			itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+			GetItemsByEquipAreaAndItemType( EquipmentSystem.GetEquipAreaType( itemID ), itemRecord.ItemType().Type(), returnArray );
+			for( i = 0; i < returnArray.Size(); i += 1 )
 			{
-				activeString = "";
-				if( equipArea.activeIndex == j )
+				if( ItemID.GetTDBID( returnArray[ i ].itemID ) == sideUpgradeRecord.GetID() )
 				{
-					activeString = " -- ACTIVE";
+					retVal = true;
 				}
-				equipSlot = equipArea.equipSlots[ j ];
-				if( ItemID.IsValid( equipSlot.itemID ) )
-				{
-					itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( equipSlot.itemID ) );
-					itemString = itemRecord.FriendlyName();
-				}
-				else
-				{
-					itemString = "EMPTY";
-				}
-				Log( ( ( ( "		Slot " + IntToString( j ) ) + ": " ) + itemString ) + activeString );
 			}
 		}
+		return retVal;
+	}
+
+	public const function GetOriginalItemIDFromSideUpgrade( sideUpgradeID : ItemID ) : ItemID
+	{
+		var transactionSystem : TransactionSystem;
+		var itemList : array< weak< gameItemData > >;
+		var itemID : ItemID;
+		var j : Int32;
+		var partData : InnerItemData;
+		var statsShardSlotTDBID : TweakDBID;
+		var shardTDBID : TweakDBID;
+		var sideUpgradeRecord : Item_Record;
+		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
+		statsShardSlotTDBID = T"AttachmentSlots.StatsShardSlot";
+		if( !( ItemID.IsValid( sideUpgradeID ) ) )
+		{
+			return ItemID.None();
+		}
+		sideUpgradeRecord = TDB.GetItemRecord( ItemID.GetTDBID( sideUpgradeID ) );
+		transactionSystem.GetItemListByTags( m_owner, sideUpgradeRecord.Tags(), itemList );
+		for( j = 0; j < itemList.Size(); j += 1 )
+		{
+			itemID = itemList[ j ].GetID();
+			if( ( ( itemID != sideUpgradeID ) && TDB.GetItemRecord( ItemID.GetTDBID( itemID ) ).Quality().Type() == sideUpgradeRecord.Quality().Type() ) && TDB.GetCName( ItemID.GetTDBID( itemID ) + T".cyberwareType", '' ) == TDB.GetCName( ItemID.GetTDBID( sideUpgradeID ) + T".cyberwareType", '' ) )
+			{
+				transactionSystem.GetItemData( m_owner, itemID ).GetItemPart( partData, statsShardSlotTDBID );
+				shardTDBID = InnerItemData.GetStaticData( partData ).GetRecordID();
+				transactionSystem.GetItemData( m_owner, sideUpgradeID ).GetItemPart( partData, statsShardSlotTDBID );
+				if( shardTDBID == InnerItemData.GetStaticData( partData ).GetRecordID() )
+				{
+					return itemID;
+				}
+			}
+		}
+		return ItemID.None();
 	}
 
 	public function GetLastUsedWeaponItemID() : ItemID
@@ -3009,32 +3404,28 @@ class EquipmentSystemPlayerData
 		item = ItemID.None();
 		lastUsedWeaponID = ItemID.None();
 		item = FindItemInEquipArea( GetLastUsedItemID( ELastUsed.Heavy ), gamedataEquipmentArea.WeaponHeavy );
-		if( ItemID.IsValid( item ) )
+		if( !( ItemID.IsValid( item ) ) )
+		{
+			lastUsedWeaponID = GetLastUsedItemID( ELastUsed.Weapon );
+			item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.WeaponWheel );
+			if( !( ItemID.IsValid( item ) ) )
+			{
+				item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.Weapon );
+			}
+			if( !( ItemID.IsValid( item ) ) )
+			{
+				item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.ArmsCW );
+			}
+			if( !( ItemID.IsValid( item ) ) )
+			{
+				item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.BaseFists );
+			}
+		}
+		if( CheckWeaponAgainstGameplayRestrictions( item, true ) )
 		{
 			return item;
 		}
-		lastUsedWeaponID = GetLastUsedItemID( ELastUsed.Weapon );
-		item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.WeaponWheel );
-		if( ItemID.IsValid( item ) )
-		{
-			return item;
-		}
-		item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.Weapon );
-		if( ItemID.IsValid( item ) )
-		{
-			return item;
-		}
-		item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.ArmsCW );
-		if( ItemID.IsValid( item ) )
-		{
-			return item;
-		}
-		item = FindItemInEquipArea( lastUsedWeaponID, gamedataEquipmentArea.BaseFists );
-		if( ItemID.IsValid( item ) )
-		{
-			return item;
-		}
-		return item;
+		return ItemID.None();
 	}
 
 	public function GetActiveWeaponToUnequip() : ItemID
@@ -3117,6 +3508,11 @@ class EquipmentSystemPlayerData
 		{
 			return item;
 		}
+		item = FindItemInEquipArea( GetLastUsedItemID( ELastUsed.Weapon ), gamedataEquipmentArea.ArmsCW );
+		if( ItemID.IsValid( item ) )
+		{
+			return item;
+		}
 		item = FindItemInEquipArea( GetLastUsedItemID( ELastUsed.Heavy ), gamedataEquipmentArea.WeaponHeavy );
 		if( ItemID.IsValid( item ) )
 		{
@@ -3187,6 +3583,28 @@ class EquipmentSystemPlayerData
 		return item;
 	}
 
+	public function GetLastUsedOrFirstAvailableDriverCombatWeapon( driverCombatWeaponTag : CName ) : ItemID
+	{
+		var item : ItemID;
+		var itemTags : array< CName >;
+		item = ItemID.None();
+		item = FindItemInEquipArea( GetLastUsedItemID( ELastUsed.Weapon ), gamedataEquipmentArea.WeaponWheel );
+		if( ItemID.IsValid( item ) )
+		{
+			itemTags = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( item ) ).Tags();
+			if( itemTags.Contains( driverCombatWeaponTag ) && CheckWeaponAgainstGameplayRestrictions( item ) )
+			{
+				return item;
+			}
+		}
+		item = FindItemInEquipAreaByTag( driverCombatWeaponTag, gamedataEquipmentArea.Weapon );
+		if( ItemID.IsValid( item ) && CheckWeaponAgainstGameplayRestrictions( item ) )
+		{
+			return item;
+		}
+		return ItemID.None();
+	}
+
 	public function GetWeaponSlotItem( weaponSlot : Int32 ) : ItemID
 	{
 		var equipArea : SEquipArea;
@@ -3214,7 +3632,7 @@ class EquipmentSystemPlayerData
 		return ItemID.None();
 	}
 
-	public function CycleWeapon( cycleNext : Bool, onlyCheck : Bool ) : ItemID
+	public function CycleWeapon( cycleNext : Bool, onlyCheck : Bool, excludeMelee : Bool ) : ItemID
 	{
 		var i : Int32;
 		var x : Int32;
@@ -3227,7 +3645,7 @@ class EquipmentSystemPlayerData
 		var barebonesWeapon : ItemID;
 		var direction : Int32;
 		equipArea = m_equipment.equipAreas[ GetEquipAreaIndex( gamedataEquipmentArea.WeaponWheel ) ];
-		eqAreaSize = equipArea.equipSlots.Size();
+		eqAreaSize = equipArea.equipSlots.Size() - ( ( excludeMelee ) ? ( 1 ) : ( 0 ) );
 		activeItem = GetLastUsedWeaponItemID();
 		currentItemSlot = equipArea.activeIndex;
 		nextItemSlot = currentItemSlot;
@@ -3246,11 +3664,11 @@ class EquipmentSystemPlayerData
 			x = nextItemSlot + direction;
 			nextItemSlot = ( ( x % eqAreaSize ) + eqAreaSize ) % eqAreaSize;
 			nextItem = equipArea.equipSlots[ nextItemSlot ].itemID;
-			if( ( ItemID.IsValid( nextItem ) && ( nextItem != activeItem ) ) && CheckWeaponAgainstGameplayRestrictions( nextItem ) )
+			if( ( ItemID.IsValid( nextItem ) && ( nextItem != activeItem ) ) && CheckWeaponAgainstGameplayRestrictions( nextItem, true ) )
 			{
 				return nextItem;
 			}
-			else if( ( ( !( ItemID.IsValid( nextItem ) ) && ( activeItem != barebonesWeapon ) ) && ( ( nextItemSlot + direction ) != eqAreaSize ) ) && CheckWeaponAgainstGameplayRestrictions( barebonesWeapon ) )
+			else if( ( ( !( ItemID.IsValid( nextItem ) ) && ( activeItem != barebonesWeapon ) ) && ( ( nextItemSlot + direction ) != eqAreaSize ) ) && CheckWeaponAgainstGameplayRestrictions( barebonesWeapon, true ) )
 			{
 				if( !( WeaponObject.IsCyberwareWeapon( barebonesWeapon ) ) && ( nextItemSlot == ( eqAreaSize - 1 ) ) )
 				{
@@ -3270,13 +3688,28 @@ class EquipmentSystemPlayerData
 		return ItemID.None();
 	}
 
-	public function CheckWeaponAgainstGameplayRestrictions( weaponItem : ItemID ) : Bool
+	public function CheckWeaponAgainstGameplayRestrictions( weaponItem : ItemID, optional suppressDriverWarnings : Bool ) : Bool
 	{
+		var itemRecord : Item_Record;
+		var itemType : gamedataItemType;
+		var equipmentArea : gamedataEquipmentArea;
 		var itemTags : array< CName >;
 		var notificationEvent : UIInGameNotificationEvent;
-		itemTags = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( weaponItem ) ).Tags();
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( weaponItem ) );
+		itemType = itemRecord.ItemType().Type();
+		equipmentArea = itemRecord.EquipArea().Type();
+		itemTags = itemRecord.Tags();
 		notificationEvent = new UIInGameNotificationEvent;
 		notificationEvent.m_notificationType = UIInGameNotificationType.ActionRestriction;
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'NoWeapons' ) )
+		{
+			GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+			return false;
+		}
+		if( ( equipmentArea == gamedataEquipmentArea.ArmsCW && StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'NoArmsCW' ) ) && itemType != gamedataItemType.Cyb_StrongArms )
+		{
+			return false;
+		}
 		if( itemTags.Contains( WeaponObject.GetRangedWeaponTag() ) )
 		{
 			if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'Melee' ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'Fists' ) )
@@ -3287,6 +3720,22 @@ class EquipmentSystemPlayerData
 			else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'OneHandedFirearms' ) && !( itemTags.Contains( WeaponObject.GetOneHandedRangedWeaponTag() ) ) )
 			{
 				GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+				return false;
+			}
+			else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatFirearms' ) && !( itemTags.Contains( WeaponObject.GetDriverCombatRangedWeaponTag() ) ) )
+			{
+				if( !( suppressDriverWarnings ) )
+				{
+					GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+				}
+				return false;
+			}
+			else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatBikeWeapons' ) && !( itemTags.Contains( WeaponObject.GetDriverCombatBikeWeaponTag() ) ) )
+			{
+				if( !( suppressDriverWarnings ) )
+				{
+					GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+				}
 				return false;
 			}
 			else
@@ -3301,7 +3750,28 @@ class EquipmentSystemPlayerData
 				GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
 				return false;
 			}
-			else if( !( WeaponObject.IsFists( weaponItem ) ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'Fists' ) )
+			else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatFirearms' ) && !( itemTags.Contains( WeaponObject.GetDriverCombatRangedWeaponTag() ) ) )
+			{
+				if( !( suppressDriverWarnings ) )
+				{
+					GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+				}
+				return false;
+			}
+			else if( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatBikeWeapons' ) && !( itemTags.Contains( WeaponObject.GetDriverCombatBikeWeaponTag() ) ) )
+			{
+				if( !( suppressDriverWarnings ) )
+				{
+					GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+				}
+				return false;
+			}
+			else if( ( !( WeaponObject.IsFists( weaponItem ) ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'Fists' ) ) && !( StatusEffectSystem.ObjectHasStatusEffect( m_owner, T"GameplayRestriction.FistFight" ) ) )
+			{
+				GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+				return false;
+			}
+			else if( ( !( WeaponObject.IsFists( weaponItem ) ) && !( WeaponObject.IsOfType( weaponItem, gamedataItemType.Cyb_StrongArms ) ) ) && StatusEffectSystem.ObjectHasStatusEffect( m_owner, T"GameplayRestriction.FistFight" ) )
 			{
 				GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
 				return false;
@@ -3311,7 +3781,10 @@ class EquipmentSystemPlayerData
 				return true;
 			}
 		}
-		GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+		if( !( suppressDriverWarnings ) || ( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatFirearms' ) ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( m_owner, 'DriverCombatBikeWeapons' ) ) ) )
+		{
+			GameInstance.GetUISystem( ( ( PlayerPuppet )( m_owner ) ).GetGame() ).QueueEvent( notificationEvent );
+		}
 		return false;
 	}
 
@@ -3668,11 +4141,41 @@ class EquipmentSystemPlayerData
 
 	public function OnGameplayEquipRequest( request : GameplayEquipRequest )
 	{
-		ProcessEquipRequest( request.owner, request.slotIndex, request.addToInventory, request.itemID, request.equipToCurrentActiveSlot, request.blockUpdateWeaponActiveSlots, request.forceEquipWeapon );
+		var equipProgramsRequest : GameplayEquipProgramsRequest;
+		ProcessEquipRequest( request.owner, request.slotIndex, request.addToInventory, request.itemID, request.equipToCurrentActiveSlot, request.blockUpdateWeaponActiveSlots, request.forceEquipWeapon, request.extraQuality );
+		if( request.partsToAdd.Size() > 0 )
+		{
+			equipProgramsRequest = new GameplayEquipProgramsRequest;
+			equipProgramsRequest.owner = request.owner;
+			equipProgramsRequest.programIDs = request.partsToAdd;
+			OnGameplayEquipProgramsRequest( equipProgramsRequest );
+		}
 	}
 
-	private function ProcessEquipRequest( owner : weak< GameObject >, slotIndex : Int32, addToInventory : Bool, itemID : ItemID, equipToCurrentActiveSlot : Bool, optional blockUpdateWeaponActiveSlots : Bool, optional forceEquipWeapon : Bool )
+	public function OnGameplayEquipProgramsRequest( request : GameplayEquipProgramsRequest )
 	{
+		var cyberdeckID : ItemID;
+		var i : Int32;
+		var transactionSystem : TransactionSystem;
+		var availableSlots : array< TweakDBID >;
+		transactionSystem = GameInstance.GetTransactionSystem( request.owner.GetGame() );
+		cyberdeckID = EquipmentSystem.GetData( request.owner ).GetActiveItem( gamedataEquipmentArea.SystemReplacementCW );
+		if( !( EquipmentSystem.IsItemCyberdeck( cyberdeckID ) ) )
+		{
+			return;
+		}
+		transactionSystem.GetAvailableSlotsOnItem( request.owner, cyberdeckID, availableSlots );
+		for( i = 0; ( i < availableSlots.Size() ) && ( i < request.programIDs.Size() ); i += 1 )
+		{
+			transactionSystem.AddPart( request.owner, cyberdeckID, request.programIDs[ i ], availableSlots[ i ] );
+			ApplyEquipGLPs( request.programIDs[ i ] );
+		}
+	}
+
+	private function ProcessEquipRequest( owner : weak< GameObject >, slotIndex : Int32, addToInventory : Bool, itemID : ItemID, equipToCurrentActiveSlot : Bool, optional blockUpdateWeaponActiveSlots : Bool, optional forceEquipWeapon : Bool, optional extraQuality : Float )
+	{
+		var statsSystem : StatsSystem;
+		var modifier : gameConstantStatModifierData;
 		if( IsMultiplayer() && equipToCurrentActiveSlot )
 		{
 			slotIndex = m_equipment.equipAreas[ GetEquipAreaIndex( EquipmentSystem.GetEquipAreaType( itemID ) ) ].activeIndex;
@@ -3688,6 +4191,15 @@ class EquipmentSystemPlayerData
 			{
 				itemID = GameInstance.GetTransactionSystem( owner.GetGame() ).GetItemData( owner, itemID ).GetID();
 			}
+		}
+		if( extraQuality > 0.0 )
+		{
+			statsSystem = GameInstance.GetStatsSystem( owner.GetGame() );
+			modifier = new gameConstantStatModifierData;
+			modifier.modifierType = gameStatModifierType.Additive;
+			modifier.statType = gamedataStatType.Quality;
+			modifier.value = extraQuality;
+			statsSystem.AddSavedModifier( ( ( StatsObjectID )( itemID ) ), modifier );
 		}
 		if( slotIndex == -1 )
 		{
@@ -3724,7 +4236,7 @@ class EquipmentSystemPlayerData
 
 	public function OnUnequipRequest( request : UnequipRequest )
 	{
-		UnequipItem( GetEquipAreaIndex( request.areaType ), request.slotIndex );
+		UnequipItem( GetEquipAreaIndex( request.areaType ), request.slotIndex, request.force );
 	}
 
 	public function OnUnequipItemsRequest( request : UnequipItemsRequest )
@@ -3782,6 +4294,99 @@ class EquipmentSystemPlayerData
 		UnequipItem( GetEquipAreaIndex( request.areaType ), request.slotIndex );
 	}
 
+	public function OnReplaceEquipmentRequest( request : ReplaceEquipmentRequest )
+	{
+		var transactionSystem : TransactionSystem;
+		var owner : GameObject;
+		var itemID : ItemID;
+		var oldItemID : ItemID;
+		var equipAreaIndex : Int32;
+		var itemModParams : ItemModParams;
+		var itemModParamsArray : array< ItemModParams >;
+		var equipArea : gamedataEquipmentArea;
+		var i : Int32;
+		var j : Int32;
+		var availableSlots : array< TweakDBID >;
+		var parts : array< SPartSlots >;
+		var sideUpgradeItem : Item_Record;
+		owner = request.owner;
+		if( !( owner ) )
+		{
+			return;
+		}
+		if( !( ItemID.IsValid( request.itemID ) ) )
+		{
+			return;
+		}
+		transactionSystem = GameInstance.GetTransactionSystem( owner.GetGame() );
+		if( transactionSystem.HasItem( owner, request.itemID ) )
+		{
+			itemID = request.itemID;
+		}
+		else
+		{
+			if( request.addToInventory )
+			{
+				if( request.rerollIdOnAddToInventory )
+				{
+					itemID = ItemID.FromTDBID( ItemID.GetTDBID( request.itemID ) );
+				}
+				else
+				{
+					itemID = request.itemID;
+				}
+				itemModParams.itemID = itemID;
+				itemModParams.quantity = 1;
+				if( ItemID.IsValid( request.customPartToGenerateID ) )
+				{
+					itemModParams.customPartsToInstall.PushBack( request.customPartToGenerateID );
+				}
+				itemModParamsArray.PushBack( itemModParams );
+				transactionSystem.GiveItems( owner, itemModParamsArray );
+			}
+			else
+			{
+				return;
+			}
+		}
+		equipArea = EquipmentSystem.GetEquipAreaType( itemID );
+		equipAreaIndex = GetEquipAreaIndex( equipArea );
+		oldItemID = GetItemInEquipSlot( equipAreaIndex, request.slotIndex );
+		if( request.transferInstalledParts )
+		{
+			parts = ItemModificationSystem.GetAllSlots( m_owner, oldItemID );
+		}
+		UnequipItem( equipAreaIndex, request.slotIndex );
+		if( request.slotIndex == -1 )
+		{
+			EquipItem( itemID, false );
+		}
+		else
+		{
+			EquipItem( itemID, request.slotIndex, false );
+		}
+		if( request.transferInstalledParts && ItemID.IsValid( GetItemInEquipSlot( equipAreaIndex, request.slotIndex ) ) )
+		{
+			transactionSystem.GetAvailableSlotsOnItem( m_owner, itemID, availableSlots );
+			for( i = 0, j = 0; ( i < parts.Size() ) && ( j < availableSlots.Size() ); i += 1 )
+			{
+				if( parts[ i ].status != ESlotState.Empty && availableSlots.Contains( parts[ i ].slotID ) )
+				{
+					transactionSystem.AddPart( m_owner, itemID, parts[ i ].installedPart, parts[ i ].slotID );
+					j += 1;
+				}
+			}
+		}
+		if( request.removeOldItem )
+		{
+			if( ( ItemID.IsValid( oldItemID ) && equipArea == gamedataEquipmentArea.MusculoskeletalSystemCW ) && !( RPGManager.CyberwareHasSideUpgrade( oldItemID, sideUpgradeItem ) ) )
+			{
+				oldItemID = GetOriginalItemIDFromSideUpgrade( oldItemID );
+			}
+			transactionSystem.RemoveItem( owner, oldItemID, 1 );
+		}
+	}
+
 	public function OnDrawItemRequest( request : DrawItemRequest )
 	{
 		DrawItem( request.itemID, request.equipAnimationType );
@@ -3833,7 +4438,7 @@ class EquipmentSystemPlayerData
 	{
 		var activeItems : SSlotActiveItems;
 		activeItems = GetSlotActiveItemStruct();
-		if( ( ItemID.GetTDBID( activeItems.rightHandItem ) == ItemID.GetTDBID( request.itemID ) ) || ( ItemID.GetTDBID( activeItems.leftHandItem ) == ItemID.GetTDBID( request.itemID ) ) )
+		if( ( activeItems.rightHandItem == request.itemID ) || ( activeItems.leftHandItem == request.itemID ) )
 		{
 			RemoveItemFromSlotActiveItem( request.itemID );
 		}
@@ -3942,9 +4547,6 @@ class EquipmentSystemPlayerData
 			if( RPGManager.IsItemCrafted( itemData ) && !( IsEquippable( itemData ) ) )
 			{
 				UnequipItem( items[ i ] );
-				if( EquipmentSystem.GetEquipAreaType( items[ i ] ) == gamedataEquipmentArea.Weapon )
-				{
-				}
 			}
 		}
 	}
@@ -3976,7 +4578,7 @@ class EquipmentSystemPlayerData
 		ClearAllWeaponSlots();
 	}
 
-	private function CreateUnequipWeaponManipulationRequest()
+	public function CreateUnequipWeaponManipulationRequest()
 	{
 		var request : EquipmentSystemWeaponManipulationRequest;
 		request = new EquipmentSystemWeaponManipulationRequest;
@@ -4053,6 +4655,10 @@ class EquipmentSystemPlayerData
 			{
 				return EquipmentManipulationRequestSlot.Left;
 			}
+			default:
+			{
+				return EquipmentManipulationRequestSlot.Undefined;
+			}
 		}
 	}
 
@@ -4100,6 +4706,14 @@ class EquipmentSystemPlayerData
 			{
 				return GetLastUsedOrFirstAvailableOneHandedRangedWeapon();
 			}
+			case EquipmentManipulationAction.RequestLastUsedOrFirstAvailableDriverCombatRangedWeapon:
+			{
+				return GetLastUsedOrFirstAvailableDriverCombatWeapon( WeaponObject.GetDriverCombatRangedWeaponTag() );
+			}
+			case EquipmentManipulationAction.RequestLastUsedOrFirstAvailableDriverCombatBikeWeapon:
+			{
+				return GetLastUsedOrFirstAvailableDriverCombatWeapon( WeaponObject.GetDriverCombatBikeWeaponTag() );
+			}
 			case EquipmentManipulationAction.RequestHeavyWeapon:
 			{
 				return GetActiveHeavyWeapon();
@@ -4142,11 +4756,11 @@ class EquipmentSystemPlayerData
 			}
 			case EquipmentManipulationAction.CycleNextWeaponWheelItem:
 			{
-				return CycleWeapon( true, false );
+				return CycleWeapon( true, false, true );
 			}
 			case EquipmentManipulationAction.CyclePreviousWeaponWheelItem:
 			{
-				return CycleWeapon( false, false );
+				return CycleWeapon( false, false, true );
 			}
 			case EquipmentManipulationAction.ReequipWeapon:
 			{
@@ -4218,17 +4832,7 @@ class EquipmentSystemPlayerData
 		{
 			return;
 		}
-		equipmentAreas.PushBack( gamedataEquipmentArea.SystemReplacementCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.FrontalCortexCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.EyesCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.MusculoskeletalSystemCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.NervousSystemCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.CardiovascularSystemCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.ImmuneSystemCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.IntegumentarySystemCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.ArmsCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.LegsCW );
-		equipmentAreas.PushBack( gamedataEquipmentArea.HandsCW );
+		equipmentAreas = GetAllCyberwareEquipmentAreas();
 		for( i = 0; i < equipmentAreas.Size(); i += 1 )
 		{
 			if( GetNumberOfItemsInEquipmentArea( equipmentAreas[ i ] ) > 0 )
@@ -4260,7 +4864,11 @@ class EquipmentSystemPlayerData
 
 }
 
-class EquipmentSystem extends ScriptableSystem
+importonly class IEquipmentSystem extends ScriptableSystem
+{
+}
+
+class EquipmentSystem extends IEquipmentSystem
 {
 	private persistent var m_ownerData : array< EquipmentSystemPlayerData >;
 
@@ -4310,7 +4918,6 @@ class EquipmentSystem extends ScriptableSystem
 	private export function OnPlayerAttach( request : PlayerAttachRequest )
 	{
 		var data : EquipmentSystemPlayerData;
-		LogAssert( GetPlayerData( request.owner ) == NULL, "[EquipmentSystem::OnPlayerAttach] Player already attached!" );
 		if( !( GetPlayerData( request.owner ) ) )
 		{
 			data = new EquipmentSystemPlayerData;
@@ -4325,6 +4932,7 @@ class EquipmentSystem extends ScriptableSystem
 			{
 				data.InitializeClothingOverrideInfo();
 			}
+			data.EvaluateUnderwearTopHiddenState();
 		}
 		data.OnAttach();
 		Debug_SetupEquipmentSystemOverlay( request.owner );
@@ -4342,13 +4950,11 @@ class EquipmentSystem extends ScriptableSystem
 				return;
 			}
 		}
-		LogAssert( false, "[EquipmentSystem::OnPlayerDetach] Can't find player!" );
 	}
 
 	public const function GetPlayerData( const owner : GameObject ) : EquipmentSystemPlayerData
 	{
 		var i : Int32;
-		LogAssert( owner != NULL, "[EquipmentSystem::GetPlayerData] Owner not defined!" );
 		for( i = 0; i < m_ownerData.Size(); i += 1 )
 		{
 			if( m_ownerData[ i ].GetOwner() == owner )
@@ -4356,7 +4962,6 @@ class EquipmentSystem extends ScriptableSystem
 				return m_ownerData[ i ];
 			}
 		}
-		LogAssert( false, "[EquipmentSystem::GetPlayerData] Unable to find player data!" );
 		return NULL;
 	}
 
@@ -4389,7 +4994,7 @@ class EquipmentSystem extends ScriptableSystem
 			SetFactValue( GetGameInstance(), 'PowerLevelRescaled2', 1 );
 		}
 		factVal = GetFact( GetGameInstance(), 'ScalingBlocked' );
-		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1510 ) )
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1510 ) ) && ( saveVersion <= 212 ) )
 		{
 			BlockAndCompensateScaling();
 			SetFactValue( GetGameInstance(), 'ScalingBlocked', 1 );
@@ -4402,6 +5007,61 @@ class EquipmentSystem extends ScriptableSystem
 				GiveFixerShirt();
 			}
 			SetFactValue( GetGameInstance(), 'FixerShirtAdded', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'IconicReworkCompleted' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2000 ) ) && ( saveVersion <= 224 ) )
+		{
+			IconicsReworkCompensate();
+			SetFactValue( GetGameInstance(), 'IconicReworkCompleted', 1 );
+		}
+		if( gameVersion <= 1650 )
+		{
+			SetFactValue( GetGameInstance(), 'ripperdoc_screen_glitched', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'RetrofixQuickhacks' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1650 ) ) && ( saveVersion <= 250 ) )
+		{
+			RetrofixQuickhacks();
+			SetFactValue( GetGameInstance(), 'RetrofixQuickhacks', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'RetrofixCyberwares' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 1650 ) ) && ( saveVersion <= 250 ) )
+		{
+			RetrofixCyberwares();
+			SetFactValue( GetGameInstance(), 'RetrofixCyberwares', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'ConsumablesUpgraded' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2000 ) ) && ( saveVersion <= 224 ) )
+		{
+			ConsumablesChargesRework();
+			SetFactValue( GetGameInstance(), 'ConsumablesUpgraded', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'SaburoTantoAdded' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2000 ) ) && ( saveVersion <= 224 ) )
+		{
+			if( GetFact( GetGameInstance(), 'q005_done' ) <= 0 )
+			{
+				CheckSaburoDogTagPresence();
+			}
+			SetFactValue( GetGameInstance(), 'SaburoTantoAdded', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'AutoscalingFleshFistsEquipped' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2000 ) ) && ( saveVersion <= 224 ) )
+		{
+			GiveAndEquipAutoscalingFleshFists();
+			SetFactValue( GetGameInstance(), 'AutoscalingFleshFistsEquipped', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'IconicsFactsForBlackMarketerAdded' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2000 ) ) && ( saveVersion <= 224 ) )
+		{
+			ProcessIconicsFactsForBlackMarketer();
+			SetFactValue( GetGameInstance(), 'IconicsFactsForBlackMarketerAdded', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'LeftHandWeaponsCompensated' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2000 ) ) && ( saveVersion <= 224 ) )
+		{
+			ReplaceLeftHandVariantWeaponsWithRegular();
+			SetFactValue( GetGameInstance(), 'LeftHandWeaponsCompensated', 1 );
 		}
 	}
 
@@ -4432,10 +5092,22 @@ class EquipmentSystem extends ScriptableSystem
 	{
 		var player : weak< PlayerPuppet >;
 		var evt : RefreshItemPlayerScalingEvent;
-		player = GetPlayer( GetGameInstance() );
+		player = GetMainPlayer( GetGameInstance() );
 		if( player )
 		{
 			evt = new RefreshItemPlayerScalingEvent;
+			player.QueueEvent( evt );
+		}
+	}
+
+	private function ConsumablesChargesRework()
+	{
+		var player : weak< PlayerPuppet >;
+		var evt : ConsumablesChargesReworkEvent;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			evt = new ConsumablesChargesReworkEvent;
 			player.QueueEvent( evt );
 		}
 	}
@@ -4444,10 +5116,22 @@ class EquipmentSystem extends ScriptableSystem
 	{
 		var player : weak< PlayerPuppet >;
 		var evt : BlockAndCompensateScalingEvent;
-		player = GetPlayer( GetGameInstance() );
+		player = GetMainPlayer( GetGameInstance() );
 		if( player )
 		{
 			evt = new BlockAndCompensateScalingEvent;
+			player.QueueEvent( evt );
+		}
+	}
+
+	private function IconicsReworkCompensate()
+	{
+		var player : weak< PlayerPuppet >;
+		var evt : IconicsReworkCompensateEvent;
+		player = GetMainPlayer( GetGameInstance() );
+		if( player )
+		{
+			evt = new IconicsReworkCompensateEvent;
 			player.QueueEvent( evt );
 		}
 	}
@@ -4457,20 +5141,134 @@ class EquipmentSystem extends ScriptableSystem
 		var ts : TransactionSystem;
 		var item : ItemID;
 		var player : weak< PlayerPuppet >;
-		player = GetPlayer( GetGameInstance() );
+		player = GetMainPlayer( GetGameInstance() );
 		ts = GameInstance.GetTransactionSystem( GetGameInstance() );
 		item = ItemID.FromTDBID( T"Items.Fixer_01_Set_TShirt" );
 		ts.GiveItem( player, item, 1 );
 	}
 
+	private function GiveSaburoTanto()
+	{
+		var ts : TransactionSystem;
+		var item : ItemID;
+		var player : weak< PlayerPuppet >;
+		player = GetPlayer( GetGameInstance() );
+		ts = GameInstance.GetTransactionSystem( GetGameInstance() );
+		item = ItemID.FromTDBID( T"Items.Preset_Tanto_Saburo_Retrofix" );
+		ts.GiveItem( player, item, 1 );
+	}
+
+	private function CheckSaburoDogTagPresence()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+			TS.GetItemList( player, itemList );
+		}
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( itemList[ i ].HasTag( 'q005_saburo_dogtag' ) )
+			{
+				GiveSaburoTanto();
+			}
+		}
+	}
+
+	private function ProcessIconicsFactsForBlackMarketer()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+			TS.GetItemList( player, itemList );
+		}
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( itemList[ i ].HasTag( 'IconicWeapon' ) )
+			{
+				RPGManager.ProcessOnLootedPackages( player, itemList[ i ].GetID() );
+			}
+		}
+	}
+
+	private function GiveAndEquipAutoscalingFleshFists()
+	{
+		var ts : TransactionSystem;
+		var es : EquipmentSystem;
+		var item : ItemID;
+		var player : weak< PlayerPuppet >;
+		var equipRequest : GameplayEquipRequest;
+		es = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'EquipmentSystem' ) ) );
+		player = GetMainPlayer( GetGameInstance() );
+		ts = GameInstance.GetTransactionSystem( GetGameInstance() );
+		item = ItemID.FromTDBID( T"Items.w_melee_004__fists_a" );
+		ts.GiveItem( player, item, 1 );
+		equipRequest = new GameplayEquipRequest;
+		equipRequest.owner = player;
+		equipRequest.itemID = item;
+		equipRequest.blockUpdateWeaponActiveSlots = true;
+		es.QueueRequest( equipRequest );
+	}
+
+	private function ReplaceLeftHandVariantWeaponsWithRegular()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		player = GetMainPlayer( GetGameInstance() );
+		if( player )
+		{
+			TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+			TS.GetItemList( player, itemList );
+		}
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( itemList[ i ].HasTag( 'Left_Hand' ) )
+			{
+				RPGManager.ProcessOnLootedPackages( player, itemList[ i ].GetID() );
+			}
+		}
+	}
+
+	private function RetrofixQuickhacks()
+	{
+		var evt : RetrofixQuickhacksEvent;
+		var player : PlayerPuppet;
+		evt = new RetrofixQuickhacksEvent;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			player.QueueEvent( evt );
+		}
+	}
+
+	private function RetrofixCyberwares()
+	{
+		var evt : RetrofixCyberwaresEvent;
+		var player : PlayerPuppet;
+		evt = new RetrofixCyberwaresEvent;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			player.QueueEvent( evt );
+		}
+	}
+
 	public const function PrintEquipment()
 	{
 		var equipmentId : Int32;
-		Log( "Player Equipments:" );
 		for( equipmentId = 0; equipmentId < m_ownerData.Size(); equipmentId += 1 )
 		{
-			Log( "Player Equipment #" + IntToString( equipmentId ) );
-			m_ownerData[ equipmentId ].PrintEquipment();
 		}
 	}
 
@@ -4536,12 +5334,8 @@ class EquipmentSystem extends ScriptableSystem
 	public static function IsCyberdeckEquipped( owner : GameObject ) : Bool
 	{
 		var systemReplacementID : ItemID;
-		var itemRecord : weak< Item_Record >;
-		var itemTags : array< CName >;
 		systemReplacementID = GetData( owner ).GetActiveItem( gamedataEquipmentArea.SystemReplacementCW );
-		itemRecord = RPGManager.GetItemRecord( systemReplacementID );
-		itemTags = itemRecord.Tags();
-		return itemTags.Contains( 'Cyberdeck' );
+		return IsItemCyberdeck( systemReplacementID );
 	}
 
 	public static function IsItemCyberdeck( itemID : ItemID ) : Bool
@@ -4648,9 +5442,7 @@ class EquipmentSystem extends ScriptableSystem
 
 	public static function GetData( owner : GameObject ) : EquipmentSystemPlayerData
 	{
-		var equipmentSystem : EquipmentSystem;
-		equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( owner.GetGame() ).Get( 'EquipmentSystem' ) ) );
-		return equipmentSystem.GetPlayerData( owner );
+		return GetInstance( owner ).GetPlayerData( owner );
 	}
 
 	public static function GetSlotActiveItem( owner : GameObject, requestSlot : EquipmentManipulationRequestSlot ) : ItemID
@@ -4664,7 +5456,7 @@ class EquipmentSystem extends ScriptableSystem
 		return ItemID.None();
 	}
 
-	public static function GetItemsInArea( owner : GameObject, area : gamedataEquipmentArea ) : array< ItemID >
+	public export static function GetItemsInArea( owner : GameObject, area : gamedataEquipmentArea ) : array< ItemID >
 	{
 		var returnArray : array< ItemID >;
 		var i : Int32;
@@ -4780,6 +5572,23 @@ class EquipmentSystem extends ScriptableSystem
 		return voidEquipArea;
 	}
 
+	public static function RequestUnequipItem( owner : GameObject, equipmentArea : gamedataEquipmentArea, slotIndex : Int32 )
+	{
+		var equipmentSystem : EquipmentSystem;
+		var itemInSlot : ItemID;
+		var unequipRequest : UnequipRequest;
+		equipmentSystem = GetInstance( owner );
+		itemInSlot = equipmentSystem.GetItemInEquipSlot( owner, equipmentArea, slotIndex );
+		if( ItemID.IsValid( itemInSlot ) )
+		{
+			unequipRequest = new UnequipRequest;
+			unequipRequest.owner = owner;
+			unequipRequest.areaType = equipmentArea;
+			unequipRequest.slotIndex = slotIndex;
+			equipmentSystem.QueueRequest( unequipRequest );
+		}
+	}
+
 	private export function OnEquipRequest( request : EquipRequest )
 	{
 		var playerData : EquipmentSystemPlayerData;
@@ -4792,6 +5601,13 @@ class EquipmentSystem extends ScriptableSystem
 		var playerData : EquipmentSystemPlayerData;
 		playerData = GetPlayerData( request.owner );
 		playerData.OnGameplayEquipRequest( request );
+	}
+
+	private export function OnGameplayEquipProgramsRequest( request : GameplayEquipProgramsRequest )
+	{
+		var playerData : EquipmentSystemPlayerData;
+		playerData = GetPlayerData( request.owner );
+		playerData.OnGameplayEquipProgramsRequest( request );
 	}
 
 	private function OnClearAllWeaponSlotsRequest( request : ClearAllWeaponSlotsRequest )
@@ -4827,6 +5643,13 @@ class EquipmentSystem extends ScriptableSystem
 		var playerData : EquipmentSystemPlayerData;
 		playerData = GetPlayerData( request.owner );
 		playerData.OnUnequipItemsRequest( request );
+	}
+
+	private export function OnReplaceEquipmentRequest( request : ReplaceEquipmentRequest )
+	{
+		var playerData : EquipmentSystemPlayerData;
+		playerData = GetPlayerData( request.owner );
+		playerData.OnReplaceEquipmentRequest( request );
 	}
 
 	private export function OnHotkeyRefreshRequest( request : HotkeyRefreshRequest )
@@ -5016,11 +5839,37 @@ class EquipmentSystem extends ScriptableSystem
 		playerData.UnequipPrereqItems();
 	}
 
+	public const function EquipCyberwareByTDBID( player : PlayerPuppet, tdbid : TweakDBID )
+	{
+		var ts : TransactionSystem;
+		var equipRequest : EquipRequest;
+		var itemData : gameItemData;
+		ts = GameInstance.GetTransactionSystem( player.GetGame() );
+		equipRequest = new EquipRequest;
+		itemData = ts.GetItemDataByTDBID( player, tdbid );
+		if( ItemID.IsValid( itemData.GetID() ) )
+		{
+			equipRequest.owner = player;
+			equipRequest.itemID = itemData.GetID();
+			QueueRequest( equipRequest );
+		}
+	}
+
+	private function EquipTutorialCyberware( player : PlayerPuppet )
+	{
+		var requiredQuality : gamedataQuality;
+		requiredQuality = RPGManager.ConvertPlayerLevelToCyberwareQuality( GameInstance.GetStatsSystem( player.GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.Level ), false );
+		EquipCyberwareByTDBID( player, RipperDocGameController.GetAppropriateEyesTutorialCyberware( requiredQuality ) );
+		EquipCyberwareByTDBID( player, RipperDocGameController.GetAppropriateHandsTutorialCyberware( requiredQuality, false ) );
+	}
+
 	private function OnDrawItemByContextRequest( request : DrawItemByContextRequest )
 	{
 		var equipData : EquipmentSystemPlayerData;
 		var eqRequest : EquipmentSystemWeaponManipulationRequest;
+		var player : PlayerPuppet;
 		eqRequest = new EquipmentSystemWeaponManipulationRequest;
+		player = ( ( PlayerPuppet )( request.owner ) );
 		equipData = GetData( request.owner );
 		switch( request.itemEquipContext )
 		{
@@ -5044,6 +5893,12 @@ class EquipmentSystem extends ScriptableSystem
 			case gameItemEquipContexts.Fists:
 				eqRequest.requestType = EquipmentManipulationAction.RequestFists;
 			break;
+			case gameItemEquipContexts.TutorialCyberware:
+				if( player )
+				{
+					EquipTutorialCyberware( player );
+				}
+			return;
 		}
 		eqRequest.equipAnimType = request.equipAnimationType;
 		equipData.OnEquipmentSystemWeaponManipulationRequest( eqRequest );
@@ -5162,7 +6017,7 @@ class EquipmentSystem extends ScriptableSystem
 		return path;
 	}
 
-	public const function Debug_SetupESAreaButton( equipArea : SEquipArea, ownerGameObject : weak< GameObject > )
+	public const function Debug_SetupESAreaButton( const equipArea : ref< SEquipArea >, ownerGameObject : weak< GameObject > )
 	{
 		var i : Int32;
 		var sink : SDOSink;
@@ -5177,7 +6032,7 @@ class EquipmentSystem extends ScriptableSystem
 		}
 	}
 
-	public const function Debug_SetupESSlotButton( slotIndex : Int32, areaStr : String, ownerGameObject : weak< GameObject > )
+	public const function Debug_SetupESSlotButton( slotIndex : Int32, const areaStr : ref< String >, ownerGameObject : weak< GameObject > )
 	{
 		var sink : SDOSink;
 		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
@@ -5186,7 +6041,7 @@ class EquipmentSystem extends ScriptableSystem
 		Debug_SetESSlotData( slotIndex, areaStr, ownerGameObject );
 	}
 
-	public const function Debug_SetESSlotData( slotIndex : Int32, areaStr : String, ownerGameObject : weak< GameObject > )
+	public const function Debug_SetESSlotData( slotIndex : Int32, const areaStr : ref< String >, ownerGameObject : weak< GameObject > )
 	{
 		var sink : SDOSink;
 		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
@@ -5198,7 +6053,7 @@ class EquipmentSystem extends ScriptableSystem
 		Debug_FillESSlotData( slotIndex, EnumValueToString( "gamedataEquipmentArea", ( ( Int32 )( area ) ) ), itemID, ownerGameObject );
 	}
 
-	public const function Debug_FillESSlotData( slotIndex : Int32, areaStr : String, itemID : ItemID, ownerGameObject : weak< GameObject > )
+	public const function Debug_FillESSlotData( slotIndex : Int32, const areaStr : ref< String >, itemID : ItemID, ownerGameObject : weak< GameObject > )
 	{
 		var sink : SDOSink;
 		sink = GameInstance.GetScriptsDebugOverlaySystem( GetGameInstance() ).CreateSink();
@@ -5231,6 +6086,50 @@ class EquipmentSystem extends ScriptableSystem
 
 }
 
+import enum gameItemEquipContexts
+{
+	LastWeaponEquipped,
+	LastUsedMeleeWeapon,
+	LastUsedRangedWeapon,
+	Gadget,
+	MeleeCyberware,
+	LauncherCyberware,
+	Fists,
+	TutorialCyberware,
+}
+
+import enum gameEquipAnimationType
+{
+	Default,
+	Instant,
+	FirstEquip,
+	HACK_ForceInstantEquip,
+}
+
+import enum gameItemUnequipContexts
+{
+	AllWeapons,
+	HeadClothing,
+	FaceClothing,
+	OuterChestClothing,
+	InnerChestClothing,
+	LegClothing,
+	FootClothing,
+	AllClothing,
+	RightHandWeapon,
+	LeftHandWeapon,
+	AllQuestItems,
+	AllItems,
+}
+
+importonly class EquipRequest extends PlayerScriptableSystemRequest
+{
+	import var itemID : ItemID;
+	import var slotIndex : Int32;
+	import var addToInventory : Bool;
+	import var equipToCurrentActiveSlot : Bool;
+}
+
 class EquipVisualsRequest extends PlayerScriptableSystemRequest
 {
 	var itemID : ItemID;
@@ -5254,6 +6153,13 @@ class GameplayEquipRequest extends PlayerScriptableSystemRequest
 	default blockUpdateWeaponActiveSlots = false;
 	var forceEquipWeapon : Bool;
 	default forceEquipWeapon = false;
+	var extraQuality : Float;
+	var partsToAdd : array< ItemID >;
+}
+
+class GameplayEquipProgramsRequest extends PlayerScriptableSystemRequest
+{
+	var programIDs : array< ItemID >;
 }
 
 importonly class DrawItemRequest extends PlayerScriptableSystemRequest
@@ -5285,9 +6191,28 @@ class AssignToCyberwareWheelRequest extends PlayerScriptableSystemRequest
 	default slotIndex = -1;
 }
 
+class UnequipRequest extends PlayerScriptableSystemRequest
+{
+	var areaType : gamedataEquipmentArea;
+	var slotIndex : Int32;
+	default slotIndex = -1;
+	var force : Bool;
+}
+
 class UnequipItemsRequest extends PlayerScriptableSystemRequest
 {
 	var items : array< ItemID >;
+}
+
+class ReplaceEquipmentRequest extends PlayerScriptableSystemRequest
+{
+	var itemID : ItemID;
+	var slotIndex : Int32;
+	var addToInventory : Bool;
+	var rerollIdOnAddToInventory : Bool;
+	var removeOldItem : Bool;
+	var customPartToGenerateID : ItemID;
+	var transferInstalledParts : Bool;
 }
 
 class ThrowEquipmentRequest extends PlayerScriptableSystemRequest
@@ -5451,7 +6376,9 @@ importonly struct SEquipArea
 importonly struct SEquipSlot
 {
 	import persistent var itemID : ItemID;
-	import persistent var isLocked : Bool;
+	import var slotID : TweakDBID;
+	import var unlockPrereq : IPrereq;
+	import var visibleWhenLocked : Bool;
 }
 
 importonly struct SEquipmentSet
@@ -5501,68 +6428,18 @@ importonly struct SSlotActiveItems
 	import persistent var leftHandItem : ItemID;
 }
 
-importonly struct SLoadout
-{
-	import persistent var equipAreas : array< SEquipArea >;
-	import persistent var equipmentSets : array< SEquipmentSet >;
-}
-
-import enum EHotkey
-{
-	INVALID,
-	DPAD_UP,
-	DPAD_DOWN,
-	DPAD_RIGHT,
-	RB,
-}
-
-enum EHotkeyRequestType
-{
-	Assign = 0,
-	Cycle = 1,
-	Restore = 2,
-}
-
-import enum gameItemEquipContexts
-{
-	LastWeaponEquipped,
-	LastUsedMeleeWeapon,
-	LastUsedRangedWeapon,
-	Gadget,
-	MeleeCyberware,
-	LauncherCyberware,
-	Fists,
-}
-
-import enum gameEquipAnimationType
-{
-	Default,
-	Instant,
-	FirstEquip,
-}
-
-import enum gameItemUnequipContexts
-{
-	AllWeapons,
-	HeadClothing,
-	FaceClothing,
-	OuterChestClothing,
-	InnerChestClothing,
-	LegClothing,
-	FootClothing,
-	AllClothing,
-	RightHandWeapon,
-	LeftHandWeapon,
-	AllQuestItems,
-	AllItems,
-}
-
 enum ELastUsed
 {
 	Weapon = 0,
 	Melee = 1,
 	Ranged = 2,
 	Heavy = 3,
+}
+
+importonly struct SLoadout
+{
+	import persistent var equipAreas : array< SEquipArea >;
+	import persistent var equipmentSets : array< SEquipmentSet >;
 }
 
 import enum EEquipmentSetType
@@ -5585,28 +6462,25 @@ enum EquipmentManipulationAction
 	RequestLastUsedOrFirstAvailableRangedWeapon = 8,
 	RequestLastUsedOrFirstAvailableMeleeWeapon = 9,
 	RequestLastUsedOrFirstAvailableOneHandedRangedWeapon = 10,
-	RequestHeavyWeapon = 11,
-	CycleWeaponWheelItem = 12,
-	CycleNextWeaponWheelItem = 13,
-	CyclePreviousWeaponWheelItem = 14,
-	RequestConsumable = 15,
-	RequestGadget = 16,
-	RequestFists = 17,
-	RequestLeftHandCyberware = 18,
-	UnequipWeapon = 19,
-	UnequipConsumable = 20,
-	UnequipGadget = 21,
-	UnequipLeftHandCyberware = 22,
-	UnequipAll = 23,
-	ReequipWeapon = 24,
-	RequestWeaponSlot1 = 25,
-	RequestWeaponSlot2 = 26,
-	RequestWeaponSlot3 = 27,
-	RequestWeaponSlot4 = 28,
-}
-
-implicit cast ( hotkey : EHotkey ) : Int32
-{
-	return ( ( Int32 )( hotkey ) );
+	RequestLastUsedOrFirstAvailableDriverCombatRangedWeapon = 11,
+	RequestLastUsedOrFirstAvailableDriverCombatBikeWeapon = 12,
+	RequestHeavyWeapon = 13,
+	CycleWeaponWheelItem = 14,
+	CycleNextWeaponWheelItem = 15,
+	CyclePreviousWeaponWheelItem = 16,
+	RequestConsumable = 17,
+	RequestGadget = 18,
+	RequestFists = 19,
+	RequestLeftHandCyberware = 20,
+	UnequipWeapon = 21,
+	UnequipConsumable = 22,
+	UnequipGadget = 23,
+	UnequipLeftHandCyberware = 24,
+	UnequipAll = 25,
+	ReequipWeapon = 26,
+	RequestWeaponSlot1 = 27,
+	RequestWeaponSlot2 = 28,
+	RequestWeaponSlot3 = 29,
+	RequestWeaponSlot4 = 30,
 }
 

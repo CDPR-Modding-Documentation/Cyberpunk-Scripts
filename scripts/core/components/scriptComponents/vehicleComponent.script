@@ -8,17 +8,23 @@ class VehicleComponent extends ScriptableDeviceComponent
 	var m_bumperFrontState : Int32;
 	var m_bumperBackState : Int32;
 	var m_visualDestructionSet : Bool;
+	var m_immuneInDecay : Bool;
+	var m_healthDecayThreshold : Float;
 	var m_healthStatPoolListener : VehicleHealthStatPoolListener;
 	var m_vehicleBlackboard : weak< IBlackboard >;
 	var m_radioState : Bool;
 	var m_mounted : Bool;
 	var m_enterTime : Float;
 	var m_mappinID : NewMappinID;
+	var m_quickhackMappinID : NewMappinID;
 	var m_ignoreAutoDoorClose : Bool;
 	var m_timeSystemCallbackID : Uint32;
 	var m_vehicleTPPCallbackID : CallbackHandle;
 	var m_vehicleSpeedCallbackID : CallbackHandle;
+	var m_carAlarmCallbackID : CallbackHandle;
 	var m_vehicleRPMCallbackID : CallbackHandle;
+	var m_vehicleDisableAlarmDelayID : DelayID;
+	var m_vehicleExitDelayId : DelayID;
 	var m_broadcasting : Bool;
 	var m_hasSpoiler : Bool;
 	var m_spoilerUp : Float;
@@ -28,8 +34,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 	var m_overheatEffectBlackboard : worldEffectBlackboard;
 	var m_overheatActive : Bool;
 	var m_hornOn : Bool;
-	var m_hasSiren : Bool;
-	var m_hornPressTime : Float;
+	var m_useAuxiliary : Bool;
+	var m_sirenPressTime : Float;
 	var m_radioPressTime : Float;
 	var m_raceClockTickID : DelayID;
 	var m_objectActionsCallbackCtrl : gameObjectActionsCallbackController;
@@ -41,7 +47,18 @@ class VehicleComponent extends ScriptableDeviceComponent
 	default m_arePlayerHitShapesEnabled = true;
 	var m_uiWantedBarBB : weak< IBlackboard >;
 	var m_currentWantedLevelCallback : CallbackHandle;
+	var m_preventionPassengers : Int32;
+	default m_preventionPassengers = 0;
+	var m_timeSinceLastHit : Float;
+	default m_timeSinceLastHit = 0;
+	var m_dragTime : Float;
+	default m_dragTime = 0;
 	private var m_vehicleController : vehicleController;
+
+	public constexpr static function GetImmobilizedName() : CName
+	{
+		return 'immobilized';
+	}
 
 	private export function OnGameAttach()
 	{
@@ -59,11 +76,12 @@ class VehicleComponent extends ScriptableDeviceComponent
 		IsPlayerVehicle();
 		LoadExplodedState();
 		SetupThrusterFX();
-		DoPreventionVehicleSetup();
 		if( GetVehicle().IsPlayerVehicle() && !( GetPS().GetIsDestroyed() ) )
 		{
 			CreateMappin();
 		}
+		m_healthDecayThreshold = TweakDBInterface.GetPoolValueModifierRecord( T"BaseStatPools.VehicleHealthDecay" ).RangeEnd();
+		SetupCarAlarmHonkListener();
 	}
 
 	private export function OnGameDetach()
@@ -74,6 +92,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		DestroyMappin();
 		RegisterToHUDManager( false );
 		UnregisterListeners();
+		UnregisterCarAlarmHonkListener();
 		UnregisterInputListener();
 		DoPanzerCleanup();
 		DoPreventionVehicleCleanup();
@@ -88,6 +107,23 @@ class VehicleComponent extends ScriptableDeviceComponent
 			return false;
 		}
 		return vehicle.IsDestroyed();
+	}
+
+	public static function HasFlatTire( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		var wheeledObject : weak< WheeledObject >;
+		GetVehicleFromID( gi, vehicleID, vehicle );
+		if( !( vehicle ) )
+		{
+			return false;
+		}
+		wheeledObject = ( ( weak< weak< WheeledObject > > )( vehicle ) );
+		if( !( wheeledObject ) )
+		{
+			return false;
+		}
+		return wheeledObject.GetFlatTireIndex() != -1;
 	}
 
 	public constexpr static function GetDriverSlotName() : CName
@@ -110,7 +146,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return 'seat_back_right';
 	}
 
-	public static function GetPassengersSlotNames( out slotNames : array< CName > )
+	public static function GetPassengersSlotNames( slotNames : ref< array< CName > > )
 	{
 		slotNames.Resize( 4 );
 		slotNames[ 0 ] = GetDriverSlotName();
@@ -148,6 +184,13 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var slotID : MountingSlotId;
 		slotID.id = GetDriverSlotName();
+		return slotID;
+	}
+
+	public static function GetFrontPassengerSlotID() : MountingSlotId
+	{
+		var slotID : MountingSlotId;
+		slotID.id = GetFrontPassengerSlotName();
 		return slotID;
 	}
 
@@ -381,7 +424,55 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
-	public static function GetDriver( gi : GameInstance, vehicleID : EntityID ) : weak< GameObject >
+	public static function GetDriver( gi : GameInstance, vehicle : weak< VehicleObject >, vehicleID : EntityID ) : weak< GameObject >
+	{
+		var playerSystem : PlayerSystem;
+		var playerObj : weak< GameObject >;
+		if( vehicle.IsVehicleRemoteControlled() )
+		{
+			playerSystem = GameInstance.GetPlayerSystem( gi );
+			playerObj = playerSystem.GetLocalPlayerMainGameObject();
+			if( playerObj )
+			{
+				return playerObj;
+			}
+			else
+			{
+				return NULL;
+			}
+		}
+		return GetDriverMounted( gi, vehicleID );
+	}
+
+	public static function IsDriverSeatOccupiedByDeadNPC( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var driver : ScriptedPuppet;
+		driver = ( ( ScriptedPuppet )( VehicleComponent.GetDriverMounted( gi, vehicleID ) ) );
+		return driver && !( driver.IsActive() );
+	}
+
+	public static function IsMountedToVehicleWithDriverSeatOccupiedByDeadNPC( gi : GameInstance, passengerID : EntityID ) : Bool
+	{
+		var mountInfos : array< MountingInfo >;
+		var driver : ScriptedPuppet;
+		var i : Int32;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( passengerID ) ) )
+		{
+			return false;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( passengerID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( IsDriverSlot( mountInfos[ i ].slotId.id ) )
+			{
+				driver = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+				return driver && !( driver.IsActive() );
+			}
+		}
+		return false;
+	}
+
+	public static function GetDriverMounted( gi : GameInstance, vehicleID : EntityID ) : weak< GameObject >
 	{
 		var mountInfos : array< MountingInfo >;
 		var i : Int32;
@@ -400,6 +491,33 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return NULL;
 	}
 
+	public static function PlayerPassengerHasGodModeFromCheatSystem( gi : GameInstance, vehicleID : EntityID, gmType : gameGodModeType ) : Bool
+	{
+		var godModeSystem : GodModeSystem;
+		var playerSystem : PlayerSystem;
+		var playerObj : weak< GameObject >;
+		var godModeSources : array< CName >;
+		var mountingInfo : MountingInfo;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return false;
+		}
+		godModeSystem = GameInstance.GetGodModeSystem( gi );
+		playerSystem = GameInstance.GetPlayerSystem( gi );
+		playerObj = playerSystem.GetLocalPlayerMainGameObject();
+		if( !( playerObj ) || !( godModeSystem.HasGodMode( playerObj.GetEntityID(), gmType ) ) )
+		{
+			return false;
+		}
+		mountingInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( playerObj.GetEntityID() );
+		if( mountingInfo.parentId != vehicleID )
+		{
+			return false;
+		}
+		godModeSources = godModeSystem.GetGodModeSources( playerObj.GetEntityID(), gmType );
+		return godModeSources.Contains( 'cheat system' );
+	}
+
 	public static function CanBeDriven( gi : GameInstance, ownerID : EntityID ) : Bool
 	{
 		var vehicle : weak< VehicleObject >;
@@ -412,7 +530,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	public static function CanBeDriven( gi : GameInstance, vehicle : weak< VehicleObject > ) : Bool
 	{
-		if( ( ( ( !( vehicle ) || vehicle.IsDestroyed() ) || HasActiveAutopilot( gi, vehicle ) ) || IsExecutingAnyCommand( gi, vehicle ) ) || vehicle.IsPerformingSceneAnimation() )
+		if( ( ( ( ( ( !( vehicle ) || vehicle.IsDestroyed() ) || ( vehicle.GetAIComponent().GetReservedSeatsCount() > 0 ) ) || HasActiveAutopilot( gi, vehicle ) ) || IsExecutingAnyCommand( gi, vehicle ) ) || vehicle.IsPerformingSceneAnimation() ) || !( vehicle.CommandsFromDriverEnabled() ) )
 		{
 			return false;
 		}
@@ -447,10 +565,10 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return false;
 	}
 
-	public static function HasActiveDriver( gi : GameInstance, vehicleID : EntityID ) : Bool
+	public static function HasActiveDriver( gi : GameInstance, vehicle : weak< VehicleObject >, vehicleID : EntityID ) : Bool
 	{
 		var driver : weak< GameObject >;
-		driver = GetDriver( gi, vehicleID );
+		driver = GetDriver( gi, vehicle, vehicleID );
 		if( driver && ScriptedPuppet.IsActive( driver ) )
 		{
 			return true;
@@ -458,24 +576,58 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return false;
 	}
 
-	public static function QueueEventToPassenger( gi : GameInstance, vehicleID : EntityID, slotID : MountingSlotId, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	public static function HasActiveDriverMounted( gi : GameInstance, vehicleID : EntityID ) : Bool
 	{
-		var mountInfos : array< MountingInfo >;
+		var driver : weak< GameObject >;
+		driver = GetDriverMounted( gi, vehicleID );
+		if( driver && ScriptedPuppet.IsActive( driver ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function QueueEventToAllPassengersRandomly( gi : GameInstance, id : EntityID, evt : Event, min : Float, max : Float ) : Bool
+	{
 		var i : Int32;
 		var passenger : weak< GameObject >;
+		var passengers : array< weak< GameObject > >;
+		var delayTime : Float;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( id ) ) )
+		{
+			return false;
+		}
+		GetAllPassengers( gi, id, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
+		{
+			passenger = passengers[ i ];
+			if( passenger )
+			{
+				delayTime = delayTime + RandRangeF( min, max );
+				GameInstance.GetDelaySystem( gi ).DelayEvent( passenger, evt, delayTime );
+			}
+		}
+		if( !( passenger ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function QueueEventToPassenger( gi : GameInstance, vehicleID : EntityID, slotID : MountingSlotId, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	{
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var passengers : array< weak< GameObject > >;
 		var delayTime : Float;
 		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
 		{
 			return false;
 		}
-		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID, slotID );
-		for( i = 0; i < mountInfos.Size(); i += 1 )
+		GetAllPassengers( gi, vehicleID, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
 		{
-			if( mountInfos[ i ].slotId.id == 'trunk_body' )
-			{
-				continue;
-			}
-			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			passenger = passengers[ i ];
 			if( passenger )
 			{
 				if( delay > 0.0 )
@@ -509,24 +661,66 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return QueueEventToPassenger( gi, vehicle.GetEntityID(), slotID, evt, delay, randomDelay );
 	}
 
-	public static function QueueEventToAllPassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	public static function HasPassengersWithThreatOnPlayer( gi : GameInstance, vehicleID : EntityID ) : Bool
+	{
+		var passengers : array< weak< GameObject > >;
+		var passengerThreats : array< TrackedLocation >;
+		var player : weak< GameObject >;
+		var i : Int32;
+		GetAllPassengers( gi, vehicleID, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
+		{
+			passengerThreats = ( ( ScriptedPuppet )( passengers[ i ] ) ).GetTargetTrackerComponent().GetThreats( false );
+			if( ( passengerThreats.Size() > 0 ) && TargetTrackingExtension.GetPlayerFromThreats( passengerThreats, player ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function GetAllPassengers( gi : GameInstance, vehicleID : EntityID, includeTrunkBody : Bool, passengers : ref< array< weak< GameObject > > > )
 	{
 		var mountInfos : array< MountingInfo >;
 		var i : Int32;
 		var passenger : weak< GameObject >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
+		{
+			return;
+		}
+		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
+		for( i = 0; i < mountInfos.Size(); i += 1 )
+		{
+			if( !( includeTrunkBody ) )
+			{
+				if( mountInfos[ i ].slotId.id == 'trunk_body' )
+				{
+					continue;
+				}
+			}
+			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			if( passenger )
+			{
+				passengers.PushBack( passenger );
+			}
+		}
+		return;
+	}
+
+	public static function QueueEventToAllPassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, optional delay : Float, optional randomDelay : Bool ) : Bool
+	{
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var passengers : array< weak< GameObject > >;
 		var delayTime : Float;
 		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
 		{
 			return false;
 		}
-		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
-		for( i = 0; i < mountInfos.Size(); i += 1 )
+		GetAllPassengers( gi, vehicleID, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
 		{
-			if( mountInfos[ i ].slotId.id == 'trunk_body' )
-			{
-				continue;
-			}
-			passenger = ( ( GameObject )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			passenger = passengers[ i ];
 			if( passenger )
 			{
 				if( delay > 0.0 )
@@ -562,21 +756,17 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	public static function QueueEventToAllNonFriendlyAggressivePassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, optional delay : Float ) : Bool
 	{
-		var mountInfos : array< MountingInfo >;
 		var i : Int32;
 		var passenger : weak< ScriptedPuppet >;
+		var passengers : array< weak< GameObject > >;
 		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
 		{
 			return false;
 		}
-		mountInfos = GameInstance.GetMountingFacility( gi ).GetMountingInfoMultipleWithIds( , vehicleID );
-		for( i = 0; i < mountInfos.Size(); i += 1 )
+		GetAllPassengers( gi, vehicleID, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
 		{
-			if( mountInfos[ i ].slotId.id == 'trunk_body' )
-			{
-				continue;
-			}
-			passenger = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( gi, mountInfos[ i ].childId ) ) );
+			passenger = ( ( ScriptedPuppet )( passengers[ i ] ) );
 			if( ( passenger && !( IsFriendlyTowardsPlayer( passenger ) ) ) && passenger.IsAggressive() )
 			{
 				if( delay > 0.0 )
@@ -596,10 +786,11 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
-	public static function QueueEventToPassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, passengers : array< weak< GameObject > >, optional delay : Bool ) : Bool
+	public static function QueueEventToPassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, const passengers : ref< array< weak< GameObject > > >, optional delay : Bool, optional maxDelayAmount : Float ) : Bool
 	{
 		var i : Int32;
 		var delayTime : Float;
+		var maxDelay : Float;
 		if( ( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) ) || ( passengers.Size() == 0 ) )
 		{
 			return false;
@@ -610,7 +801,12 @@ class VehicleComponent extends ScriptableDeviceComponent
 			{
 				if( delay )
 				{
-					delayTime = delayTime + RandRangeF( 0.1, 2.0 );
+					maxDelay = 2.0;
+					if( maxDelayAmount > 0.0 )
+					{
+						maxDelay = maxDelayAmount;
+					}
+					delayTime = delayTime + RandRangeF( 0.1, maxDelay );
 					GameInstance.GetDelaySystem( gi ).DelayEvent( passengers[ i ], evt, delayTime );
 				}
 				else
@@ -622,7 +818,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
-	public static function QueueEventToAllNonFriendlyActivePassengers( gi : GameInstance, vehicleID : EntityID, evt : Event, executionOwner : GameObject, optional broadcastHijack : Bool, optional delay : Bool ) : Bool
+	public static function QueueExitEventToAllNonFriendlyActivePassengers( gi : GameInstance, vehicleID : EntityID, executionOwner : GameObject, optional broadcastHijack : Bool, optional delay : Bool ) : Bool
 	{
 		var mountInfos : array< MountingInfo >;
 		var playerMountInfo : MountingInfo;
@@ -632,6 +828,9 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var attitude : EAIAttitude;
 		var broadcaster : StimBroadcasterComponent;
 		var delayTime : Float;
+		var exitEvent : AIEvent;
+		var exitInPanicEvent : AIEvent;
+		var evt : AIEvent;
 		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) )
 		{
 			return false;
@@ -646,6 +845,10 @@ class VehicleComponent extends ScriptableDeviceComponent
 				break;
 			}
 		}
+		exitEvent = new AIEvent;
+		exitEvent.name = 'ExitVehicle';
+		exitInPanicEvent = new AIEvent;
+		exitInPanicEvent.name = 'ExitVehicleInPanic';
 		delayTime = RandRangeF( 0.2, 0.40000001 );
 		broadcaster = GameInstance.GetPlayerSystem( gi ).GetLocalPlayerMainGameObject().GetStimBroadcasterComponent();
 		for( i = 0; i < mountInfos.Size(); i += 1 )
@@ -657,6 +860,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 			{
 				if( ( passenger && active ) && attitude != EAIAttitude.AIA_Friendly )
 				{
+					evt = ( ( ( ( ScriptedPuppet )( passenger ) ).IsEnemy() ) ? ( exitEvent ) : ( exitInPanicEvent ) );
 					if( delay )
 					{
 						delayTime = delayTime + RandRangeF( 0.2, 0.40000001 );
@@ -687,7 +891,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			return false;
 		}
-		driver = GetDriver( gi, vehicle.GetEntityID() );
+		driver = GetDriverMounted( gi, vehicle.GetEntityID() );
 		if( ( driver == NULL ) || ScriptedPuppet.IsActive( driver ) )
 		{
 			return false;
@@ -697,7 +901,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
-	public static function CheckIfPassengersCanLeaveCar( gi : GameInstance, vehicleID : EntityID, out passengersCanLeaveCar : array< weak< GameObject > >, out passengersCantLeaveCar : array< weak< GameObject > > )
+	public static function CheckIfPassengersCanLeaveCar( gi : GameInstance, vehicleID : EntityID, passengersCanLeaveCar : ref< array< weak< GameObject > > >, passengersCantLeaveCar : ref< array< weak< GameObject > > > )
 	{
 		var mountInfos : array< MountingInfo >;
 		var i : Int32;
@@ -792,6 +996,21 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
+	public static function IsSlotOccupiedByOtherEntity( gi : GameInstance, vehicleID : EntityID, vehicleSlotID : MountingSlotId, expectedEntity : EntityID ) : Bool
+	{
+		var mountInfo : MountingInfo;
+		if( ( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( vehicleID ) ) ) || !( EntityID.IsDefined( expectedEntity ) ) )
+		{
+			return false;
+		}
+		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithIds( , vehicleID, vehicleSlotID );
+		if( !( EntityID.IsDefined( mountInfo.childId ) ) )
+		{
+			return false;
+		}
+		return expectedEntity != mountInfo.childId;
+	}
+
 	public static function IsSlotOccupiedByActivePassenger( gi : GameInstance, vehicleID : EntityID, slotName : CName ) : Bool
 	{
 		var vehicleSlotID : MountingSlotId;
@@ -863,6 +1082,20 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
+	public static function HasAnyPreventionPassengers( vehicle : weak< VehicleObject > ) : Bool
+	{
+		var vehicleComp : VehicleComponent;
+		if( vehicle )
+		{
+			vehicleComp = vehicle.GetVehicleComponent();
+			if( vehicleComp )
+			{
+				return vehicleComp.HasPreventionPassenger();
+			}
+		}
+		return false;
+	}
+
 	public static function HasAnyActivePassengers( gi : GameInstance, vehicleID : EntityID ) : Bool
 	{
 		var mountInfos : array< MountingInfo >;
@@ -895,26 +1128,22 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return IMountingFacility.InfoHasChild( mountInfo );
 	}
 
-	public static function IsVehicleOccupiedByHostile( vehicleID : EntityID, passanger : weak< GameObject > ) : Bool
+	public static function IsVehicleOccupiedByHostile( vehicleID : EntityID, passenger : weak< GameObject > ) : Bool
 	{
-		var mountInfos : array< MountingInfo >;
 		var i : Int32;
 		var attitudeOwner : AttitudeAgent;
 		var attitudeTarget : AttitudeAgent;
 		var target : weak< GameObject >;
-		if( !( passanger ) )
+		var targets : array< weak< GameObject > >;
+		if( !( passenger ) )
 		{
 			return false;
 		}
-		attitudeOwner = passanger.GetAttitudeAgent();
-		mountInfos = GameInstance.GetMountingFacility( passanger.GetGame() ).GetMountingInfoMultipleWithIds( , vehicleID );
-		for( i = 0; i < mountInfos.Size(); i += 1 )
+		attitudeOwner = passenger.GetAttitudeAgent();
+		GetAllPassengers( passenger.GetGame(), vehicleID, false, targets );
+		for( i = 0; i < targets.Size(); i += 1 )
 		{
-			if( mountInfos[ i ].slotId.id == 'trunk_body' )
-			{
-				continue;
-			}
-			target = ( ( GameObject )( GameInstance.FindEntityByID( passanger.GetGame(), mountInfos[ i ].childId ) ) );
+			target = targets[ i ];
 			if( !( target ) || !( ScriptedPuppet.IsActive( target ) ) )
 			{
 				continue;
@@ -1019,7 +1248,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return false;
 	}
 
-	public static function GetVehicleType( gi : GameInstance, owner : weak< GameObject >, out type : String ) : Bool
+	public static function GetVehicleType( gi : GameInstance, owner : weak< GameObject >, type : ref< String > ) : Bool
 	{
 		var vehicleRecord : Vehicle_Record;
 		var vehTypeRecord : VehicleType_Record;
@@ -1046,14 +1275,16 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
-	public static function GetVehicleNPCData( gi : GameInstance, owner : GameObject, out vehicleNPCData : AnimFeature_VehicleNPCData ) : Bool
+	private static function GetVehicleNPCData( gi : GameInstance, owner : GameObject, out vehicleNPCData : AnimFeature_VehicleNPCData ) : Bool
 	{
 		var mountInfo : MountingInfo;
 		var slotName : CName;
+		var vehicle : weak< VehicleObject >;
 		if( !( GameInstance.IsValid( gi ) ) || !( owner ) )
 		{
 			return false;
 		}
+		vehicleNPCData = new AnimFeature_VehicleNPCData;
 		mountInfo = GameInstance.GetMountingFacility( gi ).GetMountingInfoSingleWithObjects( owner );
 		slotName = mountInfo.slotId.id;
 		if( slotName == 'seat_front_left' || slotName == 'seat_back_left' )
@@ -1072,7 +1303,40 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			vehicleNPCData.isDriver = true;
 		}
+		GetVehicle( gi, owner, vehicle );
+		if( ( vehicle.IsVehicleRemoteControlled() || vehicle.IsVehicleAccelerateQuickhackActive() ) || vehicle.IsVehicleForceBrakesQuickhackActive() )
+		{
+			vehicleNPCData.forcePanic = true;
+		}
 		return true;
+	}
+
+	private function PushVehicleNPCDataToAllPassengers( gi : GameInstance, id : EntityID )
+	{
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var passengers : array< weak< GameObject > >;
+		if( !( GameInstance.IsValid( gi ) ) || !( EntityID.IsDefined( id ) ) )
+		{
+			return;
+		}
+		GetAllPassengers( gi, id, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
+		{
+			passenger = passengers[ i ];
+			if( passenger )
+			{
+				PushVehicleNPCData( gi, passenger );
+			}
+		}
+	}
+
+	private static function PushVehicleNPCData( gi : GameInstance, passenger : weak< GameObject > )
+	{
+		var vehicleNPCData : AnimFeature_VehicleNPCData;
+		GetVehicleNPCData( gi, passenger, vehicleNPCData );
+		AnimationControllerComponent.ApplyFeatureToReplicate( passenger, 'VehicleNPCData', vehicleNPCData );
+		AnimationControllerComponent.PushEventToReplicate( passenger, 'VehicleNPCData' );
 	}
 
 	public static function HasSlot( gi : GameInstance, vehicle : weak< VehicleObject >, slotName : CName ) : Bool
@@ -1143,12 +1407,36 @@ class VehicleComponent extends ScriptableDeviceComponent
 		for( i = 0; i < seats.Size(); i += 1 )
 		{
 			slotName = seats[ i ].SeatName();
-			if( !( IsSlotOccupied( gi, vehicle.GetEntityID(), slotName ) ) )
+			if( !( IsSlotOccupied( gi, vehicle.GetEntityID(), slotName ) || ( vehicle.GetAIComponent() && vehicle.GetAIComponent().IsSeatReserved( slotName ) ) ) )
 			{
 				return true;
 			}
 		}
 		return false;
+	}
+
+	public static function GetSeatsStatus( gi : GameInstance, vehicle : weak< VehicleObject >, out totalSeatSlots : Int32, out occupiedSeatSlots : Int32, out reservedSlots : Int32 )
+	{
+		var seats : array< weak< VehicleSeat_Record > >;
+		var slotName : CName;
+		var i : Int32;
+		if( !( GetSeats( gi, vehicle, seats ) ) )
+		{
+			return;
+		}
+		for( i = 0; i < seats.Size(); i += 1 )
+		{
+			slotName = seats[ i ].SeatName();
+			if( IsSlotOccupied( gi, vehicle.GetEntityID(), slotName ) )
+			{
+				occupiedSeatSlots += 1;
+			}
+			else if( vehicle.GetAIComponent() && vehicle.GetAIComponent().IsSeatReserved( slotName ) )
+			{
+				reservedSlots += 1;
+			}
+		}
+		totalSeatSlots = seats.Size();
 	}
 
 	public static function GetNumberOfOccupiedSlots( gi : GameInstance, vehicle : weak< VehicleObject > ) : Int32
@@ -1192,7 +1480,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 			return false;
 		}
 		GetVehicleDataPackage( gi, vehicle, vehDataPackage );
-		return vehDataPackage.SupportsCombat();
+		return vehDataPackage.DriverCombat().Type() != gamedataDriverCombatType.Disabled;
 	}
 
 	public static function ToggleVehicleWindow( gi : GameInstance, vehicle : weak< VehicleObject >, slotID : MountingSlotId, toggle : Bool, optional speed : CName ) : Bool
@@ -1290,17 +1578,44 @@ class VehicleComponent extends ScriptableDeviceComponent
 		return true;
 	}
 
+	protected event OnWeaponShootEvent( evt : VehicleMountedWeaponShootEvent )
+	{
+		var broadcaster : StimBroadcasterComponent;
+		var vehicle : VehicleObject;
+		vehicle = GetVehicle();
+		broadcaster = vehicle.GetStimBroadcasterComponent();
+		broadcaster.TriggerSingleBroadcast( vehicle, gamedataStimType.Gunshot, 50.0, , true );
+		if( m_mountedPlayer )
+		{
+			broadcaster.TriggerSingleBroadcast( m_mountedPlayer, gamedataStimType.Gunshot, m_mountedPlayer.GetGunshotRange() );
+		}
+	}
+
 	protected event OnMountingEvent( evt : MountingEvent )
 	{
 		var mountChild : GameObject;
 		var PSvehicleDooropenRequest : VehicleDoorOpen;
-		var vehicleNPCData : AnimFeature_VehicleNPCData;
 		var vehicleDataPackage : weak< VehicleDataPackage_Record >;
-		mountChild = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), evt.request.lowLevelMountingInfo.childId ) ) );
-		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehicleDataPackage );
+		var vehicleRecord : Vehicle_Record;
+		var gameInstance : GameInstance;
+		var isDriverSlot : Bool;
+		var shouldAutoClose : Bool;
+		shouldAutoClose = true;
+		gameInstance = GetVehicle().GetGame();
+		mountChild = ( ( GameObject )( GameInstance.FindEntityByID( gameInstance, evt.request.lowLevelMountingInfo.childId ) ) );
+		GetVehicleDataPackage( gameInstance, GetVehicle(), vehicleDataPackage );
 		if( mountChild.IsPlayer() )
 		{
 			m_mountedPlayer = ( ( PlayerPuppet )( mountChild ) );
+			isDriverSlot = VehicleComponent.IsDriverSlot( evt.request.lowLevelMountingInfo.slotId.id );
+			if( isDriverSlot )
+			{
+				PreventionSystem.SetPlayerMounted( gameInstance, true );
+				PreventionSystemHackerLoop.UpdatePlayerVehicle( gameInstance, GetVehicle() );
+				PoliceRadioScriptSystem.UpdatePoliceRadioOnVehicleEntrance( gameInstance );
+			}
+			m_mountedPlayer.GetPlayerStateMachineBlackboard().SetBool( GetAllBlackboardDefs().PlayerStateMachine.MountedToVehicleInDriverSeat, isDriverSlot );
+			GetVehicleRecord( gameInstance, m_mountedPlayer, vehicleRecord );
 			QueueEventToAllPassengers( m_mountedPlayer.GetGame(), GetVehicle().GetEntityID(), PlayerMuntedToMyVehicle.Create( m_mountedPlayer ) );
 			PlayerPuppet.ReevaluateAllBreathingEffects( ( ( PlayerPuppet )( mountChild ) ) );
 			if( !( GetVehicle().IsCrowdVehicle() ) )
@@ -1312,8 +1627,12 @@ class VehicleComponent extends ScriptableDeviceComponent
 			{
 				RegisterToHUDManager( false );
 			}
+			if( GetVehicle().IsPlayerVehicle() && !( GetPS().GetIsDestroyed() ) )
+			{
+				CreateMappin();
+			}
 			RegisterInputListener();
-			FastTravelSystem.AddFastTravelLock( 'InVehicle', GetVehicle().GetGame() );
+			FastTravelSystem.AddFastTravelLock( 'InVehicle', gameInstance );
 			m_mounted = true;
 			m_ignoreAutoDoorClose = true;
 			SetupListeners();
@@ -1321,6 +1640,18 @@ class VehicleComponent extends ScriptableDeviceComponent
 			if( EntityID.IsDefined( evt.request.mountData.mountEventOptions.entityID ) )
 			{
 				m_enterTime = vehicleDataPackage.Stealing() + vehicleDataPackage.SlideDuration();
+			}
+			else if( ( m_mountedPlayer.IsInCombat() && vehicleRecord.Type().Type() == gamedataVehicleType.Car ) && isDriverSlot )
+			{
+				m_enterTime = vehicleDataPackage.CombatEntering() + vehicleDataPackage.SlideDuration();
+				if( vehicleDataPackage.DriverCombat().Type() == gamedataDriverCombatType.Doors && ( ( ( WeaponObject )( GameInstance.GetTransactionSystem( m_mountedPlayer.GetGame() ).GetItemInSlot( m_mountedPlayer, T"AttachmentSlots.WeaponLeft" ) ) ) || ( ( WeaponObject )( GameInstance.GetTransactionSystem( m_mountedPlayer.GetGame() ).GetItemInSlot( m_mountedPlayer, T"AttachmentSlots.WeaponRight" ) ) ) ) )
+				{
+					shouldAutoClose = false;
+				}
+				else
+				{
+					shouldAutoClose = true;
+				}
 			}
 			else
 			{
@@ -1336,14 +1667,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 				}
 				SetSteeringLimitAnimFeature( 1 );
 			}
-			if( evt.request.mountData.isInstant )
-			{
-				DetermineShouldCrystalDomeBeOn( 0.0 );
-			}
-			else
-			{
-				DetermineShouldCrystalDomeBeOn( 0.75 );
-			}
+			GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).RequestSettingStatPoolValueCustomLimit( GetVehicle().GetEntityID(), gamedataStatPoolType.Health, m_healthDecayThreshold, GetVehicle() );
 		}
 		if( !( mountChild.IsPlayer() ) )
 		{
@@ -1351,10 +1675,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 			{
 				mountChild.QueueEvent( CreateDisableRagdollEvent( 'VehicleComponentOnMountingEvent' ) );
 			}
-			vehicleNPCData = new AnimFeature_VehicleNPCData;
-			GetVehicleNPCData( GetVehicle().GetGame(), mountChild, vehicleNPCData );
-			AnimationControllerComponent.ApplyFeatureToReplicate( mountChild, 'VehicleNPCData', vehicleNPCData );
-			AnimationControllerComponent.PushEventToReplicate( mountChild, 'VehicleNPCData' );
+			PushVehicleNPCData( gameInstance, mountChild );
 			if( ( mountChild.IsPuppet() && !( GetVehicle().IsPlayerVehicle() ) ) && ( IsHostileTowardsPlayer( mountChild ) || ( ( ScriptedPuppet )( mountChild ) ).IsAggressive() ) )
 			{
 				EnableTargetingComponents();
@@ -1372,24 +1693,20 @@ class VehicleComponent extends ScriptableDeviceComponent
 			{
 				PSvehicleDooropenRequest.autoCloseTime = vehicleDataPackage.Normal_open();
 			}
-			if( !( GetPS().GetIsDestroyed() ) )
+			if( !( GetPS().GetIsDestroyed() ) && shouldAutoClose )
 			{
 				PSvehicleDooropenRequest.shouldAutoClose = true;
 			}
-			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleDooropenRequest );
+			GameInstance.GetPersistencySystem( gameInstance ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleDooropenRequest );
 		}
 		ManageAdditionalAnimFeatures( mountChild, true );
-		if( GetVehicle().IsPrevention() )
+		if( mountChild.IsPrevention() )
 		{
-			if( mountChild.IsPlayer() )
-			{
-				DestroyMappin();
-			}
-			else
-			{
-				GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).RegisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountChild.GetEntityID() );
-				CreateMappin();
-			}
+			m_preventionPassengers += 1;
+			RegisterWantedLevelListener();
+			GameInstance.GetPreventionSpawnSystem( gameInstance ).RegisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountChild.GetEntityID() );
+			CreateMappin();
+			GetVehicle().GetPreventionSystem().UpdateVehiclePassengerCount( GetVehicle().GetEntityID(), m_preventionPassengers );
 		}
 	}
 
@@ -1397,12 +1714,15 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var mountChild : GameObject;
 		var activePassengers : Int32;
-		var turnedOn : Bool;
-		var engineOn : Bool;
-		mountChild = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), evt.request.lowLevelMountingInfo.childId ) ) );
+		var mountChildIsPrevention : Bool;
+		var gameInstance : GameInstance;
+		gameInstance = GetVehicle().GetGame();
+		mountChild = ( ( GameObject )( GameInstance.FindEntityByID( gameInstance, evt.request.lowLevelMountingInfo.childId ) ) );
+		mountChildIsPrevention = mountChild && mountChild.IsPrevention();
 		VehicleComponent.SetAnimsetOverrideForPassenger( mountChild, evt.request.lowLevelMountingInfo.parentId, evt.request.lowLevelMountingInfo.slotId.id, 0.0 );
 		if( mountChild && mountChild.IsPlayer() )
 		{
+			PreventionSystem.SetPlayerMounted( gameInstance, false );
 			PlayerPuppet.ReevaluateAllBreathingEffects( ( ( PlayerPuppet )( mountChild ) ) );
 			ToggleScanningComponent( true );
 			if( GetVehicle().ShouldRegisterToHUD() )
@@ -1410,7 +1730,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 				RegisterToHUDManager( true );
 			}
 			UnregisterInputListener();
-			FastTravelSystem.RemoveFastTravelLock( 'InVehicle', GetVehicle().GetGame() );
+			FastTravelSystem.RemoveFastTravelLock( 'InVehicle', gameInstance );
 			m_mounted = false;
 			UnregisterListeners();
 			ToggleSiren( false, false );
@@ -1420,29 +1740,38 @@ class VehicleComponent extends ScriptableDeviceComponent
 			}
 			if( evt.request.lowLevelMountingInfo.slotId.id == 'seat_front_left' )
 			{
-				turnedOn = GetVehicle().IsVehicleTurnedOn();
-				engineOn = GetVehicle().IsEngineTurnedOn();
-				ToggleVehicleSystems( false, turnedOn, engineOn );
+				PreventionSystemHackerLoop.UpdatePlayerVehicle( gameInstance, NULL );
+				ToggleCrystalDome( false, true );
 				SetSteeringLimitAnimFeature( 0 );
 				m_ignoreAutoDoorClose = false;
 			}
 			DoPanzerCleanup();
 			m_mountedPlayer = NULL;
 			CleanUpRace();
+			GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).RequestSettingStatPoolValueCustomLimit( GetVehicle().GetEntityID(), gamedataStatPoolType.Health, 0.0, GetVehicle() );
+			GameInstance.GetAudioSystem( GetVehicle().GetGame() ).RemoveTriggerEffect( 'te_vehicle_car_disabled' );
 		}
-		if( mountChild && GetNumberOfActivePassengers( mountChild.GetGame(), GetVehicle().GetEntityID(), activePassengers ) )
+		if( mountChild )
 		{
-			if( activePassengers <= 0 )
+			if( mountChildIsPrevention )
 			{
-				DisableTargetingComponents();
-				if( GetVehicle().IsPrevention() )
+				GameInstance.GetPreventionSpawnSystem( gameInstance ).UnregisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountChild.GetEntityID() );
+				if( mountChild.IsActive() )
+				{
+					m_preventionPassengers = Max( 0, m_preventionPassengers - 1 );
+				}
+				GetVehicle().GetPreventionSystem().UpdateVehiclePassengerCount( GetVehicle().GetEntityID(), m_preventionPassengers );
+				if( m_preventionPassengers == 0 )
 				{
 					DestroyMappin();
 				}
 			}
-			if( GetVehicle().IsPrevention() )
+			if( GetNumberOfActivePassengers( mountChild.GetGame(), GetVehicle().GetEntityID(), activePassengers ) )
 			{
-				GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).UnregisterEntityDeathCallback( this, "OnPreventionPassengerDeath", mountChild.GetEntityID() );
+				if( activePassengers <= 0 )
+				{
+					DisableTargetingComponents();
+				}
 			}
 		}
 		ManageAdditionalAnimFeatures( mountChild, false );
@@ -1458,25 +1787,10 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	public function OnPreventionPassengerDeath( deadEntityID : EntityID )
 	{
-		var mountInfos : array< MountingInfo >;
-		var i : Int32;
-		var passanger : weak< GameObject >;
-		var activePassengers : Int32;
-		mountInfos = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoMultipleWithIds( , GetVehicle().GetEntityID() );
-		activePassengers = 0;
-		for( i = 0; i < mountInfos.Size(); i += 1 )
+		m_preventionPassengers = Max( 0, m_preventionPassengers - 1 );
+		if( m_preventionPassengers == 0 )
 		{
-			if( mountInfos[ i ].childId != deadEntityID )
-			{
-				passanger = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountInfos[ i ].childId ) ) );
-				if( passanger && ScriptedPuppet.IsActive( passanger ) )
-				{
-					activePassengers += 1;
-				}
-			}
-		}
-		if( activePassengers == 0 )
-		{
+			UnregisterWantedLevelListener();
 			DestroyMappin();
 		}
 	}
@@ -1484,6 +1798,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 	protected event OnVehicleFinishedMountingEvent( evt : VehicleFinishedMountingEvent )
 	{
 		var isDestroyed : Bool;
+		var vehDataPackage : weak< VehicleDataPackage_Record >;
 		if( evt.isMounting )
 		{
 			isDestroyed = GetPS().GetIsDestroyed();
@@ -1495,20 +1810,47 @@ class VehicleComponent extends ScriptableDeviceComponent
 				}
 			}
 		}
-		m_ignoreAutoDoorClose = false;
+		GetVehicle().GetAIComponent().ReleaseSeat( evt.slotID );
+		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehDataPackage );
+		if( vehDataPackage.DriverCombat().Type() != gamedataDriverCombatType.Doors && ( ( gamePSMVehicle )( m_mountedPlayer.GetPlayerStateMachineBlackboard().GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle ) ) ) != gamePSMVehicle.DriverCombat )
+		{
+			m_ignoreAutoDoorClose = false;
+		}
 	}
 
 	protected event OnVehicleStartedUnmountingEvent( evt : VehicleStartedUnmountingEvent ) {}
 
+	protected event OnVehicleQuestNodeActivateRemoteVehicleControl( evt : VehicleQuestNodeSetVehicleRemoteControlled )
+	{
+		var triggerVehicleRemoteControlEvent : TriggerVehicleRemoteControlEvent;
+		triggerVehicleRemoteControlEvent = new TriggerVehicleRemoteControlEvent;
+		triggerVehicleRemoteControlEvent.enable = evt.enable;
+		triggerVehicleRemoteControlEvent.shouldUnseatPassengers = evt.shouldUnseatPassengers;
+		triggerVehicleRemoteControlEvent.shouldModifyInteractionState = evt.shouldModifyInteractionState;
+		TakeOverControlSystem.ReleaseControl( GetVehicle().GetGame(), triggerVehicleRemoteControlEvent, GetVehicle().GetEntityID() );
+	}
+
+	protected event OnTriggerVehicleRemoteControlEvent( evt : TriggerVehicleRemoteControlEvent )
+	{
+		var playerPuppet : PlayerPuppet;
+		var invalidateEvent : PlayerVisionModeControllerInvalidateEvent;
+		invalidateEvent = new PlayerVisionModeControllerInvalidateEvent;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject() ) );
+		GetVehicle().SetVehicleRemoteControlled( evt.enable, evt.shouldUnseatPassengers, evt.shouldModifyInteractionState );
+		invalidateEvent.m_active = false;
+		playerPuppet.QueueEvent( invalidateEvent );
+	}
+
 	protected event OnVehicleStartedMountingEvent( evt : VehicleStartedMountingEvent )
 	{
+		var passengers : array< weak< GameObject > >;
 		if( !( evt.isMounting ) )
 		{
 			SendVehicleStartedUnmountingEventToPS( evt.isMounting, evt.slotID, evt.character );
-			if( evt.slotID == 'seat_front_left' && !( GetVehicle().IsAbandoned() ) )
+			GetAllPassengers( GetVehicle().GetGame(), GetVehicle().GetEntityID(), false, passengers );
+			if( ( ( ( evt.slotID == 'seat_front_left' || ( passengers.Size() == 1 ) ) && !( GetVehicle().IsAbandoned() ) ) && !( GetVehicle().IsVehicleAccelerateQuickhackActive() ) ) && !( ( ( evt.animationSlotName == 'cool' || evt.animationSlotName == 'combat' ) || evt.animationSlotName == 'speed' ) ) )
 			{
 				ToggleVehicleSystems( false, true, true );
-				GetVehicleControllerPS().SetState( vehicleEState.Default );
 			}
 		}
 		else
@@ -1964,6 +2306,171 @@ class VehicleComponent extends ScriptableDeviceComponent
 		GetPS().SetHasDefaultStateBeenSet( true );
 	}
 
+	protected event OnRemoteControlEvent( evt : VehicleRemoteControlEvent )
+	{
+		var vehicleQuestEvent : VehicleQuestChangeDoorStateEvent;
+		var maxDelayToUnseatPassengers : Float;
+		vehicleQuestEvent = new VehicleQuestChangeDoorStateEvent;
+		maxDelayToUnseatPassengers = 5.0;
+		if( evt.shouldModifyInteractionState )
+		{
+			if( evt.remoteControl )
+			{
+				vehicleQuestEvent.newState = EQuestVehicleDoorState.DisableAllInteractions;
+			}
+			else
+			{
+				vehicleQuestEvent.newState = EQuestVehicleDoorState.ResetInteractions;
+			}
+			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), vehicleQuestEvent );
+		}
+		if( evt.shouldUnseatPassengers )
+		{
+			GetVehicle().TriggerExitBehavior( maxDelayToUnseatPassengers );
+		}
+		if( !( evt.remoteControl ) )
+		{
+			GetPS().EndStimsOnVehicleQuickhack();
+		}
+		PushVehicleNPCDataToAllPassengers( GetVehicle().GetGame(), GetVehicle().GetEntityID() );
+	}
+
+	protected event OnForceBrakesQuickhackEvent( evt : VehicleForceBrakesQuickhackEvent )
+	{
+		if( evt.active )
+		{
+			SetDelayDisableCarAlarm( evt.alarmDuration );
+		}
+		PushVehicleNPCDataToAllPassengers( GetVehicle().GetGame(), GetVehicle().GetEntityID() );
+	}
+
+	protected event OnAccelerateQuickhackEvent( evt : VehicleAccelerateQuickhackEvent )
+	{
+		PushVehicleNPCDataToAllPassengers( GetVehicle().GetGame(), GetVehicle().GetEntityID() );
+	}
+
+	private function QueueVehicleImpactLethalHitEvent( target : weak< GameObject >, instigator : weak< GameObject >, sourceName : CName )
+	{
+		var hitEvent : gameHitEvent;
+		var attackContext : AttackInitContext;
+		var attack : IAttack;
+		if( target == NULL )
+		{
+			return;
+		}
+		hitEvent = new gameHitEvent;
+		hitEvent.attackData = new AttackData;
+		attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.VehicleImpact" );
+		attackContext.instigator = instigator;
+		attackContext.source = GetVehicle();
+		attack = IAttack.Create( attackContext );
+		hitEvent.target = target;
+		hitEvent.attackData.AddFlag( hitFlag.Kill, sourceName );
+		if( target == instigator )
+		{
+			hitEvent.attackData.AddFlag( hitFlag.CanDamageSelf, sourceName );
+		}
+		hitEvent.attackData.SetSource( GetVehicle() );
+		hitEvent.attackData.SetInstigator( instigator );
+		hitEvent.attackData.SetAttackDefinition( attack );
+		GameInstance.GetDamageSystem( GetVehicle().GetGame() ).QueueHitEvent( hitEvent, target );
+	}
+
+	protected event OnExplodeEvent( evt : VehicleExplodeEvent )
+	{
+		var instigator : weak< GameObject >;
+		instigator = GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject();
+		QueueVehicleImpactLethalHitEvent( GetVehicle(), instigator, 'Explode Quickhack' );
+	}
+
+	protected event OnVehicleNotifyPassengersOfCollision( evt : VehicleNotifyPassengersOfCollision )
+	{
+		var i : Int32;
+		var passenger : weak< GameObject >;
+		var passengers : array< weak< GameObject > >;
+		var gi : GameInstance;
+		var vehicleID : EntityID;
+		gi = GetVehicle().GetGame();
+		vehicleID = GetVehicle().GetEntityID();
+		GetAllPassengers( gi, vehicleID, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
+		{
+			passenger = passengers[ i ];
+			if( passenger )
+			{
+				DamagePassengerInCollision( passenger, evt.instigator, evt.hitDirection );
+			}
+		}
+	}
+
+	private function DamagePassengerInCollision( passenger : weak< GameObject >, instigator : weak< GameObject >, hitDirection : Vector4 )
+	{
+		var hitEvent : gameHitEvent;
+		var attackContext : AttackInitContext;
+		var attack : IAttack;
+		var player : GameObject;
+		player = GetPlayer( GetVehicle().GetGame() );
+		if( player == passenger )
+		{
+			if( !( PlayerDevelopmentSystem.GetData( player ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Body_Right_Milestone_1 ) ) )
+			{
+				hitEvent = new gameHitEvent;
+				hitEvent.attackData = new AttackData;
+				hitEvent.target = passenger;
+				attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.PlayerCarInCollision" );
+				attackContext.instigator = instigator;
+				attackContext.source = instigator;
+				attack = IAttack.Create( attackContext );
+				hitEvent.attackData.SetAttackDefinition( attack );
+				hitEvent.attackData.AddFlag( hitFlag.Nonlethal, 'Player Passenger in vehicle in collision' );
+				hitEvent.attackData.AddFlag( hitFlag.CanDamageSelf, 'Player Passenger in vehicle in collision' );
+				hitEvent.attackData.SetSource( instigator );
+				hitEvent.attackData.SetInstigator( instigator );
+				hitEvent.attackData.SetAttackDefinition( attack );
+				hitEvent.hitPosition = passenger.GetWorldPosition();
+				hitEvent.hitDirection = hitDirection;
+				GameInstance.GetDamageSystem( GetVehicle().GetGame() ).QueueHitEvent( hitEvent, GetVehicle() );
+			}
+		}
+		else
+		{
+			hitEvent = new gameHitEvent;
+			hitEvent.attackData = new AttackData;
+			hitEvent.target = passenger;
+			attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.NPCCarInCollision" );
+			attackContext.instigator = instigator;
+			attackContext.source = instigator;
+			attack = IAttack.Create( attackContext );
+			hitEvent.attackData.SetAttackDefinition( attack );
+			hitEvent.attackData.AddFlag( hitFlag.CanDamageSelf, 'npc Passenger in vehicle in collision' );
+			hitEvent.attackData.AddFlag( hitFlag.NPCPassengerVehicleCollision, 'npc Passenger in vehicle in collision' );
+			hitEvent.attackData.AddFlag( hitFlag.ForceNoCrit, 'npc Passenger in vehicle in collision' );
+			hitEvent.attackData.SetSource( instigator );
+			hitEvent.attackData.SetInstigator( instigator );
+			hitEvent.attackData.SetAttackDefinition( attack );
+			hitEvent.hitPosition = passenger.GetWorldPosition();
+			hitEvent.hitDirection = hitDirection;
+			GameInstance.GetDamageSystem( GetVehicle().GetGame() ).QueueHitEvent( hitEvent, GetVehicle() );
+		}
+	}
+
+	protected event OnRemoteControlCameraToggleEvent( evt : VehicleRemoteControlCameraToggleEvent )
+	{
+		GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'camera_transition_effect_stop' );
+	}
+
+	protected event OnToggleBrokenTireEvent( evt : VehicleToggleBrokenTireEvent ) {}
+
+	protected event OnAIVehicleDisabledEvent( evt : AIVehicleDisabledEvent )
+	{
+		if( !( GetPS().GetIsDestroyed() ) && !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( GetVehicle().GetEntityID(), gameGodModeType.Immortal ) ) )
+		{
+			DestroyMappin();
+			DisableRadio();
+			GetVehicle().TriggerExitBehavior();
+		}
+	}
+
 	private function ShouldVisualDestructionBeSet()
 	{
 		var vehVisualDestroRecord : weak< VehicleVisualDestruction_Record >;
@@ -2169,6 +2676,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject() ) );
 		playerPuppet.RegisterInputListener( this, 'VehicleInsideWheel' );
 		playerPuppet.RegisterInputListener( this, 'VehicleHorn' );
+		playerPuppet.RegisterInputListener( this, 'VehicleHornHold' );
+		playerPuppet.RegisterInputListener( this, 'VehicleSiren' );
 	}
 
 	private function UnregisterInputListener()
@@ -2282,20 +2791,26 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
+	private function RemoveQuickhackQueue()
+	{
+		var currentlyUploadingAction : ScriptableDeviceAction;
+		currentlyUploadingAction = GetVehicle().GetCurrentlyUploadingAction();
+		QuickHackableQueueHelper.RemoveQuickhackQueue( NULL, currentlyUploadingAction );
+	}
+
 	protected event OnDeath( evt : gameDeathEvent )
 	{
 		ToggleSiren( false, false );
-		GetPS().SetIsDestroyed( true );
 		m_interaction.Toggle( false );
 		ExplodeVehicle( evt.instigator );
 		GetVehicle().FindAndRewardKiller( gameKillType.Normal );
 		DisableTargetingComponents();
-		QueueEventToAllPassengers( GetVehicle().GetGame(), GetVehicle(), AIEvents.ExitVehicleEvent(), 0.5 );
 		UnmountTrunkBody();
 		ToggleInteraction( '', false );
 		TryToKnockDownBike();
 		DestroyMappin();
 		RemoveEnvironmentalHazardStimuli();
+		RemoveQuickhackQueue();
 	}
 
 	protected event OnVehicleWaterEvent( evt : VehicleWaterEvent )
@@ -2307,10 +2822,13 @@ class VehicleComponent extends ScriptableDeviceComponent
 			( ( VehicleComponentPS )( GetPS() ) ).SetIsSubmerged( true );
 			BreakAllDamageStageFX( true );
 			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'fire' );
-			DestroyVehicle();
+			GetPS().SetIsDestroyed( true );
+			DisableVehicle();
 			DestroyRandomWindow();
-			ApplyVehicleDOT( 'high' );
+			RemoveVehicleDOT();
 			GameObjectEffectHelper.StartEffectEvent( vehicle, 'underwater_bubbles' );
+			GameObjectEffectHelper.StopEffectEvent( vehicle, GetImmobilizedName() );
+			QueueLethalVehicleImpactToAllNonFriendlyAggressivePassengers( 'OnVehicleWaterEvent' );
 		}
 		ScriptedPuppet.ReevaluateOxygenConsumption( m_mountedPlayer );
 	}
@@ -2367,10 +2885,6 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var hudManager : HUDManager;
 		var registration : HUDManagerRegistrationRequest;
-		if( GetVehicle().IsCrowdVehicle() && !( GetVehicle().ShouldForceRegisterInHUDManager() ) )
-		{
-			return;
-		}
 		hudManager = ( ( HUDManager )( GameInstance.GetScriptableSystemsContainer( GetVehicle().GetGame() ).Get( 'HUDManager' ) ) );
 		if( hudManager )
 		{
@@ -2455,7 +2969,12 @@ class VehicleComponent extends ScriptableDeviceComponent
 		GetVehicle().SetScannerDirty( true );
 	}
 
-	private function ExecuteAction( choice : InteractionChoice, executor : weak< GameObject > )
+	protected event OnQuickSlotCommandUsed( evt : QuickSlotCommandUsed )
+	{
+		ExecuteAction( evt.action, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject() );
+	}
+
+	private function ExecuteAction( const choice : ref< InteractionChoice >, executor : weak< GameObject > )
 	{
 		var action : DeviceAction;
 		var i : Int32;
@@ -2480,7 +2999,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 			{
 				sAction.SetExecutor( executor );
 			}
-			GameInstance.GetPersistencySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).QueuePSDeviceEvent( sAction );
+			sAction.ProcessRPGAction( ( ( VehicleObject )( GetEntity() ) ).GetGame() );
 		}
 	}
 
@@ -2499,6 +3018,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'explosion', false );
 		GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'fire', false );
 		GameObject.PlaySoundEvent( GetVehicle(), 'v_car_test_explosion' );
+		GameObjectEffectHelper.StopEffectEvent( GetVehicle(), GetImmobilizedName() );
 	}
 
 	private function ExplodeVehicle( instigator : weak< GameObject > )
@@ -2509,13 +3029,30 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var broadcaster : StimBroadcasterComponent;
 		var vehicleRecord : Vehicle_Record;
 		var destroyedAppearanceName : CName;
+		var playerPuppet : PlayerPuppet;
+		var isPlayerDead : Bool;
+		playerPuppet = ( ( PlayerPuppet )( instigator ) );
+		isPlayerDead = GetPlayer( GetVehicle().GetGame() ).IsDead();
 		vehicleRecord = GetVehicle().GetRecord();
 		destroyedAppearanceName = vehicleRecord.DestroyedAppearance();
 		if( ( ( VehicleComponentPS )( GetPS() ) ).GetIsSubmerged() )
 		{
 			return;
 		}
+		if( !( isPlayerDead ) )
+		{
+			GetPS().SetIsDestroyed( true );
+		}
+		RemoveVehicleDOT();
+		if( GetVehicle().IsPlayerMounted() )
+		{
+			GameInstance.GetTelemetrySystem( GetVehicle().GetGame() ).LogPlayerVehicleExploded();
+		}
 		attackID = T"Attacks.CarMediumKill";
+		if( playerPuppet )
+		{
+			playerPuppet.OnExplosiveDeviceExploded();
+		}
 		if( !( instigator ) )
 		{
 			instigator = GetVehicle();
@@ -2528,11 +3065,15 @@ class VehicleComponent extends ScriptableDeviceComponent
 				explosionAttack.StartAttack();
 				GetVehicle().DetachAllParts();
 				ProcessExplosionEffects();
-				GetPS().SetHasExploded( true );
+				if( !( isPlayerDead ) )
+				{
+					GetPS().SetHasExploded( true );
+				}
 				if( IsNameValid( destroyedAppearanceName ) )
 				{
 					GetVehicle().ScheduleAppearanceChange( destroyedAppearanceName );
 				}
+				CancelVehicleExitDelayedEvent();
 				KillPassengers( instigator );
 				broadcaster = GetVehicle().GetStimBroadcasterComponent();
 				if( broadcaster )
@@ -2545,6 +3086,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			SendExplodedAIEvent();
 		}
+		GameObject.PlaySoundEvent( GetVehicle(), 'v_car_explosion_warning_stop' );
 	}
 
 	private function SendExplodedAIEvent()
@@ -2561,6 +3103,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var seSystem : StatusEffectSystem;
 		var i : Int32;
 		var playerID : EntityID;
+		var godModeSystem : GodModeSystem;
+		godModeSystem = GameInstance.GetGodModeSystem( GetVehicle().GetGame() );
 		mountInfos = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoMultipleWithIds( , GetVehicle().GetEntityID() );
 		if( mountInfos.Size() <= 0 )
 		{
@@ -2576,18 +3120,11 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			if( EntityID.IsDefined( mountInfos[ i ].childId ) )
 			{
-				if( !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( mountInfos[ i ].childId, gameGodModeType.Invulnerable ) ) )
+				if( !( godModeSystem.HasGodMode( mountInfos[ i ].childId, gameGodModeType.Invulnerable ) ) )
 				{
 					if( playerID == mountInfos[ i ].childId )
 					{
-						if( mountInfos[ i ].slotId.id == 'seat_front_left' )
-						{
-							seSystem.ApplyStatusEffect( mountInfos[ i ].childId, T"BaseStatusEffect.SoftKill", GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
-						}
-						else
-						{
-							seSystem.ApplyStatusEffect( mountInfos[ i ].childId, T"BaseStatusEffect.ForceKill", GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
-						}
+						seSystem.ApplyStatusEffect( mountInfos[ i ].childId, T"BaseStatusEffect.ForceKill", GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
 					}
 					else if( !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( mountInfos[ i ].childId, gameGodModeType.Immortal ) ) )
 					{
@@ -2639,14 +3176,23 @@ class VehicleComponent extends ScriptableDeviceComponent
 		if( IsNameValid( slotID.id ) )
 		{
 			vehicleHijackEvent = new VehicleHijackEvent;
+			vehicleHijackEvent.driverAllowedToGetAggressive = slotID.id == GetDriverSlotName();
 			QueueEventToPassenger( vehicle.GetGame(), vehicle, slotID, vehicleHijackEvent );
 		}
 		stealEvent = new StealVehicleEvent;
 		vehicle.QueueEvent( stealEvent );
 	}
 
-	protected function ToggleVehicleSystems( toggle : Bool, vehicle : Bool, engine : Bool )
+	protected function ToggleVehicleSystems( toggle : Bool, vehicle : Bool, engine : Bool, optional lockState : VehicleQuestEngineLockState )
 	{
+		if( GetVehicle().IsVehicleOnStateLocked() )
+		{
+			if( lockState == VehicleQuestEngineLockState.DontToggleIfLocked )
+			{
+				return;
+			}
+			GetVehicle().LockVehicleOnState( false );
+		}
 		if( vehicle )
 		{
 			GetVehicle().TurnVehicleOn( toggle );
@@ -2655,34 +3201,45 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			GetVehicle().TurnEngineOn( toggle );
 		}
+		if( lockState == VehicleQuestEngineLockState.Lock )
+		{
+			GetVehicle().LockVehicleOnState( true );
+		}
+	}
+
+	public function SetDelayDisableCarAlarm( evtActivationTime : Float )
+	{
+		var delayEvt : DisableAlarmEvent;
+		var duration : Float;
+		if( ( m_vehicleDisableAlarmDelayID == GetInvalidDelayID() ) && GetVehicleControllerPS().IsAlarmOn() )
+		{
+			duration = evtActivationTime;
+			delayEvt = new DisableAlarmEvent;
+			m_vehicleDisableAlarmDelayID = GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), delayEvt, duration );
+		}
 	}
 
 	protected event OnForceCarAlarm( evt : ForceCarAlarm )
 	{
-		var delayEvt : DisableAlarmEvent;
-		var broadcaster : StimBroadcasterComponent;
-		broadcaster = GetVehicle().GetStimBroadcasterComponent();
-		if( GetVehicleControllerPS().IsAlarmOn() )
-		{
-			if( broadcaster )
-			{
-				broadcaster.SetSingleActiveStimuli( GetVehicle(), gamedataStimType.CarAlarm, 5.0 );
-			}
-			delayEvt = new DisableAlarmEvent;
-			GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), delayEvt, 5.0 );
-		}
+		SetDelayDisableCarAlarm( evt.GetActivationTime() );
 	}
 
 	protected event OnDisableAlarm( evt : DisableAlarmEvent )
 	{
+		m_vehicleDisableAlarmDelayID = GetInvalidDelayID();
 		GetPS().DisableAlarm();
 	}
 
 	protected event OnChangeState( evt : vehicleChangeStateEvent )
 	{
 		var crystalDomeQuestModified : Bool;
+		var recordID : TweakDBID;
+		var record : Vehicle_Record;
+		var defaultState : VehicleDefaultState_Record;
+		var i, size : Int32;
+		var evnt : VehicleLightQuestToggleEvent;
 		crystalDomeQuestModified = GetPS().GetIsCrystalDomeQuestModified();
-		if( evt.state == vehicleEState.On )
+		if( evt.newState == vehicleEState.On )
 		{
 			if( !( crystalDomeQuestModified ) )
 			{
@@ -2696,7 +3253,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 				DrivingStimuli( true );
 			}
 		}
-		if( evt.state != vehicleEState.On )
+		if( evt.newState != vehicleEState.On )
 		{
 			if( !( crystalDomeQuestModified ) )
 			{
@@ -2706,6 +3263,21 @@ class VehicleComponent extends ScriptableDeviceComponent
 				}
 			}
 			DrivingStimuli( false );
+		}
+		if( !( GetPS().GetIsDefaultLightToggleSet() ) )
+		{
+			recordID = GetVehicle().GetRecordID();
+			record = TweakDBInterface.GetVehicleRecord( recordID );
+			defaultState = record.VehDefaultState();
+			size = defaultState.GetLightToggleComponentsCount();
+			for( i = 0; i < size; i += 1 )
+			{
+				evnt = new VehicleLightQuestToggleEvent;
+				evnt.lightType = ( ( vehicleELightType )( defaultState.GetLightToggleComponentsItem( i ) ) );
+				evnt.toggle = defaultState.DefaultLightToggle();
+				GetVehicle().QueueEvent( evnt );
+			}
+			GetPS().SetIsDefaultLightToggleSet( true );
 		}
 	}
 
@@ -2741,17 +3313,6 @@ class VehicleComponent extends ScriptableDeviceComponent
 		if( GetPS().GetCrystalDomeState() )
 		{
 			ToggleCrystalDome( true, false, true, 0.5 );
-		}
-	}
-
-	private function DetermineShouldCrystalDomeBeOn( meshVisibilityDelay : Float )
-	{
-		if( GetVehicleControllerPS().GetState() == vehicleEState.On && !( GetPS().GetIsCrystalDomeQuestModified() ) )
-		{
-			if( GetVehicle() != ( ( AVObject )( GetVehicle() ) ) )
-			{
-				ToggleCrystalDome( true, false, true, 0.0, meshVisibilityDelay );
-			}
 		}
 	}
 
@@ -2857,12 +3418,15 @@ class VehicleComponent extends ScriptableDeviceComponent
 		vehicle = GetVehicle();
 		if( mountedPlayer )
 		{
-			if( enable && !( m_isIgnoredInTargetingSystem ) )
+			if( enable )
 			{
-				targetingSystem = GameInstance.GetTargetingSystem( vehicle.GetGame() );
-				targetingSystem.AddIgnoredCollisionEntities( vehicle );
-				targetingSystem.AddIgnoredLookAtEntity( mountedPlayer, vehicle.GetEntityID() );
-				m_isIgnoredInTargetingSystem = true;
+				if( !( m_isIgnoredInTargetingSystem ) )
+				{
+					targetingSystem = GameInstance.GetTargetingSystem( vehicle.GetGame() );
+					targetingSystem.AddIgnoredCollisionEntities( vehicle );
+					targetingSystem.AddIgnoredLookAtEntity( mountedPlayer, vehicle.GetEntityID() );
+					m_isIgnoredInTargetingSystem = true;
+				}
 			}
 			else if( m_isIgnoredInTargetingSystem )
 			{
@@ -2907,9 +3471,14 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
-	private function DoPreventionVehicleSetup()
+	public const function HasPreventionPassenger() : Bool
 	{
-		if( GetVehicle().GetRecord().Affiliation().Type() == gamedataAffiliation.NCPD )
+		return m_preventionPassengers > 0;
+	}
+
+	private function RegisterWantedLevelListener()
+	{
+		if( !( m_currentWantedLevelCallback ) )
 		{
 			m_uiWantedBarBB = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).Get( GetAllBlackboardDefs().UI_WantedBar );
 			if( m_uiWantedBarBB )
@@ -2921,10 +3490,19 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	private function DoPreventionVehicleCleanup()
 	{
-		if( GetVehicle().IsPrevention() )
+		if( m_preventionPassengers > 0 )
 		{
 			UnregisterPreventionPassengerCallbacks( GetVehicle().GetGame(), GetVehicle().GetEntityID() );
-			if( m_uiWantedBarBB && m_currentWantedLevelCallback )
+		}
+		m_preventionPassengers = 0;
+		UnregisterWantedLevelListener();
+	}
+
+	private function UnregisterWantedLevelListener()
+	{
+		if( m_currentWantedLevelCallback )
+		{
+			if( m_uiWantedBarBB )
 			{
 				m_uiWantedBarBB.UnregisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, m_currentWantedLevelCallback );
 				m_uiWantedBarBB = NULL;
@@ -2947,6 +3525,25 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
+	public function InjectThreat( instigator : weak< GameObject > )
+	{
+		var mountInfos : array< MountingInfo >;
+		var i : Int32;
+		var mountedObj : weak< ScriptedPuppet >;
+		mountInfos = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoMultipleWithIds( , GetVehicle().GetEntityID() );
+		if( instigator )
+		{
+			for( i = 0; i < mountInfos.Size(); i += 1 )
+			{
+				mountedObj = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountInfos[ i ].childId ) ) );
+				if( mountedObj && AIActionHelper.TryChangingAttitudeToHostile( mountedObj, instigator ) )
+				{
+					TargetTrackingExtension.InjectThreat( mountedObj, instigator );
+				}
+			}
+		}
+	}
+
 	protected event OnVehicleForceOccupantOut( evt : VehicleForceOccupantOut )
 	{
 		StealVehicle();
@@ -2966,16 +3563,20 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	protected event OnVehicleDoorInteraction( evt : VehicleDoorInteraction )
 	{
+		var door : EVehicleDoor;
 		var doorID : CName;
 		doorID = evt.slotID;
-		EvaluateDoorReaction( doorID, false );
+		if( GetVehicleDoorEnum( door, doorID ) )
+		{
+			EvaluateDoorReaction( doorID, false, GetPS().GetDoorState( door ) );
+		}
 	}
 
 	protected event OnVehicleDoorOpen( evt : VehicleDoorOpen )
 	{
 		var PSVehicleDoorCloseRequest : VehicleDoorClose;
 		var autoCloseDelay : Float;
-		EvaluateDoorReaction( evt.slotID, evt.forceScene );
+		EvaluateDoorReaction( evt.slotID, evt.forceScene, VehicleDoorState.Open );
 		if( evt.shouldAutoClose )
 		{
 			PSVehicleDoorCloseRequest = new VehicleDoorClose;
@@ -2992,7 +3593,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	protected event OnVehicleDoorClose( evt : VehicleDoorClose )
 	{
-		EvaluateDoorReaction( evt.slotID, evt.forceScene );
+		EvaluateDoorReaction( evt.slotID, evt.forceScene, VehicleDoorState.Closed );
 	}
 
 	protected function GetVehicleDoorEnum( out door : EVehicleDoor, doorName : CName ) : Bool
@@ -3014,9 +3615,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 		DetermineInteractionState( layerName );
 	}
 
-	protected function EvaluateDoorReaction( doorID : CName, immediate : Bool )
+	protected function EvaluateDoorReaction( doorID : CName, immediate : Bool, doorState : VehicleDoorState )
 	{
-		var doorState : VehicleDoorState;
 		var door : EVehicleDoor;
 		var animFeature : AnimFeature_PartData;
 		var animFeatureName : CName;
@@ -3028,7 +3628,6 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			return;
 		}
-		doorState = GetPS().GetDoorState( door );
 		if( doorState == VehicleDoorState.Open )
 		{
 			animFeature.state = 1;
@@ -3114,6 +3713,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 			PSvehicleWindowopenRequest.slotID = evt.slotName;
 			PSvehicleWindowopenRequest.speed = evt.speed;
 			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleWindowopenRequest );
+			GetVehicle().NotifyWindowChange( evt.slotName, true );
 		}
 		else
 		{
@@ -3121,6 +3721,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 			PSvehicleWindowcloseRequest.slotID = evt.slotName;
 			PSvehicleWindowcloseRequest.speed = evt.speed;
 			GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).QueuePSEvent( GetPS().GetID(), GetPS().GetClassName(), PSvehicleWindowcloseRequest );
+			GetVehicle().NotifyWindowChange( evt.slotName, false );
 		}
 	}
 
@@ -3205,7 +3806,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		delayEvt = new ToggleDoorInteractionEvent;
 		vehicle = ( ( VehicleObject )( GetEntity() ) );
 		AnimationControllerComponent.PushEvent( vehicle, 'doorOpenTrunk' );
-		EvaluateDoorReaction( 'trunk', false );
+		EvaluateDoorReaction( 'trunk', false, VehicleDoorState.Open );
 		ToggleInteraction( 'trunk', false );
 		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( ( ( VehicleObject )( GetEntity() ) ), delayEvt, 1.0 );
 		GetPS().SetHasAnyDoorOpen( true );
@@ -3218,7 +3819,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		delayEvt = new ToggleDoorInteractionEvent;
 		vehicle = ( ( VehicleObject )( GetEntity() ) );
 		AnimationControllerComponent.PushEvent( vehicle, 'doorCloseTrunk' );
-		EvaluateDoorReaction( 'trunk', false );
+		EvaluateDoorReaction( 'trunk', false, VehicleDoorState.Closed );
 		ToggleInteraction( 'trunk', false );
 		GameInstance.GetDelaySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).DelayEvent( GetVehicle(), delayEvt, 1.0 );
 	}
@@ -3239,7 +3840,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		slotID.id = 'trunk';
 		OpenDoor( GetVehicle(), slotID );
 		ToggleInteraction( 'trunk', false );
-		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject() ) );
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject() ) );
 		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
 		mountingInfo = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoSingleWithObjects( , playerPuppet );
 		m_trunkNpcBody = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountingInfo.childId ) ) );
@@ -3257,14 +3858,14 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var workspotSystem : WorkspotGameSystem;
 		workspotSystem = GameInstance.GetWorkspotSystem( GetVehicle().GetGame() );
-		workspotSystem.PlayNpcInWorkspot( m_trunkNpcBody, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), GetVehicle(), 'trunkBodyDisposalNpc', '', 0.001 );
-		workspotSystem.PlayInDevice( GetVehicle(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), 'lockedCamera', 'trunkBodyDisposalPlayer', '', 'bodyDisposalSync', 0.1, WorkspotSlidingBehaviour.DontPlayAtResourcePosition );
+		workspotSystem.PlayNpcInWorkspot( m_trunkNpcBody, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject(), GetVehicle(), 'trunkBodyDisposalNpc', '', 0.001 );
+		workspotSystem.PlayInDevice( GetVehicle(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject(), 'lockedCamera', 'trunkBodyDisposalPlayer', '', 'bodyDisposalSync', 0.1, WorkspotSlidingBehaviour.DontPlayAtResourcePosition );
 	}
 
 	public function MountNpcBodyToTrunk()
 	{
 		var playerStateMachineBlackboard : IBlackboard;
-		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).GetLocalInstanced( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).GetLocalInstanced( GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
 		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.CarryingDisposal, false );
 		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsInteractingWithDevice, false );
 		playerStateMachineBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyDisposalDetailed, ( ( Int32 )( gamePSMDetailedBodyDisposal.Default ) ) );
@@ -3304,8 +3905,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var workspotSystem : WorkspotGameSystem;
 		workspotSystem = GameInstance.GetWorkspotSystem( GetVehicle().GetGame() );
-		workspotSystem.PlayNpcInWorkspot( m_trunkNpcBody, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), GetVehicle(), 'trunkBodyPickupNpc', '', 0.001 );
-		workspotSystem.PlayInDevice( GetVehicle(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject(), 'lockedCamera', 'trunkBodyPickupPlayer', '', 'bodyPickupSync', 0.1, WorkspotSlidingBehaviour.DontPlayAtResourcePosition );
+		workspotSystem.PlayNpcInWorkspot( m_trunkNpcBody, GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject(), GetVehicle(), 'trunkBodyPickupNpc', '', 0.001 );
+		workspotSystem.PlayInDevice( GetVehicle(), GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject(), 'lockedCamera', 'trunkBodyPickupPlayer', '', 'bodyPickupSync', 0.1, WorkspotSlidingBehaviour.DontPlayAtResourcePosition );
 	}
 
 	public function FinishTrunkBodyPickup()
@@ -3346,7 +3947,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		mountingRequest.preservePositionAfterMounting = true;
 		mountingRequest.mountData = mountData;
 		mountOptions.alive = false;
-		mountOptions.occupiedByNeutral = false;
+		mountOptions.occupiedByNonFriendly = false;
 		mountingRequest.mountData.mountEventOptions = mountOptions;
 		GameInstance.GetMountingFacility( ( ( weak< weak< GameObject > > )( GetEntity() ) ).GetGame() ).Mount( mountingRequest );
 	}
@@ -3374,7 +3975,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var player : GameObject;
 		var storageBB : IBlackboard;
 		var storageData : StorageUserData;
-		player = GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerMainGameObject();
+		player = GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject();
 		Stash.ProcessStashRetroFixes( GetVehicle() );
 		storageData = new StorageUserData;
 		storageData.storageObject = GetVehicle();
@@ -3389,19 +3990,21 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var delayEvt : ToggleDoorInteractionEvent;
 		delayEvt = new ToggleDoorInteractionEvent;
-		EvaluateDoorReaction( 'hood', false );
+		EvaluateDoorReaction( 'hood', false, VehicleDoorState.Open );
 		ToggleInteraction( 'hood', false );
 		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( ( ( VehicleObject )( GetEntity() ) ), delayEvt, 1.0 );
 		GetPS().SetHasAnyDoorOpen( true );
+		UpdateDamageEngineEffects();
 	}
 
 	protected event OnCloseHood( evt : VehicleCloseHood )
 	{
 		var delayEvt : ToggleDoorInteractionEvent;
 		delayEvt = new ToggleDoorInteractionEvent;
-		EvaluateDoorReaction( 'hood', false );
+		EvaluateDoorReaction( 'hood', false, VehicleDoorState.Closed );
 		ToggleInteraction( 'hood', false );
 		GameInstance.GetDelaySystem( ( ( VehicleObject )( GetEntity() ) ).GetGame() ).DelayEvent( GetVehicle(), delayEvt, 1.0 );
+		UpdateDamageEngineEffects();
 	}
 
 	protected event OnSummonStartedEvent( evt : SummonStartedEvent )
@@ -3439,6 +4042,23 @@ class VehicleComponent extends ScriptableDeviceComponent
 		GameInstance.GetPlayerSystem( GetVehicle().GetGame() ).GetLocalPlayerControlledGameObject().QueueEvent( audioEvent );
 	}
 
+	public function PlayDelayedHonk( honkTime : Float, delayTime : Float )
+	{
+		var hornEvt : VehicleQuestDelayedHornEvent;
+		hornEvt = new VehicleQuestDelayedHornEvent;
+		hornEvt.honkTime = honkTime;
+		hornEvt.delayTime = delayTime;
+		GetVehicle().QueueEvent( hornEvt );
+	}
+
+	public function PlayHonkForDuration( honkTime : Float )
+	{
+		var hornEvt : VehicleQuestHornEvent;
+		hornEvt = new VehicleQuestHornEvent;
+		hornEvt.honkTime = honkTime;
+		GetVehicle().QueueEvent( hornEvt );
+	}
+
 	private function HonkAndFlash()
 	{
 		var lightsEvt : VehicleLightQuestToggleEvent;
@@ -3469,7 +4089,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var vehDataPackage : weak< VehicleDataPackage_Record >;
 		GetVehicleDataPackage( GetVehicle().GetGame(), GetVehicle(), vehDataPackage );
 		m_hasSpoiler = vehDataPackage.HasSpoiler();
-		m_hasSiren = vehDataPackage.HasSiren();
+		m_useAuxiliary = vehDataPackage.UseAuxiliary();
 		if( m_hasSpoiler )
 		{
 			m_spoilerUp = vehDataPackage.SpoilerSpeedToDeploy();
@@ -3510,6 +4130,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var owner : weak< VehicleObject >;
 		var biggestImpact : Float;
 		var broadcaster : StimBroadcasterComponent;
+		var bike : BikeObject;
+		bike = ( ( BikeObject )( GetVehicle() ) );
 		for( i = 0; i < evt.rawChange.Size(); i += 1 )
 		{
 			gridState = evt.state[ i ];
@@ -3521,7 +4143,14 @@ class VehicleComponent extends ScriptableDeviceComponent
 				biggestImpact = desiredChange;
 			}
 		}
-		CreateHitEventOnSelf( biggestImpact );
+		if( evt.damageMultiplier > 0.0 )
+		{
+			CreateHitEventOnSelf( evt.damageMultiplier, evt.impactPoint, evt.otherVehicle, evt.rammedOtherVehicle, evt.otherVehicleRammed );
+		}
+		if( ( ( bike && bike.IsTiltControlEnabled() ) && ( evt.damageMultiplier >= 0.0 ) ) && !( HasActiveDriver( GetVehicle().GetGame(), GetVehicle(), GetVehicle().GetEntityID() ) ) )
+		{
+			TryToKnockDownBike();
+		}
 		owner = GetVehicle();
 		broadcaster = owner.GetStimBroadcasterComponent();
 		if( broadcaster )
@@ -3537,48 +4166,190 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
-	private function CreateHitEventOnSelf( force : Float )
+	private function CreateHitEventOnSelf( damageMultiplier : Float, impactPoint : Vector3, otherVehicle : weak< GameObject >, rammedOtherVehicle : Bool, otherVehicleRammed : Bool )
 	{
 		var evt : gameHitEvent;
-		var vehicleID : StatsObjectID;
-		var statsDataSystem : StatsDataSystem;
-		var vehHealthPrecent : Float;
-		var mountInfo : MountingInfo;
-		var slotId : MountingSlotId;
+		var hasDriver : Bool;
+		var otherCarIsPlayers : Bool;
 		var attackContext : AttackInitContext;
 		var attack : IAttack;
-		var instigator : weak< GameObject >;
-		if( force >= 0.1 )
+		var otherVehicleObject : weak< VehicleObject >;
+		hasDriver = HasActiveDriver( GetVehicle().GetGame(), GetVehicle(), GetVehicle().GetEntityID() );
+		otherVehicleObject = ( ( VehicleObject )( otherVehicle ) );
+		otherCarIsPlayers = ( ( otherVehicleObject ) ? ( otherVehicleObject.IsPlayerDriver() ) : ( false ) );
+		evt = new gameHitEvent;
+		evt.attackData = new AttackData;
+		if( hasDriver && !( otherVehicleRammed ) )
 		{
-			vehicleID = GetVehicle().GetEntityID();
-			vehHealthPrecent = GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).GetStatPoolValue( vehicleID, gamedataStatPoolType.Health );
-			statsDataSystem = GameInstance.GetStatsDataSystem( GetVehicle().GetGame() );
-			if( vehHealthPrecent >= 10.0 )
+			attackContext.instigator = GetDriver( GetVehicle().GetGame(), GetVehicle(), GetVehicle().GetEntityID() );
+			attackContext.source = GetVehicle();
+		}
+		else if( ( otherVehicle && ( otherVehicleRammed || !( hasDriver ) ) ) && HasActiveDriver( GetVehicle().GetGame(), otherVehicleObject, otherVehicle.GetEntityID() ) )
+		{
+			attackContext.instigator = GetDriver( otherVehicleObject.GetGame(), otherVehicleObject, otherVehicleObject.GetEntityID() );
+			attackContext.source = otherVehicle;
+		}
+		else if( otherVehicle )
+		{
+			attackContext.instigator = otherVehicle;
+			attackContext.source = otherVehicle;
+		}
+		else
+		{
+			attackContext.instigator = GetVehicle();
+			attackContext.source = GetVehicle();
+		}
+		attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.VehicleImpact" );
+		attack = IAttack.Create( attackContext );
+		evt.target = GetVehicle();
+		evt.attackData.SetVehicleImpactForce( damageMultiplier );
+		evt.attackData.SetAttackPosition( ( ( Vector4 )( impactPoint ) ) );
+		evt.hitPosition = ( ( Vector4 )( impactPoint ) );
+		if( otherVehicleRammed )
+		{
+			evt.attackData.AddFlag( hitFlag.CriticalHit, 'VehicleRamming' );
+		}
+		if( otherCarIsPlayers && !( otherVehicleRammed ) )
+		{
+			evt.attackData.AddFlag( hitFlag.VehicleImpactWithPlayer, 'VehicleImpact' );
+		}
+		evt.attackData.AddFlag( hitFlag.VehicleImpact, 'VehicleImpact' );
+		evt.attackData.AddFlag( hitFlag.CanDamageSelf, 'VehicleImpact' );
+		evt.attackData.AddFlag( hitFlag.FriendlyFire, 'VehicleImpact' );
+		evt.attackData.SetAttackType( attackContext.record.AttackType().Type() );
+		evt.attackData.SetSource( attackContext.source );
+		evt.attackData.SetInstigator( attackContext.instigator );
+		evt.attackData.SetAttackTime( EngineTime.ToFloat( GameInstance.GetTimeSystem( GetVehicle().GetGame() ).GetSimTime() ) );
+		evt.attackData.SetAttackDefinition( attack );
+		evt.attackData.PreAttack();
+		GameInstance.GetDamageSystem( GetVehicle().GetGame() ).QueueHitEvent( evt, GetVehicle() );
+	}
+
+	public function HandleBikeCollisionReaction( impactVelocityChange : Float, impactHitNormal : Vector4 )
+	{
+		var recordID : TweakDBID;
+		var vehicleRecord : Vehicle_Record;
+		var vehicleDataPackage : weak< VehicleDataPackage_Record >;
+		var bike : BikeObject;
+		var knockOffForce : Float;
+		var driver : GameObject;
+		var knockDownModifier : Float;
+		var animFeatureData : AnimFeature_KnockOffData;
+		var delayedKnockOffEvent : DelayedBikeKnockOffEvent;
+		bike = ( ( BikeObject )( GetVehicle() ) );
+		if( bike && GameInstance.GetCameraSystem( bike.GetGame() ).IsInCameraFrustum( bike, 2.0, 0.75 ) )
+		{
+			driver = GetDriverMounted( bike.GetGame(), GetVehicle().GetEntityID() );
+			recordID = bike.GetRecordID();
+			vehicleRecord = TweakDBInterface.GetVehicleRecord( recordID );
+			vehicleDataPackage = vehicleRecord.VehDataPackage();
+			knockDownModifier = TweakDBInterface.GetFloat( T"AIGeneralSettings.aiBikeKnockOffModifier", 1.0 );
+			knockOffForce = vehicleDataPackage.KnockOffForce() * ( ( ( ( NPCPuppet )( driver ) ) ) ? ( knockDownModifier ) : ( 1.0 ) );
+			if( ( impactVelocityChange > knockOffForce ) || IsBeingDragged() )
 			{
-				evt = new gameHitEvent;
-				evt.attackData = new AttackData;
-				slotId.id = GetDriverSlotName();
-				mountInfo = GameInstance.GetMountingFacility( GetVehicle().GetGame() ).GetMountingInfoSingleWithObjects( , GetVehicle(), slotId );
-				instigator = ( ( GameObject )( GameInstance.FindEntityByID( GetVehicle().GetGame(), mountInfo.childId ) ) );
-				attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.VehicleImpact" );
-				attackContext.instigator = instigator;
-				attackContext.source = GetVehicle();
-				attack = IAttack.Create( attackContext );
-				evt.target = GetVehicle();
-				evt.attackData.SetVehicleImpactForce( statsDataSystem.GetValueFromCurve( 'vehicle_collision_damage', force, 'collision_damage' ) );
-				evt.attackData.AddFlag( hitFlag.VehicleImpact, 'VehicleImpact' );
-				evt.attackData.AddFlag( hitFlag.CannotModifyDamage, 'VehicleImpact' );
-				evt.attackData.SetSource( GetVehicle() );
-				evt.attackData.SetInstigator( instigator );
-				evt.attackData.SetAttackDefinition( attack );
-				GameInstance.GetDamageSystem( GetVehicle().GetGame() ).QueueHitEvent( evt, GetVehicle() );
+				if( IsMountedToVehicle( bike.GetGame(), driver ) )
+				{
+					bike.EnableAirControl( false );
+					delayedKnockOffEvent = new DelayedBikeKnockOffEvent;
+					GameInstance.GetDelaySystem( bike.GetGame() ).DelayEvent( GetVehicle(), delayedKnockOffEvent, 0.40000001 );
+					if( ( ( NPCPuppet )( driver ) ) )
+					{
+						GameInstance.GetDelaySystem( driver.GetGame() ).DelayEvent( driver, CreateForceRagdollEvent( 'BikeknockDownEvent' ), 0.30000001 );
+						m_timeSinceLastHit = 0.0;
+						animFeatureData = new AnimFeature_KnockOffData;
+						animFeatureData.knockedOff = true;
+						animFeatureData.direction = GameObject.GetLocalAngleForDirectionInInt( impactHitNormal, driver );
+						animFeatureData.force = impactVelocityChange;
+						animFeatureData.draggedOff = IsBeingDragged();
+						AnimationControllerComponent.ApplyFeatureToReplicate( driver, 'KnockOffData', animFeatureData );
+						AnimationControllerComponent.PushEventToReplicate( driver, 'KnockOffData' );
+					}
+				}
 			}
 		}
+	}
+
+	protected event OnDelayedBikeKnockOffEvent( evt : DelayedBikeKnockOffEvent )
+	{
+		var knockOverBike : KnockOverBikeEvent;
+		var bike : BikeObject;
+		var aiEvent : AIEvent;
+		var driver : GameObject;
+		var collisionForce : Vector4;
+		var recordID : TweakDBID;
+		var vehicleRecord : Vehicle_Record;
+		var vehicleDataPackage : weak< VehicleDataPackage_Record >;
+		bike = ( ( BikeObject )( GetVehicle() ) );
+		driver = GetDriverMounted( bike.GetGame(), GetVehicle().GetEntityID() );
+		if( driver != NULL )
+		{
+			if( ( ( NPCPuppet )( driver ) ) )
+			{
+				GameInstance.GetWorkspotSystem( bike.GetGame() ).UnmountFromVehicle( GetVehicle(), driver, true, , , 'Bumped' );
+				knockOverBike = new KnockOverBikeEvent;
+				knockOverBike.forceKnockdown = true;
+				knockOverBike.applyDirectionalForce = true;
+				bike.QueueEvent( knockOverBike );
+				aiEvent = new AIEvent;
+				aiEvent.name = 'NoDriver';
+				bike.QueueEvent( aiEvent );
+			}
+			else
+			{
+				recordID = GetVehicle().GetRecordID();
+				vehicleRecord = TweakDBInterface.GetVehicleRecord( recordID );
+				vehicleDataPackage = vehicleRecord.VehDataPackage();
+				collisionForce = -( bike.GetLinearVelocity() );
+				if( Vector4.Length( collisionForce ) <= vehicleDataPackage.KnockOffForce() )
+				{
+					bike.EnableAirControl( true );
+					bike.EnableTiltControl( true );
+					return false;
+				}
+				bike.AddCollisionForce( collisionForce );
+			}
+		}
+		ToggleVehicleSystems( false, false, false );
+	}
+
+	public function CheckForDrag( impactImpulse : Float )
+	{
+		var currentTimeStamp : Float;
+		var isValidData : Bool;
+		var deltaTime : Float;
+		currentTimeStamp = EngineTime.ToFloat( GameInstance.GetSimTime( GetVehicle().GetGame() ) );
+		deltaTime = currentTimeStamp - m_timeSinceLastHit;
+		isValidData = ( m_timeSinceLastHit > 0.0 ) && ( deltaTime > 0.0 );
+		if( ( ( m_timeSinceLastHit != 0.0 ) && isValidData ) && ( deltaTime < 1.0 ) )
+		{
+			m_dragTime += deltaTime;
+		}
+		else
+		{
+			m_dragTime = 0.0;
+		}
+		m_timeSinceLastHit = currentTimeStamp;
+	}
+
+	public function IsBeingDragged() : Bool
+	{
+		return m_dragTime > 1.5;
 	}
 
 	private function TryToKnockDownBike()
 	{
 		var knockOverBike : KnockOverBikeEvent;
+		var recordID : TweakDBID;
+		var record : Vehicle_Record;
+		recordID = GetVehicle().GetRecordID();
+		record = TweakDBInterface.GetVehicleRecord( recordID );
+		if( record )
+		{
+			if( record.TagsContains( 'IgnoreImpulses' ) )
+			{
+				return;
+			}
+		}
 		knockOverBike = new KnockOverBikeEvent;
 		GetVehicle().QueueEvent( knockOverBike );
 	}
@@ -3599,61 +4370,151 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			if( m_damageLevel == 1 )
 			{
-				BreakAllDamageStageFX();
-				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage1', false );
+				UpdateDamageEngineEffects();
 			}
 			else if( m_damageLevel == 2 )
 			{
-				BreakAllDamageStageFX();
-				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage2', false );
-				GetVehicle().DetachPart( 'Hood' );
+				UpdateDamageEngineEffects();
+				TutorialCarDamageFact();
 				damageStageTurnOffDelayEvent = new VehicleDamageStageTurnOffEvent;
 				GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), damageStageTurnOffDelayEvent, RandRangeF( 35.0, 55.0 ) );
 			}
 			else if( m_damageLevel == 3 )
 			{
 				vehicleRecord = GetVehicle().GetRecord();
-				BreakAllDamageStageFX();
+				UpdateDamageEngineEffects();
 				destroyedAppearanceName = vehicleRecord.DestroyedAppearance();
-				TutorialCarDamageFact();
-				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage3', false );
-				DestroyVehicle();
+				DisableVehicle();
 				if( IsNameValid( destroyedAppearanceName ) )
 				{
 					GetVehicle().PrefetchAppearanceChange( destroyedAppearanceName );
 				}
 				BroadcastEnvironmentalHazardStimuli();
+				if( m_mountedPlayer )
+				{
+					GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).RequestSettingStatPoolValueCustomLimit( GetVehicle().GetEntityID(), gamedataStatPoolType.Health, 0.0, GetVehicle() );
+					m_immuneInDecay = true;
+					GamepadLightScriptableSystem.TriggerVehicleExplosionWarningSiren( GetVehicle().GetGame() );
+					GameInstance.GetAudioSystem( GetVehicle().GetGame() ).AddTriggerEffect( 'te_vehicle_car_disabled', 'VehicleDisabled' );
+					GameObject.PlaySoundEvent( GetVehicle(), 'v_car_explosion_warning_start' );
+					GameObject.PlaySoundEvent( GetVehicle(), 'v_car_malfunction' );
+				}
+				else
+				{
+					GetPS().SetIsDestroyed( true );
+				}
 			}
 			m_vehicleBlackboard.SetInt( GetAllBlackboardDefs().Vehicle.DamageState, m_damageLevel );
 		}
 	}
 
-	private function DestroyVehicle()
+	public function ForceAboutToExplodeState()
 	{
-		var exitVehicleEvent : AIEvent;
-		if( !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( GetVehicle().GetEntityID(), gameGodModeType.Immortal ) ) )
+		var vehicle : VehicleObject;
+		var statPoolSys : StatPoolsSystem;
+		var vehicleEntityID : EntityID;
+		var wantedTreshold : Float;
+		vehicle = GetVehicle();
+		statPoolSys = GameInstance.GetStatPoolsSystem( vehicle.GetGame() );
+		vehicleEntityID = vehicle.GetEntityID();
+		wantedTreshold = m_healthDecayThreshold * 0.15000001;
+		if( statPoolSys.GetStatPoolValue( vehicleEntityID, gamedataStatPoolType.Health ) > wantedTreshold )
 		{
-			GetPS().SetIsDestroyed( true );
+			statPoolSys.RequestSettingStatPoolValue( vehicleEntityID, gamedataStatPoolType.Health, wantedTreshold, NULL );
+		}
+	}
+
+	private function UpdateDamageEngineEffects()
+	{
+		var vehicleRecord : weak< Vehicle_Record >;
+		vehicleRecord = GetVehicle().GetRecord();
+		BreakAllDamageStageFX();
+		if( m_damageLevel == 1 )
+		{
+			if( ( !( vehicleRecord.UsesSecondaryHoodEmitter() ) || GetPS().GetDoorState( EVehicleDoor.hood ) == VehicleDoorState.Open ) || GetPS().GetDoorState( EVehicleDoor.hood ) == VehicleDoorState.Detached )
+			{
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage1', false );
+			}
+			else
+			{
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage1b', false );
+			}
+		}
+		else if( m_damageLevel == 2 )
+		{
+			if( ( !( vehicleRecord.UsesSecondaryHoodEmitter() ) || GetPS().GetDoorState( EVehicleDoor.hood ) == VehicleDoorState.Open ) || GetPS().GetDoorState( EVehicleDoor.hood ) == VehicleDoorState.Detached )
+			{
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage2', false );
+			}
+			else
+			{
+				GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage2b', false );
+			}
+		}
+		else if( m_damageLevel == 3 )
+		{
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage3', false );
+		}
+	}
+
+	private function DisableVehicle()
+	{
+		var delayedExitEvent : VehicleExitDelayed;
+		if( !( GetPS().GetIsDestroyed() ) && !( GameInstance.GetGodModeSystem( GetVehicle().GetGame() ).HasGodMode( GetVehicle().GetEntityID(), gameGodModeType.Immortal ) ) )
+		{
+			ToggleVehicleSystems( false, false, true );
 			DestroyMappin();
 			ToggleInteraction( '', false );
 			DisableRadio();
-			exitVehicleEvent = new AIEvent;
-			exitVehicleEvent.name = 'ExitVehicle';
-			QueueEventToAllPassengers( GetVehicle().GetGame(), GetVehicle(), exitVehicleEvent );
+			if( m_vehicleExitDelayId == DelayID.GetInvalidDelayID() )
+			{
+				delayedExitEvent = new VehicleExitDelayed;
+				m_vehicleExitDelayId = GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), delayedExitEvent, 2.0 );
+			}
 		}
+	}
+
+	private function CancelVehicleExitDelayedEvent()
+	{
+		if( m_vehicleExitDelayId != DelayID.GetInvalidDelayID() )
+		{
+			GameInstance.GetDelaySystem( GetVehicle().GetGame() ).CancelDelay( m_vehicleExitDelayId );
+			m_vehicleExitDelayId = DelayID.GetInvalidDelayID();
+		}
+	}
+
+	protected event OnVehicleExitDelayedEvent( evt : VehicleExitDelayed )
+	{
+		var exitVehicleEvent : AIEvent;
+		exitVehicleEvent = new AIEvent;
+		exitVehicleEvent.name = 'ExitVehicle';
+		m_vehicleExitDelayId = DelayID.GetInvalidDelayID();
+		QueueEventToAllPassengers( GetVehicle().GetGame(), GetVehicle(), exitVehicleEvent );
 	}
 
 	private function RepairVehicle()
 	{
+		RemoveVehicleDOT();
+		GameInstance.GetStatPoolsSystem( GetVehicle().GetGame() ).RequestSettingStatPoolMaxValue( GetVehicle().GetEntityID(), gamedataStatPoolType.Health, GetVehicle() );
 		GetPS().SetIsDestroyed( false );
 		CreateMappin();
 		ToggleInteraction( '', true );
 		ToggleVehicleSystems( true, true, true );
+		GetPS().SetIsSubmerged( false );
+		GameObjectEffectHelper.StopEffectEvent( GetVehicle(), 'underwater_bubbles' );
 	}
 
 	protected event OnVehicleRepairEvent( re : VehicleRepairEvent )
 	{
 		RepairVehicle();
+	}
+
+	private function EnableRadio()
+	{
+		var radioEvent : VehicleRadioEvent;
+		radioEvent = new VehicleRadioEvent;
+		radioEvent.toggle = true;
+		GetVehicle().QueueEvent( radioEvent );
 	}
 
 	private function DisableRadio()
@@ -3693,7 +4554,9 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var vehicle : GameObject;
 		vehicle = GetVehicle();
 		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage1' );
+		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage1b' );
 		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage2' );
+		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage2b' );
 		GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'damage_engine_stage3' );
 		if( auxillaryFX )
 		{
@@ -3777,19 +4640,32 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
+	public function IsVehicleInDecay() : Bool
+	{
+		return m_damageLevel == 3;
+	}
+
+	public function IsVehicleImmuneInDecay() : Bool
+	{
+		return m_immuneInDecay;
+	}
+
+	public function GetVehicleDecayThreshold() : Float
+	{
+		return m_healthDecayThreshold;
+	}
+
 	private function EvaluateDamageLevel( destruction : Float ) : Int32
 	{
-		var statPoolMod : PoolValueModifier_Record;
-		statPoolMod = TweakDBInterface.GetPoolValueModifierRecord( T"BaseStatPools.VehicleHealthDecay" );
-		if( ( destruction <= 75.0 ) && ( destruction > 55.0 ) )
+		if( ( destruction <= 50.0 ) && ( destruction > 25.0 ) )
 		{
 			m_damageLevel = 1;
 		}
-		else if( ( destruction <= 55.0 ) && ( destruction > statPoolMod.RangeEnd() ) )
+		else if( ( destruction <= 25.0 ) && ( destruction > m_healthDecayThreshold ) )
 		{
 			m_damageLevel = 2;
 		}
-		else if( ( destruction <= statPoolMod.RangeEnd() ) && ( destruction > 0.0 ) )
+		else if( ( destruction <= m_healthDecayThreshold ) && ( destruction > 0.0 ) )
 		{
 			m_damageLevel = 3;
 		}
@@ -3807,9 +4683,8 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		if( m_damageLevel == 2 )
 		{
-			BreakAllDamageStageFX();
-			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'damage_engine_stage1', false );
 			m_damageLevel = 1;
+			UpdateDamageEngineEffects();
 		}
 	}
 
@@ -3871,6 +4746,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		var setStation : Bool;
 		var station : Int32;
 		var uiRadioEvent : UIVehicleRadioEvent;
+		var uiRadioSongEvent : VehicleRadioSongChanged;
 		var uiSystem : UISystem;
 		toggle = evt.toggle;
 		setStation = evt.setStation;
@@ -3879,22 +4755,25 @@ class VehicleComponent extends ScriptableDeviceComponent
 		uiRadioEvent = new UIVehicleRadioEvent;
 		if( toggle )
 		{
-			if( !( m_radioState ) )
+			if( m_radioState )
+			{
+				GetVehicle().NextRadioReceiverStation();
+			}
+			else
 			{
 				GetVehicle().ToggleRadioReceiver( true );
 				m_radioState = true;
 				m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehRadioState, true );
-				m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
-				uiSystem.QueueEvent( uiRadioEvent );
+				if( !( setStation ) )
+				{
+					uiRadioSongEvent = new VehicleRadioSongChanged;
+					uiSystem.QueueEvent( uiRadioSongEvent );
+				}
 			}
-			else
-			{
-				GetVehicle().NextRadioReceiverStation();
-				m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
-				uiSystem.QueueEvent( uiRadioEvent );
-			}
+			m_vehicleBlackboard.SetName( GetAllBlackboardDefs().Vehicle.VehRadioStationName, GetVehicle().GetRadioReceiverStationName() );
+			uiSystem.QueueEvent( uiRadioEvent );
 		}
-		else if( !( toggle ) )
+		else
 		{
 			GetVehicle().ToggleRadioReceiver( false );
 			if( m_radioState )
@@ -3941,14 +4820,21 @@ class VehicleComponent extends ScriptableDeviceComponent
 		vehController.ToggleLights( toggle, lightType );
 	}
 
-	protected event OnVehicleCycleLightsEvent( evt : VehicleCycleLightsEvent )
+	protected event OnVehicleLightQuestChangeColorEvent( evt : VehicleLightQuestChangeColorEvent )
 	{
-		GetVehicleControllerPS().CycleLightMode();
+		var vehController : vehicleController;
+		vehController = GetVehicleController();
+		vehController.SetLightColor( evt.lightType, evt.color );
+	}
+
+	protected event OnVehicleCycleHeadLightsEvent( evt : VehicleCycleLightsEvent )
+	{
+		GetVehicleControllerPS().CycleHeadLightMode();
 	}
 
 	protected event OnVehicleQuestSirenEvent( evt : VehicleQuestSirenEvent )
 	{
-		if( m_hasSiren )
+		if( m_useAuxiliary )
 		{
 			ToggleSiren( GetPS().GetSirenLightsState(), GetPS().GetSirenSoundsState() );
 		}
@@ -3965,14 +4851,17 @@ class VehicleComponent extends ScriptableDeviceComponent
 	private function CanShowMappin() : Bool
 	{
 		var bb : IBlackboard;
-		if( GetVehicle().IsPrevention() && GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).IsPreventionVehiclePrototypeEnabled() )
+		if( GetVehicle().IsPrevention() && GameInstance.GetPreventionSpawnSystem( GetVehicle().GetGame() ).IsPreventionVehicleEnabled() )
 		{
 			return true;
 		}
 		bb = GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).Get( GetAllBlackboardDefs().VehicleSummonData );
 		if( bb )
 		{
-			return vehicleGarageState.SummonAvailable == ( ( vehicleGarageState )( bb.GetUint( GetAllBlackboardDefs().VehicleSummonData.GarageState ) ) );
+			if( vehicleGarageState.SummonAvailable == ( ( vehicleGarageState )( bb.GetUint( GetAllBlackboardDefs().VehicleSummonData.GarageState ) ) ) )
+			{
+				return GameInstance.GetVehicleSystem( GetVehicle().GetGame() ).IsVehiclePlayerUnlocked( GetVehicle().GetRecordID() );
+			}
 		}
 		return false;
 	}
@@ -3996,13 +4885,14 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
-	private function DestroyMappin()
+	public function DestroyMappin()
 	{
 		var system : MappinSystem;
 		if( m_mappinID.value != ( ( Uint64 )( 0 ) ) )
 		{
 			system = GameInstance.GetMappinSystem( GetVehicle().GetGame() );
 			system.UnregisterMappin( m_mappinID );
+			m_mappinID.value = ( ( Uint64 )( 0 ) );
 		}
 	}
 
@@ -4110,6 +5000,26 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
+	protected function SetupCarAlarmHonkListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( !( m_carAlarmCallbackID ) )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			m_carAlarmCallbackID = vehicleDefBlackboard.RegisterListenerBool( GetAllBlackboardDefs().Vehicle.UseCarAlarmStim, this, 'OnCarAlarmHonk' );
+		}
+	}
+
+	protected function UnregisterCarAlarmHonkListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( m_carAlarmCallbackID )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			vehicleDefBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().Vehicle.UseCarAlarmStim, m_carAlarmCallbackID );
+		}
+	}
+
 	protected function SetupVehicleSpeedBBListener()
 	{
 		var vehicleDefBlackboard : weak< IBlackboard >;
@@ -4147,6 +5057,18 @@ class VehicleComponent extends ScriptableDeviceComponent
 		{
 			vehicleDefBlackboard = GetVehicle().GetBlackboard();
 			vehicleDefBlackboard.UnregisterListenerFloat( GetAllBlackboardDefs().Vehicle.RPMValue, m_vehicleRPMCallbackID );
+		}
+	}
+
+	protected event OnCarAlarmHonk( UseCarAlarmStim : Bool )
+	{
+		if( UseCarAlarmStim )
+		{
+			GetVehicle().GetStimBroadcasterComponent().TriggerSingleBroadcast( GetVehicle(), gamedataStimType.CarAlarm );
+		}
+		else
+		{
+			GetVehicle().GetStimBroadcasterComponent().TriggerSingleBroadcast( GetVehicle(), gamedataStimType.VehicleHorn );
 		}
 	}
 
@@ -4212,7 +5134,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
-	private function CloseSelectedDoors( doors : array< CName > )
+	private function CloseSelectedDoors( const doors : ref< array< CName > > )
 	{
 		var i : Int32;
 		var size : Int32;
@@ -4301,59 +5223,27 @@ class VehicleComponent extends ScriptableDeviceComponent
 				}
 			}
 		}
-		if( ListenerAction.GetName( action ) == 'VehicleHorn' )
+		if( ( ( ListenerAction.GetName( action ) == 'VehicleHornHold' && ListenerAction.GetType( action ) == gameinputActionType.BUTTON_HOLD_COMPLETE ) || ( ListenerAction.GetName( action ) == 'VehicleHorn' && ListenerAction.IsButtonJustPressed( action ) ) ) && !( m_hornOn ) )
 		{
-			if( m_hasSiren )
+			ToggleVehicleHorn( true );
+			vehicle.GetStimBroadcasterComponent().TriggerSingleBroadcast( vehicle, gamedataStimType.VehicleHorn );
+			m_hornOn = true;
+		}
+		if( ( ( ListenerAction.GetName( action ) == 'VehicleHornHold' || ListenerAction.GetName( action ) == 'VehicleHorn' ) && m_hornOn ) && ListenerAction.IsButtonJustReleased( action ) )
+		{
+			ToggleVehicleHorn( false );
+			m_hornOn = false;
+		}
+		if( m_useAuxiliary && ListenerAction.GetName( action ) == 'VehicleSiren' )
+		{
+			if( ListenerAction.IsButtonJustPressed( action ) )
+			{
+				m_sirenPressTime = EngineTime.ToFloat( GameInstance.GetEngineTime( vehicle.GetGame() ) );
+			}
+			if( ListenerAction.IsButtonJustReleased( action ) && ( ( EngineTime.ToFloat( GameInstance.GetEngineTime( GetVehicle().GetGame() ) ) - m_sirenPressTime ) < 0.25 ) )
 			{
 				sirenState = GetPS().GetSirenState();
-				if( ListenerAction.IsButtonJustPressed( action ) )
-				{
-					m_hornPressTime = EngineTime.ToFloat( GameInstance.GetEngineTime( vehicle.GetGame() ) );
-				}
-				if( ListenerAction.IsButtonJustReleased( action ) )
-				{
-					releaseTime = EngineTime.ToFloat( GameInstance.GetEngineTime( GetVehicle().GetGame() ) );
-					if( releaseTime <= ( m_hornPressTime + 0.2 ) )
-					{
-						ToggleSiren( !( sirenState ), !( sirenState ) );
-					}
-					if( sirenState )
-					{
-						vehicle.ToggleHorn( false, true );
-					}
-					else
-					{
-						vehicle.ToggleHorn( false );
-					}
-					m_hornOn = false;
-				}
-				if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_HOLD_COMPLETE )
-				{
-					if( sirenState )
-					{
-						vehicle.ToggleHorn( true, true );
-					}
-					else
-					{
-						vehicle.ToggleHorn( true );
-					}
-					vehicle.GetStimBroadcasterComponent().TriggerSingleBroadcast( vehicle, gamedataStimType.VehicleHorn );
-					m_hornOn = true;
-				}
-			}
-			else
-			{
-				if( ( ListenerAction.GetValue( action ) == 1.0 ) && !( m_hornOn ) )
-				{
-					vehicle.GetStimBroadcasterComponent().TriggerSingleBroadcast( vehicle, gamedataStimType.VehicleHorn );
-					vehicle.ToggleHorn( true );
-					m_hornOn = true;
-				}
-				else if( ( ListenerAction.GetValue( action ) < 1.0 ) && m_hornOn )
-				{
-					vehicle.ToggleHorn( false );
-					m_hornOn = false;
-				}
+				ToggleSiren( !( sirenState ), !( sirenState ) );
 			}
 		}
 	}
@@ -4362,7 +5252,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var hornOffDelayEvent : VehicleHornOffDelayEvent;
 		var delayTimer : Float;
-		GetVehicle().ToggleHorn( true );
+		ToggleVehicleHorn( true );
 		m_hornOn = true;
 		delayTimer = evt.honkTime;
 		if( delayTimer == 0.0 )
@@ -4371,6 +5261,16 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 		hornOffDelayEvent = new VehicleHornOffDelayEvent;
 		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), hornOffDelayEvent, delayTimer );
+	}
+
+	protected event OnVehicleDelayedQuestHornEvent( evt : VehicleQuestDelayedHornEvent )
+	{
+		var honkEvent : VehicleQuestHornEvent;
+		var delayTimer : Float;
+		delayTimer = evt.delayTime;
+		honkEvent = new VehicleQuestHornEvent;
+		honkEvent.honkTime = evt.honkTime;
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), honkEvent, delayTimer );
 	}
 
 	protected event OnVehicleHornProbEvent( evt : VehicleHornProbsEvent )
@@ -4383,7 +5283,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 		if( randomDraw <= evt.probability )
 		{
 			vehicleObject = GetVehicle();
-			vehicleObject.ToggleHorn( true );
+			ToggleVehicleHorn( true );
 			m_hornOn = true;
 			delayTimer = RandRangeF( evt.honkMinTime, evt.honkMaxTime );
 			if( delayTimer == 0.0 )
@@ -4397,13 +5297,23 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	protected event OnVehicleHornOffDelayEvent( evt : VehicleHornOffDelayEvent )
 	{
-		GetVehicle().ToggleHorn( false );
+		ToggleVehicleHorn( false );
 		m_hornOn = false;
+	}
+
+	private function ToggleVehicleHorn( state : Bool, optional isPolice : Bool )
+	{
+		GetVehicle().ToggleHorn( state, isPolice );
+	}
+
+	public function ToggleLightsAndSirens( lights : Bool, sirens : Bool )
+	{
+		this.ToggleSiren( lights, sirens );
 	}
 
 	protected function ToggleSiren( lights : Bool, sounds : Bool )
 	{
-		if( m_hasSiren && !( GetPS().GetIsDestroyed() ) )
+		if( m_useAuxiliary && ( ( !( GetPS().GetIsDestroyed() ) || !( lights ) ) || !( sounds ) ) )
 		{
 			GetVehicleController().ToggleLights( lights, vehicleELightType.Utility );
 			if( lights )
@@ -4433,11 +5343,54 @@ class VehicleComponent extends ScriptableDeviceComponent
 		ToggleSiren( evt.lights, evt.sounds );
 	}
 
+	private function QueueLethalVehicleImpactToAllNonFriendlyAggressivePassengers( sourceName : CName ) : Bool
+	{
+		var i : Int32;
+		var passenger : weak< ScriptedPuppet >;
+		var passengers : array< weak< GameObject > >;
+		var gi : GameInstance;
+		var vehicleID : EntityID;
+		var success : Bool;
+		gi = GetVehicle().GetGame();
+		vehicleID = GetVehicle().GetEntityID();
+		success = false;
+		GetAllPassengers( gi, vehicleID, false, passengers );
+		for( i = 0; i < passengers.Size(); i += 1 )
+		{
+			passenger = ( ( ScriptedPuppet )( passengers[ i ] ) );
+			if( ( passenger && !( IsFriendlyTowardsPlayer( passenger ) ) ) && passenger.IsAggressive() )
+			{
+				QueueVehicleImpactLethalHitEvent( passenger, passenger, sourceName );
+				success = true;
+			}
+		}
+		return success;
+	}
+
 	protected event OnVehicleFlippedOverEvent( evt : VehicleFlippedOverEvent )
 	{
-		if( !( evt.isFlippedOver ) )
+		if( evt.isFlippedOver )
+		{
+			if( QueueLethalVehicleImpactToAllNonFriendlyAggressivePassengers( 'OnVehicleFlippedOverEvent' ) )
+			{
+				CheckAboutToExplodeStateOnFlip();
+			}
+		}
+		else
 		{
 			RemoveVehicleDOT();
+		}
+	}
+
+	private function CheckAboutToExplodeStateOnFlip()
+	{
+		var speedTreshold : Float;
+		var probability : Float;
+		speedTreshold = TDB.GetFloat( T"vehicles.common.hostile_explode_on_flip_speed_treshold", 5.0 );
+		probability = TDB.GetFloat( T"vehicles.common.hostile_explode_on_flip_probability", 0.30000001 );
+		if( ( AbsF( GetVehicle().GetCurrentSpeed() ) > speedTreshold ) && ( RandF() < probability ) )
+		{
+			ForceAboutToExplodeState();
 		}
 	}
 
@@ -4595,12 +5548,138 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	protected event OnVehicleQuestToggleEngineEvent( evt : VehicleQuestToggleEngineEvent )
 	{
-		ToggleVehicleSystems( evt.toggle, true, true );
+		if( evt.vehicleOnEngineOff )
+		{
+			if( evt.toggle )
+			{
+				ToggleVehicleSystems( true, true, false, evt.lockState );
+			}
+			else
+			{
+				ToggleVehicleSystems( false, false, true, evt.lockState );
+			}
+		}
+		else
+		{
+			ToggleVehicleSystems( evt.toggle, true, true, evt.lockState );
+		}
 	}
 
 	protected event OnSetIgnoreAutoDoorCloseEvent( evt : SetIgnoreAutoDoorCloseEvent )
 	{
 		m_ignoreAutoDoorClose = evt.set;
+	}
+
+	public static function OnThreatInstantDrop( passenger : weak< GameObject > )
+	{
+		var vehicle : weak< VehicleObject >;
+		var gi : GameInstance;
+		gi = passenger.GetGame();
+		if( ( !( VehicleComponent.GetVehicle( gi, passenger, vehicle ) ) || !( vehicle.IsAttached() ) ) || !( VehicleComponent.IsDriver( gi, passenger ) ) )
+		{
+			return;
+		}
+		VehicleComponent.SendPoliceJustLostPlayerSearchCommand( ( ( weak< weak< WheeledObject > > )( vehicle ) ) );
+	}
+
+	private static function SendPoliceJustLostPlayerSearchCommand( vehicle : weak< WheeledObject > )
+	{
+		var gi : GameInstance;
+		var destination : Vector4;
+		gi = vehicle.GetGame();
+		destination = GameInstance.GetPreventionSpawnSystem( gi ).GetIntersectionInFrontOfPlayerPos();
+		vehicle.SetPoliceStrategy( vehiclePoliceStrategy.DriveTowardsPlayer );
+		if( Vector4.IsXYZZero( destination ) )
+		{
+			destination = GameInstance.GetPlayerSystem( gi ).GetLocalPlayerControlledGameObject().GetWorldPosition();
+		}
+		vehicle.SetPoliceStrategyDestination( destination );
+		if( !( GameInstance.GetPreventionSpawnSystem( gi ).IsPlayerInDogTown() ) )
+		{
+			vehicle.GetAIComponent().SetKeepStrategyOnSearch( true );
+		}
+		PreventionSystem.StartActiveVehicleBehaviour( gi, vehicle );
+	}
+
+	protected event OnUploadProgramProgress( evt : UploadProgramProgressEvent )
+	{
+		var quickhackMappinScriptData : GameplayRoleMappinData;
+		var icon : weak< ChoiceCaptionIconPart_Record >;
+		var quickSlotCommandUsed : QuickSlotCommandUsed;
+		var currentlyUploadingAction : ScriptableDeviceAction;
+		switch( evt.state )
+		{
+			case EUploadProgramState.STARTED:
+			{
+				if( evt.progressBarContext == EProgressBarContext.QuickHack )
+				{
+					quickhackMappinScriptData = new GameplayRoleMappinData;
+					quickhackMappinScriptData.statPoolType = evt.statPoolType;
+					quickhackMappinScriptData.m_mappinVisualState = EMappinVisualState.Default;
+					quickhackMappinScriptData.m_progressBarType = evt.progressBarType;
+					quickhackMappinScriptData.m_progressBarContext = evt.progressBarContext;
+					quickhackMappinScriptData.m_duration = evt.duration;
+					quickhackMappinScriptData.m_visibleThroughWalls = true;
+					quickhackMappinScriptData.m_action = evt.action;
+					icon = evt.action.GetInteractionIcon();
+					if( icon )
+					{
+						quickhackMappinScriptData.m_textureID = icon.TexturePartID().GetID();
+					}
+					else if( evt.iconRecord )
+					{
+						quickhackMappinScriptData.m_textureID = evt.iconRecord.TexturePartID().GetID();
+					}
+					CreateQuickHackMappin( quickhackMappinScriptData );
+				}
+				break;
+			}
+			case EUploadProgramState.COMPLETED:
+			{
+				if( evt.progressBarContext == EProgressBarContext.QuickHack )
+				{
+					DestroyQuickHackMappin();
+					currentlyUploadingAction = GetVehicle().GetCurrentlyUploadingAction();
+					quickSlotCommandUsed = QuickHackableQueueHelper.PopFromQuickHackQueue( evt, NULL );
+					if( quickSlotCommandUsed && !( GetPS().GetIsDestroyed() ) )
+					{
+						OnQuickSlotCommandUsed( quickSlotCommandUsed );
+					}
+					else if( currentlyUploadingAction )
+					{
+						currentlyUploadingAction.m_isInactive = true;
+						GetVehicle().SetCurrentlyUploadingAction( currentlyUploadingAction );
+					}
+				}
+				break;
+			}
+			default:
+			{
+				break;
+			}
+		}
+	}
+
+	private function CreateQuickHackMappin( quickhackMappinScriptData : GameplayRoleMappinData )
+	{
+		var vehicle : weak< VehicleObject >;
+		var mappinData : MappinData;
+		vehicle = GetVehicle();
+		mappinData.active = true;
+		mappinData.mappinType = T"Mappins.InteractionMappinDefinition";
+		mappinData.variant = gamedataMappinVariant.QuickHackVariant;
+		mappinData.scriptData = quickhackMappinScriptData;
+		mappinData.visibleThroughWalls = true;
+		m_quickhackMappinID = GameInstance.GetMappinSystem( vehicle.GetGame() ).RegisterMappinWithObject( mappinData, vehicle, vehicle.GetQuickHackIndicatorSlotName() );
+	}
+
+	private function DestroyQuickHackMappin()
+	{
+		if( m_quickhackMappinID.value != ( ( Uint64 )( 0 ) ) )
+		{
+			GameInstance.GetMappinSystem( GetVehicle().GetGame() ).UnregisterMappin( m_quickhackMappinID );
+			m_quickhackMappinID.value = ( ( Uint64 )( 0 ) );
+		}
 	}
 
 }
@@ -4713,6 +5792,10 @@ class VehicleHornOffDelayEvent extends Event
 {
 }
 
+class VehicleExitDelayed extends Event
+{
+}
+
 class VehicleForwardRaceCheckpointFactEvent extends Event
 {
 }
@@ -4725,19 +5808,42 @@ class VehicleForwardRaceClockUpdateEvent extends Event
 {
 }
 
-exec function EnableVehicleToggleSummonMode( gameInstance : GameInstance, value : String )
+class DelayedBikeKnockOffEvent extends Event
 {
-	var blackboard : IBlackboard;
-	var intValue : Int32;
-	intValue = StringToInt( value );
-	blackboard = GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().GameplaySettings );
-	if( intValue == 1 )
+}
+
+class ShouldNPCReEquipWeaponOnDismount extends AIbehaviorconditionScript
+{
+
+	protected override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
 	{
-		blackboard.SetBool( GetAllBlackboardDefs().GameplaySettings.EnableVehicleToggleSummonMode, true );
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		var vehicle : weak< GameObject >;
+		var vehicleID : EntityID;
+		var vehicleSlotID : MountingSlotId;
+		var bike : BikeObject;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( GetAIComponent( context ).GetAssignedVehicle( gameInstance, vehicle ) )
+		{
+			if( GetAIComponent( context ).GetAssignedVehicleData( vehicleID, vehicleSlotID ) )
+			{
+				if( !( VehicleComponent.GetDriverMounted( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ).IsPlayer() ) )
+				{
+					bike = ( ( BikeObject )( vehicle ) );
+					if( bike )
+					{
+						if( !( VehicleComponent.IsDestroyed( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ) ) )
+						{
+							return false;
+						}
+					}
+				}
+			}
+		}
+		return true;
 	}
-	else
-	{
-		blackboard.SetBool( GetAllBlackboardDefs().GameplaySettings.EnableVehicleToggleSummonMode, false );
-	}
+
 }
 

@@ -2,30 +2,179 @@ importonly abstract class IPreventionSpawnSystem extends IGameSystem
 {
 }
 
+import enum DynamicVehicleType
+{
+	None,
+	Car,
+	AV,
+	RoadBlockade,
+	RoadBlockadeWithAV,
+}
+
+import struct NearestRoadFromPlayerInfo
+{
+	import var pathLength : Float;
+	import var point : Vector4;
+}
+
+importonly struct SpawnRequestResult
+{
+	import var requestID : Uint32;
+	import var policeStrategy : vehiclePoliceStrategy;
+	import var vehicleType : DynamicVehicleType;
+	import var spawnedObjects : array< weak< GameObject > >;
+	import var success : Bool;
+}
+
+importonly struct AVSpawnPointsRequestResult
+{
+	import var requestID : Uint32;
+	import var success : Bool;
+	import var spawnPoints : array< Vector3 >;
+}
+
 import class PreventionSpawnSystem extends IPreventionSpawnSystem
 {
-	public import function RequestSpawn( recordID : TweakDBID, preventionLevel : Uint32, spawnTransform : WorldTransform ) : EntityID;
-	public import function RequestVehicleSpawn( recordID : TweakDBID, districtRecordID : TweakDBID, preventionLevel : Uint32 );
-	public import function ReinitVehicle( vehicle : weak< VehicleObject > );
+	public import function CancelSpawnRequest( requestID : Uint32 );
+	public import function CancelAllSpawnRequests();
+	public import function RequestUnitSpawn( recordID : TweakDBID, spawnTransform : WorldTransform ) : Uint32;
+	public import function RequestChaseVehicle( vehicleRecordID : TweakDBID, passengersRecordIDs : array< TweakDBID >, strategy : BaseStrategyRequest ) : Uint32;
+	public import function SetStrategyPreCheckRequests( preCheckRequests : array< BaseStrategyRequest > );
+	public import function ClearStrategyPreCheckRequests();
+	public import const function IsStrategyAvailable( strategy : vehiclePoliceStrategy ) : Bool;
+	public import const function IsAnyStrategyAvailable() : Bool;
+	public import const function GetAvailableStrategies( out strategies : array< vehiclePoliceStrategy > ) : Bool;
+	public import const function GetRandomAvailableStrategyInRange( minStrat : Uint8, maxStrat : Uint8 ) : vehiclePoliceStrategy;
+	public import const function GetRandomAvailableStrategy( wantedStrategies : array< vehiclePoliceStrategy > ) : vehiclePoliceStrategy;
+	public import const function DebugTryOverrideWithForcedStrategy( out strategy : vehiclePoliceStrategy );
+	public import const function GetIntersectionInFrontOfPlayerPos() : Vector4;
+	public import const function IsPlayerOnHighway() : Bool;
+	public import const function IsPlayerInDogTown() : Bool;
+	public import const function GetNearestRoadFromPlayerInfo( out info : NearestRoadFromPlayerInfo );
+	public import function RequestRoadBlockadeSpawn( vehiclessRecordIDs : array< TweakDBID >, spawnDistanceRange : Vector2, numberNPCsPerCar : Uint32 ) : Uint32;
+	public import function NotifyPlayerMounted( isPlayerMounted : Bool );
+	public import function IsPlayerInSoftDeescalationTrigger() : Bool;
+	public import function IsInUnmountingRange( position : Vector3 ) : Bool;
+	public import function RequestAVSpawnPoints( scriptable : weak< IScriptable >, functionName : String, spawnDistanceRange : Vector2, maxSpawnPoints : Uint32, useOffTrafficPoints : Bool ) : Uint32;
+	public import function RequestAVSpawnAtLocation( recordID : TweakDBID, location : Vector3 ) : Uint32;
+	public import function RequestAVSpawn( recordID : TweakDBID, spawnDistanceRange : Vector2, useOffTrafficPoints : Bool ) : Uint32;
+	public import function ReinitAll();
 	public import function RequestDespawn( entityID : EntityID );
-	public import function RequestDespawnPreventionLevel( preventionLevel : Uint32 );
+	public import function RequestDespawnVehicleAndPassengers( vehicle : weak< VehicleObject > );
+	public import function RequestDespawnAll( shouldUseAggressiveDespawn : Bool );
 	public import function GetNumberOfSpawnedPreventionUnits() : Int32;
-	public import function IsPreventionVehiclePrototypeEnabled() : Bool;
-	public import const function FindPursuitPointsRange( playerPos : Vector4, pos : Vector4, dir : Vector4, radiusMin : Float, radiusMax : Float, count : Int32, navVisCheck : Bool, agentSize : NavGenAgentSize, out results : array< Vector4 >, out fallbackResults : array< Vector4 > ) : Bool;
+	public import function IsPreventionVehicleEnabled() : Bool;
+	public import const function FindPursuitPointsRangeAsync( spawnOriginPositions : array< Vector4 >, radiusMin : Float, radiusMax : Float, unitCount : Uint32, characterRecords : array< TweakDBID >, navVisCheck : Bool, agentSize : NavGenAgentSize, scriptable : weak< IScriptable >, functionName : String );
+	public import function ToggleFreeArea( areaReference : NodeRef, enable : Bool );
+	public import function TogglePreventionQuestTrigger( areaReference : NodeRef, enable : Bool );
+	public import function GetPreventionSystemCanSpawnInCrowd() : Bool;
 	public import function RegisterEntityDeathCallback( scriptable : weak< IScriptable >, functionName : String, entityID : EntityID );
 	public import function UnregisterEntityDeathCallback( scriptable : weak< IScriptable >, functionName : String, entityID : EntityID );
-	public import function JoinTraffic( veh : weak< VehicleObject > );
+	public import function TogglePreventionCrowdSpawns( toggle : Bool );
+	public import function TogglePreventionActive( isActive : Bool );
+	public import function InterruptAllActionAndCommands( veh : weak< VehicleObject > );
+	public import function IsEntityRegistered( id : EntityID ) : Bool;
+	public import function TryGetVehicleType( id : EntityID, out vehicleType : DynamicVehicleType ) : Bool;
+	public import function IsPointInPreventionFreeArea( point : Vector4 ) : Bool;
+	public import function MarkAsDead( entityID : EntityID );
 
-	protected function SpawnCallback( spawnedObject : GameObject )
+	protected function SpawnRequestFinished( requestResult : SpawnRequestResult )
 	{
-		if( spawnedObject.IsPuppet() )
+		var system : PreventionSystem;
+		var request : PreventionUnitSpawnedRequest;
+		system = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'PreventionSystem' ) ) );
+		if( system )
 		{
-			PreventionSystem.RegisterPoliceUnit( spawnedObject.GetGame(), ( ( ScriptedPuppet )( spawnedObject ) ) );
+			request = new PreventionUnitSpawnedRequest;
+			request.requestResult = requestResult;
+			system.QueueRequest( request );
 		}
-		else if( spawnedObject.IsVehicle() )
+	}
+
+	protected function DespawnCallback( entityID : EntityID )
+	{
+		var system : PreventionSystem;
+		var request : PreventionUnitDespawnedRequest;
+		system = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'PreventionSystem' ) ) );
+		if( system )
 		{
-			PreventionSystem.RegisterPoliceVehicle( spawnedObject.GetGame(), ( ( VehicleObject )( spawnedObject ) ) );
+			request = new PreventionUnitDespawnedRequest;
+			request.entityID = entityID;
+			system.QueueRequest( request );
 		}
+	}
+
+	public const function TryFillPreventionSystemDebugData( out dataToFill : PreventionSystemDebugData ) : Bool
+	{
+		var preventionSystem : PreventionSystem;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			preventionSystem.FillPreventionSystemDebugData( dataToFill );
+			return true;
+		}
+		return false;
+	}
+
+	protected export function Debug_EmulateDamageDealt( damageAmount : Float )
+	{
+		var preventionSystem : PreventionSystem;
+		var preventionSystemRequest : PreventionDamageRequest;
+		var playerPos : Vector4;
+		var crimeScorePercent : Float;
+		crimeScorePercent = 25.0;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'PreventionSystem' ) ) );
+		if( preventionSystem )
+		{
+			playerPos = GetPlayer( GetGameInstance() ).GetWorldPosition();
+			preventionSystemRequest = new PreventionDamageRequest;
+			preventionSystemRequest.damageDealtPercentValue = crimeScorePercent * damageAmount;
+			preventionSystemRequest.isInternal = false;
+			preventionSystemRequest.targetPosition = playerPos;
+			preventionSystemRequest.requestedHeat = EPreventionHeatStage.Heat_1;
+			preventionSystemRequest.attackType = gamedataAttackType.Direct;
+			preventionSystemRequest.telemetryInfo = "DEBUG";
+			preventionSystem.QueueRequest( preventionSystemRequest );
+		}
+	}
+
+	protected function VehicleEarlyInit( vehicleObject : WheeledObject )
+	{
+		PreventionSystem.StartActiveVehicleBehaviour( vehicleObject.GetGame(), vehicleObject );
+	}
+
+	protected function RoadblockadeNPCEarlyInit( puppet : gamePuppet )
+	{
+		PreventionSystem.StartRoadblockNPCAgentBehaviour( ( ( ScriptedPuppet )( puppet ) ) );
+	}
+
+	protected function OnEnterPreventionQuestTrigger( disablePreventionSystem : Bool )
+	{
+		var preventionSystem : PreventionSystem;
+		var preventionForceDeescalateRequest : PreventionForceDeescalateRequest;
+		var refreshDeescalationTimersRequest : RefreshDeescalationTimers;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'PreventionSystem' ) ) );
+		if( !( preventionSystem ) || !( preventionSystem.IsChasingPlayer() ) )
+		{
+			return;
+		}
+		if( disablePreventionSystem )
+		{
+			preventionForceDeescalateRequest = new PreventionForceDeescalateRequest;
+			preventionForceDeescalateRequest.fakeBlinkingDuration = TweakDBInterface.GetFloat( T"PreventionSystem.setup.forcedDeescalationUIStarsBlinkingDurationSeconds", 4.0 );
+			preventionForceDeescalateRequest.telemetryInfo = "QuestPreventionTriggerForceDeescalation";
+			preventionSystem.QueueRequest( preventionForceDeescalateRequest );
+		}
+		else
+		{
+			refreshDeescalationTimersRequest = new RefreshDeescalationTimers;
+			preventionSystem.QueueRequest( refreshDeescalationTimersRequest );
+		}
+	}
+
+	public function SetIfAvailable( value : vehiclePoliceStrategy ) : vehiclePoliceStrategy
+	{
+		return ( ( IsStrategyAvailable( value ) ) ? ( value ) : ( vehiclePoliceStrategy.None ) );
 	}
 
 }

@@ -3,6 +3,13 @@ importonly class HACK_UseSensePresetEvent extends Event
 	import var sensePreset : TweakDBID;
 }
 
+import enum AdditionalTraceType : Uint32
+{
+	Knee,
+	Hip,
+	Chest,
+}
+
 import class SensorObjectComponent extends IPlacedComponent
 {
 	public import function SetSensorObjectType( objectType : gamedataSenseObjectType ) : Bool;
@@ -16,26 +23,23 @@ import class SensorObjectComponent extends IPlacedComponent
 	public import function SetHasPierceableWapon( hasTechWeapon : Bool ) : Bool;
 }
 
+enum ESenseLogSource
+{
+	Undefined = 0,
+	AddToBlacklistEvent = 1,
+	RemoveFromBlacklistEvent = 2,
+	SecurityAreaCrossingPerimeter = 3,
+}
+
 import class SenseComponent extends IPlacedComponent
 {
-	import var visibleObject : VisibleObject;
-	private var m_highLevelCb : CallbackHandle;
-	private var m_reactionCb : CallbackHandle;
-	private var m_highLevelState : gamedataNPCHighLevelState;
-	private var m_mainPreset : TweakDBID;
-	private var m_secondaryPreset : TweakDBID;
-	private var m_puppetBlackboard : weak< IBlackboard >;
-	private var m_playerTakedownStateCallbackID : CallbackHandle;
-	private var m_playerUpperBodyStateCallbackID : CallbackHandle;
-	private var m_playerCarryingStateCallbackID : CallbackHandle;
-	private var m_playerInPerception : weak< PlayerPuppet >;
-
 	public import function SetHearingEnabled( enabled : Bool );
 	public import function IsHearingEnabled() : Bool;
 	public import function IsAgentVisible( object : GameObject ) : Bool;
 	public import function SetCrowdsAggressiveState( isAggresive : Bool );
 	public import function GetVisibilityTraceEndToAgentDist( object : GameObject ) : Float;
 	public import function GetDetection( entityID : EntityID ) : Float;
+	public import function ResetDetection( entityID : EntityID ) : Bool;
 	public import function SetDetectionFactor( detection : Float, optional shapeName : CName ) : Bool;
 	public import function SetDetectionCoolDown( coolDown : Float );
 	public import function SetDetectionDropFactor( detectionDrop : Float );
@@ -57,6 +61,7 @@ import class SenseComponent extends IPlacedComponent
 	public import function RemoveSenseMappin();
 	public import function RequestRemovingSenseMappin();
 	public import function RemoveHearingMappin();
+	public import function UpdateCrowdMappin();
 	public import function HasSenseMappin() : Bool;
 	public import function HasHearingMappin() : Bool;
 	public import function SetSensorObjectType( objectType : gamedataSenseObjectType ) : Bool;
@@ -69,7 +74,109 @@ import class SenseComponent extends IPlacedComponent
 	public import function RemoveForcedSensesTracing( targetObjectType : gamedataSenseObjectType, attitudeToTarget : EAIAttitude ) : Bool;
 	public import function SetTickDistanceOverride( overrideDistance : Float ) : Bool;
 	public import function SetHasPierceableWapon( hasTechWeapon : Bool ) : Bool;
+	public import function SetVisionBlockersIgnoredBySensor( ignoredVisionBlockers : VisionBlockerTypeFlags ) : Bool;
+	private import function SetIsPlayerInterestingFromSecuritySystemPOV( isPlayerInteresting : Bool );
 	public import function IgnoreLODChange( ignoreLOD : Bool );
+
+	import var visibleObject : VisibleObject;
+	import var forceDisableUI : Bool;
+	private var m_highLevelCb : CallbackHandle;
+	private var m_reactionCb : CallbackHandle;
+	private var m_wantedLevelChangedCb : CallbackHandle;
+	private var m_highLevelState : gamedataNPCHighLevelState;
+	private var m_mainPreset : TweakDBID;
+	private var m_secondaryPreset : TweakDBID;
+	private var m_puppetBlackboard : weak< IBlackboard >;
+	private var m_hideUIElements : Bool;
+	private var m_enabledSenses : Bool;
+	private var m_shouldStartDetectingPlayerCached : Bool;
+	private var m_wasPlayerLastReactionTarget : Bool;
+	private var m_logSource : ESenseLogSource;
+	default m_logSource = ESenseLogSource.Undefined;
+
+	private const function Log( category : CName, message : String )
+	{
+		var puppet : weak< ScriptedPuppet >;
+		var aiComponent : AIHumanComponent;
+		if( IsFinal() )
+		{
+			return;
+		}
+		puppet = GetConstOwnerPuppet();
+		if( !( puppet ) )
+		{
+			return;
+		}
+		aiComponent = puppet.GetAIControllerComponent();
+		if( aiComponent )
+		{
+			aiComponent.DebugLog( category, message );
+		}
+	}
+
+	private const function LogBySource( category : CName, message : String )
+	{
+		if( IsFinal() )
+		{
+			return;
+		}
+		switch( m_logSource )
+		{
+			case ESenseLogSource.AddToBlacklistEvent:
+				Log( category, "OnAddToBlacklist: " + message );
+			break;
+			case ESenseLogSource.RemoveFromBlacklistEvent:
+				Log( category, "OnRemoveFromBlacklist: " + message );
+			break;
+			case ESenseLogSource.SecurityAreaCrossingPerimeter:
+				Log( category, "OnSecurityAreaCrossing: " + message );
+			break;
+			default:
+				Log( category, message );
+			break;
+		}
+	}
+
+	private const function LogCategory( suffix : String ) : CName
+	{
+		var cat : String;
+		if( IsFinal() )
+		{
+			return '';
+		}
+		cat = "senses";
+		switch( m_logSource )
+		{
+			case ESenseLogSource.AddToBlacklistEvent:
+			case ESenseLogSource.RemoveFromBlacklistEvent:
+			case ESenseLogSource.SecurityAreaCrossingPerimeter:
+				cat += ".interest";
+			break;
+			default:
+				break;
+		}
+		if( StrLen( suffix ) > 0 )
+		{
+			cat += ( "." + suffix );
+		}
+		return StringToName( cat );
+	}
+
+	public function LogStart( source : ESenseLogSource, message : String )
+	{
+		m_logSource = source;
+		LogBySource( LogCategory( "start" ), message );
+	}
+
+	public const function LogInfo( message : String )
+	{
+		LogBySource( LogCategory( "info" ), message );
+	}
+
+	public const function LogTrueFalse( message : String, value : Bool )
+	{
+		LogBySource( LogCategory( "info" ), ( message + " = " ) + ( ( value ) ? ( "TRUE" ) : ( "FALSE" ) ) );
+	}
 
 	public function ToggleComponent( condition : Bool )
 	{
@@ -97,14 +204,29 @@ import class SenseComponent extends IPlacedComponent
 		return ( ( ScriptedPuppet )( GetEntity() ) );
 	}
 
-	public static function RequestMainPresetChange( obj : weak< GameObject >, const presetName : String )
+	public const function GetConstOwnerPuppet() : ScriptedPuppet
+	{
+		return ( ( ScriptedPuppet )( GetEntity() ) );
+	}
+
+	public function TryCreateSenseMappin() : Bool
+	{
+		if( !( m_hideUIElements ) && m_enabledSenses )
+		{
+			CreateSenseMappin();
+			return true;
+		}
+		return false;
+	}
+
+	public static function RequestMainPresetChange( obj : weak< GameObject >, const presetName : ref< String > )
 	{
 		var presetID : TweakDBID;
 		presetID = TDBID.Create( "Senses." + presetName );
 		RequestPresetChange( obj, presetID, true );
 	}
 
-	public static function RequestSecondaryPresetChange( obj : weak< GameObject >, const presetName : String )
+	public static function RequestSecondaryPresetChange( obj : weak< GameObject >, const presetName : ref< String > )
 	{
 		var presetID : TweakDBID;
 		presetID = TDBID.Create( "Senses." + presetName );
@@ -176,18 +298,34 @@ import class SenseComponent extends IPlacedComponent
 		var puppet : weak< ScriptedPuppet >;
 		var sensorDevice : weak< SensorDevice >;
 		sensorDevice = ( ( SensorDevice )( GetEntity() ) );
+		puppet = GetOwnerPuppet();
+		if( puppet )
+		{
+			m_hideUIElements = puppet.GetBoolFromCharacterTweak( "hideUIElements", false );
+		}
+		if( forceDisableUI )
+		{
+			m_hideUIElements = true;
+		}
 		if( sensorDevice && ( ( SensorDeviceControllerPS )( sensorDevice.GetDevicePS() ) ).IsPartOfPrevention() )
 		{
 			if( sensorDevice.GetPreventionSystem().AreTurretsActive() )
 			{
-				CreateSenseMappin();
+				m_enabledSenses = true;
+				if( !( m_hideUIElements ) )
+				{
+					CreateSenseMappin();
+				}
 			}
 		}
 		else
 		{
-			CreateSenseMappin();
+			m_enabledSenses = true;
+			if( !( m_hideUIElements ) )
+			{
+				CreateSenseMappin();
+			}
 		}
-		puppet = GetOwnerPuppet();
 		if( puppet )
 		{
 			m_mainPreset = TDBID.Create( "Senses." + ( ( ScriptedPuppet )( GetEntity() ) ).GetStringFromCharacterTweak( "relaxedSensesPreset", "Relaxed" ) );
@@ -196,6 +334,8 @@ import class SenseComponent extends IPlacedComponent
 			{
 				m_highLevelCb = m_puppetBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PuppetState.HighLevel, this, 'OnHighLevelChanged' );
 				m_reactionCb = m_puppetBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PuppetState.ReactionBehavior, this, 'OnReactionChanged' );
+				m_wantedLevelChangedCb = m_puppetBlackboard.RegisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, this, 'OnWantedLevelChanged' );
+				m_wasPlayerLastReactionTarget = false;
 			}
 		}
 	}
@@ -213,6 +353,7 @@ import class SenseComponent extends IPlacedComponent
 			{
 				m_puppetBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PuppetState.ReactionBehavior, m_reactionCb );
 				m_puppetBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PuppetState.HighLevel, m_highLevelCb );
+				m_puppetBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, m_wantedLevelChangedCb );
 			}
 		}
 		if( m_playerInPerception )
@@ -229,12 +370,23 @@ import class SenseComponent extends IPlacedComponent
 			case gamedataNPCHighLevelState.Dead:
 				RemoveHearingMappin();
 			break;
+			case gamedataNPCHighLevelState.Relaxed:
 			case gamedataNPCHighLevelState.Combat:
 			case gamedataNPCHighLevelState.Alerted:
 				ReevaluateDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
 			break;
 			default:
 				break;
+		}
+	}
+
+	private function OnWantedLevelChanged( value : Int32 )
+	{
+		var wantedLevel : EPreventionHeatStage;
+		wantedLevel = ( ( EPreventionHeatStage )( value ) );
+		if( wantedLevel == EPreventionHeatStage.Heat_0 )
+		{
+			ReevaluateDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
 		}
 	}
 
@@ -264,15 +416,19 @@ import class SenseComponent extends IPlacedComponent
 	protected event OnReactionChanged( value : Int32 )
 	{
 		var reactionData : AIReactionData;
+		var targetToReevaluate : weak< GameObject >;
 		reactionData = GetOwnerPuppet().GetStimReactionComponent().GetActiveReactionData();
 		if( !( reactionData ) )
 		{
 			reactionData = GetOwnerPuppet().GetStimReactionComponent().GetDesiredReactionData();
 		}
-		if( reactionData )
+		if( !( reactionData ) && !( m_wasPlayerLastReactionTarget ) )
 		{
-			ReevaluateDetectionOverwrite( reactionData.stimTarget );
+			return true;
 		}
+		targetToReevaluate = ( ( reactionData.stimTarget ) ? ( reactionData.stimTarget ) : ( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		ReevaluateDetectionOverwrite( targetToReevaluate );
+		m_wasPlayerLastReactionTarget = targetToReevaluate.IsPlayer();
 	}
 
 	protected event OnTargetAssessmentRequest( evt : TargetAssessmentRequest )
@@ -312,7 +468,11 @@ import class SenseComponent extends IPlacedComponent
 	{
 		if( evt.isEnabled )
 		{
-			CreateSenseMappin();
+			m_enabledSenses = true;
+			if( !( m_hideUIElements ) )
+			{
+				CreateSenseMappin();
+			}
 		}
 	}
 
@@ -336,10 +496,65 @@ import class SenseComponent extends IPlacedComponent
 		}
 	}
 
+	protected event OnAddToBlacklistEvent( evt : AddToBlacklistEvent )
+	{
+		var reevaluatedInterest : Bool;
+		LogStart( ESenseLogSource.AddToBlacklistEvent, "processing event" );
+		if( !( evt.isPlayerEntity ) )
+		{
+			LogInfo( "not player in blacklist" );
+			return false;
+		}
+		if( evt.reason != BlacklistReason.COMBAT )
+		{
+			LogInfo( "blacklist for non-combat reason" );
+			return false;
+		}
+		reevaluatedInterest = ReevaluatePlayerInterestFromSecuritySystemPOV();
+		if( reevaluatedInterest )
+		{
+			LogInfo( "set player INTERESTING from Security System POV" );
+		}
+		else
+		{
+			LogInfo( "set player NOT INTERESTING from Security System POV" );
+		}
+		SetIsPlayerInterestingFromSecuritySystemPOV( reevaluatedInterest );
+		ReevaluateDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
+	}
+
+	protected event OnRemoveFromBlacklistEvent( evt : RemoveFromBlacklistEvent )
+	{
+		var reevaluatedInterest : Bool;
+		LogStart( ESenseLogSource.RemoveFromBlacklistEvent, "processing event" );
+		if( !( evt.isPlayerEntity ) )
+		{
+			LogInfo( "not player in blacklist" );
+			return false;
+		}
+		reevaluatedInterest = ReevaluatePlayerInterestFromSecuritySystemPOV();
+		if( reevaluatedInterest )
+		{
+			LogInfo( "set player INTERESTING from Security System POV" );
+		}
+		else
+		{
+			LogInfo( "set player NOT INTERESTING from Security System POV" );
+		}
+		SetIsPlayerInterestingFromSecuritySystemPOV( reevaluatedInterest );
+		ReevaluateDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
+	}
+
+
+	private var m_playerTakedownStateCallbackID : CallbackHandle;
+	private var m_playerUpperBodyStateCallbackID : CallbackHandle;
+	private var m_playerCarryingStateCallbackID : CallbackHandle;
+	private var m_playerInPerception : weak< PlayerPuppet >;
+
 	private function PlayerEnteredPerception( player : weak< PlayerPuppet > )
 	{
 		SenseComponent.RequestDetectionOverwriteReevaluation( GetOwner(), player, 0.5 );
-		if( !( HasSenseMappin() ) )
+		if( !( HasSenseMappin() ) && !( m_enabledSenses ) )
 		{
 			return;
 		}
@@ -429,14 +644,47 @@ import class SenseComponent extends IPlacedComponent
 	protected event OnSecurityAreaCrossingPerimeter( evt : SecurityAreaCrossingPerimeter )
 	{
 		var owner : weak< GameObject >;
+		var breacher : weak< GameObject >;
+		var securitySystem : SecuritySystemControllerPS;
+		var isBlacklistedForCombat : Bool;
+		var isEnteringOrExitingWhenBlacklisted : Bool;
+		var shouldStartDetectingBreacher : Bool;
+		var reevaluatedInterest : Bool;
 		owner = ( ( GameObject )( GetEntity() ) );
-		if( owner )
+		breacher = evt.GetWhoBreached();
+		LogStart( ESenseLogSource.SecurityAreaCrossingPerimeter, "processing event" );
+		if( !( owner ) || !( breacher ) )
 		{
-			if( evt.GetWhoBreached() )
-			{
-				ReevaluateDetectionOverwrite( evt.GetWhoBreached() );
-			}
+			LogInfo( "no owner or breacher" );
+			return false;
 		}
+		shouldStartDetectingBreacher = ReevaluateDetectionOverwrite( breacher );
+		if( !( breacher.IsPlayerControlled() ) )
+		{
+			LogInfo( "breacher is not player" );
+			return false;
+		}
+		securitySystem = owner.GetSecuritySystem();
+		isBlacklistedForCombat = securitySystem && securitySystem.IsEntityBlacklistedForAtLeast( breacher, BlacklistReason.COMBAT );
+		isEnteringOrExitingWhenBlacklisted = evt.GetEnteredState() || isBlacklistedForCombat;
+		LogTrueFalse( "enteredState", evt.GetEnteredState() );
+		LogTrueFalse( "isBlacklistedForCombat", isBlacklistedForCombat );
+		LogTrueFalse( "shouldStartDetectingBreacher", shouldStartDetectingBreacher );
+		reevaluatedInterest = shouldStartDetectingBreacher && isEnteringOrExitingWhenBlacklisted;
+		if( reevaluatedInterest )
+		{
+			LogInfo( "set player INTERESTING from Security System POV" );
+		}
+		else
+		{
+			LogInfo( "set player NOT INTERESTING from Security System POV" );
+		}
+		SetIsPlayerInterestingFromSecuritySystemPOV( reevaluatedInterest );
+	}
+
+	private export function ReevaluatePlayerInterestFromSecuritySystemPOV() : Bool
+	{
+		return IsTargetInterestingForSecuritySystem( GetPlayer( GetGame() ) );
 	}
 
 	public static function RequestDetectionOverwriteReevaluation( obj : weak< GameObject >, target : weak< Entity >, optional delay : Float )
@@ -461,6 +709,16 @@ import class SenseComponent extends IPlacedComponent
 	protected event OnReevaluateDetectionOverwriteEvent( evt : ReevaluateDetectionOverwriteEvent )
 	{
 		ReevaluateDetectionOverwrite( ( ( GameObject )( evt.target ) ) );
+	}
+
+	protected event OnSensorOwnerChangedEvent( evt : SensorOwnerChangedEvent )
+	{
+		SetVisionBlockersIgnoredBySensor( GetIgnoredVisionBlockerTypes( GetGame(), evt.newOwnerId ) );
+	}
+
+	public function UpdateVisionBlockersIgnoredBySensor()
+	{
+		SetVisionBlockersIgnoredBySensor( GetIgnoredVisionBlockerTypes( GetGame(), GetEntity().GetEntityID() ) );
 	}
 
 	private function GetGame() : GameInstance
@@ -633,18 +891,20 @@ import class SenseComponent extends IPlacedComponent
 
 	private function IsPlayerRecentlyDroppedThreat( target : weak< GameObject > ) : Bool
 	{
-		var threatData : DroppedThreatData;
 		var tte : weak< TargetTrackingExtension >;
+		var threatData : DroppedThreatData;
 		var threatObject : weak< GameObject >;
-		if( TargetTrackingExtension.Get( GetOwnerPuppet(), tte ) && tte.GetDroppedThreat( GetOwner().GetGame(), threatData ) )
+		if( !( TargetTrackingExtension.Get( GetOwnerPuppet(), tte ) ) )
 		{
-			threatObject = ( ( GameObject )( threatData.threat ) );
-			if( threatObject && threatObject.IsPlayer() )
-			{
-				return true;
-			}
+			return false;
 		}
-		return false;
+		threatData = tte.GetRecentlyDroppedThreat();
+		if( !( threatData.threat ) )
+		{
+			return false;
+		}
+		threatObject = ( ( GameObject )( threatData.threat ) );
+		return threatObject && threatObject.IsPlayer();
 	}
 
 	private function IsOwnerHostileTowardsPlayer() : Bool
@@ -699,6 +959,7 @@ import class SenseComponent extends IPlacedComponent
 			if( target.IsPlayer() )
 			{
 				SetDetectionAttitudeOverwrite( 'player' );
+				m_shouldStartDetectingPlayerCached = false;
 			}
 			return false;
 		}
@@ -712,6 +973,7 @@ import class SenseComponent extends IPlacedComponent
 			if( target.IsPlayer() )
 			{
 				RemoveDetectionAttitudeOverwrite( 'player' );
+				m_shouldStartDetectingPlayerCached = true;
 			}
 			SendDetectionRiseEvent( target, isVisible );
 			if( ( target.IsPlayer() && ( GetDetection( target.GetEntityID() ) == 0.0 ) ) && IsAgentVisible( target ) )
@@ -725,6 +987,7 @@ import class SenseComponent extends IPlacedComponent
 		if( target.IsPlayer() )
 		{
 			SetDetectionAttitudeOverwrite( 'player' );
+			m_shouldStartDetectingPlayerCached = false;
 		}
 		return false;
 	}
@@ -752,7 +1015,7 @@ import class SenseComponent extends IPlacedComponent
 		return true;
 	}
 
-	private function ShouldStartDetectingPlayer( player : PlayerPuppet ) : Bool
+	public function ShouldStartDetectingPlayer( player : PlayerPuppet ) : Bool
 	{
 		var owner : weak< GameObject >;
 		var ownerPuppet : weak< ScriptedPuppet >;
@@ -766,7 +1029,7 @@ import class SenseComponent extends IPlacedComponent
 			ownerPuppet = GetOwnerPuppet();
 			if( !( TargetTrackingExtension.IsThreatInThreatList( ownerPuppet, player, false, true ) ) )
 			{
-				if( !( ownerPuppet.IsAggressive() ) && ownerPuppet.GetStimReactionComponent().GetReactionPreset().Type() != gamedataReactionPresetType.Civilian_Guard )
+				if( ( !( ownerPuppet.IsAggressive() ) && ownerPuppet.GetStimReactionComponent().GetReactionPreset().Type() != gamedataReactionPresetType.Civilian_Guard ) && ownerPuppet.GetStimReactionComponent().GetReactionPreset().Type() != gamedataReactionPresetType.Civilian_Grabbable )
 				{
 					return false;
 				}
@@ -791,6 +1054,11 @@ import class SenseComponent extends IPlacedComponent
 		return false;
 	}
 
+	public export function GetShouldStartDetectingPlayerCached() : Bool
+	{
+		return m_shouldStartDetectingPlayerCached;
+	}
+
 	private function SendDetectionRiseEvent( target : weak< GameObject >, isVisible : Bool )
 	{
 		var evtRise : DetectionRiseEvent;
@@ -805,6 +1073,15 @@ import class SenseComponent extends IPlacedComponent
 		UsePreset( evt.sensePreset );
 	}
 
+}
+
+import enum senseEShapeType
+{
+	INVALID,
+	BOX,
+	SPHERE,
+	CONE,
+	ANGLE_RANGE,
 }
 
 importonly class SenseInitializeEvent extends Event
@@ -904,11 +1181,11 @@ class DetectionRiseEvent extends SenseVisibilityEvent
 {
 }
 
-class SensePresetChangeEvent extends SenseVisibilityEvent
+importonly class SensePresetChangeEvent extends SenseVisibilityEvent
 {
-	var presetID : TweakDBID;
-	var mainPreset : Bool;
-	var reset : Bool;
+	import var presetID : TweakDBID;
+	import var mainPreset : Bool;
+	import var reset : Bool;
 }
 
 importonly class VisibleObjectDetectionMultEvent extends Event
@@ -934,6 +1211,12 @@ importonly class VisibleObjectSecondaryPositionEvent extends Event
 importonly class VisibleObjectetSecondaryDistanceEvent extends Event
 {
 	import var distance : Float;
+	import var extraEvaluationDistance : Float;
+}
+
+importonly class SensorOwnerChangedEvent extends Event
+{
+	import var newOwnerId : EntityID;
 }
 
 class ReevaluateDetectionOverwriteEvent extends Event
@@ -941,19 +1224,30 @@ class ReevaluateDetectionOverwriteEvent extends Event
 	var target : weak< Entity >;
 }
 
-import enum AdditionalTraceType : Uint32
+class SetNPCSensesMainPreset extends AIbehaviortaskScript
 {
-	Knee,
-	Hip,
-	Chest,
+	editable var newSensesPresetName : String;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		SenseComponent.RequestMainPresetChange( ScriptExecutionContext.GetOwner( context ), newSensesPresetName );
+	}
+
 }
 
-import enum senseEShapeType
+class ResetNPCSensesMainPreset extends AIbehaviortaskScript
 {
-	INVALID,
-	BOX,
-	SPHERE,
-	CONE,
-	ANGLE_RANGE,
+	editable var newSensesPresetName : String;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		SenseComponent.ResetPreset( ScriptExecutionContext.GetOwner( context ) );
+	}
+
+}
+
+import class HideUIDetectionEvent extends Event
+{
+	import var shouldHideUIDetection : Bool;
 }
 

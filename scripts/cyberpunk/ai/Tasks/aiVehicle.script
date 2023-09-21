@@ -29,6 +29,59 @@ abstract class AIVehicleTaskAbstract extends AIbehaviortaskScript
 		return true;
 	}
 
+	protected function GetMountedVehicleAIComponent( context : ScriptExecutionContext ) : AIVehicleAgent
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( VehicleComponent.GetVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ), vehicle ) ) || !( vehicle.IsAttached() ) )
+		{
+			return NULL;
+		}
+		return vehicle.GetAIComponent();
+	}
+
+	protected function InterruptMountedVehicleCommand( context : ScriptExecutionContext, command : AIVehicleCommand )
+	{
+		InterruptVehicleCommand( GetMountedVehicleAIComponent( context ), command );
+	}
+
+	protected function InterruptVehicleCommand( vehAIComponent : AIComponent, command : AIVehicleCommand )
+	{
+		if( !( command ) || !( vehAIComponent ) )
+		{
+			return;
+		}
+		if( command.state == AICommandState.Executing )
+		{
+			vehAIComponent.StopExecutingCommand( command, true );
+		}
+		else if( command.state == AICommandState.Enqueued )
+		{
+			vehAIComponent.CancelCommand( command );
+		}
+	}
+
+	protected function InterruptMountedVehicleDriveToPointCommand( context : ScriptExecutionContext )
+	{
+		var vehAIComponent : AIComponent;
+		vehAIComponent = GetMountedVehicleAIComponent( context );
+		if( !( vehAIComponent ) )
+		{
+			return;
+		}
+		vehAIComponent.CancelOrInterruptCommand( 'AIVehicleDriveToPointAutonomousCommand', false, true );
+	}
+
+	protected function InterruptMountedVehicleDriveChaseTargetCommand( context : ScriptExecutionContext )
+	{
+		var vehAIComponent : AIComponent;
+		vehAIComponent = GetMountedVehicleAIComponent( context );
+		if( !( vehAIComponent ) )
+		{
+			return;
+		}
+		vehAIComponent.CancelOrInterruptCommand( 'AIVehicleChaseCommand', false, true );
+	}
+
 }
 
 class SetAnimWrappersFromMountData extends AIVehicleTaskAbstract
@@ -71,15 +124,20 @@ class ExitFromVehicle extends AIVehicleTaskAbstract
 		var mountInfo : MountingInfo;
 		var vehicle : weak< VehicleObject >;
 		var slotName : CName;
+		var animName : CName;
 		var VehDoorRequestEvent : VehicleExternalDoorRequestEvent;
 		var unmountingEvt : VehicleStartedMountingEvent;
 		var ownerPuppet : weak< ScriptedPuppet >;
+		var isBike : Bool;
+		var validUnmount : vehicleUnmountPosition;
+		var intendedUnmountDirection : vehicleExitDirection;
 		ScriptExecutionContext.SetArgumentScriptable( context, 'ActiveMountRequest', NULL );
 		VehDoorRequestEvent = new VehicleExternalDoorRequestEvent;
 		unmountingEvt = new VehicleStartedMountingEvent;
 		mountInfo = GameInstance.GetMountingFacility( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetMountingInfoSingleWithObjects( ScriptExecutionContext.GetOwner( context ) );
 		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( ScriptExecutionContext.GetOwner( context ).GetGame(), mountInfo.parentId ) ) );
 		slotName = mountInfo.slotId.id;
+		isBike = vehicle == ( ( BikeObject )( vehicle ) );
 		VehDoorRequestEvent.slotName = vehicle.GetBoneNameFromSlot( slotName );
 		VehDoorRequestEvent.autoClose = true;
 		unmountingEvt.slotID = slotName;
@@ -89,20 +147,33 @@ class ExitFromVehicle extends AIVehicleTaskAbstract
 		if( workspotSystem )
 		{
 			ownerPuppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
-			if( useFastExit )
+			if( useFastExit || vehicle.IsFlippedOver() )
 			{
 				workspotSystem.SendFastExitSignal( ScriptExecutionContext.GetOwner( context ), , , true, , tryBlendToWalk );
 			}
-			else if( ownerPuppet && ownerPuppet.GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat )
+			else if( ownerPuppet && ( ownerPuppet.GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Combat || ownerPuppet.GetHighLevelStateFromBlackboard() == gamedataNPCHighLevelState.Alerted ) )
 			{
-				workspotSystem.UnmountFromVehicle( vehicle, ScriptExecutionContext.GetOwner( context ), false, , , 'combat' );
+				animName = 'combat';
+				if( isBike )
+				{
+					intendedUnmountDirection = ( ( RandF() > 0.5 ) ? ( vehicleExitDirection.Right ) : ( vehicleExitDirection.Left ) );
+					validUnmount = vehicle.CanUnmount( false, ownerPuppet, intendedUnmountDirection );
+					animName = ( ( validUnmount.direction == vehicleExitDirection.Right ) ? ( 'combat_opposite' ) : ( 'combat' ) );
+				}
+				workspotSystem.UnmountFromVehicle( vehicle, ScriptExecutionContext.GetOwner( context ), false, , , animName );
 			}
 			else
 			{
-				workspotSystem.UnmountFromVehicle( vehicle, ScriptExecutionContext.GetOwner( context ), false, , , 'default' );
+				animName = 'default';
+				if( isBike )
+				{
+					validUnmount = vehicle.CanUnmount( false, ownerPuppet );
+					animName = ( ( validUnmount.direction == vehicleExitDirection.Right ) ? ( 'exit_opposite' ) : ( 'default' ) );
+				}
+				workspotSystem.UnmountFromVehicle( vehicle, ScriptExecutionContext.GetOwner( context ), false, , , animName );
 			}
 		}
-		if( VehicleComponent.IsDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ) ) )
+		if( !( vehicle.IsVehicleAccelerateQuickhackActive() ) && VehicleComponent.IsDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ) ) )
 		{
 			SendAIEventToMountedVehicle( context, 'NoDriver' );
 		}
@@ -145,7 +216,7 @@ class ApproachVehicleDecorator extends AIVehicleTaskAbstract
 		var seatReservationEvent : VehicleSeatReservationEvent;
 		var hls : gamedataNPCHighLevelState;
 		hls = GetPuppet( context ).GetHighLevelStateFromBlackboard();
-		if( hls == gamedataNPCHighLevelState.Alerted )
+		if( hls == gamedataNPCHighLevelState.Alerted && !( GetPuppet( context ).IsPrevention() ) )
 		{
 			return AIbehaviorUpdateOutcome.FAILURE;
 		}
@@ -176,7 +247,21 @@ class ApproachVehicleDecorator extends AIVehicleTaskAbstract
 		{
 			return AIbehaviorUpdateOutcome.FAILURE;
 		}
-		if( m_runCompanionCheck && UpdateComponionChecks( context, vehicle ) )
+		if( VehicleComponent.IsSlotOccupiedByOtherEntity( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID, vehicleSlotID, ScriptExecutionContext.GetOwner( context ).GetEntityID() ) )
+		{
+			ScriptExecutionContext.SetArgumentBool( context, 'AllowFailsafeTeleport', false );
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( vehicle.GetBlackboard().GetFloat( GetAllBlackboardDefs().Vehicle.SpeedValue ) > 0.5 )
+		{
+			if( m_runCompanionCheck && UpdateCompanionChecks( context, vehicle, 0.0 ) )
+			{
+				ScriptExecutionContext.SetArgumentBool( context, '_teleportAfterApproach', true );
+				return AIbehaviorUpdateOutcome.SUCCESS;
+			}
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( m_runCompanionCheck && UpdateCompanionChecks( context, vehicle, 1.0 ) )
 		{
 			ScriptExecutionContext.SetArgumentBool( context, '_teleportAfterApproach', true );
 			return AIbehaviorUpdateOutcome.SUCCESS;
@@ -201,13 +286,13 @@ class ApproachVehicleDecorator extends AIVehicleTaskAbstract
 		return AIbehaviorUpdateOutcome.IN_PROGRESS;
 	}
 
-	private function UpdateComponionChecks( context : ScriptExecutionContext, ownerVehicle : weak< VehicleObject > ) : Bool
+	private function UpdateCompanionChecks( context : ScriptExecutionContext, ownerVehicle : weak< VehicleObject >, delay : Float ) : Bool
 	{
 		var componanion : weak< GameObject >;
 		var componanionVehicle : weak< VehicleObject >;
 		if( ( ScriptedPuppet.IsPlayerCompanion( ScriptExecutionContext.GetOwner( context ), componanion ) && VehicleComponent.GetVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), componanion, componanionVehicle ) ) && ( ownerVehicle == componanionVehicle ) )
 		{
-			if( ( m_activationTime + 1.0 ) <= ScriptExecutionContext.GetAITime( context ) )
+			if( ( m_activationTime + delay ) <= ScriptExecutionContext.GetAITime( context ) )
 			{
 				return true;
 			}
@@ -341,11 +426,41 @@ class InVehicleDecorator extends AIVehicleTaskAbstract
 
 class InVehicleCombatDecorator extends AIVehicleTaskAbstract
 {
-	var targetToChase : weak< GameObject >;
+	var m_targetToChase : weak< GameObject >;
+	var m_vehCommand : AIVehicleChaseCommand;
 
 	protected override function Activate( context : ScriptExecutionContext )
 	{
 		SetUpdateInterval( context, RandomizeOffsetForUpdateInterval( 0.2 ) );
+		ProcessInitCommands( context );
+	}
+
+	private function ProcessInitCommands( context : ScriptExecutionContext )
+	{
+		var aiComp : AIVehicleAgent;
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return;
+		}
+		aiComp = GetMountedVehicleAIComponent( context );
+		if( aiComp )
+		{
+			if( aiComp.InitCommandIsA( 'AIVehicleChaseCommand' ) )
+			{
+				m_vehCommand = ( ( AIVehicleChaseCommand )( aiComp.GetInitCmd() ) );
+				m_targetToChase = m_vehCommand.target;
+			}
+			else
+			{
+				InterruptVehicleCommand( aiComp, aiComp.GetInitCmd() );
+			}
+			aiComp.SetInitCmd( NULL );
+		}
+		InterruptMountedVehicleDriveToPointCommand( context );
 	}
 
 	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
@@ -358,7 +473,7 @@ class InVehicleCombatDecorator extends AIVehicleTaskAbstract
 		if( VehicleComponent.IsDriver( gameInstance, owner ) && VehicleComponent.CanBeDriven( gameInstance, owner.GetEntityID() ) )
 		{
 			combatTarget = ScriptExecutionContext.GetArgumentObject( context, 'CombatTarget' );
-			if( combatTarget && ( combatTarget != targetToChase ) )
+			if( combatTarget && ( combatTarget != m_targetToChase ) )
 			{
 				ChaseNewTarget( context, combatTarget );
 			}
@@ -368,50 +483,374 @@ class InVehicleCombatDecorator extends AIVehicleTaskAbstract
 
 	protected override function Deactivate( context : ScriptExecutionContext )
 	{
-		if( targetToChase )
+		if( m_targetToChase && m_vehCommand )
 		{
-			SendAIEventToMountedVehicle( context, 'StopFollowing' );
-			targetToChase = NULL;
+			InterruptMountedVehicleCommand( context, m_vehCommand );
+			m_targetToChase = NULL;
+			m_vehCommand = NULL;
 		}
 	}
 
-	protected function CreateChaseCommand( newTarget : weak< GameObject > ) : AIVehicleCommand
+	protected function CreateChaseCommand( newTarget : weak< GameObject >, context : ScriptExecutionContext ) : AIVehicleChaseCommand
 	{
 		var chaseCommand : AIVehicleChaseCommand;
 		chaseCommand = new AIVehicleChaseCommand;
 		chaseCommand.target = newTarget;
-		chaseCommand.distanceMin = 5.0;
-		chaseCommand.distanceMax = 6.0;
+		chaseCommand.distanceMin = 3.0;
+		chaseCommand.distanceMax = 10.0;
+		chaseCommand.needDriver = true;
 		return chaseCommand;
-	}
-
-	protected function CreateFollowCommand( newTarget : weak< GameObject > ) : AIVehicleCommand
-	{
-		var followCommand : AIVehicleFollowCommand;
-		followCommand = new AIVehicleFollowCommand;
-		followCommand.target = newTarget;
-		followCommand.stopWhenTargetReached = false;
-		followCommand.distanceMin = 5.0;
-		followCommand.distanceMax = 6.0;
-		followCommand.useTraffic = false;
-		followCommand.needDriver = true;
-		return followCommand;
 	}
 
 	protected function ChaseNewTarget( context : ScriptExecutionContext, newTarget : weak< GameObject > )
 	{
-		var command : AIVehicleCommand;
-		if( GameInstance.GetPreventionSpawnSystem( ScriptExecutionContext.GetOwner( context ).GetGame() ).IsPreventionVehiclePrototypeEnabled() )
+		m_vehCommand = CreateChaseCommand( newTarget, context );
+		if( SendAICommandToMountedVehicle( context, m_vehCommand ) )
 		{
-			command = CreateChaseCommand( newTarget );
+			m_targetToChase = newTarget;
 		}
-		else
+	}
+
+}
+
+class InVehicleDriveToPointAutonomousDecorator extends AIVehicleTaskAbstract
+{
+	var m_vehCommand : AIVehicleDriveToPointAutonomousCommand;
+	protected editable inlined var m_targetPosition : AIArgumentMapping;
+	protected editable inlined var m_minimumDistanceToTarget : AIArgumentMapping;
+	protected editable inlined var m_maxSpeed : AIArgumentMapping;
+	protected editable inlined var m_minSpeed : AIArgumentMapping;
+	protected editable inlined var m_clearTrafficOnPath : AIArgumentMapping;
+	protected editable inlined var m_driveDownTheRoadIndefinitely : AIArgumentMapping;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		var floatValue : Float;
+		var vehicle : weak< VehicleObject >;
+		var driveToPointUpdate : DriveToPointAutonomousUpdate;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		driveToPointUpdate = new DriveToPointAutonomousUpdate;
+		VehicleComponent.GetVehicle( gameInstance, owner, vehicle );
+		SetUpdateInterval( context, RandomizeOffsetForUpdateInterval( 0.2 ) );
+		ProcessInitCommands( context );
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
 		{
-			command = CreateFollowCommand( newTarget );
+			return;
 		}
-		if( SendAICommandToMountedVehicle( context, command ) )
+		if( m_vehCommand || VehicleComponent.CanBeDriven( gameInstance, owner.GetEntityID() ) )
 		{
-			targetToChase = newTarget;
+			driveToPointUpdate.targetPosition = ( ( Vector4 )( ScriptExecutionContext.GetMappingValue( context, m_targetPosition ) ) );
+			floatValue = ( ( Float )( ScriptExecutionContext.GetMappingValue( context, m_maxSpeed ) ) );
+			if( floatValue > 0.0 )
+			{
+				driveToPointUpdate.maxSpeed = floatValue;
+			}
+			else
+			{
+			}
+			floatValue = ( ( Float )( ScriptExecutionContext.GetMappingValue( context, m_minSpeed ) ) );
+			if( floatValue > 0.0 )
+			{
+				driveToPointUpdate.minSpeed = floatValue;
+			}
+			else
+			{
+			}
+			floatValue = ( ( Float )( ScriptExecutionContext.GetMappingValue( context, m_minimumDistanceToTarget ) ) );
+			if( floatValue > 0.0 )
+			{
+				driveToPointUpdate.minimumDistanceToTarget = floatValue;
+			}
+			else
+			{
+			}
+			if( driveToPointUpdate.minSpeed > driveToPointUpdate.maxSpeed )
+			{
+				driveToPointUpdate.minSpeed = -1.0;
+				driveToPointUpdate.maxSpeed = -1.0;
+			}
+			driveToPointUpdate.clearTrafficOnPath = ( ( Bool )( ScriptExecutionContext.GetMappingValue( context, m_clearTrafficOnPath ) ) );
+			driveToPointUpdate.driveDownTheRoadIndefinitely = ( ( Bool )( ScriptExecutionContext.GetMappingValue( context, m_driveDownTheRoadIndefinitely ) ) );
+			if( m_vehCommand )
+			{
+				vehicle.GetAIComponent().SetDriveToPointAutonomousUpdate( driveToPointUpdate );
+			}
+			else
+			{
+				m_vehCommand = driveToPointUpdate.CreateCmd();
+				SendAICommandToMountedVehicle( context, m_vehCommand );
+			}
+		}
+	}
+
+	private function ProcessInitCommands( context : ScriptExecutionContext )
+	{
+		var aiComp : AIVehicleAgent;
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return;
+		}
+		aiComp = GetMountedVehicleAIComponent( context );
+		if( aiComp )
+		{
+			m_vehCommand = GetMountedVehicleActiveDriveToPointCommand( context );
+			if( !( m_vehCommand ) && aiComp.GetInitCmd() )
+			{
+				InterruptVehicleCommand( aiComp, aiComp.GetInitCmd() );
+			}
+			aiComp.SetInitCmd( NULL );
+		}
+	}
+
+	protected function GetMountedVehicleActiveDriveToPointCommand( context : ScriptExecutionContext ) : AIVehicleDriveToPointAutonomousCommand
+	{
+		var vehAIComponent : AIComponent;
+		vehAIComponent = GetMountedVehicleAIComponent( context );
+		if( !( vehAIComponent ) )
+		{
+			return NULL;
+		}
+		return ( ( AIVehicleDriveToPointAutonomousCommand )( vehAIComponent.GetEnqueuedOrExecutingCommand( 'AIVehicleDriveToPointAutonomousCommand', false ) ) );
+	}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		if( m_vehCommand )
+		{
+			if( m_vehCommand.state == AICommandState.Success )
+			{
+				return AIbehaviorUpdateOutcome.SUCCESS;
+			}
+			else if( m_vehCommand.state == AICommandState.Failure )
+			{
+				return AIbehaviorUpdateOutcome.FAILURE;
+			}
+			else
+			{
+				return AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+		}
+		return AIbehaviorUpdateOutcome.FAILURE;
+	}
+
+	protected override function Deactivate( context : ScriptExecutionContext )
+	{
+		if( m_vehCommand )
+		{
+			m_vehCommand = NULL;
+		}
+	}
+
+}
+
+class InVehicleAlertedDecorator extends AIVehicleTaskAbstract
+{
+
+	protected override function Deactivate( context : ScriptExecutionContext )
+	{
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		var aiComp : AIVehicleAgent;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return;
+		}
+		aiComp = GetMountedVehicleAIComponent( context );
+		if( aiComp )
+		{
+			aiComp.SetKeepStrategyOnSearch( false );
+		}
+		InterruptMountedVehicleDriveToPointCommand( context );
+	}
+
+}
+
+class SetKeepStrategyOnSearch extends AIVehicleTaskAbstract
+{
+	protected editable inlined var m_keep : AIArgumentMapping;
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		var aiComp : AIVehicleAgent;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return;
+		}
+		aiComp = GetMountedVehicleAIComponent( context );
+		if( aiComp )
+		{
+			aiComp.SetKeepStrategyOnSearch( ( ( Bool )( ScriptExecutionContext.GetMappingValue( context, m_keep ) ) ) );
+		}
+	}
+
+}
+
+class KeepStrategyOnSearch extends AIVehicleConditionAbstract
+{
+
+	protected override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		var aiComp : AIVehicleAgent;
+		aiComp = GetMountedVehicleAIComponent( context );
+		return aiComp && aiComp.KeepStrategyOnSearch();
+	}
+
+}
+
+class InVehicleDrivePatrolDecorator extends AIVehicleTaskAbstract
+{
+	var m_vehCommand : AIVehicleDrivePatrolCommand;
+	protected editable inlined var m_maxSpeed : AIArgumentMapping;
+	protected editable inlined var m_minSpeed : AIArgumentMapping;
+	protected editable inlined var m_clearTrafficOnPath : AIArgumentMapping;
+	protected editable inlined var m_emergencyPatrol : AIArgumentMapping;
+	protected editable inlined var m_numPatrolLoops : AIArgumentMapping;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		var floatValue : Float;
+		var vehicle : weak< VehicleObject >;
+		var drivePatrolUpdate : DrivePatrolUpdate;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		drivePatrolUpdate = new DrivePatrolUpdate;
+		VehicleComponent.GetVehicle( gameInstance, owner, vehicle );
+		SetUpdateInterval( context, RandomizeOffsetForUpdateInterval( 0.2 ) );
+		ProcessInitCommands( context );
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return;
+		}
+		if( m_vehCommand || VehicleComponent.CanBeDriven( gameInstance, owner.GetEntityID() ) )
+		{
+			floatValue = ( ( Float )( ScriptExecutionContext.GetMappingValue( context, m_maxSpeed ) ) );
+			if( floatValue > 0.0 )
+			{
+				drivePatrolUpdate.maxSpeed = floatValue;
+			}
+			else
+			{
+			}
+			floatValue = ( ( Float )( ScriptExecutionContext.GetMappingValue( context, m_minSpeed ) ) );
+			if( floatValue > 0.0 )
+			{
+				drivePatrolUpdate.minSpeed = floatValue;
+			}
+			else
+			{
+			}
+			if( drivePatrolUpdate.minSpeed > drivePatrolUpdate.maxSpeed )
+			{
+				drivePatrolUpdate.minSpeed = -1.0;
+				drivePatrolUpdate.maxSpeed = -1.0;
+			}
+			drivePatrolUpdate.clearTrafficOnPath = ( ( Bool )( ScriptExecutionContext.GetMappingValue( context, m_clearTrafficOnPath ) ) );
+			drivePatrolUpdate.emergencyPatrol = ( ( Bool )( ScriptExecutionContext.GetMappingValue( context, m_emergencyPatrol ) ) );
+			m_vehCommand.numPatrolLoops = ( ( Uint32 )( ScriptExecutionContext.GetMappingValue( context, m_numPatrolLoops ) ) );
+			if( m_vehCommand )
+			{
+				vehicle.GetAIComponent().SetDrivePatrolUpdate( drivePatrolUpdate );
+			}
+			else
+			{
+				m_vehCommand = drivePatrolUpdate.CreateCmd();
+				SendAICommandToMountedVehicle( context, m_vehCommand );
+			}
+		}
+	}
+
+	private function ProcessInitCommands( context : ScriptExecutionContext )
+	{
+		var aiComp : AIVehicleAgent;
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return;
+		}
+		aiComp = GetMountedVehicleAIComponent( context );
+		if( aiComp )
+		{
+			m_vehCommand = GetMountedVehicleActivePatrolCommand( context );
+			if( !( m_vehCommand ) && aiComp.GetInitCmd() )
+			{
+				InterruptVehicleCommand( aiComp, aiComp.GetInitCmd() );
+			}
+			aiComp.SetInitCmd( NULL );
+		}
+		InterruptMountedVehicleDriveToPointCommand( context );
+	}
+
+	protected function GetMountedVehicleActivePatrolCommand( context : ScriptExecutionContext ) : AIVehicleDrivePatrolCommand
+	{
+		var vehAIComponent : AIComponent;
+		vehAIComponent = GetMountedVehicleAIComponent( context );
+		if( !( vehAIComponent ) )
+		{
+			return NULL;
+		}
+		return ( ( AIVehicleDrivePatrolCommand )( vehAIComponent.GetEnqueuedOrExecutingCommand( 'AIVehicleDrivePatrolCommand', false ) ) );
+	}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var owner : gamePuppet;
+		var gameInstance : GameInstance;
+		owner = ScriptExecutionContext.GetOwner( context );
+		gameInstance = owner.GetGame();
+		if( !( VehicleComponent.IsDriver( gameInstance, owner ) ) )
+		{
+			return AIbehaviorUpdateOutcome.IN_PROGRESS;
+		}
+		if( m_vehCommand )
+		{
+			if( m_vehCommand.state == AICommandState.Success )
+			{
+				return AIbehaviorUpdateOutcome.SUCCESS;
+			}
+			else if( m_vehCommand.state == AICommandState.Failure )
+			{
+				return AIbehaviorUpdateOutcome.FAILURE;
+			}
+			else
+			{
+				return AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+		}
+		return AIbehaviorUpdateOutcome.FAILURE;
+	}
+
+	protected override function Deactivate( context : ScriptExecutionContext )
+	{
+		if( m_vehCommand )
+		{
+			InterruptMountedVehicleCommand( context, m_vehCommand );
+			m_vehCommand = NULL;
 		}
 	}
 
@@ -461,7 +900,11 @@ class WaitBeforeExiting extends AIVehicleTaskAbstract
 
 	protected export override function Activate( context : ScriptExecutionContext )
 	{
-		if( VehicleComponent.IsDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ) ) )
+		var mountInfo : MountingInfo;
+		var vehicle : weak< VehicleObject >;
+		mountInfo = GameInstance.GetMountingFacility( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetMountingInfoSingleWithObjects( ScriptExecutionContext.GetOwner( context ) );
+		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( ScriptExecutionContext.GetOwner( context ).GetGame(), mountInfo.parentId ) ) );
+		if( !( vehicle.IsVehicleAccelerateQuickhackActive() ) && VehicleComponent.IsDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ) ) )
 		{
 			SendAIEventToMountedVehicle( context, 'NoDriver' );
 		}
@@ -479,7 +922,14 @@ class WaitBeforeExiting extends AIVehicleTaskAbstract
 		}
 		if( vehicle.GetCurrentSpeed() < 0.5 )
 		{
-			return AIbehaviorUpdateOutcome.SUCCESS;
+			if( ScriptedPuppet.IsPlayerFollower( ScriptExecutionContext.GetOwner( context ) ) )
+			{
+				return AIbehaviorUpdateOutcome.SUCCESS;
+			}
+			if( !( vehicle.IsInAir() ) && !( vehicle.IsFlippedOver() ) )
+			{
+				return AIbehaviorUpdateOutcome.SUCCESS;
+			}
 		}
 		return AIbehaviorUpdateOutcome.IN_PROGRESS;
 	}
@@ -492,6 +942,16 @@ abstract class AIVehicleConditionAbstract extends AIbehaviorconditionScript
 	protected function IsVehicleOccupiedByHostile( context : ScriptExecutionContext, vehicleID : EntityID ) : Bool
 	{
 		return VehicleComponent.IsVehicleOccupiedByHostile( vehicleID, ScriptExecutionContext.GetOwner( context ) );
+	}
+
+	protected function GetMountedVehicleAIComponent( context : ScriptExecutionContext ) : AIVehicleAgent
+	{
+		var vehicle : weak< VehicleObject >;
+		if( !( VehicleComponent.GetVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ), vehicle ) ) || !( vehicle.IsAttached() ) )
+		{
+			return NULL;
+		}
+		return vehicle.GetAIComponent();
 	}
 
 }
@@ -525,6 +985,10 @@ class CanMountVehicle extends AIVehicleConditionAbstract
 		{
 			return false;
 		}
+		if( VehicleComponent.HasFlatTire( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ) )
+		{
+			return false;
+		}
 		if( VehicleComponent.IsSlotOccupied( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID, vehicleSlotID ) )
 		{
 			return false;
@@ -533,7 +997,7 @@ class CanMountVehicle extends AIVehicleConditionAbstract
 		{
 			return false;
 		}
-		if( vehicleSlotID.id != VehicleComponent.GetDriverSlotName() && !( VehicleComponent.HasActiveDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ) ) )
+		if( vehicleSlotID.id != VehicleComponent.GetDriverSlotName() && !( VehicleComponent.HasActiveDriverMounted( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ) ) )
 		{
 			return false;
 		}
@@ -563,7 +1027,7 @@ class DoesVehicleSupportCombat extends AIVehicleConditionAbstract
 		{
 			return false;
 		}
-		if( vehicleRecord.VehDataPackage() && !( vehicleRecord.VehDataPackage().SupportsCombat() ) )
+		if( vehicleRecord.VehDataPackage() && vehicleRecord.VehDataPackage().DriverCombat().Type() == gamedataDriverCombatType.Disabled )
 		{
 			return false;
 		}
@@ -615,7 +1079,7 @@ class IsDriverActive extends AIVehicleConditionAbstract
 		{
 			return false;
 		}
-		if( !( VehicleComponent.HasActiveDriver( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ) ) )
+		if( !( VehicleComponent.HasActiveDriverMounted( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID ) ) )
 		{
 			return false;
 		}
@@ -690,6 +1154,23 @@ class ShouldExitVehicle extends AIVehicleConditionAbstract
 
 }
 
+class StepOutOfVehicle extends AIbehaviortaskScript
+{
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		var vehicleID : EntityID;
+		var evt : AIEvent;
+		if( VehicleComponent.GetVehicleID( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ), vehicleID ) )
+		{
+			evt = new AIEvent;
+			evt.name = 'ExitVehicle';
+			VehicleComponent.QueueEventToAllPassengers( ScriptExecutionContext.GetOwner( context ).GetGame(), vehicleID, evt );
+		}
+	}
+
+}
+
 class IsInVehicle extends AIVehicleConditionAbstract
 {
 
@@ -701,6 +1182,24 @@ class IsInVehicle extends AIVehicleConditionAbstract
 			return false;
 		}
 		return true;
+	}
+
+}
+
+class InArmedVehicle extends AIbehaviorconditionScript
+{
+
+	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
+	{
+		var vehicle : weak< VehicleObject >;
+		if( VehicleComponent.GetVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ).GetEntityID(), vehicle ) )
+		{
+			if( vehicle.IsArmedVehicle() )
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 }

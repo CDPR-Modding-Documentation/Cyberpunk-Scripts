@@ -1,12 +1,15 @@
 class BossHealthBarGameController extends inkHUDGameController
 {
 	private editable var m_healthControllerRef : inkWidgetRef;
-	private editable var m_healthPersentage : inkTextRef;
+	private editable var m_healthPercentage : inkTextRef;
 	private editable var m_bossName : inkTextRef;
+	private editable var m_dividerContainerRef : inkCompoundRef;
 	private var m_statListener : BossHealthStatListener;
 	private var m_boss : weak< NPCPuppet >;
 	private var m_healthController : weak< NameplateBarLogicController >;
+	private var m_thresholds : array< Float >;
 	private var m_root : weak< inkWidget >;
+	private var m_unfoldAnimation : inkAnimProxy;
 	private var m_foldAnimation : inkAnimProxy;
 	private var m_bossPuppets : array< weak< NPCPuppet > >;
 
@@ -23,10 +26,10 @@ class BossHealthBarGameController extends inkHUDGameController
 		ReevaluatePlayerInBossCombat();
 	}
 
-	public function UpdateHealthValue( newValue : Float )
+	public function UpdateHealthValue( newValue : Float, optional silent : Bool )
 	{
-		m_healthController.SetNameplateBarProgress( newValue / 100.0, false );
-		inkTextRef.SetText( m_healthPersentage, IntToString( ( ( Int32 )( newValue ) ) ) );
+		m_healthController.SetNameplateBarProgress( newValue / 100.0, silent );
+		inkTextRef.SetText( m_healthPercentage, IntToString( CeilF( newValue ) ) );
 	}
 
 	protected event OnBossCombatNotifier( evt : BossCombatNotifier )
@@ -35,7 +38,7 @@ class BossHealthBarGameController extends inkHUDGameController
 		{
 			ReevaluateBossArray();
 		}
-		else
+		else if( !( StatusEffectSystem.ObjectHasStatusEffect( ( ( NPCPuppet )( evt.bossEntity ) ), T"Chimera.HideBossHealthBar" ) ) )
 		{
 			AddBoss( ( ( NPCPuppet )( evt.bossEntity ) ) );
 		}
@@ -109,32 +112,35 @@ class BossHealthBarGameController extends inkHUDGameController
 	protected event OnDamageDealt( evt : gameTargetDamageEvent )
 	{
 		var puppet : NPCPuppet;
+		var isDeadOrDefeated : Bool;
+		var canHaveBossHealthbar : Bool;
+		var isHealthbarHidden : Bool;
 		puppet = ( ( NPCPuppet )( evt.target ) );
-		if( m_root.IsVisible() && !( puppet.m_wasJustKilledOrDefeated ) )
+		canHaveBossHealthbar = puppet.IsBoss() || puppet.GetNPCRarity() == gamedataNPCRarity.MaxTac;
+		isDeadOrDefeated = ScriptedPuppet.IsDefeated( puppet ) || puppet.IsDead();
+		isHealthbarHidden = StatusEffectSystem.ObjectHasStatusEffect( puppet, T"Chimera.HideBossHealthBar" );
+		if( ( canHaveBossHealthbar && !( isDeadOrDefeated ) ) && !( isHealthbarHidden ) )
 		{
-			AddBoss( puppet, true );
+			AddBoss( puppet );
 		}
 	}
 
-	private function AddBoss( boss : NPCPuppet, optional priorityTarget : Bool )
+	private function AddBoss( boss : NPCPuppet )
 	{
-		if( !( boss ) || !( boss.IsBoss() ) )
+		if( !( boss ) || ( !( boss.IsBoss() ) && boss.GetNPCRarity() != gamedataNPCRarity.MaxTac ) )
 		{
 			return;
 		}
 		if( m_bossPuppets.Contains( boss ) )
 		{
-			if( priorityTarget && ( boss != m_boss ) )
+			if( boss != m_boss )
 			{
-				ShowBossHealthBar( boss );
+				ShowBossHealthBar( boss, true );
 			}
 			return;
 		}
 		m_bossPuppets.PushBack( boss );
-		if( !( m_boss ) || priorityTarget )
-		{
-			ShowBossHealthBar( boss );
-		}
+		ShowBossHealthBar( boss, false );
 	}
 
 	private function RemoveBoss( boss : NPCPuppet )
@@ -146,7 +152,7 @@ class BossHealthBarGameController extends inkHUDGameController
 		m_bossPuppets.Remove( boss );
 		if( ( m_bossPuppets.Size() > 0 ) && m_bossPuppets[ 0 ] )
 		{
-			ShowBossHealthBar( m_bossPuppets[ 0 ] );
+			ShowBossHealthBar( m_bossPuppets[ 0 ], true );
 		}
 		else
 		{
@@ -164,48 +170,60 @@ class BossHealthBarGameController extends inkHUDGameController
 				m_bossPuppets.Erase( i );
 			}
 		}
-		if( ( m_bossPuppets.Size() == 0 ) && m_root.IsVisible() )
+		if( m_bossPuppets.Size() == 0 )
 		{
 			HideBossHealthBar();
 		}
 	}
 
-	private function ShowBossHealthBar( puppet : NPCPuppet )
+	private function ShowBossHealthBar( puppet : NPCPuppet, useSilentUpdate : Bool )
 	{
 		var playUnfoldAnim : Bool;
-		if( !( puppet ) || !( puppet.IsBoss() ) )
+		if( ( !( puppet ) || ( !( puppet.IsBoss() ) && puppet.GetNPCRarity() != gamedataNPCRarity.MaxTac ) ) || !( ScriptedPuppet.IsAlive( puppet ) ) )
 		{
 			return;
 		}
 		playUnfoldAnim = !( m_boss );
 		UnregisterPreviousBoss();
-		RegisterToNewBoss( puppet );
+		RegisterToNewBoss( puppet, useSilentUpdate );
 		m_root.SetVisible( true );
 		if( playUnfoldAnim )
 		{
-			if( m_foldAnimation )
+			if( m_foldAnimation && m_foldAnimation.IsPlaying() )
 			{
+				m_foldAnimation.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
 				m_foldAnimation.Stop();
 			}
-			m_foldAnimation = PlayLibraryAnimation( 'unfold' );
+			if( !( m_unfoldAnimation ) || !( m_unfoldAnimation.IsPlaying() ) )
+			{
+				m_unfoldAnimation = PlayLibraryAnimation( 'unfold' );
+			}
 		}
 	}
 
 	private function HideBossHealthBar()
 	{
 		UnregisterPreviousBoss();
-		m_foldAnimation = PlayLibraryAnimation( 'fold' );
-		m_foldAnimation.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnAnimationEnd' );
+		if( !( m_foldAnimation ) || !( m_foldAnimation.IsPlaying() ) )
+		{
+			if( m_unfoldAnimation && m_unfoldAnimation.IsPlaying() )
+			{
+				m_unfoldAnimation.Stop();
+			}
+			m_foldAnimation = PlayLibraryAnimation( 'fold' );
+			m_foldAnimation.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnAnimationEnd' );
+		}
 	}
 
-	private function RegisterToNewBoss( boss : NPCPuppet )
+	private function RegisterToNewBoss( boss : NPCPuppet, useSilentUpdate : Bool )
 	{
 		var NPCName : String;
 		var characterRecord : Character_Record;
 		m_boss = boss;
-		UpdateHealthValue( GameInstance.GetStatPoolsSystem( m_boss.GetGame() ).GetStatPoolValue( m_boss.GetEntityID(), gamedataStatPoolType.Health ) );
+		UpdateHealthValue( GameInstance.GetStatPoolsSystem( m_boss.GetGame() ).GetStatPoolValue( m_boss.GetEntityID(), gamedataStatPoolType.Health ), useSilentUpdate );
 		GameInstance.GetStatPoolsSystem( m_boss.GetGame() ).RequestRegisteringListener( m_boss.GetEntityID(), gamedataStatPoolType.Health, m_statListener );
 		characterRecord = TweakDBInterface.GetCharacterRecord( m_boss.GetRecordID() );
+		SetUpThresholds( characterRecord );
 		if( IsNameValid( characterRecord.FullDisplayName() ) )
 		{
 			NPCName = LocKeyToString( characterRecord.FullDisplayName() );
@@ -230,7 +248,7 @@ class BossHealthBarGameController extends inkHUDGameController
 	public static function ReevaluateBossHealthBar( puppet : weak< NPCPuppet >, target : weak< GameObject >, optional combatEnded : Bool )
 	{
 		var bossCombatEvent : BossCombatNotifier;
-		if( ( ( !( puppet ) || !( puppet.IsBoss() ) ) || !( target ) ) || !( target.IsPlayer() ) )
+		if( ( ( !( puppet ) || ( !( puppet.IsBoss() ) && puppet.GetNPCRarity() != gamedataNPCRarity.MaxTac ) ) || !( target ) ) || !( target.IsPlayer() ) )
 		{
 			return;
 		}
@@ -245,7 +263,7 @@ class BossHealthBarGameController extends inkHUDGameController
 		var hostileThreats : array< TrackedLocation >;
 		var bossCombatEvent : BossCombatNotifier;
 		var target : weak< GameObject >;
-		if( ( !( puppet ) || !( puppet.IsBoss() ) ) || !( targetTracker ) )
+		if( ( !( puppet ) || ( !( puppet.IsBoss() ) && puppet.GetNPCRarity() != gamedataNPCRarity.MaxTac ) ) || !( targetTracker ) )
 		{
 			return;
 		}
@@ -272,12 +290,76 @@ class BossHealthBarGameController extends inkHUDGameController
 			for( i = 0; i < threatsArray.Size(); i += 1 )
 			{
 				threatPuppet = ( ( NPCPuppet )( threatsArray[ i ].entity ) );
-				if( threatPuppet && threatPuppet.IsBoss() )
+				if( threatPuppet && ( threatPuppet.IsBoss() || threatPuppet.GetNPCRarity() == gamedataNPCRarity.MaxTac ) )
 				{
 					BossHealthBarGameController.ReevaluateBossHealthBar( threatPuppet, player );
 				}
 			}
 		}
+	}
+
+	private function SetUpThresholds( boss : Character_Record )
+	{
+		var i : Int32;
+		m_thresholds.Clear();
+		for( i = 0; i < boss.GetBossHealthBarThresholdsCount(); i += 1 )
+		{
+			m_thresholds.PushBack( boss.GetBossHealthBarThresholdsItem( i ) );
+		}
+		SortThresholds();
+		MoveDividers();
+	}
+
+	private function SortThresholds()
+	{
+		var tempVar : Float;
+		var i, j : Int32;
+		for( i = 0; i < ( m_thresholds.Size() - 1 ); i += 1 )
+		{
+			for( j = i + 1; j < m_thresholds.Size(); j += 1 )
+			{
+				if( m_thresholds[ i ] > m_thresholds[ j ] )
+				{
+					tempVar = m_thresholds[ j ];
+					m_thresholds[ j ] = m_thresholds[ i ];
+					m_thresholds[ i ] = tempVar;
+				}
+			}
+		}
+	}
+
+	private function MoveDividers()
+	{
+		var widget : weak< inkWidget >;
+		var i, j : Int32;
+		var tempSize : Vector2;
+		var leftThreshold, rightThreshold : Float;
+		var totalWidth, gapWidth : Float;
+		inkCompoundRef.RemoveAllChildren( m_dividerContainerRef );
+		tempSize = inkCompoundRef.GetSize( m_dividerContainerRef );
+		totalWidth = tempSize.X;
+		for( i = 0; i < m_thresholds.Size(); i += 1 )
+		{
+			j = i - 1;
+			leftThreshold = ( ( j >= 0 ) ? ( m_thresholds[ j ] ) : ( 0.0 ) );
+			rightThreshold = ( ( i < m_thresholds.Size() ) ? ( m_thresholds[ i ] ) : ( 100.0 ) );
+			gapWidth = ( ( rightThreshold - leftThreshold ) / 100.0 ) * totalWidth;
+			widget = SpawnFromLocal( inkCompoundRef.Get( m_dividerContainerRef ), 'divider' );
+			if( i != 0 )
+			{
+				tempSize = widget.GetSize();
+				gapWidth -= tempSize.X;
+			}
+			widget.SetMargin( gapWidth, 0.0, 0.0, 0.0 );
+		}
+	}
+
+	private function ScaleBetween( value : Float, inMin : Float, inMax : Float, outMin : Float, outMax : Float ) : Float
+	{
+		var dividend, divisor : Float;
+		dividend = ( outMax - outMin ) * ( value - inMin );
+		divisor = inMax - inMin;
+		return ( dividend / divisor ) + outMin;
 	}
 
 }

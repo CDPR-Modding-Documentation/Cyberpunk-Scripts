@@ -1,0 +1,536 @@
+class QuickHackableQueueHelper
+{
+
+	public static function PutActionInQuickhackQueue( action : ScriptableDeviceAction, gameplayRoleComponent : GameplayRoleComponent, gameInstance : GameInstance, qhIndicatorSlotName : CName, requesterObject : GameObject ) : Bool
+	{
+		var player : PlayerPuppet;
+		var putActionInQueue : Bool;
+		var isQueuePerkBought : Bool;
+		var inQueueVisualData : GameplayRoleMappinData;
+		var deviceActionQueue : DeviceActionQueue;
+		var statSystem : StatsSystem;
+		var playerBlackboard : IBlackboard;
+		var decreaseQhUploadTimeVal : Float;
+		var firstHackInQueueUploadTimeDecrease : Float;
+		var playerEntityID : EntityID;
+		var hackedEntityID : EntityID;
+		var currentlyUploadingAction : ScriptableDeviceAction;
+		var statPoolsSystem : StatPoolsSystem;
+		currentlyUploadingAction = requesterObject.GetCurrentlyUploadingAction();
+		player = ( ( PlayerPuppet )( action.GetExecutor() ) );
+		if( !( player ) )
+		{
+			return false;
+		}
+		if( !( action.IsQuickHack() ) )
+		{
+			return false;
+		}
+		playerEntityID = player.GetEntityID();
+		if( action.m_isQueuedAction )
+		{
+			if( currentlyUploadingAction )
+			{
+				deviceActionQueue = currentlyUploadingAction.m_deviceActionQueue;
+			}
+			currentlyUploadingAction = ( ( ScriptableDeviceAction )( action ) );
+			currentlyUploadingAction.m_deviceActionQueue = deviceActionQueue;
+			currentlyUploadingAction.m_isActionQueueingUsed = true;
+			requesterObject.SetCurrentlyUploadingAction( currentlyUploadingAction );
+			playerBlackboard = GameInstance.GetBlackboardSystem( gameInstance ).GetLocalInstanced( playerEntityID, GetAllBlackboardDefs().PlayerStateMachine );
+			playerBlackboard.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.CostFreeActionID, currentlyUploadingAction.GetObjectActionID() );
+			return false;
+		}
+		statSystem = GameInstance.GetStatsSystem( gameInstance );
+		decreaseQhUploadTimeVal = statSystem.GetStatValue( playerEntityID, gamedataStatType.QuickHackUploadTimeDecrease );
+		if( decreaseQhUploadTimeVal > 0.0 )
+		{
+			action.m_activationTimeReduction = MinF( decreaseQhUploadTimeVal, 1.0 );
+		}
+		if( ( player.IsBeingRevealed() && IsAwarenessBumpingAllowed( ( ( ScriptedPuppet )( requesterObject ) ) ) ) && ( statSystem.GetStatValue( playerEntityID, gamedataStatType.IgnoreAwarenessCostWhenOverclocked ) != 1.0 ) )
+		{
+			GameInstance.GetStatPoolsSystem( gameInstance ).RequestChangingStatPoolValue( player.GetEntityID(), gamedataStatPoolType.QuickHackUpload, action.GetAwarenessCost( gameInstance ), player, true, true );
+		}
+		isQueuePerkBought = IsQueuePerkBought( player );
+		if( isQueuePerkBought && ( action.CanSkipPayCost( true ) || action.CanPayCost( NULL, true ) ) )
+		{
+			if( currentlyUploadingAction && !( currentlyUploadingAction.m_deviceActionQueue ) )
+			{
+				currentlyUploadingAction.m_deviceActionQueue = new DeviceActionQueue;
+			}
+			if( currentlyUploadingAction && currentlyUploadingAction.m_deviceActionQueue )
+			{
+				currentlyUploadingAction.m_deviceActionQueue.SetMaxQueueSize( ( ( Int32 )( statSystem.GetStatValue( playerEntityID, gamedataStatType.QuickHackQueueSize ) ) ) );
+			}
+			putActionInQueue = ( currentlyUploadingAction && !( currentlyUploadingAction.m_isInactive ) ) && currentlyUploadingAction.m_deviceActionQueue.CanNewActionBeQueued();
+			if( putActionInQueue && ( action.CanSkipPayCost( true ) || action.PayCost( true ) ) )
+			{
+				decreaseQhUploadTimeVal = statSystem.GetStatValue( playerEntityID, gamedataStatType.QuickHackQueueUploadTimeDecrease );
+				firstHackInQueueUploadTimeDecrease = statSystem.GetStatValue( playerEntityID, gamedataStatType.FirstHackInQueueUploadTimeDecrease );
+				if( ( ( currentlyUploadingAction.m_deviceActionQueue.GetQueueSize() == 0 ) && ( firstHackInQueueUploadTimeDecrease > 0.0 ) ) && ( firstHackInQueueUploadTimeDecrease < 1.0 ) )
+				{
+					decreaseQhUploadTimeVal += firstHackInQueueUploadTimeDecrease;
+					decreaseQhUploadTimeVal = MinF( decreaseQhUploadTimeVal, 1.0 );
+				}
+				currentlyUploadingAction.m_deviceActionQueue.PutActionInQueue( action, decreaseQhUploadTimeVal );
+				if( PlayerDevelopmentSystem.GetData( player ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Master_Perk_1 ) && ( currentlyUploadingAction.m_deviceActionQueue.GetQueueSize() >= currentlyUploadingAction.m_deviceActionQueue.GetMaxQueueSize() ) )
+				{
+					hackedEntityID = gameplayRoleComponent.GetOwner().GetEntityID();
+					GameInstance.GetStatusEffectSystem( gameInstance ).ApplyStatusEffect( hackedEntityID, T"BaseStatusEffect.Intelligence_Master_Perk_2_Queue_Lock" );
+					currentlyUploadingAction.m_deviceActionQueue.LockQueue();
+				}
+				if( gameplayRoleComponent )
+				{
+					inQueueVisualData = new GameplayRoleMappinData;
+					inQueueVisualData.m_progressBarType = EProgressBarType.UPLOAD;
+					if( action.GetInteractionIcon() )
+					{
+						inQueueVisualData.m_textureID = action.GetInteractionIcon().TexturePartID().GetID();
+					}
+					inQueueVisualData.m_visibleThroughWalls = true;
+					gameplayRoleComponent.AddQuickhackMappinToQueue( inQueueVisualData );
+				}
+				statSystem.AddModifier( playerEntityID, ( ( gameConstantStatModifierData )( RPGManager.CreateStatModifier( gamedataStatType.QuickHackQueueCount, gameStatModifierType.Additive, 1.0 ) ) ) );
+				QuickhackModule.RequestRefreshQuickhackMenu( gameInstance, currentlyUploadingAction.GetRequesterID() );
+				return true;
+			}
+			else
+			{
+				statPoolsSystem = GameInstance.GetStatPoolsSystem( gameInstance );
+				if( statPoolsSystem )
+				{
+					statPoolsSystem.RequestRemovingStatPool( action.GetRequesterID(), gamedataStatPoolType.QuickHackUpload );
+				}
+				QuickHackableQueueHelper.RemoveQuickhackQueue( gameplayRoleComponent, currentlyUploadingAction );
+				action.m_isActionQueueingUsed = true;
+				requesterObject.SetCurrentlyUploadingAction( action );
+				QuickhackModule.RequestRefreshQuickhackMenu( gameInstance, currentlyUploadingAction.GetRequesterID() );
+			}
+		}
+		else if( currentlyUploadingAction )
+		{
+			currentlyUploadingAction.m_isInactive = true;
+			requesterObject.SetCurrentlyUploadingAction( currentlyUploadingAction );
+		}
+		return false;
+	}
+
+	public static function IsAwarenessBumpingAllowed( target : ScriptedPuppet ) : Bool
+	{
+		var i : Int32;
+		var completionEffects : array< weak< ObjectActionEffect_Record > >;
+		var statusEffect : weak< StatusEffect_Record >;
+		var completedQhHistory : array< ScriptableDeviceAction >;
+		var currentlyUploadingAction : ScriptableDeviceAction;
+		var objectActionRecords : array< ObjectAction_Record >;
+		if( target && target.IsActionQueueEnabled() )
+		{
+			completedQhHistory = target.GetCompletedQuickhackActionHistory();
+			currentlyUploadingAction = target.GetCurrentlyUploadingAction();
+			if( currentlyUploadingAction && !( currentlyUploadingAction.m_isInactive ) )
+			{
+				completedQhHistory.PushBack( currentlyUploadingAction );
+				if( currentlyUploadingAction.m_deviceActionQueue )
+				{
+					currentlyUploadingAction.m_deviceActionQueue.GetAllQueuedActionObjectRecords( objectActionRecords );
+					for( i = 0; i < objectActionRecords.Size(); i += 1 )
+					{
+						objectActionRecords[ i ].CompletionEffects( completionEffects );
+					}
+				}
+			}
+			for( i = 0; i < completedQhHistory.Size(); i += 1 )
+			{
+				completedQhHistory[ i ].GetObjectActionRecord().CompletionEffects( completionEffects );
+			}
+			for( i = 0; i < completionEffects.Size(); i += 1 )
+			{
+				statusEffect = completionEffects[ i ].StatusEffect();
+				if( statusEffect && statusEffect.GameplayTagsContains( 'DisallowsAwarenessBumpInQueue' ) )
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	public static function CheckAndSetInactivityReasonForVehicleActions( actions : array< DeviceAction >, scriptableDeviceAction : ScriptableDeviceAction ) : Bool
+	{
+		var i, j : Int32;
+		var action : ScriptableDeviceAction;
+		var actionNames : array< CName >;
+		var isFailureSet : Bool;
+		var blockSameQhTypeQueuingOnVehicles : Bool;
+		var inactivityReasonIsQuickHacked : String;
+		if( !( scriptableDeviceAction ) )
+		{
+			return false;
+		}
+		inactivityReasonIsQuickHacked = QuickhacksListGameController.EActionInactivityResonToLocalizationString( EActionInactivityReson.IsQuickHacked );
+		blockSameQhTypeQueuingOnVehicles = TDB.GetBool( T"NewPerks.Intelligence_Left_Milestone_2.blockSameQhTypeQueuingOnVehicles" );
+		if( blockSameQhTypeQueuingOnVehicles )
+		{
+			for( i = 0; i < actions.Size(); i += 1 )
+			{
+				action = ( ( ScriptableDeviceAction )( actions[ i ] ) );
+				if( action && action.actionName == scriptableDeviceAction.actionName )
+				{
+					action.SetInactiveWithReason( false, inactivityReasonIsQuickHacked );
+					isFailureSet = true;
+				}
+				else if( action && scriptableDeviceAction.m_deviceActionQueue )
+				{
+					actionNames.Clear();
+					scriptableDeviceAction.m_deviceActionQueue.GetAllQueuedActionNames( actionNames );
+					for( j = 0; j < actionNames.Size(); j += 1 )
+					{
+						if( action.actionName == actionNames[ j ] )
+						{
+							action.SetInactiveWithReason( false, inactivityReasonIsQuickHacked );
+							isFailureSet = true;
+						}
+					}
+				}
+			}
+		}
+		else
+		{
+			for( i = 0; i < actions.Size(); i += 1 )
+			{
+				action = ( ( ScriptableDeviceAction )( actions[ i ] ) );
+				if( action && SetInactivityReasonForAction( action, action.actionName, scriptableDeviceAction, inactivityReasonIsQuickHacked ) )
+				{
+					isFailureSet = true;
+				}
+			}
+		}
+		return isFailureSet;
+	}
+
+	public static function SetInactivityReasonForAction( scriptableDeviceAction : ScriptableDeviceAction, actionName : CName, currentlyUploadingAction : ScriptableDeviceAction, failureExplanation : String ) : Bool
+	{
+		var actionNamesInQueue : array< CName >;
+		var disallowedActionNames : array< CName >;
+		var actionShouldBeAllowed : Bool;
+		var i, j : Int32;
+		actionShouldBeAllowed = true;
+		if( currentlyUploadingAction )
+		{
+			currentlyUploadingAction.m_deviceActionQueue.GetAllQueuedActionNames( actionNamesInQueue );
+			DeviceActionQueue.GetAllDisallowedActionNames( disallowedActionNames );
+			for( i = 0; i < disallowedActionNames.Size(); i += 1 )
+			{
+				if( ( !( currentlyUploadingAction.m_isInactive ) && actionName == currentlyUploadingAction.GetActionName() ) && currentlyUploadingAction.GetActionName() == disallowedActionNames[ i ] )
+				{
+					actionShouldBeAllowed = false;
+					break;
+				}
+				for( j = 0; j < actionNamesInQueue.Size(); j += 1 )
+				{
+					if( actionName == actionNamesInQueue[ j ] && actionNamesInQueue[ j ] == disallowedActionNames[ i ] )
+					{
+						actionShouldBeAllowed = false;
+						break;
+					}
+				}
+			}
+		}
+		if( ( failureExplanation != "LocKey#43809" && failureExplanation != "LocKey#43808" ) || !( actionShouldBeAllowed ) )
+		{
+			scriptableDeviceAction.SetInactiveWithReason( false, failureExplanation );
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsStatusEffectStackable( statusEffectRecord : StatusEffect_Record ) : Bool
+	{
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		var package : weak< GameplayLogicPackage_Record >;
+		var i : Int32;
+		var hasStackableComponent : Bool;
+		statusEffectRecord.Packages( packages );
+		for( i = 0; i < packages.Size(); i += 1 )
+		{
+			package = packages[ i ];
+			hasStackableComponent = hasStackableComponent || package.Stackable();
+		}
+		return hasStackableComponent;
+	}
+
+	public static function RemoveQuickhackQueue( gameplayRoleComponent : GameplayRoleComponent, currentlyUploadingAction : ScriptableDeviceAction )
+	{
+		var i : Int32;
+		var objectActionRecords : array< ObjectAction_Record >;
+		if( gameplayRoleComponent )
+		{
+			gameplayRoleComponent.ToggleMappin( gamedataMappinVariant.QuickHackVariant, false, false );
+		}
+		if( currentlyUploadingAction )
+		{
+			currentlyUploadingAction.m_isTargetDead = true;
+			if( currentlyUploadingAction.GetExecutor().IsPlayer() && ( currentlyUploadingAction.m_deviceActionQueue != NULL ) )
+			{
+				currentlyUploadingAction.m_deviceActionQueue.GetAllQueuedActionObjectRecords( objectActionRecords );
+				for( i = 0; i < objectActionRecords.Size(); i += 1 )
+				{
+					RPGManager.DecrementQuickHackBlackboard( currentlyUploadingAction.GetExecutor().GetGame(), objectActionRecords[ i ].GetID() );
+				}
+			}
+		}
+	}
+
+	public static function PopFromQuickHackQueue( evt : UploadProgramProgressEvent, gameplayRoleComponent : GameplayRoleComponent ) : QuickSlotCommandUsed
+	{
+		var action : ScriptableDeviceAction;
+		var quickSlotCommandUsed : QuickSlotCommandUsed;
+		var statSystem : StatsSystem;
+		var player : PlayerPuppet;
+		var gameInstance : GameInstance;
+		var playerEntityID : EntityID;
+		var hackedEntityID : EntityID;
+		var setQuickHackAttempt : SetQuickHackAttemptEvent;
+		setQuickHackAttempt = new SetQuickHackAttemptEvent;
+		gameInstance = gameplayRoleComponent.GetOwner().GetGame();
+		if( !( evt.deviceActionQueue ) )
+		{
+			setQuickHackAttempt.wasQuickHackAttempt = false;
+			GameInstance.GetPersistencySystem( gameInstance ).QueuePSEvent( evt.action.GetPersistentID(), evt.action.GetDeviceClassName(), setQuickHackAttempt );
+			return NULL;
+		}
+		action = ( ( ScriptableDeviceAction )( evt.deviceActionQueue.PopActionInQueue() ) );
+		if( action )
+		{
+			action.m_isQueuedAction = true;
+			quickSlotCommandUsed = new QuickSlotCommandUsed;
+			quickSlotCommandUsed.action = action;
+			player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( gameInstance ).GetLocalPlayerMainGameObject() ) );
+			playerEntityID = player.GetEntityID();
+			statSystem = GameInstance.GetStatsSystem( gameInstance );
+			if( statSystem.GetStatValue( playerEntityID, gamedataStatType.QuickHackQueueCount ) == 1.0 )
+			{
+				statSystem.RemoveAllModifiers( playerEntityID, gamedataStatType.QuickHackQueueCount );
+			}
+			else
+			{
+				statSystem.AddModifier( playerEntityID, ( ( gameConstantStatModifierData )( RPGManager.CreateStatModifier( gamedataStatType.QuickHackQueueCount, gameStatModifierType.Additive, -1.0 ) ) ) );
+			}
+		}
+		else
+		{
+			hackedEntityID = gameplayRoleComponent.GetOwner().GetEntityID();
+			GameInstance.GetStatusEffectSystem( gameInstance ).RemoveStatusEffect( hackedEntityID, T"BaseStatusEffect.Intelligence_Master_Perk_2_Queue_Lock" );
+			evt.deviceActionQueue.UnlockQueue();
+			setQuickHackAttempt.wasQuickHackAttempt = false;
+			GameInstance.GetPersistencySystem( gameInstance ).QueuePSEvent( evt.action.GetPersistentID(), evt.action.GetDeviceClassName(), setQuickHackAttempt );
+		}
+		return quickSlotCommandUsed;
+	}
+
+	public static function IsQueuePerkBought( playerPuppet : PlayerPuppet ) : Bool
+	{
+		return playerPuppet && ( PlayerDevelopmentSystem.GetData( playerPuppet ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Left_Milestone_2 ) == 2 );
+	}
+
+	public static function IsActionQueueEnabled( currentlyUploadingAction : ScriptableDeviceAction, playerPuppet : PlayerPuppet ) : Bool
+	{
+		return ( currentlyUploadingAction && currentlyUploadingAction.m_isActionQueueingUsed ) || IsQueuePerkBought( playerPuppet );
+	}
+
+	public static function IsActionQueueFull( currentlyUploadingAction : ScriptableDeviceAction ) : Bool
+	{
+		return ( currentlyUploadingAction && currentlyUploadingAction.m_deviceActionQueue ) && currentlyUploadingAction.m_deviceActionQueue.IsActionQueueFull();
+	}
+
+	public static function CanNewActionBeQueued( currentlyUploadingAction : ScriptableDeviceAction ) : Bool
+	{
+		return ( currentlyUploadingAction && currentlyUploadingAction.m_deviceActionQueue ) && currentlyUploadingAction.m_deviceActionQueue.CanNewActionBeQueued();
+	}
+
+	public static function GetFinisherHealthThresholdIncreaseForQueue( player : GameObject, target : GameObject ) : Float
+	{
+		var statsSystem : StatsSystem;
+		var scriptedPuppet : ScriptedPuppet;
+		var finisherHealthThresholdIncreaseForQueue : Float;
+		var qhQueueSize : Int32;
+		scriptedPuppet = ( ( ScriptedPuppet )( target ) );
+		if( !( scriptedPuppet ) )
+		{
+			return 0.0;
+		}
+		statsSystem = GameInstance.GetStatsSystem( player.GetGame() );
+		finisherHealthThresholdIncreaseForQueue = statsSystem.GetStatValue( player.GetEntityID(), gamedataStatType.FinisherHealthThresholdIncreaseForQueue );
+		if( finisherHealthThresholdIncreaseForQueue > 0.0 )
+		{
+			qhQueueSize = scriptedPuppet.GetDeviceActionQueueSize();
+			return ( ( Float )( qhQueueSize ) ) * finisherHealthThresholdIncreaseForQueue;
+		}
+		return 0.0;
+	}
+
+}
+
+class DeviceActionQueue
+{
+	private var m_actionsInQueue : array< DeviceAction >;
+	private var m_maxQueueSize : Int32;
+	default m_maxQueueSize = 1;
+	private var m_locked : Bool;
+	default m_locked = false;
+
+	public static function GetAllDisallowedActionNames( out actionNames : array< CName > )
+	{
+		actionNames = TDB.GetCNameArray( T"NewPerks.Intelligence_Left_Milestone_2.preventInQueueAgain" );
+	}
+
+	public function LockQueue()
+	{
+		m_locked = true;
+	}
+
+	public function UnlockQueue()
+	{
+		m_locked = false;
+	}
+
+	public function GetMaxQueueSize() : Int32
+	{
+		return m_maxQueueSize;
+	}
+
+	public function SetMaxQueueSize( maxQueueSize : Int32 )
+	{
+		if( maxQueueSize > 0 )
+		{
+			m_maxQueueSize = maxQueueSize;
+		}
+	}
+
+	public function GetQueueSize() : Int32
+	{
+		return m_actionsInQueue.Size();
+	}
+
+	public function GetQueuedActionsTotalCost() : Int32
+	{
+		var scriptableDeviceAction : ScriptableDeviceAction;
+		var totalCost : Int32;
+		var i : Int32;
+		for( i = 0; i < m_actionsInQueue.Size(); i += 1 )
+		{
+			scriptableDeviceAction = ( ( ScriptableDeviceAction )( m_actionsInQueue[ i ] ) );
+			if( scriptableDeviceAction )
+			{
+				totalCost += scriptableDeviceAction.GetCost();
+			}
+		}
+		return totalCost;
+	}
+
+	public function GetAllQueuedActionNames( out actionNames : array< CName > ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < m_actionsInQueue.Size(); i += 1 )
+		{
+			actionNames.PushBack( m_actionsInQueue[ i ].actionName );
+		}
+		return HasActionInQueue();
+	}
+
+	public function GetAllQueuedActionObjectRecords( out objectActionRecords : array< ObjectAction_Record > ) : Bool
+	{
+		var i : Int32;
+		var action : ScriptableDeviceAction;
+		for( i = 0; i < m_actionsInQueue.Size(); i += 1 )
+		{
+			action = ( ( ScriptableDeviceAction )( m_actionsInQueue[ i ] ) );
+			if( action )
+			{
+				objectActionRecords.PushBack( action.GetObjectActionRecord() );
+			}
+		}
+		return HasActionInQueue();
+	}
+
+	public function IsQhQueueUploadInProgress() : Bool
+	{
+		var uploadVal : Float;
+		var statPoolsSystem : StatPoolsSystem;
+		var action : ScriptableDeviceAction;
+		if( m_actionsInQueue.Size() > 0 )
+		{
+			if( ( m_actionsInQueue[ 0 ] == NULL ) && !( m_actionsInQueue[ 0 ].IsA( 'ScriptableDeviceAction' ) ) )
+			{
+				return false;
+			}
+			action = ( ( ScriptableDeviceAction )( m_actionsInQueue[ 0 ] ) );
+			if( action )
+			{
+				statPoolsSystem = GameInstance.GetStatPoolsSystem( action.GetExecutor().GetGame() );
+				uploadVal = statPoolsSystem.GetStatPoolValue( action.GetRequesterID(), gamedataStatPoolType.QuickHackUpload );
+				return ( uploadVal > 0.0 ) && ( uploadVal < 100.0 );
+			}
+		}
+		return true;
+	}
+
+	public function CanNewActionBeQueued() : Bool
+	{
+		if( !( IsQhQueueUploadInProgress() ) )
+		{
+			return false;
+		}
+		return !( m_locked ) && ( m_actionsInQueue.Size() < m_maxQueueSize );
+	}
+
+	public function HasActionInQueue() : Bool
+	{
+		return m_actionsInQueue.Size() > 0;
+	}
+
+	public function IsActionQueueFull() : Bool
+	{
+		if( !( IsQhQueueUploadInProgress() ) )
+		{
+			return false;
+		}
+		return !( CanNewActionBeQueued() ) || ( m_actionsInQueue.Size() == m_maxQueueSize );
+	}
+
+	private function DecreaseUploadTime( deviceAction : ScriptableDeviceAction, decreaseQhUploadTimeVal : Float )
+	{
+		if( decreaseQhUploadTimeVal < 0.0 )
+		{
+			return;
+		}
+		decreaseQhUploadTimeVal += ( decreaseQhUploadTimeVal * ( ( Float )( m_actionsInQueue.Size() ) ) );
+		decreaseQhUploadTimeVal = MinF( decreaseQhUploadTimeVal, 0.99000001 );
+		deviceAction.m_activationTimeReduction = decreaseQhUploadTimeVal;
+	}
+
+	public function PutActionInQueue( deviceAction : ScriptableDeviceAction, decreaseQhUploadTimeVal : Float ) : Bool
+	{
+		if( IsActionQueueFull() )
+		{
+			return false;
+		}
+		DecreaseUploadTime( deviceAction, decreaseQhUploadTimeVal );
+		m_actionsInQueue.PushBack( deviceAction );
+		return true;
+	}
+
+	public function PopActionInQueue() : DeviceAction
+	{
+		var deviceAction : DeviceAction;
+		if( !( HasActionInQueue() ) )
+		{
+			return NULL;
+		}
+		deviceAction = m_actionsInQueue[ 0 ];
+		m_actionsInQueue.Erase( 0 );
+		return deviceAction;
+	}
+
+}
+

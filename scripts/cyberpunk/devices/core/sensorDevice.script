@@ -1,3 +1,157 @@
+enum ETargetManagerAnimGraphState
+{
+	MODELOOKAT = 0,
+	IDLE = 1,
+	JAMMED = 2,
+}
+
+enum ESensorDeviceWakeState
+{
+	NONE = -1,
+	CLOSED = 0,
+	WAKEN = 1,
+	OPEN = 2,
+}
+
+enum ESensorDeviceStates
+{
+	NONE = 0,
+	IDLE = 1,
+	IDLEFORCED = 2,
+	TARGETLOCK = 3,
+	TARGETLOSE = 4,
+	TARGETRECEIVED = 5,
+	REPRIMAND = 6,
+	JAMMER = 7,
+}
+
+struct PlayerControlDeviceData
+{
+	var m_currentYawModifier : Float;
+	var m_currentPitchModifier : Float;
+}
+
+struct CameraRotationData
+{
+	var m_pitch : Float;
+	var m_maxPitch : Float;
+	var m_minPitch : Float;
+	var m_yaw : Float;
+	var m_maxYaw : Float;
+	var m_minYaw : Float;
+}
+
+class ReactoToPreventionSystem extends Event
+{
+	var wakeUp : Bool;
+}
+
+class ResolveSensorDeviceBehaviour extends Event
+{
+	var iteration : Int32;
+}
+
+class LostTargetDelayFalsePositivesDelay extends Event
+{
+	var target : weak< GameObject >;
+}
+
+class SetDetectionMultiplier extends Event
+{
+	var multiplier : Float;
+}
+
+class TurnOnVisibilitySenseComponent extends Event
+{
+}
+
+class HostileUpdateTowardsPlayerHostiles extends Event
+{
+}
+
+class AnimFeature_SensorDevice extends AnimFeature
+{
+	var isCeiling : Bool;
+	var isInitialized : Bool;
+	default isInitialized = true;
+	editable var isTurnedOn : Bool;
+	editable var isDestroyed : Bool;
+	editable var wasHit : Bool;
+	editable var state : Int32;
+	editable var wakeState : Int32;
+	editable var isControlled : Bool;
+	editable var overrideRootRotation : Float;
+	editable var pitchAngle : Float;
+	editable var maxRotationAngle : Float;
+	editable var rotationSpeed : Float;
+	editable var currentRotation : Vector4;
+}
+
+class DisableAreaIndicatorEvent extends Event
+{
+}
+
+class KillTaggedTargetEvent extends Event
+{
+	var taggedObject : weak< GameObject >;
+}
+
+class TargetLockedEvent extends Event
+{
+}
+
+class ReevaluateTargetsEvent extends Event
+{
+}
+
+class SetJammedEvent extends Event
+{
+	var newJammedState : Bool;
+	var instigator : weak< WeaponObject >;
+}
+
+class QuestForceAttitude extends ActionName
+{
+
+	public function SetProperties( atttitudeName : CName )
+	{
+		actionName = 'QuestForceAttitude';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Name( 'atttitudeName', atttitudeName );
+	}
+
+}
+
+class UnregisterListenerOnTargetHPEvent extends Event
+{
+	var listener : TargetedObjectDeathListener;
+	var isFromListenerEvent : Bool;
+}
+
+class TargetedObjectDeathListener extends CustomValueStatPoolsListener
+{
+	var m_lsitener : weak< SensorDevice >;
+	var m_lsitenTarget : weak< GameObject >;
+
+	protected event OnStatPoolMinValueReached( value : Float )
+	{
+		if( m_lsitenTarget )
+		{
+			m_lsitener.UnregisterListenerOnTargetHP( m_lsitener, this );
+		}
+	}
+
+}
+
+struct LedColors_SensorDevice
+{
+	var off : ScriptLightSettings;
+	var red : ScriptLightSettings;
+	var green : ScriptLightSettings;
+	var blue : ScriptLightSettings;
+	var yellow : ScriptLightSettings;
+	var white : ScriptLightSettings;
+}
+
 class SensorDevice extends ExplosiveDevice
 {
 	protected var m_attitudeAgent : AttitudeAgent;
@@ -42,6 +196,8 @@ class SensorDevice extends ExplosiveDevice
 	private var m_hasSupport : Bool;
 	protected var m_defaultSensePreset : TweakDBID;
 	default m_defaultSensePreset = T"Senses.BasicCamera";
+	private var m_keepHostilityTowardsPlayerHostiles : Bool;
+	private var m_hostileUpdateTowardsPlayerHostilesDelayed : Bool;
 	[ category = "Sensor entity specific data" ]
 	protected const editable var m_elementsToHideOnTCS : array< CName >;
 	protected var m_elementsToHideOnTCSRefs : array< IPlacedComponent >;
@@ -301,6 +457,21 @@ class SensorDevice extends ExplosiveDevice
 				OnTCSTakeOverControlDeactivate( tcsEvt );
 			}
 		}
+		KeepHostilityTowardsPlayerHostiles( false );
+	}
+
+	protected event OnAttitudeChanged( evt : AttitudeChangedEvent )
+	{
+		var agentPuppet : ScriptedPuppet;
+		super.OnAttitudeChanged( evt );
+		if( evt.attitude != EAIAttitude.AIA_Friendly )
+		{
+			agentPuppet = ( ( ScriptedPuppet )( evt.otherAgent.GetEntity() ) );
+			if( agentPuppet.IsPlayer() )
+			{
+				KeepHostilityTowardsPlayerHostiles( false );
+			}
+		}
 	}
 
 	public export const override function IsSensor() : Bool
@@ -405,7 +576,7 @@ class SensorDevice extends ExplosiveDevice
 		return m_sensorDeviceState;
 	}
 
-	public const function GetRotationData() : CameraRotationData
+	public const virtual function GetRotationData() : CameraRotationData
 	{
 		var res : CameraRotationData;
 		res.m_pitch = m_playerControlData.m_currentPitchModifier;
@@ -629,7 +800,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [HPEvent] Target was not found on HP listeners list " );
 			}
 		}
 	}
@@ -638,12 +808,11 @@ class SensorDevice extends ExplosiveDevice
 	{
 		if( m_targetForcedFormTagKill && ( evt.listener.m_lsitenTarget == m_currentlyFollowedTarget ) )
 		{
-			RevertTepmoraryAttitude();
+			RevertTemporaryAttitude();
 			m_targetForcedFormTagKill = false;
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( " [HPEvent] Target " + NameToString( evt.listener.m_lsitenTarget.GetClassName() ) ) + EntityID.ToDebugString( evt.listener.m_lsitenTarget.GetEntityID() ) ) + " was killed " );
 		}
 		m_HPListenersList.Remove( evt.listener );
 		GameInstance.GetStatPoolsSystem( GetGame() ).RequestUnregisteringListener( evt.listener.m_lsitenTarget.GetEntityID(), gamedataStatPoolType.Health, evt.listener );
@@ -689,14 +858,12 @@ class SensorDevice extends ExplosiveDevice
 			isIntresting = GetDevicePS().GetSecuritySystem().ShouldReactToTarget( target.GetEntityID(), GetEntityID() );
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( " [RecognizeTarget][SetIntresting] Target was set as: " + BoolToString( isIntresting ) ) + " By security system " );
 			}
 			return isIntresting;
 		}
 		isIntresting = GetAttitudeTowards( this, target ) == EAIAttitude.AIA_Hostile;
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( " [RecognizeTarget][SetIntresting] Target was set as: " + BoolToString( isIntresting ) ) + "  By security device attitude " );
 		}
 		return isIntresting;
 	}
@@ -715,7 +882,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [CurrentTargetApperas] Forced target. StartLockingTarget called " );
 			}
 			ChangeTemporaryAttitude();
 			StartBehaviourResolve( ESensorDeviceStates.TARGETLOCK );
@@ -732,6 +898,7 @@ class SensorDevice extends ExplosiveDevice
 			if( securityState == ESecuritySystemState.ALERTED )
 			{
 				StartBehaviourResolve( ESensorDeviceStates.TARGETLOCK );
+				SetQuestVisibility( true );
 				return;
 			}
 			if( securityState == ESecuritySystemState.COMBAT )
@@ -772,7 +939,6 @@ class SensorDevice extends ExplosiveDevice
 			GetAttitudeAgent().SetAttitudeGroup( groupName );
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [TemporaryAttitude] attitude changet to player group: " + NameToString( groupName ) );
 			}
 		}
 		else
@@ -792,7 +958,6 @@ class SensorDevice extends ExplosiveDevice
 			m_initialAttitude = GetAttitudeAgent().GetAttitudeGroup();
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [TemporaryAttitude] attitude catched as " + NameToString( m_initialAttitude ) );
 			}
 		}
 	}
@@ -807,7 +972,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( ( " [TemporaryAttitude] There was a try to clear m_initialAttitude when sensor is in m_targetForcedFormTagKill. Attempt rejected DEBUG IT! -- initial attitude: " + NameToString( m_initialAttitude ) ) + " current attitude: " ) + NameToString( GetAttitudeAgent().GetAttitudeGroup() ) );
 			}
 		}
 	}
@@ -817,13 +981,12 @@ class SensorDevice extends ExplosiveDevice
 		return m_initialAttitude == '';
 	}
 
-	private function RevertTepmoraryAttitude()
+	private function RevertTemporaryAttitude()
 	{
 		if( m_initialAttitude != '' )
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [TemporaryAttitude] attitude reverted to previous " + NameToString( m_initialAttitude ) );
 			}
 			GetAttitudeAgent().SetAttitudeGroup( m_initialAttitude );
 			DetermineLightAttitudeRefs();
@@ -851,8 +1014,8 @@ class SensorDevice extends ExplosiveDevice
 
 	public virtual function OnAllValidTargetsDisappears()
 	{
-		RevertTepmoraryAttitude();
-		GetDevicePS().SetTargetIsLocked( false );
+		RevertTemporaryAttitude();
+		SetQuestVisibility( false );
 		DetermineLightScanRefs( m_lightColors.yellow );
 	}
 
@@ -897,7 +1060,6 @@ class SensorDevice extends ExplosiveDevice
 		evt = new TargetLockedEvent;
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( " [TargetLocked] Locking with " + FloatToString( lockingTime ) ) + " delay " );
 		}
 		if( lockingTime <= 0.0 )
 		{
@@ -916,7 +1078,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [TargetLocked] Targetting Break! " );
 			}
 			GameInstance.GetDelaySystem( GetGame() ).CancelCallback( m_targetingDelayEventID );
 			hack_isTargetingDelayEventFilled = false;
@@ -929,7 +1090,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [Behaviour] Behaviour Break! " );
 			}
 			GameInstance.GetDelaySystem( GetGame() ).CancelDelay( m_currentResolveDelayEventID );
 			hack_isResolveDelayEventFilled = false;
@@ -940,16 +1100,8 @@ class SensorDevice extends ExplosiveDevice
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( " [TargetLocked] LOCKED actions are taken against target ( " + NameToString( m_currentlyFollowedTarget.GetClassName() ) ) + EntityID.ToDebugString( m_currentlyFollowedTarget.GetEntityID() ) ) + " ) " );
 		}
-		if( EntityID.IsDefined( GetDevicePS().GetQuestSpotTargetID() ) )
-		{
-			if( GetDevicePS().GetQuestSpotTargetID() == m_currentlyFollowedTarget.GetEntityID() )
-			{
-				GetDevicePS().SetQuestTargetSpotted( true );
-			}
-		}
-		GetDevicePS().SetTargetIsLocked( true );
+		SetQuestVisibility( true );
 		if( GetDevicePS().IsConnectedToSecuritySystem() )
 		{
 			if( !( hack_wasTargetReevaluated ) )
@@ -960,6 +1112,18 @@ class SensorDevice extends ExplosiveDevice
 			}
 			BreakReprimand();
 		}
+	}
+
+	private function SetQuestVisibility( isVisible : Bool )
+	{
+		if( EntityID.IsDefined( GetDevicePS().GetQuestSpotTargetID() ) )
+		{
+			if( GetDevicePS().GetQuestSpotTargetID() == m_currentlyFollowedTarget.GetEntityID() )
+			{
+				GetDevicePS().SetQuestTargetSpotted( isVisible );
+			}
+		}
+		GetDevicePS().SetTargetIsLocked( isVisible );
 	}
 
 	protected event OnDetectionRiseEvent( evt : DetectionRiseEvent )
@@ -976,7 +1140,6 @@ class SensorDevice extends ExplosiveDevice
 					m_isPLAYERSAFETargetLock = true;
 					if( !( IsFinal() ) )
 					{
-						LogDevices( this, " [Detection] Detection rise to plyer. PLAYERSAFETargetLock is true " );
 					}
 					ForcedLookAtEntityWithoutTargetMODE( evt.target );
 					StopSoundEvent( this, m_idleSound );
@@ -1011,7 +1174,6 @@ class SensorDevice extends ExplosiveDevice
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, " [Detection] Detection rise to NOT plyer" );
 				}
 				RecognizeTarget( evt.target );
 			}
@@ -1031,7 +1193,6 @@ class SensorDevice extends ExplosiveDevice
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, ( ( " [Detection] Target: " + NameToString( evt.target.GetClassName() ) ) + EntityID.ToDebugString( evt.target.GetEntityID() ) ) + " fully detected " );
 				}
 				m_isPLAYERSAFETargetLock = false;
 				TerminateGameEffect( m_scanGameEffect );
@@ -1234,7 +1395,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] sensor cannot react to targets. RETURN" );
 			}
 			return;
 		}
@@ -1242,7 +1402,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] Device is controlled by player. RETURN" );
 			}
 			return;
 		}
@@ -1250,7 +1409,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] Target has no attitude agent. RETURN" );
 			}
 			return;
 		}
@@ -1258,7 +1416,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] Target has no HP. RETURN" );
 			}
 			return;
 		}
@@ -1266,7 +1423,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] Target is puppet and is unconscious. RETURN" );
 			}
 			return;
 		}
@@ -1276,7 +1432,6 @@ class SensorDevice extends ExplosiveDevice
 			isIntresting = true;
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( " [RecognizeTarget] Target was set as: " + BoolToString( isIntresting ) ) + " By forced intresting " );
 			}
 			SimpleTargetManager.AddTarget( m_targets, newObject, isIntresting, true );
 			if( m_currentlyFollowedTarget != GetForcedTargetObject() )
@@ -1295,7 +1450,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] sensor has no intresting targets and new is not intresting. RETURN" );
 			}
 			return;
 		}
@@ -1303,7 +1457,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [RecognizeTarget] sensor is in fallow mode and current target is same as new target. RETURN" );
 			}
 			return;
 		}
@@ -1317,7 +1470,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( ( " [RecognizeTarget] Target: " + NameToString( newObject.GetClassName() ) ) + EntityID.ToDebugString( newObject.GetEntityID() ) ) + " RETURN! sensor is in PLAYERSAFETargetLock" );
 			}
 		}
 	}
@@ -1332,7 +1484,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [LoseTarget] target is same as forced target and device is in follow mode. RETURN" );
 			}
 			return;
 		}
@@ -1353,14 +1504,12 @@ class SensorDevice extends ExplosiveDevice
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( " [LoseTarget] target " + NameToString( lostObject.GetClassName() ) ) + EntityID.ToDebugString( lostObject.GetEntityID() ) ) + " was removed from target list " );
 		}
 		OnValidTargetDisappears( lostObject );
 		if( ( lostObject != m_currentlyFollowedTarget ) && ( m_currentlyFollowedTarget != NULL ) )
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( ( ( ( ( " [LoseTarget] target " + NameToString( lostObject.GetClassName() ) ) + EntityID.ToDebugString( lostObject.GetEntityID() ) ) + " is different than current target " ) + NameToString( m_currentlyFollowedTarget.GetClassName() ) ) + EntityID.ToDebugString( m_currentlyFollowedTarget.GetEntityID() ) ) + " so no additional action is taken. RETURN" );
 			}
 			return;
 		}
@@ -1368,13 +1517,11 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [LoseTarget] Device is in follow mode RETURN" );
 			}
 			return;
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [LoseTarget] lost target is same as current target" );
 		}
 		BreakReprimand();
 		if( SimpleTargetManager.HasInterestingTargets( m_targets ) && !( GetDevicePS().IsControlledByPlayer() ) )
@@ -1382,14 +1529,12 @@ class SensorDevice extends ExplosiveDevice
 			m_currentlyFollowedTarget = SimpleTargetManager.GetFirstInterestingTargetObject( m_targets );
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( " [LoseTarget] new intresting target found as: " + NameToString( m_currentlyFollowedTarget.GetClassName() ) ) + EntityID.ToDebugString( m_currentlyFollowedTarget.GetEntityID() ) );
 			}
 			StartBehaviourResolve( ESensorDeviceStates.TARGETLOCK );
 			return;
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [LoseTarget] No intresting targets on target list" );
 		}
 		OnAllValidTargetsDisappears();
 		if( !( HasSupport() ) )
@@ -1473,7 +1618,6 @@ class SensorDevice extends ExplosiveDevice
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [SSRequests] Target assesment request " );
 		}
 		debug_SS_TargetAssessmentRequest += 1;
 		SetSensePresetBasedOnSSState();
@@ -1487,7 +1631,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [Reprimand] StartReprimand " );
 			}
 			StartReprimand();
 		}
@@ -1495,7 +1638,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [Reprimand] BreakReprimand  coz of:  RELEASE_TO_ANOTHER_ENTITY" );
 			}
 			BreakReprimand();
 			StartBehaviourResolve( ESensorDeviceStates.TARGETLOCK );
@@ -1504,7 +1646,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [Reprimand] BreakReprimand  coz of:  CONCLUDE_SUCCESSFUL" );
 			}
 			BreakReprimand();
 			StartBehaviourResolve( ESensorDeviceStates.IDLE );
@@ -1528,7 +1669,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, " [BreakReprimand] was sucesfull(optional): " + BoolToString( wasSucesfull ) );
 			}
 			BreakTargeting();
 			m_sensorDeviceState = ESensorDeviceStates.NONE;
@@ -1546,7 +1686,6 @@ class SensorDevice extends ExplosiveDevice
 				debug_SS_inputsSendIntresting += 1;
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, ( " [SSNotyfication] Send defaultSSNotification about: " + NameToString( target.GetClassName() ) ) + EntityID.ToDebugString( target.GetEntityID() ) );
 				}
 				DetermineLightInfoRefs( m_lightColors.white );
 				if( securityIntresting )
@@ -1598,7 +1737,6 @@ class SensorDevice extends ExplosiveDevice
 		OnAllValidTargetsDisappears();
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( " [Quest][Target] Forced target follow: " + NameToString( GetForcedTargetObject().GetClassName() ) ) + EntityID.ToDebugString( GetForcedTargetObject().GetEntityID() ) );
 		}
 		if( GetForcedTargetObject() )
 		{
@@ -1612,7 +1750,6 @@ class SensorDevice extends ExplosiveDevice
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [Quest][Target] Stop forced target follow " );
 		}
 		if( EntityID.IsDefined( evt.targetEntityID ) )
 		{
@@ -1633,7 +1770,6 @@ class SensorDevice extends ExplosiveDevice
 		OnAllValidTargetsDisappears();
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( " [Quest][Target] Forced target lookAt: " + NameToString( GetForcedTargetObject().GetClassName() ) ) + EntityID.ToDebugString( GetForcedTargetObject().GetEntityID() ) );
 		}
 		ForceLookAtQuestTarget();
 	}
@@ -1642,7 +1778,6 @@ class SensorDevice extends ExplosiveDevice
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [Quest][Target] Stop forced target lookAt " );
 		}
 		LoseTarget( m_currentlyFollowedTarget );
 	}
@@ -1651,7 +1786,6 @@ class SensorDevice extends ExplosiveDevice
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [Quest][Targgeting] Detection forced to TRUE " );
 		}
 	}
 
@@ -1659,7 +1793,6 @@ class SensorDevice extends ExplosiveDevice
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [Quest][Targgeting] Detection forced to FALSE " );
 		}
 		RemoveAllTargets();
 		CancelPLAYERSAFEDelayEvent();
@@ -1691,7 +1824,6 @@ class SensorDevice extends ExplosiveDevice
 		m_attitudeAgent.SetAttitudeGroup( groupName );
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, " [Quest][Attitude] Force attitude set to: " + NameToString( groupName ) );
 		}
 		GetDevicePS().SetIsAttitudeChanged( true );
 		ReevaluateTargets();
@@ -1714,7 +1846,6 @@ class SensorDevice extends ExplosiveDevice
 		BreakBehaviourResolve();
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( " [Behaviour] State resolve FORCED from: " + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( m_sensorDeviceState ) ) ) ) + "to: " ) + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( newState ) ) ) );
 		}
 		m_sensorDeviceState = newState;
 		OnResolveSensorDeviceBehaviour( behaviourEvent );
@@ -1726,7 +1857,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( ( ( " [Behaviour] State resolve FAILED from: " + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( m_sensorDeviceState ) ) ) ) + "to: " ) + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( newState ) ) ) ) + " | reason: Idle forced " );
 			}
 			return ESensorDeviceStates.IDLEFORCED;
 		}
@@ -1734,7 +1864,6 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( ( ( " [Behaviour] State resolve FAILED from: " + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( m_sensorDeviceState ) ) ) ) + "to: " ) + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( newState ) ) ) ) + " | reason: Jammed " );
 			}
 			return ESensorDeviceStates.JAMMER;
 		}
@@ -1742,14 +1871,12 @@ class SensorDevice extends ExplosiveDevice
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( ( ( " [Behaviour] State resolve FAILED from: " + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( m_sensorDeviceState ) ) ) ) + "to: " ) + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( newState ) ) ) ) + " | reason: Reprimand " );
 			}
 			return ESensorDeviceStates.REPRIMAND;
 		}
 		BreakBehaviourResolve();
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( " [Behaviour] State resolve SUCCESS from: " + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( m_sensorDeviceState ) ) ) ) + "to: " ) + EnumValueToString( "ESensorDeviceStates", ( ( Int32 )( newState ) ) ) );
 		}
 		return newState;
 	}
@@ -2106,7 +2233,6 @@ class SensorDevice extends ExplosiveDevice
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, ( ( " [TagKill] Target: " + NameToString( object.GetClassName() ) ) + EntityID.ToDebugString( object.GetEntityID() ) ) + " was found on list of targets so its gonna be killed (:" );
 				}
 				RemoveAllTargets();
 				m_targetForcedFormTagKill = true;
@@ -2116,7 +2242,7 @@ class SensorDevice extends ExplosiveDevice
 		return false;
 	}
 
-	private function ChangeAttiudetowardsTag( currentList : array< weak< GameObject > > )
+	private function ChangeAttiudetowardsTag( const currentList : ref< array< weak< GameObject > > > )
 	{
 		var attitudeBetweenGroups : EAIAttitude;
 		var i : Int32;
@@ -2141,10 +2267,67 @@ class SensorDevice extends ExplosiveDevice
 
 	protected event OnSetDeviceAttitude( evt : SetDeviceAttitude )
 	{
+		var playerPuppet : PlayerPuppet;
+		var current_attitude : EAIAttitude;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+		current_attitude = GetAttitudeTowards( playerPuppet );
+		if( current_attitude != evt.Attitude )
+		{
+			switch( evt.Attitude )
+			{
+				case EAIAttitude.AIA_Friendly:
+					SetDeviceFriendly( evt );
+				break;
+				case EAIAttitude.AIA_Neutral:
+					SetDeviceNeutral( evt );
+				break;
+				default:
+					KeepHostilityTowardsPlayerHostiles( false );
+				break;
+			}
+		}
+		super.OnSetDeviceAttitude( evt );
+	}
+
+	private function SetDeviceNeutral( evt : SetDeviceAttitude )
+	{
 		var puppetAttitudeAgent : AttitudeAgent;
-		var groupName : CName;
+		var enableAimAssist : EnableAimAssist;
+		SetHasSupport( false );
+		if( !( IsSurveillanceCamera() ) )
+		{
+			SenseComponent.RequestPresetChange( this, T"Senses.BasicTurret", true );
+		}
+		else
+		{
+			SenseComponent.RequestPresetChange( this, m_defaultSensePreset, true );
+		}
+		enableAimAssist = new EnableAimAssist;
+		QueueEvent( enableAimAssist );
+		SendReprimandInstructionToSecuritySystem();
+		RevertTemporaryAttitude();
+		puppetAttitudeAgent = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject().GetAttitudeAgent();
+		m_attitudeAgent.SetAttitudeTowards( puppetAttitudeAgent, EAIAttitude.AIA_Neutral );
+		m_senseComponent.ReevaluateDetectionOverwrite( evt.GetExecutor() );
+		m_senseComponent.RequestRemovingSenseMappin();
+		KeepHostilityTowardsPlayerHostiles( false );
+		GetDevicePS().SetIsAttitudeChanged( true );
+		ReevaluateTargets();
+		DetermineLightScanRefs( m_lightColors.red );
+		ToggleActiveEffect( true );
+		UpdateDeviceState();
+		SendReactivateHighlightEvent();
+		if( IsTaggedinFocusMode() )
+		{
+			RunVisionConeGameEffect();
+		}
+		GetDevicePS().SetBlockSecurityWakeUp( true );
+	}
+
+	private function SetDeviceFriendly( evt : SetDeviceAttitude )
+	{
+		var puppetAttitudeAgent : AttitudeAgent;
 		var disableAimAssist : DisableAimAssist;
-		disableAimAssist = new DisableAimAssist;
 		SetHasSupport( false );
 		if( !( IsSurveillanceCamera() ) )
 		{
@@ -2154,17 +2337,21 @@ class SensorDevice extends ExplosiveDevice
 		{
 			SenseComponent.RequestPresetChange( this, m_defaultSensePreset, true );
 		}
+		disableAimAssist = new DisableAimAssist;
 		QueueEvent( disableAimAssist );
 		SendReprimandInstructionToSecuritySystem();
-		ClearInitialAttitude();
+		CacheInitialAttitude();
 		puppetAttitudeAgent = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject().GetAttitudeAgent();
-		groupName = puppetAttitudeAgent.GetAttitudeGroup();
-		GetAttitudeAgent().SetAttitudeTowards( puppetAttitudeAgent, EAIAttitude.AIA_Friendly );
+		m_attitudeAgent.SetAttitudeTowards( puppetAttitudeAgent, EAIAttitude.AIA_Friendly );
 		GetSensesComponent().SetDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID() );
-		m_attitudeAgent.SetAttitudeGroup( groupName );
+		m_attitudeAgent.SetAttitudeGroup( puppetAttitudeAgent.GetAttitudeGroup() );
 		m_senseComponent.ReevaluateDetectionOverwrite( evt.GetExecutor() );
 		m_senseComponent.RequestRemovingSenseMappin();
-		SetHostileTowardsPlayerHostiles();
+		if( !( evt.IgnoreHostiles ) )
+		{
+			SetHostileTowardsPlayerHostiles();
+			KeepHostilityTowardsPlayerHostiles( true );
+		}
 		GetDevicePS().SetIsAttitudeChanged( true );
 		ReevaluateTargets();
 		DetermineLightAttitudeRefs();
@@ -2179,6 +2366,25 @@ class SensorDevice extends ExplosiveDevice
 		GetDevicePS().SendDeviceNotOperationalEvent();
 	}
 
+	private function KeepHostilityTowardsPlayerHostiles( keep : Bool )
+	{
+		var playerPuppet : PlayerPuppet;
+		if( keep == m_keepHostilityTowardsPlayerHostiles )
+		{
+			return;
+		}
+		m_keepHostilityTowardsPlayerHostiles = keep;
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+		if( keep )
+		{
+			playerPuppet.RegisterFriendlyDeviceHostileToEnemies( GetEntityID() );
+		}
+		else
+		{
+			playerPuppet.UnregisterFriendlyDeviceHostileToEnemies( GetEntityID() );
+		}
+	}
+
 	protected function SetHostileTowardsPlayerHostiles()
 	{
 		var player : PlayerPuppet;
@@ -2188,8 +2394,35 @@ class SensorDevice extends ExplosiveDevice
 		playerTargets = player.GetTargetTrackerComponent().GetHostileThreats( false );
 		for( i = 0; i < playerTargets.Size(); i += 1 )
 		{
-			GetAttitudeAgent().SetAttitudeTowardsAgentGroup( ( ( GameObject )( playerTargets[ i ].entity ) ).GetAttitudeAgent(), GetAttitudeAgent(), EAIAttitude.AIA_Hostile );
+			m_attitudeAgent.SetAttitudeTowardsAgentGroup( ( ( GameObject )( playerTargets[ i ].entity ) ).GetAttitudeAgent(), m_attitudeAgent, EAIAttitude.AIA_Hostile );
 		}
+	}
+
+	public function ScheduleHostileUpdateTowardsPlayerHostiles()
+	{
+		var evt : HostileUpdateTowardsPlayerHostiles;
+		if( !( m_keepHostilityTowardsPlayerHostiles ) )
+		{
+			return;
+		}
+		if( m_hostileUpdateTowardsPlayerHostilesDelayed )
+		{
+			return;
+		}
+		evt = new HostileUpdateTowardsPlayerHostiles;
+		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 0.2 );
+		m_hostileUpdateTowardsPlayerHostilesDelayed = true;
+	}
+
+	protected event OnHostileUpdateTowardsPlayerHostiles( evt : HostileUpdateTowardsPlayerHostiles )
+	{
+		if( !( m_keepHostilityTowardsPlayerHostiles ) )
+		{
+			return false;
+		}
+		SetHostileTowardsPlayerHostiles();
+		ReevaluateTargets();
+		m_hostileUpdateTowardsPlayerHostilesDelayed = false;
 	}
 
 	protected event OnForcePlayerIgnore( evt : ForceIgnoreTargets )
@@ -2247,7 +2480,7 @@ class SensorDevice extends ExplosiveDevice
 	{
 		SimpleTargetManager.RemoveAllTargets( m_targets );
 		m_currentlyFollowedTarget = NULL;
-		RevertTepmoraryAttitude();
+		RevertTemporaryAttitude();
 		ClearAllHPListeners();
 	}
 
@@ -2412,7 +2645,7 @@ class SensorDevice extends ExplosiveDevice
 		m_animFeatureData.isControlled = GetDevicePS().IsControlledByPlayer();
 		ApplyAnimFeatureToReplicate( this, m_animFeatureDataName, m_animFeatureData );
 		StartBehaviourResolve( ESensorDeviceStates.IDLE );
-		RevertTepmoraryAttitude();
+		RevertTemporaryAttitude();
 		TCSMeshToggle( true );
 		ToggleActiveEffect( true );
 		if( IsTaggedinFocusMode() )
@@ -2645,7 +2878,7 @@ class SensorDevice extends ExplosiveDevice
 		}
 		else
 		{
-			RevertTepmoraryAttitude();
+			RevertTemporaryAttitude();
 			ClearInitialAttitude();
 		}
 	}
@@ -2671,34 +2904,8 @@ class SensorDevice extends ExplosiveDevice
 		ps.SetNetrunnerID( evt.netrunnerID );
 		ps.SetNetrunnerProxyID( evt.proxyID );
 		ps.SetNetrunnerTargetID( evt.targetID );
-		ps.DrawBetweenEntities( true, true, GetFxResourceByKey( 'pingNetworkLink' ), evt.to, evt.from, false, false, false, false );
+		ps.DrawBetweenEntities( true, false, GetFxResourceByKey( 'pingNetworkLink' ), evt.to, evt.from, false, false, false, false );
 		ToggleForcedVisibilityInAnimSystem( 'pingNetworkLink', true, 0.0, evt.from );
-		if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( evt.targetID, gamedataStatType.RevealNetrunnerWhenHacked ) == 1.0 )
-		{
-			ForceVisionAppearanceNetrunner( ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), evt.netrunnerID ) ) ), evt.netrunnerID, 'EnemyNetrunner', true );
-			if( EntityID.IsDefined( evt.proxyID ) )
-			{
-				ForceVisionAppearanceNetrunner( ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), evt.proxyID ) ) ), evt.netrunnerID, 'EnemyNetrunner', true );
-			}
-		}
-	}
-
-	public static function ForceVisionAppearanceNetrunner( target : GameObject, sourceID : EntityID, sourceName : CName, toggle : Bool )
-	{
-		var data : FocusForcedHighlightData;
-		var visionEvt : ForceVisionApperanceEvent;
-		visionEvt = new ForceVisionApperanceEvent;
-		data = new FocusForcedHighlightData;
-		data.sourceID = sourceID;
-		data.sourceName = sourceName;
-		data.outlineType = EFocusOutlineType.ENEMY_NETRUNNER;
-		data.highlightType = EFocusForcedHighlightType.ENEMY_NETRUNNER;
-		data.priority = EPriority.High;
-		data.isRevealed = true;
-		data.patternType = VisionModePatternType.Netrunner;
-		visionEvt.forcedHighlight = data;
-		visionEvt.apply = toggle;
-		target.QueueEvent( visionEvt );
 	}
 
 	public function RemoveLinkedStatusEffects() : Bool
@@ -2763,7 +2970,6 @@ class SensorDevice extends ExplosiveDevice
 		var proxyID : EntityID;
 		var targetID : EntityID;
 		var netrunner : GameObject;
-		var proxy : GameObject;
 		var target : GameObject;
 		var attackAttemptEvent : AIAttackAttemptEvent;
 		var ps : SensorDeviceControllerPS;
@@ -2790,7 +2996,6 @@ class SensorDevice extends ExplosiveDevice
 			ps.DrawBetweenEntities( false, true, GetFxResourceByKey( 'pingNetworkLink' ), proxyID, targetID, false, false );
 			ToggleForcedVisibilityInAnimSystem( 'pingNetworkLink', false, 0.0, netrunnerID );
 			ToggleForcedVisibilityInAnimSystem( 'pingNetworkLink', false, 0.0, proxyID );
-			proxy = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), proxyID ) ) );
 		}
 		else
 		{
@@ -2799,14 +3004,6 @@ class SensorDevice extends ExplosiveDevice
 		}
 		netrunner = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), netrunnerID ) ) );
 		target = ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), targetID ) ) );
-		if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( targetID, gamedataStatType.RevealNetrunnerWhenHacked ) == 1.0 )
-		{
-			ForceVisionAppearanceNetrunner( netrunner, netrunnerID, 'EnemyNetrunner', false );
-			if( proxy )
-			{
-				ForceVisionAppearanceNetrunner( proxy, netrunnerID, 'EnemyNetrunner', false );
-			}
-		}
 		attackAttemptEvent = new AIAttackAttemptEvent;
 		attackAttemptEvent.instigator = netrunner;
 		attackAttemptEvent.continuousMode = gameEContinuousMode.Stop;
@@ -2874,155 +3071,5 @@ class SensorDevice extends ExplosiveDevice
 		}
 	}
 
-}
-
-struct PlayerControlDeviceData
-{
-	var m_currentYawModifier : Float;
-	var m_currentPitchModifier : Float;
-}
-
-struct CameraRotationData
-{
-	var m_pitch : Float;
-	var m_maxPitch : Float;
-	var m_minPitch : Float;
-	var m_yaw : Float;
-	var m_maxYaw : Float;
-	var m_minYaw : Float;
-}
-
-class ReactoToPreventionSystem extends Event
-{
-	var wakeUp : Bool;
-}
-
-class ResolveSensorDeviceBehaviour extends Event
-{
-	var iteration : Int32;
-}
-
-class LostTargetDelayFalsePositivesDelay extends Event
-{
-	var target : weak< GameObject >;
-}
-
-class SetDetectionMultiplier extends Event
-{
-	var multiplier : Float;
-}
-
-class TurnOnVisibilitySenseComponent extends Event
-{
-}
-
-class AnimFeature_SensorDevice extends AnimFeature
-{
-	var isCeiling : Bool;
-	var isInitialized : Bool;
-	default isInitialized = true;
-	editable var isTurnedOn : Bool;
-	editable var isDestroyed : Bool;
-	editable var wasHit : Bool;
-	editable var state : Int32;
-	editable var wakeState : Int32;
-	editable var isControlled : Bool;
-	editable var overrideRootRotation : Float;
-	editable var pitchAngle : Float;
-	editable var maxRotationAngle : Float;
-	editable var rotationSpeed : Float;
-	editable var currentRotation : Vector4;
-}
-
-class DisableAreaIndicatorEvent extends Event
-{
-}
-
-class KillTaggedTargetEvent extends Event
-{
-	var taggedObject : weak< GameObject >;
-}
-
-class TargetLockedEvent extends Event
-{
-}
-
-class ReevaluateTargetsEvent extends Event
-{
-}
-
-class SetJammedEvent extends Event
-{
-	var newJammedState : Bool;
-	var instigator : weak< WeaponObject >;
-}
-
-class QuestForceAttitude extends ActionName
-{
-
-	public function SetProperties( atttitudeName : CName )
-	{
-		actionName = 'QuestForceAttitude';
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Name( 'atttitudeName', atttitudeName );
-	}
-
-}
-
-class UnregisterListenerOnTargetHPEvent extends Event
-{
-	var listener : TargetedObjectDeathListener;
-	var isFromListenerEvent : Bool;
-}
-
-class TargetedObjectDeathListener extends CustomValueStatPoolsListener
-{
-	var m_lsitener : weak< SensorDevice >;
-	var m_lsitenTarget : weak< GameObject >;
-
-	protected event OnStatPoolMinValueReached( value : Float )
-	{
-		if( m_lsitenTarget )
-		{
-			m_lsitener.UnregisterListenerOnTargetHP( m_lsitener, this );
-		}
-	}
-
-}
-
-struct LedColors_SensorDevice
-{
-	var off : ScriptLightSettings;
-	var red : ScriptLightSettings;
-	var green : ScriptLightSettings;
-	var blue : ScriptLightSettings;
-	var yellow : ScriptLightSettings;
-	var white : ScriptLightSettings;
-}
-
-enum ETargetManagerAnimGraphState
-{
-	MODELOOKAT = 0,
-	IDLE = 1,
-	JAMMED = 2,
-}
-
-enum ESensorDeviceWakeState
-{
-	NONE = -1,
-	CLOSED = 0,
-	WAKEN = 1,
-	OPEN = 2,
-}
-
-enum ESensorDeviceStates
-{
-	NONE = 0,
-	IDLE = 1,
-	IDLEFORCED = 2,
-	TARGETLOCK = 3,
-	TARGETLOSE = 4,
-	TARGETRECEIVED = 5,
-	REPRIMAND = 6,
-	JAMMER = 7,
 }
 

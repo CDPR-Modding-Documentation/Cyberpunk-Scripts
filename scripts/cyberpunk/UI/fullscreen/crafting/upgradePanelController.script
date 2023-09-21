@@ -1,13 +1,16 @@
 class UpgradingScreenController extends CraftingMainLogicController
 {
 	default m_maxIngredientCount = 8;
-	private var m_itemTooltipControllers : array< weak< AGenericTooltipController > >;
-	private var m_tooltipDatas : array< InventoryTooltipData >;
+	private editable var m_itemNameUpgrade : inkTextRef;
+	private editable var m_arrowComparison : inkWidgetRef;
+	private var m_itemTooltipControllerLeft : weak< AGenericTooltipController >;
+	private var m_itemTooltipControllerRight : weak< AGenericTooltipController >;
+	private var m_tooltipDataLeft : MinimalItemTooltipData;
+	private var m_tooltipDataRight : MinimalItemTooltipData;
 	private var m_WeaponAreas : array< gamedataItemType >;
 	private var m_EquipAreas : array< gamedataEquipmentArea >;
-	private var m_newItem : weak< gameItemData >;
-	private var m_statMod : gameStatModifierData;
-	private var m_levelMod : gameStatModifierData;
+	private const var DELAYED_TOOLTIP_RIGHT : Float;
+	default DELAYED_TOOLTIP_RIGHT = 0.15f;
 
 	public override function Init( craftingGameController : weak< CraftingMainGameController > )
 	{
@@ -15,13 +18,21 @@ class UpgradingScreenController extends CraftingMainLogicController
 		SetCraftingButton( "UI-Crafting-Upgrade" );
 		m_EquipAreas = InventoryDataManagerV2.GetInventoryEquipmentAreas();
 		m_WeaponAreas = InventoryDataManagerV2.GetInventoryWeaponTypes();
+		SpawnItemTooltipAsync( inkWidgetRef.Get( m_tooltipContainer ), this, 'OnItemTooltipSpawnedLeft' );
+		SpawnItemTooltipAsync( inkWidgetRef.Get( m_tooltipContainer ), this, 'OnItemTooltipSpawnedRight' );
+		m_hasSpawnedTooltip = true;
 	}
 
 	public override function RefreshListViewContent( optional inventoryItemData : InventoryItemData )
 	{
 		m_dataSource.Clear();
 		m_dataSource.Reset( GetUpgradableList() );
-		if( !( InventoryItemData.IsEmpty( inventoryItemData ) ) )
+		if( IsEmptyData() )
+		{
+			HideContent();
+			return;
+		}
+		if( !( inventoryItemData.Empty ) )
 		{
 			UpdateItemPreviewPanel( inventoryItemData );
 		}
@@ -31,42 +42,59 @@ class UpgradingScreenController extends CraftingMainLogicController
 		}
 	}
 
+	private function HideContent()
+	{
+		inkWidgetRef.SetVisible( m_itemDetailsContainer, false );
+		m_isCraftable = false;
+		inkTextRef.SetVisible( m_blockedText, !( m_isCraftable ) );
+		inkWidgetRef.SetVisible( m_arrowComparison, m_isCraftable );
+		inkCompoundRef.SetVisible( m_progressBarContainer, m_isCraftable );
+		inkCompoundRef.SetVisible( m_progressButtonContainer, m_isCraftable );
+		m_progressButtonController.SetAvaibility( EProgressBarState.Invisible );
+	}
+
 	protected override function SetupFilters()
 	{
 		m_filters.PushBack( ( ( Int32 )( ItemFilterCategory.AllCount ) ) );
 		m_filters.PushBack( ( ( Int32 )( ItemFilterCategory.RangedWeapons ) ) );
 		m_filters.PushBack( ( ( Int32 )( ItemFilterCategory.MeleeWeapons ) ) );
-		m_filters.PushBack( ( ( Int32 )( ItemFilterCategory.Clothes ) ) );
 		super.SetupFilters();
 	}
 
 	protected override function UpdateItemPreview( craftableController : CraftableItemLogicController )
 	{
 		var selectedItem : InventoryItemData;
-		SetItemButtonHintsHoverOut( NULL );
+		m_progressButtonController.Reset();
 		selectedItem = ( ( ItemCraftingData )( ( ( IScriptable )( craftableController.GetData() ) ) ) ).inventoryItem;
 		UpdateItemPreviewPanel( selectedItem );
 	}
 
-	private function UpdateItemPreviewPanel( selectedItem : InventoryItemData )
+	private function UpdateItemPreviewPanel( const selectedItem : ref< InventoryItemData > )
 	{
-		if( InventoryItemData.IsEmpty( selectedItem ) )
+		var itemQuality : gamedataQuality;
+		var isMaxed : Bool;
+		var buttonState : EProgressBarState;
+		itemQuality = RPGManager.GetItemTierForUpgrades( InventoryItemData.GetGameItemData( selectedItem ) );
+		isMaxed = IsItemMaxedLevel( itemQuality );
+		if( selectedItem.Empty || isMaxed )
 		{
 			inkWidgetRef.SetVisible( m_itemDetailsContainer, false );
 			return;
 		}
 		inkWidgetRef.SetVisible( m_itemDetailsContainer, true );
 		m_selectedItemData = selectedItem;
-		m_selectedRecipe = m_craftingSystem.GetUpgradeRecipeData( InventoryItemData.GetID( m_selectedItemData ) );
+		m_selectedRecipe = m_craftingSystem.GetUpgradeRecipeData( m_selectedItemData.ID );
 		SetupIngredients( m_selectedRecipe.ingredients );
-		UpdateTooltipData();
-		SetQualityHeader();
 		m_isCraftable = IsUpgradable( m_selectedItemData, true );
+		UpdateTooltipData();
+		SetItemNames();
+		buttonState = ( ( m_isCraftable ) ? ( EProgressBarState.Available ) : ( EProgressBarState.Blocked ) );
 		inkTextRef.SetVisible( m_blockedText, !( m_isCraftable ) );
-		m_progressButtonController.SetAvaibility( m_isCraftable );
+		inkWidgetRef.SetVisible( m_arrowComparison, m_isCraftable );
+		m_progressButtonController.SetAvaibility( buttonState );
 	}
 
-	private function SetupIngredients( ingredient : array< IngredientData > )
+	private function SetupIngredients( const ingredient : ref< array< IngredientData > > )
 	{
 		var i, ingredientCount : Int32;
 		var controller : weak< IngredientListItemLogicController >;
@@ -85,52 +113,156 @@ class UpgradingScreenController extends CraftingMainLogicController
 
 	private function UpdateTooltipData()
 	{
-		GetItemTooltips( m_selectedItemData );
-		if( m_itemTooltipControllers.Size() <= 0 )
+		var delayedCall : DelayedTooltipCall;
+		var itemQuality : gamedataQuality;
+		var isQualityShown : Bool;
+		delayedCall = CreateDelayedCall();
+		itemQuality = RPGManager.GetItemQuality( InventoryItemData.GetGameItemData( m_selectedItemData ) );
+		isQualityShown = IsQualityShown( itemQuality );
+		if( m_isCraftable || isQualityShown )
 		{
-			AsyncSpawnFromExternal( inkWidgetRef.Get( m_tooltipContainer ), R"base\gameplay\gui\common\tooltip\itemtooltip.inkwidget", 'itemTooltip', this, 'OnItemTooltipSpawned' );
-			AsyncSpawnFromExternal( inkWidgetRef.Get( m_tooltipContainer ), R"base\gameplay\gui\common\tooltip\itemtooltip.inkwidget", 'itemTooltip', this, 'OnUpgradedItemTooltipSpawned' );
+			UpdateTooltipLeft();
+			m_DelaySystem.DelayCallback( delayedCall, DELAYED_TOOLTIP_RIGHT, false );
 			return;
 		}
-		m_itemTooltipControllers[ 0 ].SetData( m_tooltipDatas[ 0 ] );
-		ApplyStatsModification();
-		m_itemTooltipControllers[ 1 ].SetData( m_tooltipDatas[ 1 ] );
-		RemoveStatsModification();
+		else
+		{
+			HideTooltips();
+		}
 	}
 
-	protected event OnItemTooltipSpawned( widget : inkWidget, userData : IScriptable )
+	private function CreateDelayedCall() : DelayedTooltipCall
+	{
+		var delay : DelayedTooltipCall;
+		delay = new DelayedTooltipCall;
+		delay.m_controller = this;
+		return delay;
+	}
+
+	private function UpdateTooltipLeft()
+	{
+		m_tooltipDataLeft = m_inventoryManager.GetMinimalTooltipDataForInventoryItem( m_selectedItemData, false, NULL, false );
+		m_tooltipDataLeft.displayContext = InventoryTooltipDisplayContext.Upgrading;
+		m_itemTooltipControllerLeft.SetData( m_tooltipDataLeft );
+	}
+
+	public function UpdateTooltipRightAndShow()
+	{
+		ApplyQualityModifier( 1.0 );
+		m_tooltipDataRight = m_inventoryManager.GetMinimalTooltipDataForInventoryItem( m_selectedItemData, false, NULL, false );
+		m_tooltipDataRight.isEquipped = false;
+		m_tooltipDataRight.price = ( ( Float )( RPGManager.CalculateSellPriceItemData( m_Game, m_Player, InventoryItemData.GetGameItemData( m_selectedItemData ) ) ) );
+		m_tooltipDataRight.displayContext = InventoryTooltipDisplayContext.Upgrading;
+		FillBarsComparisonData( m_tooltipDataLeft, m_tooltipDataRight );
+		m_itemTooltipControllerRight.SetData( m_tooltipDataRight );
+		ApplyQualityModifier( -1.0 );
+		ShowTooltips();
+	}
+
+	private function ShowTooltips()
+	{
+		if( m_itemTooltipControllerLeft )
+		{
+			m_itemTooltipControllerLeft.Show();
+		}
+		if( m_itemTooltipControllerRight )
+		{
+			m_itemTooltipControllerRight.Show();
+		}
+	}
+
+	private function HideTooltips()
+	{
+		if( m_itemTooltipControllerLeft )
+		{
+			m_itemTooltipControllerLeft.Hide();
+		}
+		if( m_itemTooltipControllerRight )
+		{
+			m_itemTooltipControllerRight.Hide();
+		}
+	}
+
+	private function FillBarsComparisonData( tooltipDataLeft : MinimalItemTooltipData, tooltipDataRight : MinimalItemTooltipData )
+	{
+		var statsManagerLeft : weak< UIInventoryItemStatsManager >;
+		var statsManagerRight : weak< UIInventoryItemStatsManager >;
+		var weaponBarsLeft : weak< UIInventoryItemWeaponBars >;
+		var weaponBarsRight : weak< UIInventoryItemWeaponBars >;
+		statsManagerLeft = tooltipDataLeft.GetStatsManager();
+		statsManagerRight = tooltipDataRight.GetStatsManager();
+		weaponBarsLeft = statsManagerLeft.GetWeaponBars();
+		weaponBarsRight = statsManagerRight.GetWeaponBars();
+		weaponBarsRight.SetComparedBars( weaponBarsLeft );
+	}
+
+	private function ApplyQualityModifier( multiplier : Float )
+	{
+		var itemData : weak< gameItemData >;
+		var qualityOld : Float;
+		var qualityNew : Float;
+		var mod : gameStatModifierData;
+		itemData = InventoryItemData.GetGameItemData( m_selectedItemData );
+		qualityOld = itemData.GetStatValueByType( gamedataStatType.WasItemUpgraded );
+		qualityNew = qualityOld + ( 1.0 * multiplier );
+		m_StatsSystem.RemoveAllModifiers( itemData.GetStatsObjectID(), gamedataStatType.WasItemUpgraded, true );
+		mod = RPGManager.CreateStatModifier( gamedataStatType.WasItemUpgraded, gameStatModifierType.Additive, qualityNew );
+		m_StatsSystem.AddSavedModifier( itemData.GetStatsObjectID(), mod );
+	}
+
+	protected event OnItemTooltipSpawnedLeft( widget : inkWidget, userData : IScriptable )
 	{
 		var tooltipController : AGenericTooltipController;
 		tooltipController = ( ( AGenericTooltipController )( widget.GetController() ) );
-		tooltipController.SetData( m_tooltipDatas[ 0 ] );
-		m_itemTooltipControllers.PushBack( tooltipController );
+		tooltipController.Hide();
+		m_itemTooltipControllerLeft = tooltipController;
 	}
 
-	protected event OnUpgradedItemTooltipSpawned( widget : inkWidget, userData : IScriptable )
+	protected event OnItemTooltipSpawnedRight( widget : inkWidget, userData : IScriptable )
 	{
 		var tooltipController : AGenericTooltipController;
 		tooltipController = ( ( AGenericTooltipController )( widget.GetController() ) );
-		m_itemTooltipControllers.PushBack( tooltipController );
-		ApplyStatsModification();
-		tooltipController.SetData( m_tooltipDatas[ 1 ] );
-		RemoveStatsModification();
+		tooltipController.Hide();
+		m_itemTooltipControllerRight = tooltipController;
 	}
 
-	private function SetQualityHeader()
+	private function SetItemNames()
 	{
-		var rarityLabel, iconicLabel : String;
-		var stateName : CName;
-		var isIconic : Bool;
-		var quality : gamedataQuality;
-		iconicLabel = GetLocalizedText( UIItemsHelper.QualityToLocalizationKey( gamedataQuality.Iconic ) );
-		stateName = InventoryItemData.GetQuality( m_selectedItemData );
-		isIconic = RPGManager.IsItemIconic( InventoryItemData.GetGameItemData( m_selectedItemData ) );
-		quality = UIItemsHelper.QualityNameToEnum( InventoryItemData.GetQuality( m_selectedItemData ) );
-		rarityLabel = GetLocalizedText( UIItemsHelper.QualityToLocalizationKey( quality ) );
-		inkTextRef.SetText( m_itemQuality, ( ( isIconic ) ? ( ( rarityLabel + " / " ) + iconicLabel ) : ( rarityLabel ) ) );
-		inkTextRef.SetState( m_itemQuality, stateName );
-		inkTextRef.SetText( m_itemName, m_selectedRecipe.label );
-		inkTextRef.SetState( m_itemName, stateName );
+		var itemQuality : gamedataQuality;
+		var isShown : Bool;
+		itemQuality = RPGManager.GetItemQuality( InventoryItemData.GetGameItemData( m_selectedItemData ) );
+		isShown = IsQualityShown( itemQuality );
+		inkTextRef.SetVisible( m_itemName, isShown );
+		inkTextRef.SetVisible( m_itemNameUpgrade, false );
+		inkTextRef.SetText( m_itemName, m_selectedItemData.Name );
+		inkTextRef.SetText( m_itemNameUpgrade, m_selectedRecipe.label );
+	}
+
+	private function IsQualityShown( itemQuality : gamedataQuality ) : Bool
+	{
+		return ( ( ( ( ( ( ( ( itemQuality == gamedataQuality.CommonPlus || itemQuality == gamedataQuality.UncommonPlus ) || itemQuality == gamedataQuality.RarePlus ) || itemQuality == gamedataQuality.EpicPlus ) || itemQuality == gamedataQuality.Common ) || itemQuality == gamedataQuality.Uncommon ) || itemQuality == gamedataQuality.Rare ) || itemQuality == gamedataQuality.Epic ) || itemQuality == gamedataQuality.Legendary ) || itemQuality == gamedataQuality.LegendaryPlus;
+	}
+
+	private function IsItemMaxedLevel( itemQuality : gamedataQuality ) : Bool
+	{
+		return itemQuality == gamedataQuality.LegendaryPlusPlus;
+	}
+
+	private function IsLastUpgrade( itemQuality : gamedataQuality ) : Bool
+	{
+		return itemQuality == gamedataQuality.LegendaryPlus;
+	}
+
+	private function SetItemQualities()
+	{
+		var qualityUpgradeType : gamedataQuality;
+		var qualityUpgradeName : CName;
+		var qualityNormalName : CName;
+		qualityUpgradeType = RPGManager.GetNextItemQuality( InventoryItemData.GetGameItemData( m_selectedItemData ) );
+		qualityUpgradeName = UIItemsHelper.QualityEnumToName( qualityUpgradeType );
+		qualityNormalName = m_selectedItemData.Quality;
+		inkTextRef.SetState( m_itemName, qualityNormalName );
+		inkTextRef.SetState( m_itemNameUpgrade, qualityUpgradeName );
 	}
 
 	protected event OnHoldFinished( evt : ProgressBarFinishedProccess )
@@ -140,6 +272,8 @@ class UpgradingScreenController extends CraftingMainLogicController
 			return false;
 		}
 		UpgradeItem( m_selectedItemData );
+		PlaySound( 'Item', 'OnCrafted' );
+		PlayRumble( RumbleStrength.Heavy, RumbleType.Pulse, RumblePosition.Right );
 	}
 
 	protected override function SetItemButtonHintsHoverOver( evt : inkPointerEvent )
@@ -155,61 +289,33 @@ class UpgradingScreenController extends CraftingMainLogicController
 		var i : Int32;
 		var itemArrayHolder : array< IScriptable >;
 		m_inventoryManager.MarkToRebuild();
-		for( i = 0; i < m_EquipAreas.Size(); i += 1 )
-		{
-			FillInventoryData( m_inventoryManager.GetPlayerInventoryData( m_EquipAreas[ i ] ), itemArrayHolder );
-		}
 		for( i = 0; i < m_WeaponAreas.Size(); i += 1 )
 		{
-			FillInventoryData( m_inventoryManager.GetPlayerItemsByType( m_WeaponAreas[ i ] ), itemArrayHolder );
+			FillInventoryData( m_inventoryManager.GetPlayerIconicWeaponsByType( m_WeaponAreas[ i ] ), itemArrayHolder );
 		}
 		return itemArrayHolder;
 	}
 
-	private function GetItemTooltips( oldData : InventoryItemData )
-	{
-		var newData : InventoryItemData;
-		m_tooltipDatas.Clear();
-		m_newItem = GameInstance.GetTransactionSystem( m_craftingGameController.GetPlayer().GetGame() ).GetItemData( m_craftingGameController.GetPlayer(), InventoryItemData.GetID( oldData ) );
-		ApplyStatsModification();
-		newData = m_inventoryManager.GetInventoryItemData( m_craftingGameController.GetPlayer(), m_newItem, false, false );
-		m_tooltipDatas.PushBack( m_inventoryManager.GetComparisonTooltipsData( newData, oldData, false ) );
-		m_tooltipDatas.PushBack( m_inventoryManager.GetComparisonTooltipsData( oldData, newData, false ) );
-		m_tooltipDatas[ 0 ].displayContext = InventoryTooltipDisplayContext.Upgrading;
-		m_tooltipDatas[ 1 ].displayContext = InventoryTooltipDisplayContext.Upgrading;
-		RemoveStatsModification();
-	}
-
-	private function ApplyStatsModification()
-	{
-		m_statMod = RPGManager.CreateStatModifier( gamedataStatType.ItemLevel, gameStatModifierType.Additive, 10.0 );
-		GameInstance.GetStatsSystem( m_craftingGameController.GetPlayer().GetGame() ).AddModifier( m_newItem.GetStatsObjectID(), m_statMod );
-		if( TweakDBInterface.GetItemRecord( ItemID.GetTDBID( m_newItem.GetID() ) ).TagsContains( WeaponObject.GetRangedWeaponTag() ) )
-		{
-			m_levelMod = RPGManager.CreateStatModifier( gamedataStatType.Level, gameStatModifierType.Additive, 1.0 );
-			GameInstance.GetStatsSystem( m_craftingGameController.GetPlayer().GetGame() ).AddModifier( m_newItem.GetStatsObjectID(), m_levelMod );
-		}
-	}
-
-	private function RemoveStatsModification()
-	{
-		GameInstance.GetStatsSystem( m_craftingGameController.GetPlayer().GetGame() ).RemoveModifier( m_newItem.GetStatsObjectID(), m_statMod );
-		if( m_levelMod )
-		{
-			GameInstance.GetStatsSystem( m_craftingGameController.GetPlayer().GetGame() ).RemoveModifier( m_newItem.GetStatsObjectID(), m_levelMod );
-		}
-	}
-
-	private function UpgradeItem( selectedItemData : InventoryItemData )
+	private function UpgradeItem( const selectedItemData : ref< InventoryItemData > )
 	{
 		var upgradeItemRequest : UpgradeItemRequest;
+		var itemQuality : gamedataQuality;
+		var isEmpty : Bool;
+		var isLastUpgrade : Bool;
+		itemQuality = RPGManager.GetItemTierForUpgrades( InventoryItemData.GetGameItemData( m_selectedItemData ) );
+		isEmpty = IsEmptyData();
+		isLastUpgrade = IsLastUpgrade( itemQuality );
 		upgradeItemRequest = new UpgradeItemRequest;
 		upgradeItemRequest.owner = m_craftingGameController.GetPlayer();
-		upgradeItemRequest.itemID = InventoryItemData.GetID( selectedItemData );
+		upgradeItemRequest.itemID = selectedItemData.ID;
 		m_craftingSystem.QueueRequest( upgradeItemRequest );
+		if( isLastUpgrade && !( isEmpty ) )
+		{
+			DispatchSelectDelayed( 0 );
+		}
 	}
 
-	private function FillInventoryData( itemDataHolder : array< InventoryItemData >, out itemArrayHolder : array< IScriptable > )
+	private function FillInventoryData( const itemDataHolder : ref< array< InventoryItemData > >, itemArrayHolder : ref< array< IScriptable > > )
 	{
 		var itemWrapper : ItemCraftingData;
 		var itemData : gameItemData;
@@ -220,8 +326,8 @@ class UpgradingScreenController extends CraftingMainLogicController
 			itemWrapper.inventoryItem = itemDataHolder[ i ];
 			itemData = InventoryItemData.GetGameItemData( itemDataHolder[ i ] );
 			itemWrapper.isUpgradable = IsUpgradable( itemDataHolder[ i ], false );
-			itemWrapper.isNew = m_craftingGameController.GetScriptableSystem().IsInventoryItemNew( InventoryItemData.GetID( itemDataHolder[ i ] ) );
-			if( !( RPGManager.IsItemMaxLevel( itemData ) ) )
+			itemWrapper.isNew = m_craftingGameController.GetScriptableSystem().IsInventoryItemNew( itemDataHolder[ i ].ID );
+			if( !( RPGManager.IsItemMaxTier( itemData ) ) )
 			{
 				itemArrayHolder.PushBack( itemWrapper );
 			}
@@ -229,18 +335,18 @@ class UpgradingScreenController extends CraftingMainLogicController
 		}
 	}
 
-	private function IsUpgradable( item : InventoryItemData, sendNotification : Bool ) : Bool
+	private function IsUpgradable( const item : ref< InventoryItemData >, sendNotification : Bool ) : Bool
 	{
 		var canUpgrade : Bool;
 		var pl_level, it_level : Int32;
 		var playerDevelopmentData : PlayerDevelopmentData;
 		var levelParams : inkTextParams;
-		var isItemMaxLevel : Bool;
+		var isItemMaxTier : Bool;
 		playerDevelopmentData = PlayerDevelopmentSystem.GetData( m_craftingGameController.GetPlayer() );
 		pl_level = playerDevelopmentData.GetProficiencyLevel( gamedataProficiencyType.Level );
-		it_level = InventoryItemData.GetRequiredLevel( item ) + 1;
+		it_level = 1;
 		canUpgrade = m_craftingSystem.CanItemBeUpgraded( InventoryItemData.GetGameItemData( item ) ) && ( pl_level >= it_level );
-		isItemMaxLevel = RPGManager.IsItemMaxLevel( InventoryItemData.GetGameItemData( item ) );
+		isItemMaxTier = RPGManager.IsItemMaxTier( InventoryItemData.GetGameItemData( item ) );
 		if( sendNotification && !( canUpgrade ) )
 		{
 			if( pl_level < it_level )
@@ -255,12 +361,26 @@ class UpgradingScreenController extends CraftingMainLogicController
 				inkTextRef.SetText( m_blockedText, "LocKey#42797" );
 				m_notificationType = UIMenuNotificationType.CraftingNotEnoughMaterial;
 			}
-			else if( isItemMaxLevel )
+			else if( isItemMaxTier )
 			{
 				m_notificationType = UIMenuNotificationType.InventoryActionBlocked;
 			}
 		}
 		return canUpgrade;
+	}
+
+}
+
+class DelayedTooltipCall extends DelayCallback
+{
+	var m_controller : weak< UpgradingScreenController >;
+
+	public override function Call()
+	{
+		if( m_controller )
+		{
+			m_controller.UpdateTooltipRightAndShow();
+		}
 	}
 
 }

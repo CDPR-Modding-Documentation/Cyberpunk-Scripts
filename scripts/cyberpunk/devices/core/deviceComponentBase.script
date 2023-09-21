@@ -1,3 +1,12 @@
+class RevokeQuickHackAccess extends Event
+{
+}
+
+class SetRevealedInNetwork extends Event
+{
+	var wasRevealed : Bool;
+}
+
 importonly class DeviceComponent extends GameComponent
 {
 }
@@ -22,6 +31,345 @@ class ScriptableDeviceComponent extends DeviceComponent
 
 }
 
+class SharedGameplayPS extends DeviceComponentPS
+{
+	protected instanceeditable persistent var m_deviceState : EDeviceStatus;
+	protected instanceeditable persistent var m_authorizationProperties : AuthorizationData;
+	protected persistent var m_wasStateCached : Bool;
+	protected persistent var m_wasStateSet : Bool;
+	protected persistent var m_cachedDeviceState : EDeviceStatus;
+	[ category = "Devices Grid" ]
+	protected instanceeditable var m_revealDevicesGrid : Bool;
+	[ category = "Devices Grid" ]
+	protected instanceeditable var m_revealDevicesGridWhenUnpowered : Bool;
+	protected persistent var m_wasRevealedInNetworkPing : Bool;
+	[ category = "Backdoor Properties" ]
+	protected instanceeditable var m_hasNetworkBackdoor : Bool;
+
+	public const function GetDeviceState() : EDeviceStatus
+	{
+		return m_deviceState;
+	}
+
+	protected function CacheDeviceState( state : EDeviceStatus )
+	{
+		m_cachedDeviceState = state;
+		m_wasStateCached = true;
+	}
+
+	protected virtual function SetDeviceState( state : EDeviceStatus )
+	{
+		m_deviceState = state;
+		m_wasStateSet = true;
+	}
+
+	public virtual function EvaluateDeviceState()
+	{
+		var i : Int32;
+		var parents : array< DeviceComponentPS >;
+		var expectedState : EDeviceStatus;
+		var parent : MasterControllerPS;
+		if( m_deviceState == EDeviceStatus.DISABLED )
+		{
+			return;
+		}
+		parents = GetImmediateParents();
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			parent = ( ( MasterControllerPS )( parents[ i ] ) );
+			if( parent )
+			{
+				expectedState = parent.GetExpectedSlaveState();
+				if( expectedState != EDeviceStatus.INVALID )
+				{
+					SetDeviceState( expectedState );
+					return;
+				}
+			}
+		}
+	}
+
+	protected const final function QueuePSEvent( targetPS : weak< PersistentState >, evt : Event )
+	{
+		if( !( targetPS ) )
+		{
+			return;
+		}
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( targetPS.GetID(), targetPS.GetClassName(), evt );
+	}
+
+	protected const final function QueuePSEvent( targetID : PersistentID, psClassName : CName, evt : Event )
+	{
+		if( ( ( BaseScriptableAction )( evt ) ) )
+		{
+			if( !( EntityID.IsDefined( ( ( BaseScriptableAction )( evt ) ).GetRequesterID() ) ) )
+			{
+				( ( BaseScriptableAction )( evt ) ).RegisterAsRequester( GetMyEntityID() );
+			}
+		}
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( targetID, psClassName, evt );
+	}
+
+	protected const final function QueuePSEventWithDelay( targetPS : weak< PersistentState >, evt : Event, delay : Float )
+	{
+		if( !( targetPS ) )
+		{
+			return;
+		}
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( targetPS.GetID(), targetPS.GetClassName(), evt, delay );
+	}
+
+	protected const final function QueuePSEventWithDelay( targetID : PersistentID, psClassName : CName, evt : Event, delay : Float )
+	{
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( targetID, psClassName, evt, delay );
+	}
+
+	protected const final function QueueEntityEvent( entityID : EntityID, evt : Event )
+	{
+		GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( entityID, evt );
+	}
+
+	public const virtual function IsPartOfSystem( systemType : ESystems ) : Bool
+	{
+		switch( systemType )
+		{
+			case ESystems.SecuritySystem:
+				return IsConnectedToSecuritySystem();
+			case ESystems.AccessPoints:
+				return IsConnectedToBackdoorDevice();
+			default:
+				return false;
+		}
+	}
+
+	public const function IsConnectedToSecuritySystem() : Bool
+	{
+		var securitySystem : SecuritySystemControllerPS;
+		securitySystem = GetSecuritySystem();
+		return securitySystem;
+	}
+
+	public const virtual function IsConnectedToSecuritySystem( out level : ESecurityAccessLevel ) : Bool
+	{
+		level = GetSecurityAccessLevel();
+		return IsConnectedToSecuritySystem();
+	}
+
+	public const virtual function GetSecurityAccessLevel() : ESecurityAccessLevel
+	{
+		return FindHighestSecurityAccessLevel( GetSecurityAreas() );
+	}
+
+	protected const function FindHighestSecurityAccessLevel( const securityAreas : ref< array< SecurityAreaControllerPS > > ) : ESecurityAccessLevel
+	{
+		var i : Int32;
+		var highestLevel : ESecurityAccessLevel;
+		highestLevel = ESecurityAccessLevel.ESL_NONE;
+		for( i = 0; i < securityAreas.Size(); i += 1 )
+		{
+			if( ( ( Int64 )( securityAreas[ i ].GetSecurityAccessLevel() ) ) > ( ( Int64 )( highestLevel ) ) )
+			{
+				highestLevel = securityAreas[ i ].GetSecurityAccessLevel();
+			}
+		}
+		if( highestLevel == ESecurityAccessLevel.ESL_NONE )
+		{
+			highestLevel = m_authorizationProperties.m_authorizationDataEntry.m_level;
+		}
+		return highestLevel;
+	}
+
+	public const virtual function IsBreached() : Bool
+	{
+		var aps : array< AccessPointControllerPS >;
+		var i : Int32;
+		aps = GetAccessPoints();
+		for( i = 0; i < aps.Size(); i += 1 )
+		{
+			if( aps[ i ].IsNetworkBreached() )
+			{
+				return true;
+			}
+		}
+		if( !( IsFinal() ) )
+		{
+		}
+		return false;
+	}
+
+	public const virtual function HasNetworkBackdoor() : Bool
+	{
+		var ap : AccessPointControllerPS;
+		if( m_hasNetworkBackdoor && ( ( ( Int32 )( GetDeviceState() ) ) > ( ( Int32 )( EDeviceStatus.UNPOWERED ) ) ) )
+		{
+			ap = GetBackdoorAccessPoint();
+			if( ap )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const virtual function IsConnectedToBackdoorDevice() : Bool
+	{
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( ScriptableDeviceComponentPS )( parents[ i ] ) ).HasNetworkBackdoor() )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public const virtual function GetBackdoorAccessPoint() : AccessPointControllerPS
+	{
+		var aps : array< AccessPointControllerPS >;
+		var backdoorAP : AccessPointControllerPS;
+		if( !( m_hasNetworkBackdoor ) )
+		{
+			if( !( IsFinal() ) )
+			{
+			}
+			return NULL;
+		}
+		aps = GetAccessPoints();
+		if( aps.Size() > 0 )
+		{
+			backdoorAP = aps[ 0 ];
+			return backdoorAP;
+		}
+		if( !( IsFinal() ) )
+		{
+		}
+		return NULL;
+	}
+
+	public const function GetAccessPoints() : array< AccessPointControllerPS >
+	{
+		var ap : AccessPointControllerPS;
+		var aps : array< AccessPointControllerPS >;
+		var parents : array< DeviceComponentPS >;
+		var i : Int32;
+		GetParents( parents );
+		for( i = 0; i < parents.Size(); i += 1 )
+		{
+			if( ( ( AccessPointControllerPS )( parents[ i ] ) ) )
+			{
+				ap = ( ( AccessPointControllerPS )( parents[ i ] ) );
+				aps.PushBack( ap );
+			}
+		}
+		return aps;
+	}
+
+	public const virtual function GetNetworkName() : String
+	{
+		var aps : array< AccessPointControllerPS >;
+		var networkName : String;
+		aps = GetAccessPoints();
+		if( aps.Size() > 0 )
+		{
+			networkName = aps[ 0 ].GetNetworkName();
+			if( IsStringValid( networkName ) )
+			{
+				return networkName;
+			}
+			else
+			{
+				return "LOCAL NETWORK";
+			}
+		}
+		if( !( IsFinal() ) )
+		{
+		}
+		return "";
+	}
+
+	public const function CheckMasterConnectedClassTypes() : ConnectedClassTypes
+	{
+		var data, processedData, emptyData : ConnectedClassTypes;
+		var aps : array< AccessPointControllerPS >;
+		var i : Int32;
+		aps = GetAccessPoints();
+		for( i = 0; i < aps.Size(); i += 1 )
+		{
+			processedData = emptyData;
+			processedData = aps[ i ].CheckConnectedClassTypes();
+			if( processedData.surveillanceCamera == true )
+			{
+				data.surveillanceCamera = true;
+			}
+			if( processedData.securityTurret == true )
+			{
+				data.securityTurret = true;
+			}
+			if( processedData.puppet == true )
+			{
+				data.puppet = true;
+			}
+		}
+		return data;
+	}
+
+	public const virtual function WasRevealedInNetworkPing() : Bool
+	{
+		return m_wasRevealedInNetworkPing;
+	}
+
+	public const virtual function SetRevealedInNetworkPing( wasRevealed : Bool )
+	{
+		var evt : SetRevealedInNetwork;
+		if( m_wasRevealedInNetworkPing == wasRevealed )
+		{
+			return;
+		}
+		evt = new SetRevealedInNetwork;
+		evt.wasRevealed = wasRevealed;
+		QueuePSEvent( GetID(), GetClassName(), evt );
+	}
+
+	private function OnSetRevealedInNetwork( evt : SetRevealedInNetwork ) : EntityNotificationType
+	{
+		var notifyNetworkSystem : MarkBackdoorAsRevealedRequest;
+		if( m_wasRevealedInNetworkPing == evt.wasRevealed )
+		{
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
+		m_wasRevealedInNetworkPing = evt.wasRevealed;
+		if( HasNetworkBackdoor() )
+		{
+			notifyNetworkSystem = new MarkBackdoorAsRevealedRequest;
+			notifyNetworkSystem.device = this;
+			GetNetworkSystem().QueueRequest( notifyNetworkSystem );
+		}
+		return EntityNotificationType.SendThisEventToEntity;
+	}
+
+	public const virtual function IsPuppet() : Bool
+	{
+		return false;
+	}
+
+}
+
+class ProcessDevicesEvent extends Event
+{
+	var devices : array< DeviceComponentPS >;
+}
+
+class ExtractDevicesEvent extends Event
+{
+	var lazyDevices : array< LazyDevice >;
+	var devices : array< DeviceComponentPS >;
+	var eventToSendOnCompleted : ProcessDevicesEvent;
+	var lastExtractedIndex : Int32;
+}
+
 import class DeviceComponentPS extends GameComponentPS
 {
 	[ category = "Quest" ]
@@ -37,6 +385,9 @@ import class DeviceComponentPS extends GameComponentPS
 	protected instanceeditable inlined persistent var m_backdoorObjectiveData : BackDoorObjectiveData;
 	[ category = "Quest" ]
 	protected instanceeditable inlined persistent var m_controlPanelObjectiveData : ControlPanelObjectiveData;
+	[ category = "UI Zoom / Fullscreen" ]
+	protected instanceeditable var m_deviceUIStyle : gamedataComputerUIStyle;
+	default m_deviceUIStyle = gamedataComputerUIStyle.LightBlue;
 	protected var m_blackboard : weak< IBlackboard >;
 	protected persistent var m_isScanned : Bool;
 	default m_isScanned = false;
@@ -49,7 +400,7 @@ import class DeviceComponentPS extends GameComponentPS
 	protected var m_maxDevicesToExtractInOneFrame : Int32;
 	default m_maxDevicesToExtractInOneFrame = 10;
 
-	protected function ProcessDevicesLazy( lazyDevices : array< LazyDevice >, optional eventToSendOnCompleted : ProcessDevicesEvent )
+	protected function ProcessDevicesLazy( const lazyDevices : ref< array< LazyDevice > >, optional eventToSendOnCompleted : ProcessDevicesEvent )
 	{
 		var evt : ExtractDevicesEvent;
 		evt = new ExtractDevicesEvent;
@@ -137,7 +488,7 @@ import class DeviceComponentPS extends GameComponentPS
 		return true;
 	}
 
-	public virtual function GetQuestActions( out outActions : array< DeviceAction >, context : GetActionsContext ) {}
+	public virtual function GetQuestActions( out outActions : array< DeviceAction >, const context : ref< GetActionsContext > ) {}
 
 	public virtual function GetQuestActionByName( actionName : CName ) : DeviceAction
 	{
@@ -447,7 +798,7 @@ import class DeviceComponentPS extends GameComponentPS
 		return '';
 	}
 
-	public virtual function GetDeviceWidget( context : GetActionsContext ) : SDeviceWidgetPackage
+	public virtual function GetDeviceWidget( const context : ref< GetActionsContext > ) : SDeviceWidgetPackage
 	{
 		var widgetData : SDeviceWidgetPackage;
 		return widgetData;
@@ -468,14 +819,20 @@ import class DeviceComponentPS extends GameComponentPS
 		return R"";
 	}
 
-	protected virtual function GetInkWidgetLibraryID( context : GetActionsContext ) : CName
+	protected virtual function GetInkWidgetLibraryID( const context : ref< GetActionsContext > ) : CName
 	{
 		return '';
 	}
 
-	protected virtual function GetInkWidgetTweakDBID( context : GetActionsContext ) : TweakDBID
+	protected virtual function GetInkWidgetTweakDBID( const context : ref< GetActionsContext > ) : TweakDBID
 	{
-		return T"DevicesUIDefinitions.GenericDeviceWidget";
+		switch( m_deviceUIStyle )
+		{
+			case gamedataComputerUIStyle.Orange:
+				return T"DevicesUIDefinitions.GenericDeviceWidgetOA";
+			default:
+				return T"DevicesUIDefinitions.GenericDeviceWidget";
+		}
 	}
 
 	protected virtual function GetBackgroundTextureTweakDBID() : TweakDBID
@@ -494,7 +851,7 @@ import class DeviceComponentPS extends GameComponentPS
 		return widgetData;
 	}
 
-	protected virtual function GetActionWidgets( context : GetActionsContext ) : array< SActionWidgetPackage >
+	protected virtual function GetActionWidgets( const context : ref< GetActionsContext > ) : array< SActionWidgetPackage >
 	{
 		var widgetsData : array< SActionWidgetPackage >;
 		return widgetsData;
@@ -520,7 +877,7 @@ import class DeviceComponentPS extends GameComponentPS
 		m_isScanned = isComplete;
 	}
 
-	public virtual function DetermineInteractionState( interactionComponent : InteractionComponent, context : GetActionsContext ) {}
+	public virtual function DetermineInteractionState( interactionComponent : InteractionComponent, const context : ref< GetActionsContext > ) {}
 
 	public function PassBlackboard( blackboard : IBlackboard )
 	{
@@ -556,6 +913,7 @@ import class DeviceComponentPS extends GameComponentPS
 		action = new ThumbnailUI;
 		action.SetUp( this );
 		action.SetProperties();
+		action.SetWidgetStyle( m_deviceUIStyle );
 		action.AddDeviceName( GetDeviceName() );
 		action.CreateThumbnailWidgetPackage( "LocKey#42210" );
 		return action;
@@ -566,366 +924,6 @@ import class DeviceComponentPS extends GameComponentPS
 		return PersistentID.ExtractEntityID( GetID() );
 	}
 
-}
-
-class SharedGameplayPS extends DeviceComponentPS
-{
-	protected instanceeditable persistent var m_deviceState : EDeviceStatus;
-	protected instanceeditable persistent var m_authorizationProperties : AuthorizationData;
-	protected persistent var m_wasStateCached : Bool;
-	protected persistent var m_wasStateSet : Bool;
-	protected persistent var m_cachedDeviceState : EDeviceStatus;
-	[ category = "Devices Grid" ]
-	protected instanceeditable var m_revealDevicesGrid : Bool;
-	[ category = "Devices Grid" ]
-	protected instanceeditable var m_revealDevicesGridWhenUnpowered : Bool;
-	protected persistent var m_wasRevealedInNetworkPing : Bool;
-	[ category = "Backdoor Properties" ]
-	protected instanceeditable var m_hasNetworkBackdoor : Bool;
-
-	public const function GetDeviceState() : EDeviceStatus
-	{
-		return m_deviceState;
-	}
-
-	protected function CacheDeviceState( state : EDeviceStatus )
-	{
-		m_cachedDeviceState = state;
-		m_wasStateCached = true;
-	}
-
-	protected virtual function SetDeviceState( state : EDeviceStatus )
-	{
-		m_deviceState = state;
-		m_wasStateSet = true;
-	}
-
-	public virtual function EvaluateDeviceState()
-	{
-		var i : Int32;
-		var parents : array< DeviceComponentPS >;
-		var expectedState : EDeviceStatus;
-		var parent : MasterControllerPS;
-		if( m_deviceState == EDeviceStatus.DISABLED )
-		{
-			return;
-		}
-		parents = GetImmediateParents();
-		for( i = 0; i < parents.Size(); i += 1 )
-		{
-			parent = ( ( MasterControllerPS )( parents[ i ] ) );
-			if( parent )
-			{
-				expectedState = parent.GetExpectedSlaveState();
-				if( expectedState != EDeviceStatus.INVALID )
-				{
-					SetDeviceState( expectedState );
-					return;
-				}
-			}
-		}
-	}
-
-	protected const final function QueuePSEvent( targetPS : weak< PersistentState >, evt : Event )
-	{
-		if( !( targetPS ) )
-		{
-			return;
-		}
-		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( targetPS.GetID(), targetPS.GetClassName(), evt );
-	}
-
-	protected const final function QueuePSEvent( targetID : PersistentID, psClassName : CName, evt : Event )
-	{
-		if( ( ( BaseScriptableAction )( evt ) ) )
-		{
-			if( !( EntityID.IsDefined( ( ( BaseScriptableAction )( evt ) ).GetRequesterID() ) ) )
-			{
-				( ( BaseScriptableAction )( evt ) ).RegisterAsRequester( GetMyEntityID() );
-			}
-		}
-		GameInstance.GetPersistencySystem( GetGameInstance() ).QueuePSEvent( targetID, psClassName, evt );
-	}
-
-	protected const final function QueuePSEventWithDelay( targetPS : weak< PersistentState >, evt : Event, delay : Float )
-	{
-		if( !( targetPS ) )
-		{
-			return;
-		}
-		GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( targetPS.GetID(), targetPS.GetClassName(), evt, delay );
-	}
-
-	protected const final function QueuePSEventWithDelay( targetID : PersistentID, psClassName : CName, evt : Event, delay : Float )
-	{
-		GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( targetID, psClassName, evt, delay );
-	}
-
-	protected const final function QueueEntityEvent( entityID : EntityID, evt : Event )
-	{
-		GameInstance.GetPersistencySystem( GetGameInstance() ).QueueEntityEvent( entityID, evt );
-	}
-
-	public const virtual function IsPartOfSystem( systemType : ESystems ) : Bool
-	{
-		switch( systemType )
-		{
-			case ESystems.SecuritySystem:
-				return IsConnectedToSecuritySystem();
-			case ESystems.AccessPoints:
-				return IsConnectedToBackdoorDevice();
-		}
-	}
-
-	public const function IsConnectedToSecuritySystem() : Bool
-	{
-		var secSys : SecuritySystemControllerPS;
-		secSys = GetSecuritySystem();
-		if( secSys )
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public const virtual function IsConnectedToSecuritySystem( out level : ESecurityAccessLevel ) : Bool
-	{
-		var secSys : SecuritySystemControllerPS;
-		level = GetSecurityAccessLevel();
-		secSys = GetSecuritySystem();
-		if( secSys )
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public const virtual function GetSecurityAccessLevel() : ESecurityAccessLevel
-	{
-		return FindHighestSecurityAccessLevel( GetSecurityAreas() );
-	}
-
-	protected const function FindHighestSecurityAccessLevel( securityAreas : array< SecurityAreaControllerPS > ) : ESecurityAccessLevel
-	{
-		var i : Int32;
-		var highestLevel : ESecurityAccessLevel;
-		highestLevel = ESecurityAccessLevel.ESL_NONE;
-		for( i = 0; i < securityAreas.Size(); i += 1 )
-		{
-			if( ( ( Int64 )( securityAreas[ i ].GetSecurityAccessLevel() ) ) > ( ( Int64 )( highestLevel ) ) )
-			{
-				highestLevel = securityAreas[ i ].GetSecurityAccessLevel();
-			}
-		}
-		if( highestLevel == ESecurityAccessLevel.ESL_NONE )
-		{
-			highestLevel = m_authorizationProperties.m_authorizationDataEntry.m_level;
-		}
-		return highestLevel;
-	}
-
-	public const virtual function IsBreached() : Bool
-	{
-		var aps : array< AccessPointControllerPS >;
-		var i : Int32;
-		aps = GetAccessPoints();
-		for( i = 0; i < aps.Size(); i += 1 )
-		{
-			if( aps[ i ].IsNetworkBreached() )
-			{
-				return true;
-			}
-		}
-		if( !( IsFinal() ) )
-		{
-			LogDevices( this, "UNSUPPORTED AMOUNT OF ACCESS POINTS FOR THIS BACKDOOR DEVICE!", ELogType.ERROR );
-		}
-		return false;
-	}
-
-	public const virtual function HasNetworkBackdoor() : Bool
-	{
-		var ap : AccessPointControllerPS;
-		if( m_hasNetworkBackdoor && ( ( ( Int32 )( GetDeviceState() ) ) > ( ( Int32 )( EDeviceStatus.UNPOWERED ) ) ) )
-		{
-			ap = GetBackdoorAccessPoint();
-			if( ap )
-			{
-				return true;
-			}
-		}
-		return false;
-	}
-
-	public const virtual function IsConnectedToBackdoorDevice() : Bool
-	{
-		var parents : array< DeviceComponentPS >;
-		var i : Int32;
-		GetParents( parents );
-		for( i = 0; i < parents.Size(); i += 1 )
-		{
-			if( ( ( ScriptableDeviceComponentPS )( parents[ i ] ) ).HasNetworkBackdoor() )
-			{
-				return true;
-			}
-		}
-		return false;
-	}
-
-	public const virtual function GetBackdoorAccessPoint() : AccessPointControllerPS
-	{
-		var aps : array< AccessPointControllerPS >;
-		var backdoorAP : AccessPointControllerPS;
-		if( !( m_hasNetworkBackdoor ) )
-		{
-			if( !( IsFinal() ) )
-			{
-				LogDevices( this, "GetBackdoorAccessPoint called on a device that does not have network backdoor", ELogType.ERROR );
-			}
-			return NULL;
-		}
-		aps = GetAccessPoints();
-		if( aps.Size() > 0 )
-		{
-			backdoorAP = aps[ 0 ];
-			return backdoorAP;
-		}
-		if( !( IsFinal() ) )
-		{
-			LogDevices( this, "UNSUPPORTED AMOUNT OF ACCESS POINTS FOR THIS BACKDOOR DEVICE!", ELogType.ERROR );
-		}
-		return NULL;
-	}
-
-	public const function GetAccessPoints() : array< AccessPointControllerPS >
-	{
-		var ap : AccessPointControllerPS;
-		var aps : array< AccessPointControllerPS >;
-		var parents : array< DeviceComponentPS >;
-		var i : Int32;
-		GetParents( parents );
-		for( i = 0; i < parents.Size(); i += 1 )
-		{
-			if( ( ( AccessPointControllerPS )( parents[ i ] ) ) )
-			{
-				ap = ( ( AccessPointControllerPS )( parents[ i ] ) );
-				aps.PushBack( ap );
-			}
-		}
-		return aps;
-	}
-
-	public const virtual function GetNetworkName() : String
-	{
-		var aps : array< AccessPointControllerPS >;
-		var networkName : String;
-		aps = GetAccessPoints();
-		if( aps.Size() > 0 )
-		{
-			networkName = aps[ 0 ].GetNetworkName();
-			if( IsStringValid( networkName ) )
-			{
-				return networkName;
-			}
-			else
-			{
-				return "LOCAL NETWORK";
-			}
-		}
-		if( !( IsFinal() ) )
-		{
-			LogDevices( this, "Illegal callback", ELogType.ERROR );
-		}
-		return "";
-	}
-
-	public const function CheckMasterConnectedClassTypes() : ConnectedClassTypes
-	{
-		var data, processedData, emptyData : ConnectedClassTypes;
-		var aps : array< AccessPointControllerPS >;
-		var i : Int32;
-		aps = GetAccessPoints();
-		for( i = 0; i < aps.Size(); i += 1 )
-		{
-			processedData = emptyData;
-			processedData = aps[ i ].CheckConnectedClassTypes();
-			if( processedData.surveillanceCamera == true )
-			{
-				data.surveillanceCamera = true;
-			}
-			if( processedData.securityTurret == true )
-			{
-				data.securityTurret = true;
-			}
-			if( processedData.puppet == true )
-			{
-				data.puppet = true;
-			}
-		}
-		return data;
-	}
-
-	public const virtual function WasRevealedInNetworkPing() : Bool
-	{
-		return m_wasRevealedInNetworkPing;
-	}
-
-	public const virtual function SetRevealedInNetworkPing( wasRevealed : Bool )
-	{
-		var evt : SetRevealedInNetwork;
-		if( m_wasRevealedInNetworkPing == wasRevealed )
-		{
-			return;
-		}
-		evt = new SetRevealedInNetwork;
-		evt.wasRevealed = wasRevealed;
-		QueuePSEvent( GetID(), GetClassName(), evt );
-	}
-
-	private function OnSetRevealedInNetwork( evt : SetRevealedInNetwork ) : EntityNotificationType
-	{
-		var notifyNetworkSystem : MarkBackdoorAsRevealedRequest;
-		if( m_wasRevealedInNetworkPing == evt.wasRevealed )
-		{
-			return EntityNotificationType.DoNotNotifyEntity;
-		}
-		m_wasRevealedInNetworkPing = evt.wasRevealed;
-		if( HasNetworkBackdoor() )
-		{
-			notifyNetworkSystem = new MarkBackdoorAsRevealedRequest;
-			notifyNetworkSystem.device = this;
-			GetNetworkSystem().QueueRequest( notifyNetworkSystem );
-		}
-		return EntityNotificationType.SendThisEventToEntity;
-	}
-
-	public const virtual function IsPuppet() : Bool
-	{
-		return false;
-	}
-
-}
-
-class ProcessDevicesEvent extends Event
-{
-	var devices : array< DeviceComponentPS >;
-}
-
-class RevokeQuickHackAccess extends Event
-{
-}
-
-class SetRevealedInNetwork extends Event
-{
-	var wasRevealed : Bool;
-}
-
-class ExtractDevicesEvent extends Event
-{
-	var lazyDevices : array< LazyDevice >;
-	var devices : array< DeviceComponentPS >;
-	var eventToSendOnCompleted : ProcessDevicesEvent;
-	var lastExtractedIndex : Int32;
 }
 
 function BasicAvailabilityTest( device : ScriptableDeviceComponentPS ) : Bool

@@ -55,6 +55,7 @@ class NPCStatesComponent extends AINetStateComponent
 	private var m_toughRecordID : TweakDBID;
 	private var m_bulkyRecordID : TweakDBID;
 	private var m_regularRecordID : TweakDBID;
+	private var m_keepRecentThreatAfterRelaxedDuration : Float;
 	private var m_inCombat : Bool;
 	default m_inCombat = false;
 
@@ -73,6 +74,7 @@ class NPCStatesComponent extends AINetStateComponent
 		m_toughRecordID = T"HitReactionThresholdModifiers.Tough";
 		m_bulkyRecordID = T"HitReactionThresholdModifiers.Bulky";
 		m_regularRecordID = T"HitReactionThresholdModifiers.Regular";
+		m_keepRecentThreatAfterRelaxedDuration = TweakDBInterface.GetFloat( T"AIGeneralSettings.keepRecentThreatAfterRelaxedDuration", 0.0 );
 		if( GetPuppetStateBlackboard() )
 		{
 			GetPuppetStateBlackboard().SetInt( GetAllBlackboardDefs().PuppetState.Stance, ( ( Int32 )( GetCurrentStanceState() ) ) );
@@ -233,11 +235,11 @@ class NPCStatesComponent extends AINetStateComponent
 		currentHLS = ownerPuppet.GetHighLevelStateFromBlackboard();
 		if( currentHLS == gamedataNPCHighLevelState.Relaxed )
 		{
-			if( !( ownerPuppet.IsCharacterCivilian() ) && !( ownerPuppet.IsCrowd() ) )
+			if( ( !( ownerPuppet.IsCharacterCivilian() ) && !( ownerPuppet.IsCrowd() ) ) || ownerPuppet.IsCharacterPolice() )
 			{
 				NPCPuppet.ChangeHighLevelState( ownerPuppet, gamedataNPCHighLevelState.Alerted );
 			}
-			if( !( ownerPuppet.IsBoss() ) )
+			if( !( ownerPuppet.IsBoss() ) && ownerPuppet.GetNPCRarity() != gamedataNPCRarity.MaxTac )
 			{
 				return true;
 			}
@@ -411,11 +413,38 @@ class NPCStatesComponent extends AINetStateComponent
 		}
 	}
 
+	private function MaxtacSetQuestCammo( newState : gamedataNPCHighLevelState )
+	{
+		var gameInstance : GameInstance;
+		var puppet : ScriptedPuppet;
+		puppet = GetPuppet();
+		gameInstance = puppet.GetGame();
+		if( !( PreventionSystem.IsPreventionMaxTac( gameInstance, puppet ) ) )
+		{
+			return;
+		}
+		if( newState == gamedataNPCHighLevelState.Combat || newState == gamedataNPCHighLevelState.Alerted )
+		{
+			if( StatusEffectSystem.ObjectHasStatusEffect( puppet, T"BaseStatusEffect.Cloaked" ) )
+			{
+				StatusEffectHelper.RemoveStatusEffect( puppet, T"BaseStatusEffect.Cloaked" );
+			}
+		}
+		else if( newState == gamedataNPCHighLevelState.Relaxed && !( VehicleComponent.IsMountedToVehicle( gameInstance, puppet ) ) )
+		{
+			GameObjectEffectHelper.StartEffectEvent( puppet, 'camo_intro_vfx' );
+			StatusEffectHelper.ApplyStatusEffectOnSelf( gameInstance, T"BaseStatusEffect.Cloaked", puppet.GetEntityID() );
+		}
+	}
+
 	private function UpdateHighLevelState( newState : gamedataNPCHighLevelState, previousState : gamedataNPCHighLevelState )
 	{
 		var stateAnimFeature : AnimFeature_NPCState;
 		var aiRole : AIRole;
-		aiRole = GetPuppet().GetAIControllerComponent().GetAIRole();
+		var puppet : ScriptedPuppet;
+		puppet = GetPuppet();
+		aiRole = puppet.GetAIControllerComponent().GetAIRole();
+		MaxtacSetQuestCammo( newState );
 		OnHighLevelStateExit( previousState, newState );
 		if( aiRole )
 		{
@@ -425,6 +454,7 @@ class NPCStatesComponent extends AINetStateComponent
 		stateAnimFeature.state = ( ( Int32 )( newState ) );
 		AnimationControllerComponent.ApplyFeature( GetOwner(), m_highLevelAnimFeatureName, stateAnimFeature );
 		GetPuppetStateBlackboard().SetInt( GetAllBlackboardDefs().PuppetState.HighLevel, ( ( Int32 )( newState ) ) );
+		GetPuppetStateBlackboard().FireCallbacks();
 		OnHighLevelStateEnter( newState, previousState );
 		if( aiRole )
 		{
@@ -515,7 +545,14 @@ class NPCStatesComponent extends AINetStateComponent
 		}
 		if( TargetTrackingExtension.Get( GetPuppet(), targetTracker ) )
 		{
-			targetTracker.ResetRecentlyDroppedThreat();
+			if( GetPuppet().IsPrevention() )
+			{
+				targetTracker.ResetRecentlyDroppedThreat( 1.0 );
+			}
+			else
+			{
+				targetTracker.ResetRecentlyDroppedThreat( m_keepRecentThreatAfterRelaxedDuration );
+			}
 		}
 	}
 
@@ -535,67 +572,123 @@ class NPCStatesComponent extends AINetStateComponent
 		{
 			SenseComponent.RequestMainPresetChange( GetPuppet(), GetPuppet().GetStringFromCharacterTweak( "alertedSensesPreset", "Alerted" ) );
 		}
+		GetPuppet().RefreshCachedReactionPresetData();
+		GetPuppet().TryRegisterToPrevention();
+	}
+
+	private static function GetCombatTarget( npcPuppet : NPCPuppet ) : weak< GameObject >
+	{
+		var combatTarget : weak< GameObject >;
+		combatTarget = ( ( weak< weak< GameObject > > )( npcPuppet.GetAIControllerComponent().GetBehaviorArgument( 'CombatTarget' ) ) );
+		return combatTarget;
 	}
 
 	private function OnCombat()
 	{
-		var combatTarget : weak< GameObject >;
-		var targetTracker : weak< TargetTrackingExtension >;
-		var isCompanion : Bool;
+		var npcPuppet : NPCPuppet;
+		var presetName : String;
+		var delayID : DelayID;
+		var game : GameInstance;
+		var player : PlayerPuppet;
+		var evt : DodgeToAvoidCombatEvent;
 		var broadcaster : StimBroadcasterComponent;
-		( ( NPCPuppet )( GetOwner() ) ).GetInfluenceComponent().SetReservationRadius( 1.0 );
-		isCompanion = ScriptedPuppet.IsPlayerCompanion( GetPuppet() );
-		if( isCompanion )
+		var targetTracker : weak< TargetTrackingExtension >;
+		var cooldownIsActive : Bool;
+		var aiHoldPositionCommand : AIHoldPositionCommand;
+		npcPuppet = ( ( NPCPuppet )( GetPuppet() ) );
+		npcPuppet.GetInfluenceComponent().SetReservationRadius( 1.0 );
+		presetName = ( ( ScriptedPuppet.IsPlayerCompanion( npcPuppet ) ) ? ( "FollowerCombat" ) : ( npcPuppet.GetStringFromCharacterTweak( "combatSensesPreset", "Combat" ) ) );
+		SenseComponent.RequestMainPresetChange( npcPuppet, presetName );
+		GameObject.StartCooldown( npcPuppet, 'chatter_flank_order', 7.0 );
+		if( GameInstance.GetStatsSystem( game ).GetStatValue( npcPuppet.GetEntityID(), gamedataStatType.IsHeavyRangedArchetype ) > 0.0 )
 		{
-			SenseComponent.RequestMainPresetChange( GetPuppet(), "FollowerCombat" );
-		}
-		else
-		{
-			SenseComponent.RequestMainPresetChange( GetPuppet(), GetPuppet().GetStringFromCharacterTweak( "combatSensesPreset", "Combat" ) );
-		}
-		GameObject.StartCooldown( GetOwner(), 'chatter_flank_order', 7.0 );
-		if( GameInstance.GetStatsSystem( GetOwner().GetGame() ).GetStatValue( GetOwner().GetEntityID(), gamedataStatType.IsHeavyRangedArchetype ) > 0.0 )
-		{
-			GameObject.PlayVoiceOver( GetOwner(), 'hmg_charge', 'Scripts:OnCombat' );
+			GameObject.PlayVoiceOver( npcPuppet, 'hmg_charge', 'Scripts:OnCombat' );
 		}
 		if( GetPuppet().IsCrowd() )
 		{
-			GameObject.PlayVoiceOver( GetOwner(), 'crowd_combat', 'Scripts:OnCombat' );
+			GameObject.PlayVoiceOver( npcPuppet, 'crowd_combat', 'Scripts:OnCombat' );
 		}
 		else
 		{
-			GameObject.PlayVoiceOver( GetOwner(), 'start_combat', 'Scripts:OnCombat', ( ( isCompanion ) ? ( 1.5 ) : ( 0.0 ) ) );
+			GameObject.PlayVoiceOver( npcPuppet, 'start_combat', 'Scripts:OnCombat', ( ( ScriptedPuppet.IsPlayerCompanion( npcPuppet ) ) ? ( 1.5 ) : ( 0.0 ) ) );
 		}
-		combatTarget = ( ( weak< weak< GameObject > > )( ( ( ScriptedPuppet )( GetOwner() ) ).GetAIControllerComponent().GetBehaviorArgument( 'CombatTarget' ) ) );
-		if( combatTarget )
+		delayID = AIActionHelper.QueueNearbyCombatNotification( npcPuppet );
+		if( GetCombatTarget( npcPuppet ) )
 		{
-			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'CommsNoiseJam' ) ) )
+			game = npcPuppet.GetGame();
+			player = GetPlayer( game );
+			cooldownIsActive = StatusEffectHelper.HasStatusEffectWithTagConst( player, 'DodgeOutOfSightCooldown' );
+			if( ( player.CanAvoidCombatWithDodge() && !( npcPuppet.PuppetIsNotVisible() ) ) && !( cooldownIsActive ) )
 			{
-				AIActionHelper.QueuePullSquadSync( GetOwner() );
-				if( GetOwner().IsConnectedToSecuritySystem() )
-				{
-					AIActionHelper.QueueSecuritySystemCombatNotification( GetOwner() );
-				}
+				StatusEffectHelper.ApplyStatusEffect( player, T"BaseStatusEffect.SecondChancePerkTimeDilation" );
+				evt = new DodgeToAvoidCombatEvent;
+				evt.delayID = delayID;
+				evt.npcID = npcPuppet.GetEntityID();
+				GameInstance.GetDelaySystem( game ).DelayEvent( player, evt, 1.0, false );
+				GameInstance.GetDelaySystem( game ).DelayEvent( player, evt, 2.0, false );
+				GameInstance.GetDelaySystem( game ).DelayEvent( player, evt, 3.0, false );
 			}
-			broadcaster = GetOwner().GetStimBroadcasterComponent();
+			if( player.CanAvoidCombatWithGag() )
+			{
+				StatusEffectHelper.ApplyStatusEffect( npcPuppet, T"BaseStatusEffect.GagOpportunity" );
+			}
+			broadcaster = npcPuppet.GetStimBroadcasterComponent();
 			if( broadcaster )
 			{
-				broadcaster.TriggerSingleBroadcast( GetOwner(), gamedataStimType.Alarm, 10.0, , true );
+				broadcaster.TriggerSingleBroadcast( npcPuppet, gamedataStimType.SilentAlarm, 10.0 );
 			}
 		}
-		if( TargetTrackingExtension.Get( GetPuppet(), targetTracker ) )
+		if( TargetTrackingExtension.Get( npcPuppet, targetTracker ) )
 		{
-			targetTracker.ResetRecentlyDroppedThreat();
-			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( ( ( GameObject )( GetEntity() ) ), 'ResetSquadSync' ) ) )
+			targetTracker.ResetRecentlyDroppedThreatNoCallbacks();
+		}
+		AICoverHelper.GetCoverBlackboard( npcPuppet ).SetBool( GetAllBlackboardDefs().AICover.firstCoverEvaluationDone, false );
+		AICoverHelper.GetCoverBlackboard( npcPuppet ).SetFloat( GetAllBlackboardDefs().AICover.startCoverEvaluationTimeStamp, -1.0 );
+		npcPuppet.GetBumpComponent().Toggle( false );
+		npcPuppet.ReevaluatEAIThreatCalculationType();
+		if( PreventionSystem.CheckNPCSpawnedType( GetPuppet().GetGame(), GetPuppet().GetEntityID(), DynamicVehicleType.RoadBlockade ) )
+		{
+			aiHoldPositionCommand = new AIHoldPositionCommand;
+			aiHoldPositionCommand.duration = 20.0;
+			AIComponent.SendCommand( GetPuppet(), aiHoldPositionCommand );
+		}
+		GetPuppet().RefreshCachedReactionPresetData();
+		GetPuppet().TryRegisterToPrevention();
+	}
+
+	protected event OnNotifyNearbyAboutCombatEvent( evt : NotifyNearbyAboutCombatEvent )
+	{
+		var npcPuppet : NPCPuppet;
+		var npcObject : GameObject;
+		var targetTracker : weak< TargetTrackingExtension >;
+		var broadcaster : StimBroadcasterComponent;
+		npcPuppet = ( ( NPCPuppet )( GetPuppet() ) );
+		if( !( npcPuppet.IsActive() ) )
+		{
+			return true;
+		}
+		npcObject = ( ( GameObject )( GetEntity() ) );
+		if( GetCombatTarget( npcPuppet ) )
+		{
+			if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( npcObject, 'CommsNoiseJam' ) ) )
 			{
-				targetTracker.PushSquadSync( AISquadType.Combat );
-				targetTracker.PullSquadSync( AISquadType.Combat );
+				AIActionHelper.QueuePullSquadSync( npcPuppet, true );
+				if( npcPuppet.IsConnectedToSecuritySystem() )
+				{
+					AIActionHelper.QueueSecuritySystemCombatNotification( npcPuppet, true );
+				}
+			}
+			broadcaster = npcPuppet.GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				broadcaster.TriggerSingleBroadcast( GetOwner(), gamedataStimType.Alarm, 10.0 );
 			}
 		}
-		AICoverHelper.GetCoverBlackboard( GetPuppet() ).SetBool( GetAllBlackboardDefs().AICover.firstCoverEvaluationDone, false );
-		AICoverHelper.GetCoverBlackboard( GetPuppet() ).SetFloat( GetAllBlackboardDefs().AICover.startCoverEvaluationTimeStamp, -1.0 );
-		( ( ScriptedPuppet )( GetOwner() ) ).GetBumpComponent().Toggle( false );
-		( ( NPCPuppet )( GetOwner() ) ).ReevaluatEAIThreatCalculationType();
+		if( TargetTrackingExtension.Get( npcPuppet, targetTracker ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( npcObject, 'ResetSquadSync' ) ) )
+		{
+			targetTracker.PushSquadSync( AISquadType.Combat );
+			targetTracker.PullSquadSync( AISquadType.Combat );
+		}
 	}
 
 	private function OnDead()
@@ -609,7 +702,7 @@ class NPCStatesComponent extends AINetStateComponent
 	private function PlayDeadVO()
 	{
 		var broadcaster : StimBroadcasterComponent;
-		if( m_previousHighLevelState != gamedataNPCHighLevelState.Combat )
+		if( m_previousHighLevelState != gamedataNPCHighLevelState.Combat || StatusEffectSystem.ObjectHasStatusEffectOfType( ( ( GameObject )( GetEntity() ) ), gamedataStatusEffectType.MuteAudioStims ) )
 		{
 			GameObject.PlayVoiceOver( GetOwner(), 'stlh_death', 'Scripts:PlayDeadVO' );
 		}
@@ -949,7 +1042,6 @@ class NPCStatesComponent extends AINetStateComponent
 		statSystem.DefineModifierGroupFromRecord( tdbId, recordID );
 		statSystem.ApplyModifierGroup( entityID, tdbId );
 		AnimationControllerComponent.SetInputFloat( ( ( NPCPuppet )( GetOwner() ) ), 'twitch_hit_scale', 0.80000001 );
-		LogAI( "HitReactionMode changed to: Regular" );
 	}
 
 	private function OnForceImpact( statSystem : StatsSystem, entityID : EntityID, recordID : TweakDBID )
@@ -1015,7 +1107,6 @@ class NPCStatesComponent extends AINetStateComponent
 		statSystem.DefineModifierGroupFromRecord( tdbId, recordID );
 		statSystem.ApplyModifierGroup( entityID, tdbId );
 		SendOnUnstoppableRemovedSignal( true );
-		LogAI( "HitReactionMode changed to: Unstoppable" );
 	}
 
 	private function OnUnstoppableTwitchMin( statSystem : StatsSystem, entityID : EntityID, recordID : TweakDBID )
@@ -1025,7 +1116,6 @@ class NPCStatesComponent extends AINetStateComponent
 		statSystem.DefineModifierGroupFromRecord( tdbId, recordID );
 		statSystem.ApplyModifierGroup( entityID, tdbId );
 		AnimationControllerComponent.SetInputFloat( ( ( NPCPuppet )( GetOwner() ) ), 'twitch_hit_scale', 0.1 );
-		LogAI( "HitReactionMode changed to: Unstoppable" );
 	}
 
 	private function OnUnstoppableTwitchNone( statSystem : StatsSystem, entityID : EntityID, recordID : TweakDBID )
@@ -1035,7 +1125,6 @@ class NPCStatesComponent extends AINetStateComponent
 		statSystem.DefineModifierGroupFromRecord( tdbId, recordID );
 		statSystem.ApplyModifierGroup( entityID, tdbId );
 		AnimationControllerComponent.SetInputFloat( ( ( NPCPuppet )( GetOwner() ) ), 'twitch_hit_scale', 0.0 );
-		LogAI( "HitReactionMode changed to: Unstoppable" );
 	}
 
 	private function OnStaggerMin( statSystem : StatsSystem, entityID : EntityID, recordID : TweakDBID )
@@ -1044,7 +1133,6 @@ class NPCStatesComponent extends AINetStateComponent
 		tdbId = TDBID.ToNumber( recordID );
 		statSystem.DefineModifierGroupFromRecord( tdbId, recordID );
 		statSystem.ApplyModifierGroup( entityID, tdbId );
-		LogAI( "HitReactionMode changed to: StaggerMin" );
 	}
 
 	private function OnBulkyStaggerMin( statSystem : StatsSystem, entityID : EntityID, recordID : TweakDBID )
@@ -1132,6 +1220,10 @@ class NPCStatesComponent extends AINetStateComponent
 }
 
 class NotifySecuritySystemCombatEvent extends Event
+{
+}
+
+class NotifyNearbyAboutCombatEvent extends Event
 {
 }
 

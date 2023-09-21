@@ -1,3 +1,16 @@
+enum TakeOverControlSystemInputHintSortPriority
+{
+	Shoot = 0,
+	SpiderNextAim = 1,
+	Scanner = 2,
+	NextDevice = 3,
+	PreviousDevice = 4,
+	ZoomIn = 5,
+	ZoomOut = 6,
+	SpiderNestView = 7,
+	Exit = 8,
+}
+
 class TakeOverControlSystem extends ScriptableSystem
 {
 	private var m_controlledObject : weak< GameObject >;
@@ -7,11 +20,14 @@ class TakeOverControlSystem extends ScriptableSystem
 	private var m_isChainForcedFromQuest : Bool;
 	private var m_isActionButtonLocked : Bool;
 	private var m_isDeviceChainCreationLocked : Bool;
+	private var m_isReleaseOnHitLocked : Bool;
 	private var m_chainLockSources : array< CName >;
 	private var m_TCDUpdateDelayID : DelayID;
 	private var m_TCSupdateRate : Float;
 	default m_TCSupdateRate = 0.1f;
 	private var m_lastInputSimTime : Float;
+	private var m_sniperNestObject : weak< GameObject >;
+	private var m_timestampLastTCS : Float;
 
 	public const function GetControlledObject() : GameObject
 	{
@@ -46,9 +62,18 @@ class TakeOverControlSystem extends ScriptableSystem
 		CleanupActiveEntityInChainBlackboard();
 	}
 
-	private function OnEnableFastTravelRequest( request : LockTakeControlAction )
+	private function OnLockTakeControlActionRequest( request : LockTakeControlAction )
 	{
 		m_isActionButtonLocked = request.isLocked;
+		if( GetControlledObject().GetPSClassName() == 'SniperNestControllerPS' )
+		{
+			SniperNest.CreateInputHint( GetGameInstance(), true );
+		}
+	}
+
+	private function OnLockReleaseOnHitRequest( request : LockReleaseOnHit )
+	{
+		m_isReleaseOnHitLocked = request.isLocked;
 	}
 
 	private function OnLockDeviceChainCreationRequest( request : LockDeviceChainCreation )
@@ -65,7 +90,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().DeviceTakeControl ).SetBool( GetAllBlackboardDefs().DeviceTakeControl.ChainLocked, m_isDeviceChainCreationLocked );
 	}
 
-	public const function IskDeviceChainCreationLocked() : Bool
+	public const function IsDeviceChainCreationLocked() : Bool
 	{
 		return m_isDeviceChainCreationLocked;
 	}
@@ -87,6 +112,8 @@ class TakeOverControlSystem extends ScriptableSystem
 		var psmBlackboard : IBlackboard;
 		var tier : Int32;
 		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( context.GetGame() ).Get( 'TakeOverControlSystem' ) ) );
+		psmBlackboard = GameInstance.GetBlackboardSystem( context.GetGame() ).GetLocalInstanced( GameInstance.GetPlayerSystem( context.GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		psmBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingCamera, true );
 		if( !( takeOverControlSystem ) )
 		{
 			return;
@@ -103,6 +130,7 @@ class TakeOverControlSystem extends ScriptableSystem
 				}
 			}
 		}
+		ReleaseControlOfRemoteControlledVehicle( context.GetGame(), GameInstance.GetPlayerSystem( context.GetGame() ).GetLocalPlayerControlledGameObject().GetEntityID() );
 		takeOverRequest = new RequestTakeControl;
 		takeOverRequest.requestSource = context.GetEntityID();
 		takeOverRequest.originalEvent = originalevent;
@@ -125,6 +153,11 @@ class TakeOverControlSystem extends ScriptableSystem
 		else
 		{
 			TryFillControlBlackboard( request );
+		}
+		if( GetControlledObject().GetPSClassName() == 'SniperNestControllerPS' )
+		{
+			m_sniperNestObject = GetControlledObject();
+			m_timestampLastTCS = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
 		}
 		EnablePlayerTPPRepresenation( true );
 		HideAdvanceInteractionInputHints();
@@ -165,6 +198,10 @@ class TakeOverControlSystem extends ScriptableSystem
 		{
 			return false;
 		}
+		if( takeOverControlSystem.m_isReleaseOnHitLocked )
+		{
+			return false;
+		}
 		controlledObject = takeOverControlSystem.GetControlledObject();
 		if( !( controlledObject ) )
 		{
@@ -182,31 +219,78 @@ class TakeOverControlSystem extends ScriptableSystem
 		return false;
 	}
 
-	public static function ReleaseControl( game : GameInstance ) : Bool
+	public static function ReleaseControl( game : GameInstance, optional followupEvent : Event, optional followupEventEntityID : EntityID ) : Bool
 	{
 		var takeOverControlSystem : TakeOverControlSystem;
+		var requestReleaseControl : RequestReleaseControl;
 		if( !( GameInstance.IsValid( game ) ) )
 		{
+			PlayFollowupEvent( game, followupEvent, followupEventEntityID );
 			return false;
 		}
 		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( 'TakeOverControlSystem' ) ) );
 		if( !( takeOverControlSystem ) )
 		{
+			PlayFollowupEvent( game, followupEvent, followupEventEntityID );
 			return false;
 		}
 		if( !( takeOverControlSystem.IsDeviceControlled() ) )
 		{
+			PlayFollowupEvent( game, followupEvent, followupEventEntityID );
 			return false;
 		}
-		takeOverControlSystem.QueueRequest( new RequestReleaseControl );
+		if( takeOverControlSystem.m_sniperNestObject != NULL )
+		{
+			takeOverControlSystem.m_sniperNestObject = NULL;
+		}
+		requestReleaseControl = new RequestReleaseControl;
+		requestReleaseControl.followupEvent = followupEvent;
+		requestReleaseControl.followupEventEntityID = followupEventEntityID;
+		takeOverControlSystem.QueueRequest( requestReleaseControl );
 		return true;
+	}
+
+	public static function ReleaseControlOfRemoteControlledVehicle( game : GameInstance, playerID : EntityID )
+	{
+		var vehicle : weak< VehicleObject >;
+		var vehicleID : EntityID;
+		var playerStateMachineBlackboard : IBlackboard;
+		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( game ).GetLocalInstanced( playerID, GetAllBlackboardDefs().PlayerStateMachine );
+		vehicleID = playerStateMachineBlackboard.GetEntityID( GetAllBlackboardDefs().PlayerStateMachine.EntityIDVehicleRemoteControlled );
+		if( EntityID.IsDefined( vehicleID ) )
+		{
+			VehicleComponent.GetVehicleFromID( game, vehicleID, vehicle );
+			if( vehicle )
+			{
+				vehicle.SetVehicleRemoteControlled( false, false, true );
+			}
+		}
+	}
+
+	private static function PlayFollowupEvent( game : GameInstance, followupEvent : Event, followupEventEntityID : EntityID )
+	{
+		if( followupEvent )
+		{
+			GameInstance.FindEntityByID( game, followupEventEntityID ).QueueEvent( followupEvent );
+		}
 	}
 
 	private export function OnRequestReleaseControl( request : RequestReleaseControl )
 	{
 		var invalidID : EntityID;
+		var psmBlackboard : IBlackboard;
+		psmBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		psmBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingCamera, false );
 		m_takeControlSourceID = invalidID;
 		ToggleToMainPlayerObject();
+		if( m_sniperNestObject != NULL )
+		{
+			m_sniperNestObject = NULL;
+		}
+		if( request.followupEvent )
+		{
+			GameInstance.FindEntityByID( GetGameInstance(), request.followupEventEntityID ).QueueEvent( request.followupEvent );
+		}
 	}
 
 	private export function OnRequestQuestTakeControlInputLock( request : RequestQuestTakeControlInputLock )
@@ -229,6 +313,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		RegisterSystemOnInput( true );
 		PSMSetIsPlayerControllDevice( true );
 		GameObjectEffectHelper.StartEffectEvent( GetControlledObject(), 'camera_transition_effect_start' );
+		CreateInputHint( GetGameInstance(), true );
 	}
 
 	private function RegisterBBActiveObjectAsCurrentObject()
@@ -254,6 +339,11 @@ class TakeOverControlSystem extends ScriptableSystem
 		}
 		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
 		m_controlledObject = ( ( GameObject )( GameInstance.FindEntityByID( GetGameInstance(), EntID ) ) );
+		if( m_controlledObject.GetPSClassName() == 'SniperNestControllerPS' )
+		{
+			m_sniperNestObject = m_controlledObject;
+			m_timestampLastTCS = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+		}
 		GetCameraDataFromControlledObject( GetControlledObject(), player );
 		RegisterBBActiveObjectAsCurrentObject();
 	}
@@ -348,6 +438,10 @@ class TakeOverControlSystem extends ScriptableSystem
 				player.RegisterInputListener( this, 'SwitchDevicePrevious' );
 				player.RegisterInputListener( this, 'SwitchDeviceNext' );
 				player.RegisterInputListener( this, 'OpenPauseMenu' );
+				if( m_sniperNestObject != NULL )
+				{
+					player.RegisterInputListener( this, 'ReturnToSniperNest' );
+				}
 				m_isInputRegistered = true;
 				CreateTCSUpdate();
 			}
@@ -381,6 +475,7 @@ class TakeOverControlSystem extends ScriptableSystem
 
 	private function PSMSetIsPlayerControllDevice( controllsDevice : Bool )
 	{
+		var invalidID : EntityID;
 		var playerStateMachineBlackboard : IBlackboard;
 		playerStateMachineBlackboard = GameInstance.GetBlackboardSystem( GetGameInstance() ).GetLocalInstanced( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
 		playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, controllsDevice );
@@ -388,6 +483,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		if( controllsDevice )
 		{
 			playerStateMachineBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsUIZoomDevice, false );
+			playerStateMachineBlackboard.SetEntityID( GetAllBlackboardDefs().PlayerStateMachine.UIZoomDeviceID, invalidID );
 			playerStateMachineBlackboard.FireCallbacks();
 		}
 		else
@@ -421,7 +517,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		ToggleToOtherDeviceFromChain( package );
 	}
 
-	private function ToggleToOtherDeviceFromChain( otherPackage : SWidgetPackage )
+	private function ToggleToOtherDeviceFromChain( const otherPackage : ref< SWidgetPackage > )
 	{
 		RegisterAsCurrentObject( PersistentID.ExtractEntityID( otherPackage.ownerID ) );
 		SendTSCActivateEventToEntity( false );
@@ -435,6 +531,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		PSMSetIsPlayerControllDevice( false );
 		CleanupChainBlackboard();
 		EnablePlayerTPPRepresenation( false );
+		CreateInputHint( GetGameInstance(), false );
 	}
 
 	private function ReturnToDeviceScreen()
@@ -493,7 +590,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		return deviceChain[ myIndex ];
 	}
 
-	private function GetCurrentActiveDeviceChainBlackboardIndex( deviceChain : array< SWidgetPackage > ) : Int32
+	private function GetCurrentActiveDeviceChainBlackboardIndex( const deviceChain : ref< array< SWidgetPackage > > ) : Int32
 	{
 		var i : Int32;
 		var myPersistenID : PersistentID;
@@ -512,9 +609,25 @@ class TakeOverControlSystem extends ScriptableSystem
 		return -1;
 	}
 
+	private function MoveToSpecificEntity( entity : EntityID )
+	{
+		var takeOverRequest : RequestTakeControl;
+		var eventTakeOver : ToggleTakeOverControl;
+		GameObjectEffectHelper.StartEffectEvent( GetControlledObject(), 'camera_transition_effect_start' );
+		eventTakeOver = new ToggleTakeOverControl;
+		eventTakeOver.SetProperties( true, false );
+		takeOverRequest = new RequestTakeControl;
+		takeOverRequest.requestSource = entity;
+		takeOverRequest.originalEvent = eventTakeOver;
+		GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( 'TakeOverControlSystem', takeOverRequest, 0.01 );
+		SendTSCActivateEventToEntity( false );
+	}
+
 	private const function EnablePlayerTPPRepresenation( enable : Bool )
 	{
 		var player : PlayerPuppet;
+		var vehicleObject : weak< VehicleObject >;
+		var isMountedToVehicle : Bool;
 		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
 		if( player )
 		{
@@ -522,11 +635,18 @@ class TakeOverControlSystem extends ScriptableSystem
 			{
 				player.QueueEvent( new ActivateTPPRepresentationEvent );
 				GameInstance.GetAudioSystem( GetGameInstance() ).SetBDCameraListenerOverride( true );
-				GameObjectEffectHelper.StartEffectEvent( player, 'camera_mask' );
+				if( m_sniperNestObject == NULL )
+				{
+					GameObjectEffectHelper.StartEffectEvent( player, 'camera_mask' );
+				}
 			}
 			else
 			{
-				player.QueueEvent( new DeactivateTPPRepresentationEvent );
+				isMountedToVehicle = VehicleComponent.GetVehicle( player.GetGame(), player, vehicleObject );
+				if( !( isMountedToVehicle ) || !( vehicleObject.GetCameraManager().IsTPPActive() ) )
+				{
+					player.QueueEvent( new DeactivateTPPRepresentationEvent );
+				}
 				GameInstance.GetAudioSystem( GetGameInstance() ).SetBDCameraListenerOverride( false );
 				GameObjectEffectHelper.StopEffectEvent( player, 'camera_mask' );
 			}
@@ -557,6 +677,7 @@ class TakeOverControlSystem extends ScriptableSystem
 		var XAxisEvt : TCSInputXAxisEvent;
 		var YAxisEvt : TCSInputYAxisEvent;
 		var devceAttackEvt : TCSInputDeviceAttack;
+		var delaySwitchSniperNest : Float;
 		inputModifier = 1.0;
 		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
 		if( player )
@@ -629,21 +750,50 @@ class TakeOverControlSystem extends ScriptableSystem
 					ReturnToDeviceScreen();
 				}
 			}
+			if( ListenerAction.GetName( action ) == 'ReturnToSniperNest' )
+			{
+				if( GetControlledObject().GetPSClassName() != 'SniperNestControllerPS' )
+				{
+					MoveToSpecificEntity( m_sniperNestObject.GetEntityID() );
+				}
+			}
 		}
-		if( !( IskDeviceChainCreationLocked() ) )
+		if( !( IsDeviceChainCreationLocked() ) )
 		{
 			if( ListenerAction.GetName( action ) == 'SwitchDevicePrevious' )
 			{
 				if( ListenerAction.IsButtonJustPressed( action ) )
 				{
-					ToggleToPreviousControlledDevice();
+					if( GetControlledObject().GetPSClassName() == 'SniperNestControllerPS' )
+					{
+						delaySwitchSniperNest = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+						if( ( delaySwitchSniperNest - m_timestampLastTCS ) > 1.5 )
+						{
+							ToggleToPreviousControlledDevice();
+						}
+					}
+					else
+					{
+						ToggleToPreviousControlledDevice();
+					}
 				}
 			}
 			if( ListenerAction.GetName( action ) == 'SwitchDeviceNext' )
 			{
 				if( ListenerAction.IsButtonJustPressed( action ) )
 				{
-					ToggleToNextControlledDevice();
+					if( GetControlledObject().GetPSClassName() == 'SniperNestControllerPS' )
+					{
+						delaySwitchSniperNest = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
+						if( ( delaySwitchSniperNest - m_timestampLastTCS ) > 1.5 )
+						{
+							ToggleToNextControlledDevice();
+						}
+					}
+					else
+					{
+						ToggleToNextControlledDevice();
+					}
 				}
 			}
 		}
@@ -654,26 +804,53 @@ class TakeOverControlSystem extends ScriptableSystem
 		var data : InputHintData;
 		var takeOverControlSystem : TakeOverControlSystem;
 		takeOverControlSystem = ( ( TakeOverControlSystem )( GameInstance.GetScriptableSystemsContainer( context ).Get( 'TakeOverControlSystem' ) ) );
-		if( !( takeOverControlSystem.IsInputLockedFromQuest() ) )
-		{
-			data.action = 'StopDeviceControl';
-			data.source = 'TakeOverControlSystem';
-			data.localizedLabel = "LocKey#52037";
-			SendInputHintData( context, isVisible, data );
-		}
-		data.action = 'ZoomIn';
-		data.source = 'TakeOverControlSystem';
-		data.localizedLabel = "LocKey#52038";
-		SendInputHintData( context, isVisible, data );
-		data.action = 'ZoomOut';
-		data.source = 'TakeOverControlSystem';
-		data.localizedLabel = "LocKey#52039";
-		SendInputHintData( context, isVisible, data );
 		if( EquipmentSystem.IsCyberdeckEquipped( GameInstance.GetPlayerSystem( context ).GetLocalPlayerControlledGameObject() ) )
 		{
 			data.action = 'VisionHold';
 			data.source = 'TakeOverControlSystem';
 			data.localizedLabel = "LocKey#52040";
+			data.sortingPriority = ( ( Int32 )( TakeOverControlSystemInputHintSortPriority.Scanner ) );
+			SendInputHintData( context, isVisible, data );
+		}
+		if( takeOverControlSystem.m_sniperNestObject != NULL )
+		{
+			data.action = 'AimWithSniperNest';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#52038";
+			data.sortingPriority = ( ( Int32 )( TakeOverControlSystemInputHintSortPriority.SpiderNextAim ) );
+			SendInputHintData( context, isVisible, data );
+			data.action = 'ReturnToSniperNest';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#90340";
+			data.sortingPriority = ( ( Int32 )( TakeOverControlSystemInputHintSortPriority.SpiderNestView ) );
+			if( takeOverControlSystem.GetControlledObject().GetPSClassName() != 'SniperNestControllerPS' )
+			{
+				SendInputHintData( context, isVisible, data );
+			}
+			else
+			{
+				SendInputHintData( context, false, data );
+			}
+		}
+		else
+		{
+			data.action = 'ZoomIn';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#52038";
+			data.sortingPriority = ( ( Int32 )( TakeOverControlSystemInputHintSortPriority.ZoomIn ) );
+			SendInputHintData( context, isVisible, data );
+			data.action = 'ZoomOut';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#52039";
+			data.sortingPriority = ( ( Int32 )( TakeOverControlSystemInputHintSortPriority.ZoomOut ) );
+			SendInputHintData( context, isVisible, data );
+		}
+		if( !( takeOverControlSystem.IsInputLockedFromQuest() ) )
+		{
+			data.action = 'StopDeviceControl';
+			data.source = 'TakeOverControlSystem';
+			data.localizedLabel = "LocKey#52037";
+			data.sortingPriority = ( ( Int32 )( TakeOverControlSystemInputHintSortPriority.Exit ) );
 			SendInputHintData( context, isVisible, data );
 		}
 	}
@@ -755,6 +932,11 @@ class LockDeviceChainCreation extends ScriptableSystemRequest
 
 }
 
+class LockReleaseOnHit extends ScriptableSystemRequest
+{
+	editable var isLocked : Bool;
+}
+
 class RequestTakeControl extends ScriptableSystemRequest
 {
 	var requestSource : EntityID;
@@ -763,6 +945,8 @@ class RequestTakeControl extends ScriptableSystemRequest
 
 class RequestReleaseControl extends ScriptableSystemRequest
 {
+	var followupEvent : Event;
+	var followupEventEntityID : EntityID;
 }
 
 class RemoveFromChainRequest extends ScriptableSystemRequest

@@ -17,6 +17,14 @@ class IronsightDetail
 		return playbackOptions;
 	}
 
+	public static function PlaybackWithTimeDilation( timeDilation : Float ) : inkAnimOptions
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.applyCustomTimeDilation = true;
+		playbackOptions.customTimeDilation = timeDilation;
+		return playbackOptions;
+	}
+
 	public static function Fmodf( a : Float, b : Float ) : Float
 	{
 		if( b == 0.0 )
@@ -70,15 +78,27 @@ class ChargebarController extends inkLogicController
 	protected editable var m_midground : inkWidgetRef;
 	protected editable var m_background : inkWidgetRef;
 	protected editable var m_maxChargeAnimationName : CName;
-	protected var m_animationMaxCharge : inkAnimProxy;
+	protected editable var m_maxChargeResetAnimationName : CName;
+	protected editable var m_staticChargeAnimationName : CName;
+	protected editable var m_chargedShootAnimationName : CName;
+	protected editable var m_radialWipe : Bool;
+	protected editable var m_verticalChargeBar : Bool;
+	protected editable var m_playStaticChargeAnimationInstead : Bool;
+	protected var m_player : weak< GameObject >;
 	protected var m_statsSystem : StatsSystem;
 	protected var m_canFullyCharge : Bool;
 	protected var m_canOvercharge : Bool;
 	protected var m_listenerFullCharge : ChargebarStatsListener;
 	protected var m_listenerOvercharge : ChargebarStatsListener;
+	protected var m_animationMaxCharge : inkAnimProxy;
+	protected var m_animationStaticCharge : inkAnimProxy;
+	protected var m_animationChargedShoot : inkAnimProxy;
+	var m_animationStaticChargePlayed : Bool;
+	protected var m_isCharged : Bool;
 
 	public function OnPlayerAttach( player : GameObject )
 	{
+		m_player = player;
 		m_statsSystem = GameInstance.GetStatsSystem( player.GetGame() );
 		m_canFullyCharge = m_statsSystem.GetStatBoolValue( player.GetEntityID(), gamedataStatType.CanFullyChargeWeapon );
 		m_canOvercharge = m_statsSystem.GetStatBoolValue( player.GetEntityID(), gamedataStatType.CanOverchargeWeapon );
@@ -123,7 +143,18 @@ class ChargebarController extends inkLogicController
 	{
 		var threshold : Float;
 		threshold = GetCurrentChargeLimit();
-		SetBarsSize( value, threshold );
+		if( m_playStaticChargeAnimationInstead )
+		{
+			PlayStaticChargeAnimation( value, threshold );
+		}
+		else if( m_radialWipe )
+		{
+			SetRadialWipe( value, threshold );
+		}
+		else
+		{
+			SetBarsSize( value, threshold );
+		}
 		EvalChargeAnimation( value, threshold );
 	}
 
@@ -131,29 +162,58 @@ class ChargebarController extends inkLogicController
 	{
 		if( m_canOvercharge )
 		{
-			return WeaponObject.GetOverchargeThreshold();
+			return WeaponObject.GetOverchargeThreshold( GetWeaponObject() );
 		}
 		if( m_canFullyCharge )
 		{
-			return WeaponObject.GetFullyChargedThreshold();
+			return WeaponObject.GetFullyChargedThreshold( GetWeaponObject() );
 		}
-		return WeaponObject.GetBaseMaxChargeThreshold();
+		return WeaponObject.GetBaseMaxChargeThreshold( GetWeaponObject() );
+	}
+
+	public function SetRadialWipe( value : Float, threshold : Float )
+	{
+		var perecent : Float;
+		perecent = value / threshold;
+		inkWidgetRef.SetVisible( m_foreground, perecent > 0.0 );
+		inkWidgetRef.SetOpacity( m_foreground, perecent );
+		inkWidgetRef.Get( m_foreground ).SetEffectParamValue( inkEffectType.RadialWipe, 'RadialWipe_0', 'transition', perecent );
 	}
 
 	protected function SetBarsSize( value : Float, threshold : Float )
 	{
 		inkWidgetRef.SetVisible( m_foreground, value > 0.0 );
-		inkWidgetRef.SetScale( m_foreground, Vector2( value / threshold, 1.0 ) );
 		inkWidgetRef.SetVisible( m_midground, value > 0.0 );
-		inkWidgetRef.SetScale( m_midground, Vector2( WeaponObject.GetFullyChargedThreshold() / threshold, 1.0 ) );
 		inkWidgetRef.SetVisible( m_background, value > 0.0 );
-		inkWidgetRef.SetScale( m_background, Vector2( WeaponObject.GetBaseMaxChargeThreshold() / threshold, 1.0 ) );
+		if( m_verticalChargeBar )
+		{
+			inkWidgetRef.SetScale( m_foreground, Vector2( 1.0, value / threshold ) );
+			inkWidgetRef.SetScale( m_midground, Vector2( 1.0, WeaponObject.GetFullyChargedThreshold( GetWeaponObject() ) / threshold ) );
+			inkWidgetRef.SetScale( m_background, Vector2( 1.0, WeaponObject.GetBaseMaxChargeThreshold( GetWeaponObject() ) / threshold ) );
+		}
+		else
+		{
+			inkWidgetRef.SetScale( m_foreground, Vector2( value / threshold, 1.0 ) );
+			inkWidgetRef.SetScale( m_midground, Vector2( WeaponObject.GetFullyChargedThreshold( GetWeaponObject() ) / threshold, 1.0 ) );
+			inkWidgetRef.SetScale( m_background, Vector2( WeaponObject.GetBaseMaxChargeThreshold( GetWeaponObject() ) / threshold, 1.0 ) );
+		}
 	}
 
 	protected function EvalChargeAnimation( value : Float, threshold : Float )
 	{
+		if( value == 0.0 )
+		{
+			StopChargingAnimation();
+			if( m_isCharged )
+			{
+				PlayChargedShootAnimation();
+				m_isCharged = false;
+			}
+		}
 		if( value >= threshold )
 		{
+			m_animationStaticChargePlayed = false;
+			m_isCharged = true;
 			if( !( m_animationMaxCharge ) )
 			{
 				m_animationMaxCharge = PlayLibraryAnimation( m_maxChargeAnimationName, IronsightDetail.PlaybackCycleInfinite() );
@@ -163,7 +223,59 @@ class ChargebarController extends inkLogicController
 		{
 			m_animationMaxCharge.Stop();
 			m_animationMaxCharge = NULL;
+			PlayLibraryAnimation( m_maxChargeResetAnimationName );
 		}
+	}
+
+	private function StopChargingAnimation()
+	{
+		m_animationStaticChargePlayed = false;
+		if( m_animationStaticCharge && m_animationStaticCharge.IsPlaying() )
+		{
+			m_animationStaticCharge.GotoStartAndStop( true );
+			m_animationStaticCharge = NULL;
+		}
+	}
+
+	public function PlayStaticChargeAnimation( value : Float, threshold : Float )
+	{
+		var chargingRatio : Float;
+		if( m_animationStaticChargePlayed || m_animationStaticCharge.IsPlaying() )
+		{
+			return;
+		}
+		if( ( value / threshold ) > 0.1 )
+		{
+			chargingRatio = GetWeponChargingSpeedRatio();
+			m_animationStaticChargePlayed = true;
+			m_animationStaticCharge = PlayLibraryAnimation( m_staticChargeAnimationName, IronsightDetail.PlaybackWithTimeDilation( chargingRatio ) );
+		}
+	}
+
+	public function GetWeponChargingSpeedRatio() : Float
+	{
+		var weponObjectId : StatsObjectID;
+		var chargeTime : Float;
+		var baseChargeTime : Float;
+		weponObjectId = GetWeaponObject().GetEntityID();
+		chargeTime = m_statsSystem.GetStatValue( weponObjectId, gamedataStatType.ChargeTime );
+		baseChargeTime = m_statsSystem.GetStatValue( weponObjectId, gamedataStatType.BaseChargeTime );
+		return chargeTime / baseChargeTime;
+	}
+
+	public function PlayChargedShootAnimation()
+	{
+		if( m_animationChargedShoot != NULL )
+		{
+			m_animationChargedShoot.Stop();
+			m_animationChargedShoot = NULL;
+		}
+		m_animationChargedShoot = PlayLibraryAnimation( m_chargedShootAnimationName );
+	}
+
+	protected function GetWeaponObject() : WeaponObject
+	{
+		return ScriptedPuppet.GetWeaponRight( m_player );
 	}
 
 }
@@ -231,7 +343,7 @@ class AnimationChain
 	var m_data : array< AnimationElement >;
 	var m_name : CName;
 
-	public function AddAnimation( name : CName, options : inkAnimOptions )
+	public function AddAnimation( name : CName, const options : ref< inkAnimOptions > )
 	{
 		var element : AnimationElement;
 		element.m_animation = name;
@@ -326,7 +438,7 @@ class AnimationChainPlayer
 		}
 	}
 
-	private function GetEndEvent( animOptions : inkAnimOptions ) : inkanimEventType
+	private function GetEndEvent( const animOptions : ref< inkAnimOptions > ) : inkanimEventType
 	{
 		return ( ( animOptions.loopInfinite ) ? ( inkanimEventType.OnEndLoop ) : ( inkanimEventType.OnFinish ) );
 	}
@@ -495,11 +607,13 @@ class AimDownSightController extends BasicAnimationController
 
 	public function OnPlayerAttach( playerPuppet : GameObject )
 	{
+		PlayHide( true );
 		m_isAiming = false;
 	}
 
 	public function OnPlayerDetach( playerPuppet : GameObject )
 	{
+		PlayHide( true );
 		m_isAiming = false;
 	}
 
@@ -618,19 +732,20 @@ import class gameuiIronsightGameController extends inkGameController
 class IronsightGameController extends gameuiIronsightGameController
 {
 	private var m_playerPuppet : weak< GameObject >;
-	private editable var m_dot : inkWidgetRef;
-	private editable var m_ammo : inkTextRef;
-	private editable var m_ammoSpareCount : inkTextRef;
-	private editable var m_range : inkTextRef;
-	private editable var m_seeThroughWalls : Bool;
-	private editable var m_targetAttitudeFriendly : inkWidgetRef;
-	private editable var m_targetAttitudeHostile : inkWidgetRef;
-	private editable var m_targetAttitudeEnemyNonHostile : inkWidgetRef;
-	private var m_weaponDataBB : weak< IBlackboard >;
-	private editable var m_targetHitAnimationName : CName;
+	protected editable var m_dot : inkWidgetRef;
+	protected editable var m_ammo : inkTextRef;
+	protected editable var m_ammoSpareCount : inkTextRef;
+	protected editable var m_range : inkTextRef;
+	protected editable var m_seeThroughWalls : Bool;
+	protected editable var m_targetAttitudeFriendly : inkWidgetRef;
+	protected editable var m_targetAttitudeHostile : inkWidgetRef;
+	protected editable var m_targetAttitudeEnemyNonHostile : inkWidgetRef;
+	protected var m_weaponDataBB : weak< IBlackboard >;
+	protected editable var m_targetHitAnimationName : CName;
 	private var m_targetHitAnimation : inkAnimProxy;
 	private var m_weaponDataTargetHitBBID : CallbackHandle;
-	private editable var m_shootAnimationName : CName;
+	protected editable var m_shootAnimationName : CName;
+	protected editable var m_firstEquipAnimationName : CName;
 	private var m_shootAnimation : inkAnimProxy;
 	private var m_weaponDataShootBBID : CallbackHandle;
 	protected var m_currentAmmo : Int32;
@@ -638,9 +753,10 @@ class IronsightGameController extends gameuiIronsightGameController
 	private var m_animIntro : inkAnimProxy;
 	private var m_animLoop : inkAnimProxy;
 	private var m_animReload : inkAnimProxy;
-	private var m_BufferedRosterData : SlotDataHolder;
+	private var m_animPerfectCharge : inkAnimProxy;
 	private var m_ActiveWeapon : SlotWeaponData;
 	private var m_weaponItemData : InventoryItemData;
+	private var m_originalWeapon : weak< WeaponObject >;
 	private var m_InventoryManager : InventoryDataManagerV2;
 	private var bb : weak< IBlackboard >;
 	private var bbID : CallbackHandle;
@@ -652,30 +768,32 @@ class IronsightGameController extends gameuiIronsightGameController
 	private var m_targetAcquiredBBID : CallbackHandle;
 	private var m_targetRangeObstructedBBID : CallbackHandle;
 	private var m_targetAcquiredObstructedBBID : CallbackHandle;
-	private editable var m_targetRangeDecimalPrecision : Uint32;
+	protected editable var m_targetRangeDecimalPrecision : Uint32;
 	default m_targetRangeDecimalPrecision = 2;
 	private var m_targetAttitudeAnimator : weak< TargetAttitudeAnimationController >;
-	private editable var m_targetAttitudeContainer : inkWidgetRef;
+	protected editable var m_targetAttitudeContainer : inkWidgetRef;
 	private var m_targetHealthListener : IronsightTargetHealthChangeListener;
 	private var m_compass : weak< CompassController >;
-	private editable var m_compassContainer : inkWidgetRef;
+	protected editable var m_compassContainer : inkWidgetRef;
 	private var m_compass2 : weak< CompassController >;
-	private editable var m_compassContainer2 : inkWidgetRef;
+	protected editable var m_compassContainer2 : inkWidgetRef;
 	private var m_altimeter : weak< AltimeterController >;
-	private editable var m_altimeterContainer : inkWidgetRef;
+	protected editable var m_altimeterContainer : inkWidgetRef;
 	private var m_weaponBB : weak< IBlackboard >;
 	private var m_chargebar : weak< ChargebarController >;
-	private editable var m_chargebarContainer : inkWidgetRef;
+	protected editable var m_chargebarContainer : inkWidgetRef;
 	private var m_chargebarValueChanged : CallbackHandle;
 	private var m_chargebarTriggerModeChanged : CallbackHandle;
-	private editable var m_ADSContainer : inkWidgetRef;
+	protected editable var m_ADSContainer : inkWidgetRef;
 	private var m_ADSAnimator : weak< AimDownSightController >;
 	private var m_playerStateMachineBB : weak< IBlackboard >;
 	private var m_playerStateMachineUpperBodyBBID : CallbackHandle;
 	private var m_crosshairStateChanged : CallbackHandle;
+	private editable var m_perfectChargeIndicator : inkWidgetRef;
 	private var m_crosshairState : gamePSMCrosshairStates;
 	private var m_isTargetEnemy : Bool;
 	private var m_attitude : EAIAttitude;
+	protected var m_upperBodyState : gamePSMUpperBodyStates;
 
 	protected function StopAnimation( anim : inkAnimProxy )
 	{
@@ -748,7 +866,7 @@ class IronsightGameController extends gameuiIronsightGameController
 		}
 	}
 
-	private static function IsDead( obj : GameObject ) : Bool
+	protected static function IsDead( obj : GameObject ) : Bool
 	{
 		var puppet : ScriptedPuppet;
 		var device : Device;
@@ -802,13 +920,14 @@ class IronsightGameController extends gameuiIronsightGameController
 	protected event OnPlayerAttach( playerPuppet : GameObject )
 	{
 		var owner : Entity;
-		var weaponObject : WeaponObject;
 		var enableUpdate : Bool;
+		var firstEquip : Bool;
 		enableUpdate = false;
+		firstEquip = false;
 		m_playerPuppet = playerPuppet;
 		owner = GetOwnerEntity();
-		weaponObject = ( ( WeaponObject )( owner ) );
-		m_weaponBB = weaponObject.GetSharedData();
+		m_originalWeapon = ( ( WeaponObject )( owner ) );
+		m_weaponBB = m_originalWeapon.GetSharedData();
 		m_InventoryManager = new InventoryDataManagerV2;
 		m_InventoryManager.Initialize( ( ( PlayerPuppet )( playerPuppet ) ) );
 		bb = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_EquipmentData );
@@ -874,7 +993,43 @@ class IronsightGameController extends gameuiIronsightGameController
 			EnableUpdate( enableUpdate );
 			m_crosshairStateChanged = m_playerStateMachineBB.RegisterDelayedListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Crosshair, this, 'OnCrosshairStatStateeChanged' );
 		}
+		inkWidgetRef.SetVisible( m_perfectChargeIndicator, false );
 		m_targetHealthListener = IronsightTargetHealthChangeListener.Create( this );
+		firstEquip = m_playerStateMachineBB.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsWeaponFirstEquip );
+		if( firstEquip )
+		{
+			PlayLibraryAnimation( m_firstEquipAnimationName );
+		}
+	}
+
+	protected event OnPerfectChargeUIEvent( evt : PerfectChargeUIEvent )
+	{
+		var animOptions : inkAnimOptions;
+		animOptions.loopType = inkanimLoopType.Cycle;
+		animOptions.loopInfinite = true;
+		if( evt.type == 'perfectChargeCharged' )
+		{
+			inkWidgetRef.SetVisible( m_perfectChargeIndicator, true );
+			m_animPerfectCharge = PlayLibraryAnimation( 'release', animOptions );
+		}
+		else if( evt.type == 'perfectChargeShot' )
+		{
+			if( m_animPerfectCharge && m_animPerfectCharge.IsPlaying() )
+			{
+				m_animPerfectCharge.Stop();
+			}
+			inkWidgetRef.SetVisible( m_perfectChargeIndicator, false );
+			PlayLibraryAnimation( 'splash' );
+		}
+		else if( evt.type == 'perfectChargeFailed' )
+		{
+			if( m_animPerfectCharge && m_animPerfectCharge.IsPlaying() )
+			{
+				m_animPerfectCharge.Stop();
+			}
+			inkWidgetRef.SetVisible( m_perfectChargeIndicator, false );
+			PlayLibraryAnimation( 'miss' );
+		}
 	}
 
 	protected function OnAnimationIntroFinished( anim : inkAnimProxy )
@@ -1011,11 +1166,12 @@ class IronsightGameController extends gameuiIronsightGameController
 
 	protected event OnWeaponDataChanged( value : Variant )
 	{
+		var slotDataHolder : SlotDataHolder;
 		var currentData : SlotWeaponData;
 		var item : gameItemData;
-		m_BufferedRosterData = ( ( SlotDataHolder )value );
-		currentData = m_BufferedRosterData.weapon;
-		if( ItemID.IsValid( currentData.weaponID ) )
+		slotDataHolder = ( ( SlotDataHolder )value );
+		currentData = slotDataHolder.weapon;
+		if( ItemID.IsValid( currentData.weaponID ) && IsOriginalWeapon( currentData.weaponID ) )
 		{
 			m_ActiveWeapon = currentData;
 			if( m_ActiveWeapon.weaponID != currentData.weaponID )
@@ -1032,8 +1188,8 @@ class IronsightGameController extends gameuiIronsightGameController
 		if( m_shootAnimation )
 		{
 			m_shootAnimation.Stop();
-			m_shootAnimation = PlayLibraryAnimation( m_shootAnimationName, IronsightDetail.PlaybackCycleOnce() );
 		}
+		m_shootAnimation = PlayLibraryAnimation( m_shootAnimationName, IronsightDetail.PlaybackCycleOnce() );
 	}
 
 	protected event OnTargetHit( arg : Variant )
@@ -1041,8 +1197,8 @@ class IronsightGameController extends gameuiIronsightGameController
 		if( m_targetHitAnimation )
 		{
 			m_targetHitAnimation.Stop();
-			m_targetHitAnimation = PlayLibraryAnimation( m_targetHitAnimationName, IronsightDetail.PlaybackCycleOnce() );
 		}
+		m_targetHitAnimation = PlayLibraryAnimation( m_targetHitAnimationName, IronsightDetail.PlaybackCycleOnce() );
 	}
 
 	public function OnAmmoSpareCountChanged()
@@ -1079,7 +1235,7 @@ class IronsightGameController extends gameuiIronsightGameController
 		switch( newState )
 		{
 			case gamePSMCrosshairStates.Reload:
-				if( m_animReload && !( m_animReload.IsPlaying() ) )
+				if( ( m_animReload == NULL ) || !( m_animReload.IsPlaying() ) )
 				{
 					m_animReload = PlayLibraryAnimation( 'reload', IronsightDetail.PlaybackCycleInfinite() );
 				}
@@ -1097,7 +1253,8 @@ class IronsightGameController extends gameuiIronsightGameController
 	protected event OnUpperBodyChanged( state : Int32 )
 	{
 		var isAiming : Bool;
-		isAiming = state == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) );
+		isAiming = isAiming = state == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) );
+		m_upperBodyState = ( ( gamePSMUpperBodyStates )( state ) );
 		EnableUpdate( isAiming );
 		if( m_ADSAnimator )
 		{
@@ -1105,5 +1262,20 @@ class IronsightGameController extends gameuiIronsightGameController
 		}
 	}
 
+	protected function IsOriginalWeapon( weaponID : ItemID ) : Bool
+	{
+		return m_originalWeapon.GetItemID() == weaponID;
+	}
+
+	protected function IsWeaponActive() : Bool
+	{
+		return ItemID.GetTDBID( m_ActiveWeapon.weaponID ) == ItemID.GetTDBID( m_originalWeapon.GetItemID() );
+	}
+
+}
+
+class PerfectChargeUIEvent extends Event
+{
+	var type : CName;
 }
 

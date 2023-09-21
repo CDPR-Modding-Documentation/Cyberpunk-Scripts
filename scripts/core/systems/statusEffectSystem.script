@@ -1,11 +1,3 @@
-importonly abstract class IStatusEffectListener extends IScriptable
-{
-}
-
-import class ScriptStatusEffectListener extends IStatusEffectListener
-{
-}
-
 importonly abstract class StatusEffectEvent extends Event
 {
 	import var staticData : StatusEffect_Record;
@@ -17,11 +9,20 @@ importonly class ApplyStatusEffectEvent extends StatusEffectEvent
 	import var isNewApplication : Bool;
 	import var isAppliedOnSpawn : Bool;
 	import var instigatorEntityID : EntityID;
+	import var proxyEntityID : EntityID;
 }
 
 importonly class RemoveStatusEffect extends StatusEffectEvent
 {
 	import var isFinalRemoval : Bool;
+}
+
+importonly abstract class IStatusEffectListener extends IScriptable
+{
+}
+
+import class ScriptStatusEffectListener extends IStatusEffectListener
+{
 }
 
 importonly abstract class IStatusEffectSystem extends IGameSystem
@@ -30,7 +31,7 @@ importonly abstract class IStatusEffectSystem extends IGameSystem
 
 importonly final class StatusEffectSystem extends IStatusEffectSystem
 {
-	public import function ApplyStatusEffect( objID : EntityID, statusEffectID : TweakDBID, optional instigatorID : TweakDBID, optional instigatorEntityID : EntityID, optional applyCount : Uint32, optional direction : Vector4, optional isSavable : Bool ) : Bool;
+	public import function ApplyStatusEffect( objID : EntityID, statusEffectID : TweakDBID, optional instigatorID : TweakDBID, optional instigatorEntityID : EntityID, optional applyCount : Uint32, optional direction : Vector4, optional isSavable : Bool, optional proxyEntityID : EntityID ) : Bool;
 	public import function RemoveStatusEffect( objID : EntityID, statusEffectID : TweakDBID, optional removeCount : Uint32 ) : Bool;
 	public import function RemoveAllStatusEffectOfType( objID : EntityID, statusEffectType : gamedataStatusEffectType ) : Bool;
 	public import function HasStatusEffect( objID : EntityID, statusEffectID : TweakDBID ) : Bool;
@@ -49,6 +50,16 @@ importonly final class StatusEffectSystem extends IStatusEffectSystem
 	public import static function ObjectHasStatusEffectOfTypeName( target : weak< GameObject >, statusEffectTypeName : String ) : Bool;
 	public import static function ObjectHasStatusEffectWithTag( target : weak< GameObject >, tag : CName ) : Bool;
 	public import static function ObjectHasStatusEffectWithTags( target : weak< GameObject >, tag : ref< array< CName > > ) : Bool;
+}
+
+enum EKnockdownStates
+{
+	Invalid = 0,
+	Start = 1,
+	FallLoop = 2,
+	Land = 3,
+	Recovery = 4,
+	AirRecovery = 5,
 }
 
 class StatusEffectHelper
@@ -75,9 +86,19 @@ class StatusEffectHelper
 		return GameInstance.GetStatusEffectSystem( target.GetGame() ).ApplyStatusEffect( target.GetEntityID(), statusEffectID, GameObject.GetTDBID( ( ( GameObject )( GameInstance.FindEntityByID( target.GetGame(), instigatorEntityID ) ) ) ), instigatorEntityID );
 	}
 
+	public static function ApplyStatusEffect( target : weak< GameObject >, statusEffectID : TweakDBID, instigatorEntityID : EntityID, proxyEntityID : EntityID ) : Bool
+	{
+		return GameInstance.GetStatusEffectSystem( target.GetGame() ).ApplyStatusEffect( target.GetEntityID(), statusEffectID, GameObject.GetTDBID( ( ( GameObject )( GameInstance.FindEntityByID( target.GetGame(), instigatorEntityID ) ) ) ), instigatorEntityID, 1, Vector4( 0.0, 0.0, 0.0, 0.0 ), true, proxyEntityID );
+	}
+
 	public static function ApplyStatusEffect( target : weak< GameObject >, statusEffectID : TweakDBID, instigatorID : TweakDBID ) : Bool
 	{
 		return GameInstance.GetStatusEffectSystem( target.GetGame() ).ApplyStatusEffect( target.GetEntityID(), statusEffectID, instigatorID );
+	}
+
+	public static function ApplyStatusEffectOnSelf( gameInstance : GameInstance, statusEffectID : TweakDBID, entityID : EntityID ) : Bool
+	{
+		return GameInstance.GetStatusEffectSystem( gameInstance ).ApplyStatusEffect( entityID, statusEffectID, GameObject.GetTDBID( ( ( GameObject )( GameInstance.FindEntityByID( gameInstance, entityID ) ) ) ), entityID );
 	}
 
 	public static function ApplyStatusEffectForTimeWindow( target : weak< GameObject >, statusEffectID : TweakDBID, instigatorEntityID : EntityID, delay : Float, duration : Float )
@@ -101,14 +122,14 @@ class StatusEffectHelper
 		}
 	}
 
-	public static function RemoveStatusEffect( target : weak< GameObject >, statusEffectID : TweakDBID ) : Bool
+	public static function RemoveStatusEffect( target : weak< GameObject >, statusEffectID : TweakDBID, optional removeCount : Uint32 ) : Bool
 	{
-		return GameInstance.GetStatusEffectSystem( target.GetGame() ).RemoveStatusEffect( target.GetEntityID(), statusEffectID );
+		return GameInstance.GetStatusEffectSystem( target.GetGame() ).RemoveStatusEffect( target.GetEntityID(), statusEffectID, removeCount );
 	}
 
-	public static function RemoveStatusEffect( target : weak< GameObject >, statusEffect : StatusEffect ) : Bool
+	public static function RemoveStatusEffect( target : weak< GameObject >, statusEffect : StatusEffect, optional removeCount : Uint32 ) : Bool
 	{
-		return GameInstance.GetStatusEffectSystem( target.GetGame() ).RemoveStatusEffect( target.GetEntityID(), statusEffect.GetRecord().GetID() );
+		return GameInstance.GetStatusEffectSystem( target.GetGame() ).RemoveStatusEffect( target.GetEntityID(), statusEffect.GetRecord().GetID(), removeCount );
 	}
 
 	public static function RemoveStatusEffectsByInstigatorID( target : weak< GameObject >, instigatorID : TweakDBID )
@@ -136,22 +157,27 @@ class StatusEffectHelper
 		}
 	}
 
-	public static function RemoveAllStatusEffectsByType( target : weak< GameObject >, type : gamedataStatusEffectType )
+	public static function RemoveAllStatusEffectsByType( gameInstance : GameInstance, target : EntityID, type : gamedataStatusEffectType )
 	{
 		var appliedEffects : array< StatusEffect >;
 		var i : Int32;
 		var effectType : gamedataStatusEffectType;
 		var effectSystem : StatusEffectSystem;
-		effectSystem = GameInstance.GetStatusEffectSystem( target.GetGame() );
-		effectSystem.GetAppliedEffects( target.GetEntityID(), appliedEffects );
+		effectSystem = GameInstance.GetStatusEffectSystem( gameInstance );
+		effectSystem.GetAppliedEffects( target, appliedEffects );
 		for( i = 0; i < appliedEffects.Size(); i += 1 )
 		{
 			effectType = appliedEffects[ i ].GetRecord().StatusEffectType().Type();
 			if( effectType == type )
 			{
-				effectSystem.RemoveStatusEffect( target.GetEntityID(), appliedEffects[ i ].GetRecord().GetID() );
+				effectSystem.RemoveStatusEffect( target, appliedEffects[ i ].GetRecord().GetID() );
 			}
 		}
+	}
+
+	public static function RemoveAllStatusEffectsByType( target : weak< GameObject >, type : gamedataStatusEffectType )
+	{
+		RemoveAllStatusEffectsByType( target.GetGame(), target.GetEntityID(), type );
 	}
 
 	public static function RemoveStatusEffectsWithTag( target : weak< GameObject >, gameplayTag : CName, optional delay : Float )
@@ -270,7 +296,7 @@ class StatusEffectHelper
 		return effects;
 	}
 
-	public static function GetAppliedEffectsWithTag( target : weak< GameObject >, tag : CName, out statusEffects : array< StatusEffect >, optional instigatorID : EntityID ) : Bool
+	public static function GetAppliedEffectsWithTag( target : weak< GameObject >, tag : CName, statusEffects : ref< array< StatusEffect > >, optional instigatorID : EntityID ) : Bool
 	{
 		var appliedStatusEffects : array< StatusEffect >;
 		var i : Int32;
@@ -546,7 +572,7 @@ class PlayerGameplayRestrictions
 		StatusEffectHelper.RemoveStatusEffectsWithTag( target, 'GameplayRestriction' );
 	}
 
-	public static function OnGameplayRestrictionAdded( player : weak< PlayerPuppet >, record : StatusEffect_Record, gameplayTags : array< CName > )
+	public static function OnGameplayRestrictionAdded( player : weak< PlayerPuppet >, record : StatusEffect_Record, const gameplayTags : ref< array< CName > > )
 	{
 		var restrictionName : CName;
 		if( !( player ) )
@@ -558,6 +584,14 @@ class PlayerGameplayRestrictions
 			GameInstance.GetInventoryManager( player.GetGame() ).AddEquipmentStateFlag( gameEEquipmentManagerState.InfiniteAmmo );
 		}
 		if( gameplayTags.Contains( 'Fists' ) )
+		{
+			PlayerGameplayRestrictions.RequestFists( player );
+		}
+		if( gameplayTags.Contains( 'Melee' ) )
+		{
+			PlayerGameplayRestrictions.RequestMeleeWeapon( player );
+		}
+		if( gameplayTags.Contains( 'NoArmsCW' ) )
 		{
 			PlayerGameplayRestrictions.RequestFists( player );
 		}
@@ -589,7 +623,7 @@ class PlayerGameplayRestrictions
 		}
 	}
 
-	public static function OnGameplayRestrictionRemoved( player : weak< PlayerPuppet >, evt : RemoveStatusEffect, gameplayTags : array< CName > )
+	public static function OnGameplayRestrictionRemoved( player : weak< PlayerPuppet >, evt : RemoveStatusEffect, const gameplayTags : ref< array< CName > > )
 	{
 		var restrictionName : CName;
 		if( !( player ) )
@@ -630,11 +664,11 @@ class PlayerGameplayRestrictions
 
 	public static function PushForceRefreshInputHintsEventToPSM( requester : GameObject )
 	{
-		var psmEvent : PSMPostponedParameterBool;
-		psmEvent = new PSMPostponedParameterBool;
-		psmEvent.id = 'forceRefreshInputHints';
-		psmEvent.value = true;
-		requester.QueueEvent( psmEvent );
+		var psmForceRefreshInputHintsEvent : PSMPostponedParameterBool;
+		psmForceRefreshInputHintsEvent = new PSMPostponedParameterBool;
+		psmForceRefreshInputHintsEvent.id = 'ForceRefreshInputHints';
+		psmForceRefreshInputHintsEvent.value = true;
+		requester.QueueEvent( psmForceRefreshInputHintsEvent );
 	}
 
 	public static function SendBlockMenuRequest( player : weak< PlayerPuppet >, blockMenu : Bool )
@@ -671,6 +705,26 @@ class PlayerGameplayRestrictions
 		request = new EquipmentSystemWeaponManipulationRequest;
 		request.owner = player;
 		request.requestType = EquipmentManipulationAction.RequestFists;
+		request.equipAnimType = animType;
+		eqs.QueueRequest( request );
+	}
+
+	public static function RequestMeleeWeapon( player : weak< PlayerPuppet >, optional animType : gameEquipAnimationType )
+	{
+		var request : EquipmentSystemWeaponManipulationRequest;
+		var eqs : EquipmentSystem;
+		if( !( player ) )
+		{
+			return;
+		}
+		eqs = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( player.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		if( !( eqs ) )
+		{
+			return;
+		}
+		request = new EquipmentSystemWeaponManipulationRequest;
+		request.owner = player;
+		request.requestType = EquipmentManipulationAction.RequestLastUsedOrFirstAvailableMeleeWeapon;
 		request.equipAnimType = animType;
 		eqs.QueueRequest( request );
 	}
@@ -717,7 +771,7 @@ class PlayerGameplayRestrictions
 		return true;
 	}
 
-	public static function AcquireHotkeyRestrictionTags( hotkey : EHotkey, out hotkeyTags : array< CName > ) : Bool
+	public static function AcquireHotkeyRestrictionTags( hotkey : EHotkey, hotkeyTags : ref< array< CName > > ) : Bool
 	{
 		var recordKey : String;
 		var record : DPadUIData_Record;
@@ -743,15 +797,5 @@ struct SPlayerCooldown
 {
 	var effectID : TweakDBID;
 	var instigatorID : TweakDBID;
-}
-
-enum EKnockdownStates
-{
-	Invalid = 0,
-	Start = 1,
-	FallLoop = 2,
-	Land = 3,
-	Recovery = 4,
-	AirRecovery = 5,
 }
 

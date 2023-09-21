@@ -1,5 +1,7 @@
 class CraftingMainLogicController extends inkLogicController
 {
+	private const var TIME_UNTIL_SELECTION : Float;
+	default TIME_UNTIL_SELECTION = 0.3f;
 	protected editable var m_root : inkWidgetRef;
 	protected editable var m_itemDetailsContainer : inkWidgetRef;
 	protected editable var m_leftListScrollHolder : inkWidgetRef;
@@ -38,6 +40,16 @@ class CraftingMainLogicController extends inkLogicController
 	protected var m_sortingController : weak< DropdownListController >;
 	protected var m_sortingButtonController : weak< DropdownButtonController >;
 	protected var m_isPanelOpen : Bool;
+	protected var m_hasSpawnedTooltip : Bool;
+	private var m_currentSelected : weak< CraftableItemLogicController >;
+	private var m_itemTooltipPath : ResRef;
+	private var m_isProcessing : Bool;
+	protected var m_DelaySystem : weak< DelaySystem >;
+	protected var m_StatsSystem : weak< StatsSystem >;
+	protected var m_Player : weak< PlayerPuppet >;
+	protected var m_Game : GameInstance;
+	private var m_firstClicked : Bool;
+	private var m_progress : Float;
 
 	public virtual function Init( craftingGameController : weak< CraftingMainGameController > )
 	{
@@ -52,7 +64,11 @@ class CraftingMainLogicController extends inkLogicController
 		SetupSortingDropdown();
 		inkWidgetRef.SetVisible( m_itemDetailsContainer, false );
 		m_leftListScrollController = ( ( inkScrollController )( inkWidgetRef.GetController( m_leftListScrollHolder ) ) );
-		m_doPlayFilterSounds = true;
+		m_itemTooltipPath = R"base\gameplay\gui\common\tooltip\new_itemtooltip.inkwidget";
+		m_Player = m_craftingGameController.GetPlayer();
+		m_Game = m_Player.GetGame();
+		m_DelaySystem = GameInstance.GetDelaySystem( m_Game );
+		m_StatsSystem = GameInstance.GetStatsSystem( m_Game );
 	}
 
 	protected function InitVirtualList()
@@ -66,17 +82,21 @@ class CraftingMainLogicController extends inkLogicController
 		m_dataView.EnableSorting();
 		m_dataView.BindUIScriptableSystem( m_craftingGameController.GetScriptableSystem() );
 		m_virtualListController.SetSource( m_dataView );
-		m_virtualListController.RegisterToCallback( 'OnItemActivated', this, 'OnItemSelect' );
+		m_virtualListController.RegisterToCallback( 'OnItemSelected', this, 'OnItemSelect' );
 	}
 
 	public function OpenPanel()
 	{
 		inkWidgetRef.SetVisible( m_root, true );
 		RefreshListViewContent();
+		SetItemButtonHintsHoverOut( NULL );
+		DispatchSelectDelayed( 0 );
 		m_isPanelOpen = true;
 	}
 
 	public virtual function RefreshListViewContent( optional inventoryItemData : InventoryItemData ) {}
+
+	public virtual function OnChangeTab() {}
 
 	public function ClosePanel()
 	{
@@ -161,19 +181,20 @@ class CraftingMainLogicController extends inkLogicController
 		}
 	}
 
-	protected function SetCraftingButton( label : String )
+	protected function SetCraftingButton( const label : ref< String > )
 	{
 		m_progressButtonController = ( ( ProgressBarButton )( inkCompoundRef.GetControllerByType( m_progressButtonContainer, 'ProgressBarButton' ) ) );
 		m_progressButtonController.SetupProgressButton( label, ( ( ProgressBarsController )( inkCompoundRef.GetControllerByType( m_progressBarContainer, 'ProgressBarsController' ) ) ) );
 		m_progressButtonController.ButtonController.RegisterToCallback( 'OnPress', this, 'OnButtonClick' );
 		m_progressButtonController.ButtonController.RegisterToCallback( 'OnHoverOver', this, 'SetItemButtonHintsHoverOver' );
 		m_progressButtonController.ButtonController.RegisterToCallback( 'OnHoverOut', this, 'SetItemButtonHintsHoverOut' );
+		inkCompoundRef.SetVisible( m_progressBarContainer, false );
 	}
 
 	protected event OnButtonClick( evt : inkPointerEvent )
 	{
 		var craftingNotification : UIMenuNotificationEvent;
-		if( evt.IsAction( 'click' ) )
+		if( evt.IsAction( 'craft_item' ) )
 		{
 			if( !( m_isCraftable ) )
 			{
@@ -183,19 +204,106 @@ class CraftingMainLogicController extends inkLogicController
 					craftingNotification.m_notificationType = m_notificationType;
 					QueueEvent( craftingNotification );
 				}
-				PlaySound( 'Item', 'OnCraftFailed' );
 			}
 			else
 			{
-				PlaySound( 'Item', 'OnCraftStarted' );
+				StartProcess();
 			}
 		}
+		m_craftingGameController.DisableTabs();
 	}
 
 	protected event OnItemSelect( previous : inkVirtualCompoundItemController, next : inkVirtualCompoundItemController )
 	{
-		UpdateItemPreview( ( ( CraftableItemLogicController )( next ) ) );
-		PlaySound( 'Button', 'OnPress' );
+		if( next == m_currentSelected )
+		{
+			return true;
+		}
+		UpdateSelection( ( ( CraftableItemLogicController )( next ) ) );
+		ResetProcess();
+		SetItemButtonHintsHoverOver( NULL );
+	}
+
+	private function UpdateSelection( selection : CraftableItemLogicController )
+	{
+		if( m_currentSelected )
+		{
+			m_currentSelected.UnregisterFromCallback( 'OnPress', this, 'OnPressSelectedItem' );
+			m_currentSelected.UnregisterFromCallback( 'OnHold', this, 'OnHoldSelectedItem' );
+			m_currentSelected.UnregisterFromCallback( 'OnHoverOut', this, 'OnHoverOutSelectedItem' );
+			m_currentSelected.UnregisterFromCallback( 'OnRelease', this, 'OnReleaseSelectedItem' );
+			m_firstClicked = false;
+		}
+		m_currentSelected = selection;
+		m_currentSelected.RegisterToCallback( 'OnPress', this, 'OnPressSelectedItem' );
+		m_currentSelected.RegisterToCallback( 'OnHold', this, 'OnHoldSelectedItem' );
+		m_currentSelected.RegisterToCallback( 'OnHoverOut', this, 'OnHoverOutSelectedItem' );
+		m_currentSelected.RegisterToCallback( 'OnRelease', this, 'OnReleaseSelectedItem' );
+	}
+
+	private function OnPressSelectedItem( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			UpdateItemPreview( m_currentSelected );
+		}
+		if( evt.IsAction( 'craft_item' ) )
+		{
+			if( m_isCraftable )
+			{
+				StartProcess();
+				m_craftingGameController.DisableTabs();
+			}
+		}
+	}
+
+	protected event OnHoverOutSelectedItem( evt : inkPointerEvent )
+	{
+		m_progressButtonController.Lock();
+		if( m_firstClicked )
+		{
+			PlaySound( 'Item', 'OnCraftFailed' );
+		}
+		if( m_isProcessing )
+		{
+			m_craftingGameController.EnableTabs();
+		}
+		ResetProcess();
+	}
+
+	protected event OnHoldSelectedItem( evt : inkPointerEvent )
+	{
+		m_progress = evt.GetHoldProgress();
+		if( evt.IsAction( 'craft_item' ) )
+		{
+			if( ( m_progress > 0.2 ) && m_isProcessing )
+			{
+				if( !( m_firstClicked ) )
+				{
+					m_firstClicked = true;
+					PlaySound( 'Item', 'OnCraftStarted' );
+				}
+				m_progressButtonController.UpdateCraftProcess( evt );
+			}
+		}
+	}
+
+	protected event OnReleaseSelectedItem( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+		}
+		if( evt.IsAction( 'craft_item' ) )
+		{
+			m_craftingGameController.EnableTabs();
+		}
+		if( m_firstClicked )
+		{
+			m_firstClicked = false;
+			PlaySound( 'Item', 'OnCraftFailed' );
+		}
+		ResetProcess();
 	}
 
 	protected virtual function UpdateItemPreview( craftableController : CraftableItemLogicController ) {}
@@ -208,11 +316,27 @@ class CraftingMainLogicController extends inkLogicController
 		m_dataView = NULL;
 		m_dataSource = NULL;
 		m_classifier = NULL;
+		if( m_currentSelected )
+		{
+			m_currentSelected.UnregisterFromCallback( 'OnPress', this, 'OnPressSelectedItem' );
+			m_currentSelected.UnregisterFromCallback( 'OnHold', this, 'OnHoldSelectedItem' );
+			m_currentSelected.UnregisterFromCallback( 'OnHoverOut', this, 'OnHoverOutSelectedItem' );
+			m_currentSelected.UnregisterFromCallback( 'OnRelease', this, 'OnReleaseSelectedItem' );
+		}
 		m_virtualListController.UnregisterFromCallback( 'OnItemSelected', this, 'OnItemSelect' );
 		m_progressButtonController.ButtonController.UnregisterFromCallback( 'OnPress', this, 'OnButtonClick' );
 		m_progressButtonController.ButtonController.UnregisterFromCallback( 'OnHoverOver', this, 'SetItemButtonHintsHoverOver' );
 		m_progressButtonController.ButtonController.UnregisterFromCallback( 'OnHoverOut', this, 'SetItemButtonHintsHoverOut' );
 		m_doPlayFilterSounds = false;
+		if( m_firstClicked )
+		{
+			PlaySound( 'Item', 'OnCraftFailed' );
+		}
+	}
+
+	protected function SpawnItemTooltipAsync( parentWidget : weak< inkWidget >, optional callbackObject : IScriptable, optional callbackFunctionName : CName )
+	{
+		AsyncSpawnFromExternal( parentWidget, m_itemTooltipPath, 'itemTooltip', callbackObject, callbackFunctionName );
 	}
 
 	protected virtual function SetItemButtonHintsHoverOver( evt : inkPointerEvent ) {}
@@ -220,6 +344,8 @@ class CraftingMainLogicController extends inkLogicController
 	protected function SetItemButtonHintsHoverOut( evt : inkPointerEvent )
 	{
 		m_buttonHintsController.RemoveButtonHint( 'craft_item' );
+		m_craftingGameController.EnableTabs();
+		ResetProcess();
 	}
 
 	public static function IsWeapon( type : gamedataEquipmentArea ) : Bool
@@ -240,6 +366,57 @@ class CraftingMainLogicController extends inkLogicController
 			}
 		}
 		return NULL;
+	}
+
+	private function ResetProcess()
+	{
+		m_progressButtonController.Reset();
+		m_isProcessing = false;
+	}
+
+	private function StartProcess()
+	{
+		if( m_isProcessing )
+		{
+			return;
+		}
+		m_isProcessing = true;
+		m_progressButtonController.Unlock();
+	}
+
+	protected function DispatchSelectDelayed( index : Uint32 )
+	{
+		var delayedSelect : DelayedSelect;
+		delayedSelect = new DelayedSelect;
+		delayedSelect.m_controller = this;
+		delayedSelect.m_index = index;
+		m_DelaySystem.DelayCallback( delayedSelect, TIME_UNTIL_SELECTION, false );
+	}
+
+	public function Select( index : Uint32 )
+	{
+		m_virtualListController.SelectItem( index );
+		UpdateItemPreview( m_currentSelected );
+	}
+
+	protected function IsEmptyData() : Bool
+	{
+		return m_dataSource.Size() < 1;
+	}
+
+}
+
+class DelayedSelect extends DelayCallback
+{
+	var m_controller : weak< CraftingMainLogicController >;
+	var m_index : Uint32;
+
+	public override function Call()
+	{
+		if( m_controller )
+		{
+			m_controller.Select( m_index );
+		}
 	}
 
 }

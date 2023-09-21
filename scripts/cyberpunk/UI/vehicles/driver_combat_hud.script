@@ -1,0 +1,155 @@
+import class DriverCombatHUDGameController extends inkHUDGameController
+{
+	private var m_player : weak< GameObject >;
+	private var m_psmBlackboard : weak< IBlackboard >;
+	private var m_psmWeaponCallback : CallbackHandle;
+	private var m_uiActiveVehicleFPPRearviewCameraActivatedCallback : CallbackHandle;
+	private var m_reloadingAnimProxy : inkAnimProxy;
+	private editable var m_vehicleFPPRearviewCamera : inkWidgetRef;
+	private editable var m_vehicleManufacturer : inkImageRef;
+	private import var inWeaponizedVehicle : Bool;
+	private import var inDriverCombat : Bool;
+	private import var inReloadState : Bool;
+	private import var inSafeState : Bool;
+	private editable var m_debugTuningStatusText : inkTextRef;
+
+	private import function Reset();
+	private import function UpdateCrosshairVisibility();
+
+	protected event OnInitialize()
+	{
+		LocalReset();
+	}
+
+	protected event OnPlayerAttach( player : GameObject )
+	{
+		m_player = player;
+		m_psmBlackboard = GetPSMBlackboard( m_player );
+		m_psmWeaponCallback = m_psmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon, this, 'OnPSMWeaponStateChanged' );
+		OnPSMWeaponStateChanged( m_psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon ) );
+		m_uiActiveVehicleFPPRearviewCameraActivatedCallback = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveVehicleData ).RegisterListenerBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsFPPRearviewCameraActivated, this, 'OnUIActiveVehicleFPPRearviewCameraActivated' );
+		UpdateVehicleData( GameInstance.GetMountingFacility( m_player.GetGame() ).GetMountingInfoSingleWithObjects( m_player ) );
+	}
+
+	protected event OnPlayerDetach( player : GameObject )
+	{
+		if( m_psmWeaponCallback )
+		{
+			m_psmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon, m_psmWeaponCallback );
+		}
+		if( m_uiActiveVehicleFPPRearviewCameraActivatedCallback )
+		{
+			GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ActiveVehicleData ).UnregisterListenerBool( GetAllBlackboardDefs().UI_ActiveVehicleData.IsFPPRearviewCameraActivated, m_uiActiveVehicleFPPRearviewCameraActivatedCallback );
+		}
+	}
+
+	protected event OnMountingEvent( evt : MountingEvent )
+	{
+		if( evt.relationship.relationshipType == gameMountingRelationshipType.Parent && evt.relationship.otherMountableType == gameMountingObjectType.Vehicle )
+		{
+			UpdateVehicleData( GameInstance.GetMountingFacility( m_player.GetGame() ).GetMountingInfoSingleWithObjects( m_player ), true );
+		}
+	}
+
+	protected event OnUnmountingEvent( evt : UnmountingEvent )
+	{
+		LocalReset();
+	}
+
+	private function LocalReset()
+	{
+		inWeaponizedVehicle = false;
+		Reset();
+		inkWidgetRef.SetVisible( m_vehicleFPPRearviewCamera, false );
+		inkTextRef.SetVisible( m_debugTuningStatusText, false );
+	}
+
+	private function UpdateVehicleData( mountingInfo : MountingInfo, optional isMounting : Bool )
+	{
+		var vehicle : VehicleObject;
+		var vehicleRecord : Vehicle_Record;
+		var vehicleDataPackageRecord : VehicleDataPackage_Record;
+		var debugTuningStatus : String;
+		if( EntityID.IsDefined( mountingInfo.parentId ) )
+		{
+			vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( m_player.GetGame(), mountingInfo.parentId ) ) );
+			vehicleRecord = vehicle.GetRecord();
+			if( vehicleRecord )
+			{
+				inkImageRef.SetTexturePart( m_vehicleManufacturer, TweakDBInterface.GetUIIconRecord( TDBID.Create( "UIIcon." + vehicleRecord.Manufacturer().EnumName() ) ).AtlasPartName() );
+				if( vehicle.IsPlayerDriver() )
+				{
+					vehicleDataPackageRecord = vehicleRecord.VehDataPackageHandle();
+					if( vehicleDataPackageRecord )
+					{
+						inWeaponizedVehicle = vehicleDataPackageRecord.DriverCombat().Type() == gamedataDriverCombatType.MountedWeapons;
+						if( inWeaponizedVehicle && isMounting )
+						{
+							ToggleVisibility( true, false );
+							GameObject.PlaySoundEvent( vehicle, ( ( vehicle.CanSwitchWeapons() ) ? ( 'w_mounted_weapon_window_appearing_ui' ) : ( 'w_mounted_weapon_window_appearing_ui_no_missile' ) ) );
+							PlayLibraryAnimation( ( ( vehicle.CanSwitchWeapons() ) ? ( 'vehicles_startup' ) : ( 'vehicles_startup_no_missile' ) ) );
+						}
+					}
+				}
+				inkTextRef.SetVisible( m_debugTuningStatusText, false );
+				if( !( IsFinal() ) )
+				{
+					debugTuningStatus = vehicleRecord.DebugStatusString();
+					inkTextRef.SetText( m_debugTuningStatusText, debugTuningStatus );
+					inkTextRef.SetVisible( m_debugTuningStatusText, StrLen( debugTuningStatus ) > 0 );
+				}
+			}
+		}
+	}
+
+	protected event OnUIActiveVehicleFPPRearviewCameraActivated( value : Bool )
+	{
+		if( value )
+		{
+			GameObjectEffectHelper.StartEffectEvent( m_player, 'fish_eye' );
+		}
+		else
+		{
+			GameObjectEffectHelper.StopEffectEvent( m_player, 'fish_eye' );
+		}
+		inkWidgetRef.SetVisible( m_vehicleFPPRearviewCamera, value );
+	}
+
+	protected event OnPSMWeaponStateChanged( value : Int32 )
+	{
+		var psmRangedWeaponState : gamePSMRangedWeaponStates;
+		var isReloading : Bool;
+		psmRangedWeaponState = ( ( gamePSMRangedWeaponStates )( value ) );
+		isReloading = psmRangedWeaponState == gamePSMRangedWeaponStates.Reload;
+		inSafeState = psmRangedWeaponState == gamePSMRangedWeaponStates.Safe;
+		if( ( inReloadState && m_reloadingAnimProxy ) && m_reloadingAnimProxy.IsValid() )
+		{
+			m_reloadingAnimProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnReloadingIntroFinished' );
+			m_reloadingAnimProxy.Stop();
+			m_reloadingAnimProxy = PlayLibraryAnimation( 'reloading_outro' );
+		}
+		if( inReloadState != isReloading )
+		{
+			inReloadState = isReloading;
+			if( inDriverCombat )
+			{
+				UpdateCrosshairVisibility();
+				if( inReloadState )
+				{
+					m_reloadingAnimProxy = PlayLibraryAnimation( 'reloading_intro' );
+					m_reloadingAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnReloadingIntroFinished' );
+				}
+			}
+		}
+	}
+
+	protected event OnReloadingIntroFinished( anim : inkAnimProxy )
+	{
+		var options : inkAnimOptions;
+		options.loopType = inkanimLoopType.Cycle;
+		options.loopInfinite = true;
+		m_reloadingAnimProxy = PlayLibraryAnimation( 'reloading_loop', options );
+	}
+
+}
+

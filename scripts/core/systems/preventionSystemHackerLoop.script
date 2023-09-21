@@ -1,0 +1,686 @@
+enum EAppliedTriangulationHackSpeed
+{
+	NotAssigned = 0,
+	Slow = 1,
+	Normal = 2,
+	Fast = 3,
+}
+
+class VehiclePreventionHackState
+{
+	var m_vehicle : weak< VehicleObject >;
+	var m_vehicleID : EntityID;
+	var m_progressBarProgressSoFar : Float;
+	var m_progressBarProgressStart : Float;
+	var m_hacked : Bool;
+	var m_hackInProgress : Bool;
+	var m_stoppedVehicle : Bool;
+	var m_progressBar : weak< UploadFromNPCToPlayerListener >;
+	var m_appliedHackSpeed : EAppliedTriangulationHackSpeed;
+
+	public function GetAppliedHackSpeedHack() : TweakDBID
+	{
+		switch( m_appliedHackSpeed )
+		{
+			case EAppliedTriangulationHackSpeed.Slow:
+				return T"AIQuickHack.PreventionSystemHackerLoop";
+			case EAppliedTriangulationHackSpeed.Normal:
+				return T"AIQuickHack.PreventionSystemHackerLoop2";
+			case EAppliedTriangulationHackSpeed.Fast:
+				return T"AIQuickHack.PreventionSystemHackerLoop3";
+			case EAppliedTriangulationHackSpeed.NotAssigned:
+				return T"AIQuickHack.PreventionSystemHackerLoop";
+			default:
+				return T"AIQuickHack.PreventionSystemHackerLoop";
+		}
+	}
+
+	public function HasAppliedHackSpeed() : Bool
+	{
+		return m_appliedHackSpeed != EAppliedTriangulationHackSpeed.NotAssigned;
+	}
+
+	public function GetTimeToHack( instance : GameInstance ) : Float
+	{
+		var table : weak< PreventionHeatTable_Record >;
+		table = PreventionSystem.GetPreventionHeatTableRecord( instance );
+		if( !( table ) )
+		{
+			return 0.0;
+		}
+		switch( m_appliedHackSpeed )
+		{
+			case EAppliedTriangulationHackSpeed.Slow:
+				return table.HackLoopTimeToHack();
+			case EAppliedTriangulationHackSpeed.Normal:
+				return table.HackLoopTimeToHack2();
+			case EAppliedTriangulationHackSpeed.Fast:
+				return table.HackLoopTimeToHack3();
+			case EAppliedTriangulationHackSpeed.NotAssigned:
+				return table.HackLoopTimeToHack();
+			default:
+				return table.HackLoopTimeToHack();
+		}
+	}
+
+	public function IncrementHackSpeed()
+	{
+		switch( m_appliedHackSpeed )
+		{
+			case EAppliedTriangulationHackSpeed.Slow:
+				m_appliedHackSpeed = EAppliedTriangulationHackSpeed.Normal;
+			break;
+			case EAppliedTriangulationHackSpeed.Normal:
+				m_appliedHackSpeed = EAppliedTriangulationHackSpeed.Fast;
+			break;
+		}
+	}
+
+}
+
+enum EPreventionHackLoopState
+{
+	IDLE = 0,
+	INTRO_RADIO = 1,
+	HACK_LOOP = 2,
+}
+
+class PreventionSystemHackerLoop extends ScriptableSystem
+{
+	private var m_firstVehicle : weak< VehicleObject >;
+	private var m_state : EPreventionHackLoopState;
+	default m_state = EPreventionHackLoopState.IDLE;
+	private var m_shouldHackLoopBeEnabledOnThisStar : Bool;
+	private var m_showingHackingPopUp : Bool;
+	private var m_currentVehicle : weak< VehicleObject >;
+	private var m_previousVehicle : weak< VehicleObject >;
+	private var m_curentHackDelayId : DelayID;
+	private var m_futureDelayedUpdateDelayId : DelayID;
+	private var m_hackedVehicles : array< VehiclePreventionHackState >;
+	private var m_otherProgressBar : weak< UploadFromNPCToPlayerListener >;
+	private var m_waitingForUpdate : Bool;
+
+	public constexpr static function GetSystemName() : CName
+	{
+		return 'PreventionSystemHackerLoop';
+	}
+
+	private function IsFirstVehicle( vehicle : weak< VehicleObject > ) : Bool
+	{
+		return ( m_firstVehicle && vehicle ) && ( m_firstVehicle == vehicle );
+	}
+
+	private static function GetInstance( game : GameInstance ) : PreventionSystemHackerLoop
+	{
+		var instance : PreventionSystemHackerLoop;
+		instance = ( ( PreventionSystemHackerLoop )( GameInstance.GetScriptableSystemsContainer( game ).Get( GetSystemName() ) ) );
+		return instance;
+	}
+
+	private static function GetCurrentStarState( game : GameInstance ) : EStarState
+	{
+		var instance : PreventionSystem;
+		instance = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( game ).Get( PreventionSystem.GetSystemName() ) ) );
+		return instance.GetStarState();
+	}
+
+	public static function UpdateStarStateUI( game : GameInstance )
+	{
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		instance.UpdateState();
+	}
+
+	public static function KeepProgressBarAliveAfterCompletion( game : GameInstance ) : Bool
+	{
+		var hackedState : VehiclePreventionHackState;
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		if( instance.m_currentVehicle )
+		{
+			hackedState = instance.FindVehicleState( instance.m_currentVehicle );
+			if( hackedState.m_stoppedVehicle )
+			{
+				return false;
+			}
+			return hackedState.m_hacked || hackedState.m_hackInProgress;
+		}
+		return false;
+	}
+
+	public static function ShouldForceUpdateProgressBar( game : GameInstance ) : Bool
+	{
+		var hackedState : VehiclePreventionHackState;
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		if( instance.m_currentVehicle )
+		{
+			hackedState = instance.FindVehicleState( instance.m_currentVehicle );
+			return hackedState.m_hacked || hackedState.m_hackInProgress;
+		}
+		return false;
+	}
+
+	public static function GetProgressBarForcedValue( game : GameInstance ) : Float
+	{
+		var hackedState : VehiclePreventionHackState;
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		if( instance.m_currentVehicle )
+		{
+			hackedState = instance.FindVehicleState( instance.m_currentVehicle );
+			return hackedState.m_progressBarProgressStart;
+		}
+		return 0.0;
+	}
+
+	public static function UpdateHackLoopProgressBarValue( game : GameInstance, newValue : Float, progressbar : UploadFromNPCToPlayerListener )
+	{
+		var hackedState : VehiclePreventionHackState;
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		if( instance.m_currentVehicle )
+		{
+			hackedState = instance.FindVehicleState( instance.m_currentVehicle );
+			hackedState.m_progressBarProgressSoFar = newValue;
+			hackedState.m_progressBar = progressbar;
+		}
+	}
+
+	public static function UpdateOtherProgressBarReference( game : GameInstance, progressbar : UploadFromNPCToPlayerListener )
+	{
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		instance.m_otherProgressBar = progressbar;
+	}
+
+	public static function AVCanBeSpawned( game : GameInstance ) : Bool
+	{
+		var hackedState : VehiclePreventionHackState;
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		if( instance.m_currentVehicle )
+		{
+			if( instance.m_currentVehicle.IsInAir() )
+			{
+				return false;
+			}
+			hackedState = instance.FindVehicleState( instance.m_currentVehicle );
+			return hackedState.m_hacked;
+		}
+		return true;
+	}
+
+	public static function ForceCarToStop( game : GameInstance )
+	{
+		var vehicle : VehiclePreventionHackState;
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		if( !( instance.m_currentVehicle ) )
+		{
+			return;
+		}
+		PoliceRadioScriptSystem.PlayRadio( game, 'maxtac_dispatch_start' );
+		vehicle = instance.FindVehicleState( instance.m_currentVehicle );
+		instance.StopVehicle_Internal( game, vehicle );
+	}
+
+	public static function UpdateHeatLevel( game : GameInstance, shouldHackLoopBeEnabledOnThisStar : Bool )
+	{
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		instance.m_shouldHackLoopBeEnabledOnThisStar = shouldHackLoopBeEnabledOnThisStar;
+		instance.UpdateState();
+	}
+
+	public static function UpdatePlayerVehicle( game : GameInstance, currentVehicle : weak< VehicleObject > )
+	{
+		var instance : PreventionSystemHackerLoop;
+		instance = GetInstance( game );
+		instance.m_previousVehicle = instance.m_currentVehicle;
+		instance.m_currentVehicle = currentVehicle;
+		instance.UpdateState();
+	}
+
+	private function FindVehicleState( vehicle : weak< VehicleObject > ) : VehiclePreventionHackState
+	{
+		var i : Int32;
+		var data : VehiclePreventionHackState;
+		var tempVehicleID : EntityID;
+		var vehicleID : EntityID;
+		vehicleID = vehicle.GetEntityID();
+		for( i = m_hackedVehicles.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( !( m_hackedVehicles[ i ] ) || !( m_hackedVehicles[ i ].m_vehicle ) )
+			{
+				m_hackedVehicles.Erase( i );
+				continue;
+			}
+			tempVehicleID = m_hackedVehicles[ i ].m_vehicleID;
+			if( tempVehicleID == vehicleID )
+			{
+				return m_hackedVehicles[ i ];
+			}
+		}
+		data = new VehiclePreventionHackState;
+		data.m_vehicleID = vehicleID;
+		data.m_vehicle = vehicle;
+		m_hackedVehicles.PushBack( data );
+		return data;
+	}
+
+	private function LaunchDelayedStateUpdate( delay : Float )
+	{
+		var evt : PreventionSystemUpdateHackLoopStateEvent;
+		if( m_waitingForUpdate )
+		{
+			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_futureDelayedUpdateDelayId );
+		}
+		else
+		{
+			m_waitingForUpdate = true;
+		}
+		evt = new PreventionSystemUpdateHackLoopStateEvent;
+		m_futureDelayedUpdateDelayId = GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( GetSystemName(), evt, delay );
+	}
+
+	private function UpdateState()
+	{
+		if( m_waitingForUpdate )
+		{
+			return;
+		}
+		switch( m_state )
+		{
+			case EPreventionHackLoopState.IDLE:
+				Idle();
+			return;
+			case EPreventionHackLoopState.INTRO_RADIO:
+				IntroRadio();
+			break;
+			case EPreventionHackLoopState.HACK_LOOP:
+				HackLoop();
+			break;
+		}
+		if( !( m_shouldHackLoopBeEnabledOnThisStar ) )
+		{
+			m_state = EPreventionHackLoopState.IDLE;
+		}
+	}
+
+	private function Idle()
+	{
+		var delay : Float;
+		if( !( m_currentVehicle ) )
+		{
+			return;
+		}
+		if( !( m_shouldHackLoopBeEnabledOnThisStar ) )
+		{
+			return;
+		}
+		m_firstVehicle = m_currentVehicle;
+		m_state = EPreventionHackLoopState.INTRO_RADIO;
+		delay = PreventionSystem.GetPreventionHeatTableRecord( GetGameInstance() ).IdleStateTransitionDelay();
+		LaunchDelayedStateUpdate( delay );
+	}
+
+	private function IntroRadio()
+	{
+		var delay : Float;
+		if( !( m_currentVehicle ) )
+		{
+			return;
+		}
+		if( !( m_shouldHackLoopBeEnabledOnThisStar ) )
+		{
+			m_state = EPreventionHackLoopState.IDLE;
+			return;
+		}
+		m_state = EPreventionHackLoopState.HACK_LOOP;
+		PoliceRadioScriptSystem.PlayRadio( GetGameInstance(), 'start_hack_vehicle_loop' );
+		delay = PreventionSystem.GetPreventionHeatTableRecord( GetGameInstance() ).IntroRadioStateTransitionDelay();
+		LaunchDelayedStateUpdate( delay );
+	}
+
+	private function HackLoop()
+	{
+		var data : VehiclePreventionHackState;
+		var evt : DelayedStopVehicle;
+		if( !( m_currentVehicle ) )
+		{
+			if( m_showingHackingPopUp )
+			{
+				if( m_shouldHackLoopBeEnabledOnThisStar )
+				{
+					data = FindVehicleState( m_previousVehicle );
+					PauseHack( data );
+				}
+				if( m_showingHackingPopUp )
+				{
+					data.m_hackInProgress = false;
+					InterruptHackingPopUp();
+				}
+				LaunchDelayedStateUpdate( 1.0 );
+			}
+			return;
+		}
+		data = FindVehicleState( m_currentVehicle );
+		if( !( m_shouldHackLoopBeEnabledOnThisStar ) )
+		{
+			m_state = EPreventionHackLoopState.IDLE;
+			data.m_appliedHackSpeed = EAppliedTriangulationHackSpeed.NotAssigned;
+			data.m_hackInProgress = false;
+			AbortHacks();
+			LaunchDelayedStateUpdate( 1.0 );
+			return;
+		}
+		if( GetCurrentStarState( GetGameInstance() ) != EStarState.Active )
+		{
+			if( m_showingHackingPopUp )
+			{
+				data.IncrementHackSpeed();
+				data.m_hackInProgress = false;
+				AbortHacks();
+				LaunchDelayedStateUpdate( 1.0 );
+			}
+			return;
+		}
+		if( data.m_stoppedVehicle )
+		{
+			evt = new DelayedStopVehicle;
+			evt.state = data;
+			GameInstance.GetDelaySystem( GetGameInstance() ).DelayScriptableSystemRequest( GetSystemName(), evt, 1.0 );
+			return;
+		}
+		if( m_otherProgressBar )
+		{
+			LaunchDelayedStateUpdate( 2.0 );
+			return;
+		}
+		if( data.m_progressBarProgressStart > 0.01 )
+		{
+			UnpauseHack( data );
+		}
+		if( !( m_showingHackingPopUp ) )
+		{
+			StartHackTimer( data );
+			LaunchDelayedStateUpdate( 1.0 );
+		}
+	}
+
+	private function PauseHack( newHack : VehiclePreventionHackState )
+	{
+		newHack.m_progressBarProgressStart = newHack.m_progressBarProgressSoFar;
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_curentHackDelayId );
+	}
+
+	private function UnpauseHack( newHack : VehiclePreventionHackState )
+	{
+		newHack.m_progressBarProgressSoFar = newHack.m_progressBarProgressStart;
+	}
+
+	private function AbortHacks()
+	{
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_curentHackDelayId );
+		InterruptHackingPopUp();
+	}
+
+	private function HackTimerCallback( data : VehiclePreventionHackState, delay : Float )
+	{
+		var hackLoopReportPlayerLocationRequest : HackLoopReportPlayerLocationRequest;
+		data.m_hackInProgress = false;
+		data.m_hacked = true;
+		if( m_currentVehicle != data.m_vehicle )
+		{
+			return;
+		}
+		hackLoopReportPlayerLocationRequest = new HackLoopReportPlayerLocationRequest;
+		hackLoopReportPlayerLocationRequest.state = data;
+		BroadcastPlayerLocationUntilVehicleExit( hackLoopReportPlayerLocationRequest, 0.5 );
+	}
+
+	private function IsNearMaxtac() : Bool
+	{
+		var maxtacNpcs : array< NPCAgent >;
+		var table : weak< PreventionHeatTable_Record >;
+		var player : PlayerPuppet;
+		var agent : NPCAgent;
+		var i : Int32;
+		var playerVehicleMaxTacDistance : Float;
+		table = PreventionSystem.GetPreventionHeatTableRecord( GetGameInstance() );
+		if( !( table ) )
+		{
+			return false;
+		}
+		if( PreventionSystem.GetAgentRegistry( GetGameInstance() ).GetMaxTacNPCCount() > 0 )
+		{
+			playerVehicleMaxTacDistance = table.HackLoopPlayerVehicleMaxtacDistance();
+			playerVehicleMaxTacDistance *= playerVehicleMaxTacDistance;
+			maxtacNpcs = PreventionSystem.GetAgentRegistry( GetGameInstance() ).GetMaxTacNPCList();
+			player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerControlledGameObject() ) );
+			for( i = 0; i < maxtacNpcs.Size(); i += 1 )
+			{
+				agent = maxtacNpcs[ i ];
+				if( Vector4.DistanceSquared( player.GetWorldPosition(), agent.gameObject.GetWorldPosition() ) < playerVehicleMaxTacDistance )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private function BroadcastPlayerLocationUntilVehicleExit( request : HackLoopReportPlayerLocationRequest, delay : Float )
+	{
+		var instance : GameInstance;
+		instance = GetGameInstance();
+		if( ( ( !( m_currentVehicle ) || !( m_shouldHackLoopBeEnabledOnThisStar ) ) || ( m_currentVehicle != request.state.m_vehicle ) ) || request.state.m_stoppedVehicle )
+		{
+			PreventionSystem.ForceStarStateToActive( instance, false );
+			return;
+		}
+		if( IsNearMaxtac() )
+		{
+			StopVehicle_Internal( GetGameInstance(), request.state );
+			PreventionSystem.ForceStarStateToActive( instance, false );
+			return;
+		}
+		PreventionSystem.SetLastKnownPlayerPosition( instance, m_currentVehicle.GetWorldPosition() );
+		PreventionSystem.ForceStarStateToActive( instance, true );
+		GameInstance.GetDelaySystem( instance ).DelayScriptableSystemRequest( GetSystemName(), request, delay );
+	}
+
+	private function OnHackLoopReportPlayerLocationRequest( request : HackLoopReportPlayerLocationRequest )
+	{
+		BroadcastPlayerLocationUntilVehicleExit( request, 0.5 );
+	}
+
+	private function StartHackTimer( data : VehiclePreventionHackState )
+	{
+		var timeToHack : Float;
+		var isInterruptedHack : Bool;
+		var instance : GameInstance;
+		var evt : PreventionSystemPlayerCarHackTimeOutEvent;
+		isInterruptedHack = data.m_progressBarProgressStart > 0.01;
+		instance = GetGameInstance();
+		evt = new PreventionSystemPlayerCarHackTimeOutEvent;
+		evt.state = data;
+		if( !( data.HasAppliedHackSpeed() ) )
+		{
+			data.m_appliedHackSpeed = EAppliedTriangulationHackSpeed.Normal;
+			if( IsFirstVehicle( m_currentVehicle ) )
+			{
+				data.m_appliedHackSpeed = EAppliedTriangulationHackSpeed.Slow;
+			}
+			if( IsNearMaxtac() )
+			{
+				data.m_appliedHackSpeed = EAppliedTriangulationHackSpeed.Fast;
+			}
+		}
+		StartBigHackingPopUp( data );
+		timeToHack = data.GetTimeToHack( GetGameInstance() );
+		if( isInterruptedHack )
+		{
+			timeToHack -= ( ( data.m_progressBarProgressStart / 100.0 ) * timeToHack );
+		}
+		if( timeToHack < 0.01 )
+		{
+			timeToHack = 1.0;
+			data.m_progressBarProgressStart = 98.0;
+		}
+		data.m_hackInProgress = true;
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_curentHackDelayId );
+		m_curentHackDelayId = GameInstance.GetDelaySystem( instance ).DelayScriptableSystemRequest( GetSystemName(), evt, timeToHack );
+	}
+
+	private function StartBigHackingPopUp( data : VehiclePreventionHackState )
+	{
+		var evt : HackPlayerEvent;
+		var player : GameObject;
+		player = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		evt = new HackPlayerEvent;
+		evt.targetID = player.GetEntityID();
+		evt.netrunnerID = player.GetEntityID();
+		evt.objectRecord = TweakDBInterface.GetObjectActionRecord( data.GetAppliedHackSpeedHack() );
+		evt.showDirectionalIndicator = false;
+		evt.revealPositionAction = false;
+		evt.skipBeingHackedSetUp = true;
+		if( StatusEffectSystem.ObjectHasStatusEffect( player, T"StatusEffect.HackReveal" ) )
+		{
+			StatusEffectHelper.RemoveStatusEffect( player, T"AIQuickHackStatusEffect.HackRevealInterrupted" );
+		}
+		else
+		{
+			StatusEffectHelper.RemoveStatusEffect( player, T"AIQuickHackStatusEffect.HackingInterrupted" );
+		}
+		player.QueueEvent( evt );
+		m_showingHackingPopUp = true;
+	}
+
+	private function ForceCloseProgressBar( vehicle : VehicleObject ) : Bool
+	{
+		var data : VehiclePreventionHackState;
+		if( vehicle )
+		{
+			data = FindVehicleState( vehicle );
+			if( data.m_progressBar )
+			{
+				data.m_progressBar.ForceClose();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function InterruptHackingPopUp()
+	{
+		var player : GameObject;
+		player = GameInstance.GetPlayerSystem( GetGameInstance() ).GetLocalPlayerMainGameObject();
+		if( !( ForceCloseProgressBar( m_currentVehicle ) ) )
+		{
+			ForceCloseProgressBar( m_previousVehicle );
+		}
+		if( StatusEffectSystem.ObjectHasStatusEffect( player, T"StatusEffect.HackReveal" ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( player, T"AIQuickHackStatusEffect.HackRevealInterrupted" );
+		}
+		else
+		{
+			StatusEffectHelper.ApplyStatusEffect( player, T"AIQuickHackStatusEffect.HackingInterrupted" );
+		}
+		m_showingHackingPopUp = false;
+	}
+
+	private function StopVehicle( state : VehiclePreventionHackState, delay : Float )
+	{
+		var instance : GameInstance;
+		var evt : PreventionSystemPlayerCarHackFinishedEvent;
+		instance = GetGameInstance();
+		evt = new PreventionSystemPlayerCarHackFinishedEvent;
+		state.m_vehicle.ForceBrakesUntilStoppedOrFor( delay );
+		evt.state = state;
+		GameInstance.GetDelaySystem( instance ).DelayScriptableSystemRequest( GetSystemName(), evt, delay );
+	}
+
+	private function OnDelayedStopVehicle( request : DelayedStopVehicle )
+	{
+		StopVehicle( request.state, PreventionSystem.GetPreventionHeatTableRecord( GetGameInstance() ).HackLoopDurationInGoodSpot() );
+	}
+
+	private function OnPreventionSystemPlayerCarHackFinishedEvent( request : PreventionSystemPlayerCarHackFinishedEvent )
+	{
+		GameObjectEffectHelper.StopEffectEvent( request.state.m_vehicle, VehicleComponent.GetImmobilizedName() );
+		request.state.m_hacked = false;
+		UpdateState();
+	}
+
+	private function OnPreventionSystemPlayerCarHackTimeOutEvent( request : PreventionSystemPlayerCarHackTimeOutEvent )
+	{
+		var duration : Float;
+		duration = PreventionSystem.GetPreventionHeatTableRecord( GetGameInstance() ).HackLoopHackDuration();
+		HackTimerCallback( request.state, duration );
+	}
+
+	private function OnPreventionSystemUpdateHackLoopStateEvent( request : PreventionSystemUpdateHackLoopStateEvent )
+	{
+		m_waitingForUpdate = false;
+		UpdateState();
+	}
+
+	private function StopVehicle_Internal( game : GameInstance, data : VehiclePreventionHackState )
+	{
+		data.m_stoppedVehicle = true;
+		GameObjectEffectHelper.StartEffectEvent( data.m_vehicle, 'immobilized' );
+		ForceCloseProgressBar( data.m_vehicle );
+		StopVehicle( data, PreventionSystem.GetPreventionHeatTableRecord( game ).HackLoopDurationInGoodSpot() );
+		GameObjectEffectHelper.StartEffectEvent( data.m_vehicle, VehicleComponent.GetImmobilizedName() );
+		DelayForceAboutToExplodeState( data, 5.0 );
+	}
+
+	private function DelayForceAboutToExplodeState( state : VehiclePreventionHackState, delay : Float )
+	{
+		var evt : DelayedForceAboutToExplodeStateRequest;
+		var instance : GameInstance;
+		evt = new DelayedForceAboutToExplodeStateRequest;
+		instance = GetGameInstance();
+		evt.state = state;
+		GameInstance.GetDelaySystem( instance ).DelayScriptableSystemRequest( GetSystemName(), evt, delay );
+	}
+
+	private function OnDelayedForceAboutToExplodeState( request : DelayedForceAboutToExplodeStateRequest )
+	{
+		request.state.m_vehicle.GetVehicleComponent().ForceAboutToExplodeState();
+	}
+
+}
+
+class HackLoopReportPlayerLocationRequest extends ScriptableSystemRequest
+{
+	var state : VehiclePreventionHackState;
+}
+
+class DelayedForceAboutToExplodeStateRequest extends ScriptableSystemRequest
+{
+	var state : VehiclePreventionHackState;
+}
+
+class DelayedStopVehicle extends ScriptableSystemRequest
+{
+	var state : VehiclePreventionHackState;
+}
+
+class PreventionSystemPlayerCarHackFinishedEvent extends ScriptableSystemRequest
+{
+	var state : VehiclePreventionHackState;
+}
+
+class PreventionSystemPlayerCarHackTimeOutEvent extends ScriptableSystemRequest
+{
+	var state : VehiclePreventionHackState;
+}
+
+class PreventionSystemUpdateHackLoopStateEvent extends ScriptableSystemRequest
+{
+}
+

@@ -1,0 +1,424 @@
+importonly abstract class IPoliceRadioSystem extends IGameSystem
+{
+}
+
+import class PoliceRadioSystem extends IPoliceRadioSystem
+{
+	var lastDistrictEntry : CName;
+	var isHeat1LineRequestOngoing : Bool;
+
+	public import function PoliceRadioRequest( voRequest : CName );
+	public import function GetRecentRequests() : CName[ 3 ];
+	public import function AbortCurrentRadioLine();
+}
+
+class PlayRadioArgs
+{
+	var instance : GameInstance;
+	var delay : Float;
+	var entryName : CName;
+	var onlyPlayIfPlayerIsBeingChased : Bool;
+	var shouldCheckDistrictAfterDelay : Bool;
+	var handleVehicleEntranceEdgeCase : Bool;
+	var handleVehicleLostOrSpottedEdgeCase : Bool;
+	var stateUsedOnRequest : EStarState;
+
+	public static function CheckPlayerIsChasedAndDistrictArgs( gameInstance : GameInstance, entry : CName, timeDelay : Float ) : PlayRadioArgs
+	{
+		var args : PlayRadioArgs;
+		args = CheckPlayerIsChasedArgs( gameInstance, entry, timeDelay );
+		args.shouldCheckDistrictAfterDelay = true;
+		return args;
+	}
+
+	public static function CheckPlayerIsChasedAndVehicleEntranceArgs( gameInstance : GameInstance, entry : CName, timeDelay : Float ) : PlayRadioArgs
+	{
+		var args : PlayRadioArgs;
+		args = CheckPlayerIsChasedArgs( gameInstance, entry, timeDelay );
+		args.handleVehicleEntranceEdgeCase = true;
+		return args;
+	}
+
+	public static function CheckPlayerIsChasedAndVisibilityArgs( gameInstance : GameInstance, entry : CName, timeDelay : Float, state : EStarState ) : PlayRadioArgs
+	{
+		var args : PlayRadioArgs;
+		args = CheckPlayerIsChasedArgs( gameInstance, entry, timeDelay );
+		args.handleVehicleLostOrSpottedEdgeCase = true;
+		args.stateUsedOnRequest = state;
+		return args;
+	}
+
+	public static function CheckPlayerIsChasedArgs( gameInstance : GameInstance, entry : CName, timeDelay : Float ) : PlayRadioArgs
+	{
+		var args : PlayRadioArgs;
+		args = DefaultDelayedArgs( gameInstance, entry, timeDelay );
+		args.onlyPlayIfPlayerIsBeingChased = true;
+		return args;
+	}
+
+	public static function DefaultDelayedArgs( gameInstance : GameInstance, entry : CName, timeDelay : Float ) : PlayRadioArgs
+	{
+		var args : PlayRadioArgs;
+		args = DefaultArgs( gameInstance, entry );
+		args.delay = timeDelay;
+		return args;
+	}
+
+	public static function DefaultArgs( gameInstance : GameInstance, entry : CName ) : PlayRadioArgs
+	{
+		var args : PlayRadioArgs;
+		args = new PlayRadioArgs;
+		args.instance = gameInstance;
+		args.delay = -1.0;
+		args.entryName = entry;
+		args.onlyPlayIfPlayerIsBeingChased = false;
+		args.shouldCheckDistrictAfterDelay = false;
+		args.handleVehicleEntranceEdgeCase = false;
+		args.handleVehicleLostOrSpottedEdgeCase = false;
+		args.stateUsedOnRequest = EStarState.Default;
+		return args;
+	}
+
+}
+
+class RadioDelayedRequest extends ScriptableSystemRequest
+{
+	var data : PlayRadioArgs;
+}
+
+class PoliceRadioScriptSystem extends ScriptableSystem
+{
+
+	public constexpr static function GetSystemName() : CName
+	{
+		return 'PoliceRadioScriptSystem';
+	}
+
+	private static function IsPlayerInVehicle( instance : GameInstance ) : Bool
+	{
+		return GetPlayer( instance ).GetPlayerStateMachineBlackboard().GetBool( GetAllBlackboardDefs().PlayerStateMachine.MountedToVehicle );
+	}
+
+	public static function PlayRadio( instance : GameInstance, entryName : CName )
+	{
+		var args : PlayRadioArgs;
+		args = PlayRadioArgs.DefaultArgs( instance, entryName );
+		PlayRadio( args );
+	}
+
+	public static function PlayRadio( args : PlayRadioArgs )
+	{
+		var radioSystem : PoliceRadioSystem;
+		var preventionSystem : PreventionSystem;
+		var heatLevel : EPreventionHeatStage;
+		var starState : EStarState;
+		var currentTime : Float;
+		var evt : RadioDelayedRequest;
+		var delay : Float;
+		if( !( IsNameValid( args.entryName ) ) )
+		{
+			return;
+		}
+		if( args.delay > 0.01 )
+		{
+			delay = args.delay;
+			evt = new RadioDelayedRequest;
+			evt.data = args;
+			evt.data.delay = -1.0;
+			GameInstance.GetDelaySystem( args.instance ).DelayScriptableSystemRequest( GetSystemName(), evt, delay );
+			return;
+		}
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( args.instance ).Get( PreventionSystem.GetSystemName() ) ) );
+		radioSystem = GameInstance.GetPoliceRadioSystem( args.instance );
+		if( IsHeat1Line( args.entryName, preventionSystem.GetCurrentDistrict() ) )
+		{
+			radioSystem.isHeat1LineRequestOngoing = false;
+		}
+		else if( radioSystem.isHeat1LineRequestOngoing )
+		{
+			return;
+		}
+		if( !( IsPlayerInVehicle( args.instance ) ) )
+		{
+			return;
+		}
+		if( ( args.shouldCheckDistrictAfterDelay && IsNameValid( radioSystem.lastDistrictEntry ) ) && args.entryName != radioSystem.lastDistrictEntry )
+		{
+			return;
+		}
+		if( !( args.onlyPlayIfPlayerIsBeingChased ) )
+		{
+			radioSystem.PoliceRadioRequest( args.entryName );
+			return;
+		}
+		heatLevel = preventionSystem.GetHeatStage();
+		starState = preventionSystem.GetStarState();
+		if( heatLevel == EPreventionHeatStage.Heat_0 )
+		{
+			return;
+		}
+		if( args.handleVehicleLostOrSpottedEdgeCase )
+		{
+			if( args.stateUsedOnRequest == starState )
+			{
+				radioSystem.PoliceRadioRequest( args.entryName );
+			}
+			return;
+		}
+		if( !( args.handleVehicleEntranceEdgeCase ) )
+		{
+			radioSystem.PoliceRadioRequest( args.entryName );
+			return;
+		}
+		currentTime = EngineTime.ToFloat( GameInstance.GetSimTime( args.instance ) );
+		if( preventionSystem.IsPoliceUnawareOfThePlayerExactLocation() || ( ( currentTime - preventionSystem.GetFirstStarTimeStamp() ) < 21.0 ) )
+		{
+			radioSystem.PoliceRadioRequest( preventionSystem.GetCurrentDistrict().GetRadioEntryName() );
+		}
+		else if( starState == EStarState.Active && ( heatLevel == EPreventionHeatStage.Heat_3 || heatLevel == EPreventionHeatStage.Heat_4 ) )
+		{
+			radioSystem.PoliceRadioRequest( args.entryName );
+		}
+	}
+
+	private static function GetHeatStageRadioEntryName( instance : GameInstance, heatStage : EPreventionHeatStage, currentDistrict : weak< District > ) : CName
+	{
+		var radioSystem : PoliceRadioSystem;
+		var recentValues : CName[ 3 ];
+		var currentDistrictLine : CName;
+		var i : Int32;
+		var isSpam : Bool;
+		radioSystem = GameInstance.GetPoliceRadioSystem( instance );
+		recentValues = radioSystem.GetRecentRequests();
+		if( currentDistrict )
+		{
+			if( currentDistrict.IsDogTown() )
+			{
+				switch( heatStage )
+				{
+					case EPreventionHeatStage.Heat_0:
+						return 'dogtown_losing_player_start';
+					case EPreventionHeatStage.Heat_1:
+						return 'dogtown_heat_1_start';
+					case EPreventionHeatStage.Heat_2:
+						return 'dogtown_heat_2_start';
+					case EPreventionHeatStage.Heat_3:
+						return 'dogtown_heat_3_start';
+					case EPreventionHeatStage.Heat_4:
+						return 'dogtown_heat_4_start';
+					case EPreventionHeatStage.Heat_5:
+						return 'dogtown_heat_5_start';
+				}
+			}
+		}
+		currentDistrictLine = currentDistrict.GetRadioEntryName();
+		for( i = 0; i < recentValues.Size(); i += 1 )
+		{
+			if( heatStage == EPreventionHeatStage.Heat_0 )
+			{
+				if( 'nc_heat_0_start_1' == recentValues[ i ] )
+				{
+					return 'nc_heat_0_start_2';
+				}
+				if( 'nc_heat_0_start_2' == recentValues[ i ] )
+				{
+					return 'nc_heat_0_start_1';
+				}
+			}
+			if( recentValues[ i ] == currentDistrictLine )
+			{
+				isSpam = true;
+				break;
+			}
+		}
+		switch( heatStage )
+		{
+			case EPreventionHeatStage.Heat_0:
+				i = RandRange( 0, 2 );
+			if( i == 1 )
+			{
+				return 'nc_heat_0_start_1';
+			}
+			return 'nc_heat_0_start_2';
+			case EPreventionHeatStage.Heat_1:
+				if( isSpam )
+				{
+					return 'nc_heat_1_start';
+				}
+			return currentDistrictLine;
+			case EPreventionHeatStage.Heat_2:
+				return 'nc_heat_2_start';
+			case EPreventionHeatStage.Heat_3:
+				return 'nc_heat_3_start';
+			case EPreventionHeatStage.Heat_4:
+				return 'nc_heat_4_start';
+			case EPreventionHeatStage.Heat_5:
+				return 'nc_heat_5_start';
+			default:
+				return '';
+		}
+	}
+
+	private static function IsHeat1Line( line : CName, currentDistrict : weak< District > ) : Bool
+	{
+		var currentDistrictLine : CName;
+		currentDistrictLine = currentDistrict.GetRadioEntryName();
+		return ( line == currentDistrictLine || line == 'dogtown_heat_1_start' ) || line == 'nc_heat_1_start';
+	}
+
+	public static function UpdatePoliceRadioOnHeatChange( instance : GameInstance, heatStage : EPreventionHeatStage, currentDistrict : weak< District > )
+	{
+		var radioSystem : PoliceRadioSystem;
+		var args : PlayRadioArgs;
+		radioSystem = GameInstance.GetPoliceRadioSystem( instance );
+		if( heatStage == EPreventionHeatStage.Heat_1 )
+		{
+			radioSystem.isHeat1LineRequestOngoing = true;
+			args = PlayRadioArgs.DefaultDelayedArgs( instance, GetHeatStageRadioEntryName( instance, heatStage, currentDistrict ), 3.0 );
+		}
+		else
+		{
+			args = PlayRadioArgs.DefaultArgs( instance, GetHeatStageRadioEntryName( instance, heatStage, currentDistrict ) );
+		}
+		PlayRadio( args );
+	}
+
+	public static function UpdatePoliceRadioOnDistrictChange( instance : GameInstance, currentDistrict : weak< District >, heatStage : EPreventionHeatStage )
+	{
+		var radioSystem : PoliceRadioSystem;
+		var districtEntry : CName;
+		var delay : Float;
+		var rnd : Int32;
+		radioSystem = GameInstance.GetPoliceRadioSystem( instance );
+		delay = 5.0;
+		districtEntry = currentDistrict.GetRadioEntryName();
+		if( districtEntry == radioSystem.lastDistrictEntry )
+		{
+			return;
+		}
+		if( !( currentDistrict.IsDogTown() ) )
+		{
+			if( heatStage != EPreventionHeatStage.Heat_2 )
+			{
+				return;
+			}
+			rnd = RandRange( 0, 3 );
+		}
+		else
+		{
+			if( heatStage == EPreventionHeatStage.Heat_4 )
+			{
+				return;
+			}
+			if( heatStage == EPreventionHeatStage.Heat_5 )
+			{
+				radioSystem.lastDistrictEntry = districtEntry;
+				PlayRadio( PlayRadioArgs.CheckPlayerIsChasedArgs( instance, 'dogtown_heat_5_start', delay ) );
+				return;
+			}
+		}
+		if( rnd == 0 )
+		{
+			PlayRadio( PlayRadioArgs.CheckPlayerIsChasedAndDistrictArgs( instance, districtEntry, delay ) );
+		}
+		radioSystem.lastDistrictEntry = districtEntry;
+	}
+
+	public static function UpdatePoliceRadioOnVehicleEntrance( instance : GameInstance )
+	{
+		var preventionSystem : PreventionSystem;
+		var args : PlayRadioArgs;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( instance ).Get( PreventionSystem.GetSystemName() ) ) );
+		if( preventionSystem.GetCurrentDistrict().IsDogTown() )
+		{
+			args = PlayRadioArgs.CheckPlayerIsChasedAndVehicleEntranceArgs( instance, 'dogtown_on_vehicle_start', 2.0 );
+		}
+		else
+		{
+			args = PlayRadioArgs.CheckPlayerIsChasedAndVehicleEntranceArgs( instance, 'nc_on_vehicle_start', 2.0 );
+		}
+		PlayRadio( args );
+	}
+
+	public static function UpdatePoliceRadioOnPlayerVisibilityChanged( instance : GameInstance, lastStarChangeStartTimeStamp : Float, currentHeatState : EPreventionHeatStage, currentVisibilityState : EStarState, futureVisibilityState : EStarState )
+	{
+		var preventionSystem : PreventionSystem;
+		var playerNotInVehicle : Bool;
+		var args : PlayRadioArgs;
+		var entry : CName;
+		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( instance ).Get( PreventionSystem.GetSystemName() ) ) );
+		playerNotInVehicle = !( IsPlayerInVehicle( instance ) );
+		if( playerNotInVehicle )
+		{
+			return;
+		}
+		if( ( EngineTime.ToFloat( GameInstance.GetSimTime( instance ) ) - lastStarChangeStartTimeStamp ) < 10.0 )
+		{
+			return;
+		}
+		if( !( ( currentHeatState == EPreventionHeatStage.Heat_1 || currentHeatState == EPreventionHeatStage.Heat_2 ) || currentHeatState == EPreventionHeatStage.Heat_3 ) )
+		{
+			return;
+		}
+		if( preventionSystem.GetCurrentDistrict().IsDogTown() )
+		{
+			if( currentVisibilityState == EStarState.Active && futureVisibilityState == EStarState.Searching )
+			{
+				entry = 'dogtown_almost_losing_player_start';
+				if( IsARecentEntry( instance, entry ) )
+				{
+					return;
+				}
+				args = PlayRadioArgs.CheckPlayerIsChasedAndVisibilityArgs( instance, entry, 3.0, futureVisibilityState );
+				PlayRadio( args );
+			}
+		}
+		else
+		{
+			if( currentVisibilityState == EStarState.Active && futureVisibilityState == EStarState.Searching )
+			{
+				entry = 'losing_player_start';
+				if( IsARecentEntry( instance, entry ) )
+				{
+					return;
+				}
+				args = PlayRadioArgs.CheckPlayerIsChasedAndVisibilityArgs( instance, entry, 3.0, futureVisibilityState );
+				PlayRadio( args );
+			}
+			else if( ( currentVisibilityState == EStarState.Searching || currentVisibilityState == EStarState.Blinking ) && futureVisibilityState == EStarState.Active )
+			{
+				entry = 'nc_on_vehicle_spotted';
+				if( IsARecentEntry( instance, entry ) )
+				{
+					return;
+				}
+				args = PlayRadioArgs.CheckPlayerIsChasedAndVisibilityArgs( instance, entry, 1.0, futureVisibilityState );
+				PlayRadio( args );
+			}
+		}
+	}
+
+	private static function IsARecentEntry( instance : GameInstance, entryName : CName ) : Bool
+	{
+		var radioSystem : PoliceRadioSystem;
+		var recentRequests : CName[ 3 ];
+		var i : Int32;
+		radioSystem = GameInstance.GetPoliceRadioSystem( instance );
+		recentRequests = radioSystem.GetRecentRequests();
+		for( i = 0; i < 3; i += 1 )
+		{
+			if( recentRequests[ i ] == entryName )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function OnRadioDelayedRequest( request : RadioDelayedRequest )
+	{
+		PlayRadio( request.data );
+	}
+
+}
+

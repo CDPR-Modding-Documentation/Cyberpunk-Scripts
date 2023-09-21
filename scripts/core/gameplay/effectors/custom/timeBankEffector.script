@@ -1,0 +1,192 @@
+class TimeBankOnStatusEffectAppliedListener extends ScriptStatusEffectListener
+{
+	var m_effector : weak< StatusEffectBasedTimeBankEffector >;
+
+	public virtual function OnStatusEffectApplied( statusEffect : weak< StatusEffect_Record > )
+	{
+		if( StatusEffectHelper.HasTag( statusEffect, 'PlayerCyberwareCooldown' ) )
+		{
+			m_effector.EvaluateCyberwareCooldown( statusEffect.GetID() );
+		}
+	}
+
+}
+
+class StatusEffectBasedTimeBankEffector extends Effector
+{
+	private var m_player : weak< GameObject >;
+	private var m_playerEntityID : EntityID;
+	private var m_statusEffectListener : TimeBankOnStatusEffectAppliedListener;
+	private var m_gameInstance : GameInstance;
+
+	protected export override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		m_gameInstance = game;
+		m_player = GameInstance.GetPlayerSystem( m_gameInstance ).GetLocalPlayerControlledGameObject();
+		m_playerEntityID = m_player.GetEntityID();
+		GameInstance.GetStatPoolsSystem( m_gameInstance ).RequestSettingStatPoolValue( m_playerEntityID, gamedataStatPoolType.TimeBank, 100.0, m_player );
+		m_statusEffectListener = new TimeBankOnStatusEffectAppliedListener;
+		m_statusEffectListener.m_effector = this;
+		GameInstance.GetStatusEffectSystem( m_gameInstance ).RegisterListener( m_playerEntityID, m_statusEffectListener );
+	}
+
+	protected export override function Uninitialize( game : GameInstance )
+	{
+		m_statusEffectListener = NULL;
+	}
+
+	public function EvaluateCyberwareCooldown( statusEffectID : TweakDBID )
+	{
+		var spawnEffectEvent : entSpawnEffectEvent;
+		var appliedStatusEffects : array< StatusEffect >;
+		var timeBankVal : Float;
+		var remainingDuration : Float;
+		var i : Int32;
+		if( m_player )
+		{
+			GameInstance.GetStatusEffectSystem( m_gameInstance ).GetAppliedEffectsWithID( m_playerEntityID, statusEffectID, appliedStatusEffects );
+			for( i = 0; i < appliedStatusEffects.Size(); i += 1 )
+			{
+				timeBankVal = GameInstance.GetStatPoolsSystem( m_gameInstance ).GetStatPoolValue( m_playerEntityID, gamedataStatPoolType.TimeBank, false );
+				if( timeBankVal <= 0.0 )
+				{
+					return;
+				}
+				remainingDuration = appliedStatusEffects[ i ].GetRemainingDuration();
+				if( timeBankVal > remainingDuration )
+				{
+					timeBankVal -= remainingDuration;
+					remainingDuration = 0.0;
+				}
+				else
+				{
+					remainingDuration -= timeBankVal;
+					timeBankVal = 0.0;
+				}
+				GameInstance.GetStatPoolsSystem( m_gameInstance ).RequestSettingStatPoolValue( m_playerEntityID, gamedataStatPoolType.TimeBank, timeBankVal, m_player, false );
+				GameInstance.GetStatusEffectSystem( m_gameInstance ).SetStatusEffectRemainingDuration( m_playerEntityID, statusEffectID, remainingDuration );
+				spawnEffectEvent = new entSpawnEffectEvent;
+				spawnEffectEvent.effectName = 'time_bank';
+				m_player.QueueEvent( spawnEffectEvent );
+				break;
+			}
+		}
+	}
+
+}
+
+class TimeBankValueListener extends ScriptStatPoolsListener
+{
+	var m_effector : weak< StatPoolBasedTimeBankEffector >;
+
+	public override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		m_effector.m_TimeBankValue = newValue * percToPoints;
+	}
+
+}
+
+class StatPoolValueListener extends ScriptStatPoolsListener
+{
+	var m_effector : weak< StatPoolBasedTimeBankEffector >;
+
+	public export override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		if( ( m_effector.m_statPoolType == gamedataStatPoolType.OpticalCamoCharges && ( newValue < 1.0 ) ) && ( newValue > 0.0 ) )
+		{
+			m_effector.EvaluateStatPoolCooldown();
+		}
+	}
+
+	protected event OnStatPoolMinValueReached( value : Float )
+	{
+		m_effector.EvaluateStatPoolCooldown();
+	}
+
+}
+
+class StatPoolBasedTimeBankEffector extends ContinuousEffector
+{
+	var m_TimeBankValue : Float;
+	var m_maxStatPoolValue : Float;
+	var m_statPoolType : gamedataStatPoolType;
+	private var m_player : weak< GameObject >;
+	private var m_statPoolSystem : StatPoolsSystem;
+	private var m_TimeBankListener : TimeBankValueListener;
+	private var m_StatPoolListener : StatPoolValueListener;
+	private var m_playerEntityID : EntityID;
+	private var m_gameInstance : GameInstance;
+	private var m_regenMod : StatPoolModifier;
+
+	protected export override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
+	{
+		var statPoolRecord : StatPool_Record;
+		m_gameInstance = game;
+		m_player = GameInstance.GetPlayerSystem( m_gameInstance ).GetLocalPlayerControlledGameObject();
+		m_playerEntityID = m_player.GetEntityID();
+		m_statPoolSystem = GameInstance.GetStatPoolsSystem( m_gameInstance );
+		m_TimeBankListener = new TimeBankValueListener;
+		m_TimeBankListener.m_effector = this;
+		m_statPoolSystem.RequestRegisteringListener( m_playerEntityID, gamedataStatPoolType.TimeBank, m_TimeBankListener );
+		m_statPoolSystem.RequestSettingStatPoolValue( m_playerEntityID, gamedataStatPoolType.TimeBank, 100.0, m_player );
+		statPoolRecord = TweakDBInterface.GetStatPoolRecord( TDB.GetForeignKey( record + T".statPoolType" ) );
+		if( statPoolRecord )
+		{
+			m_statPoolType = statPoolRecord.StatPoolType();
+			m_StatPoolListener = new StatPoolValueListener;
+			m_StatPoolListener.m_effector = this;
+			m_statPoolSystem.RequestRegisteringListener( m_playerEntityID, m_statPoolType, m_StatPoolListener );
+		}
+		else
+		{
+			m_statPoolType = gamedataStatPoolType.Invalid;
+		}
+	}
+
+	protected export override function Uninitialize( game : GameInstance )
+	{
+		m_StatPoolListener = NULL;
+		m_TimeBankListener = NULL;
+	}
+
+	protected override function ContinuousAction( owner : GameObject, instigator : GameObject )
+	{
+		if( m_maxStatPoolValue != m_statPoolSystem.GetStatPoolMaxPointValue( m_playerEntityID, m_statPoolType ) )
+		{
+			m_maxStatPoolValue = m_statPoolSystem.GetStatPoolMaxPointValue( m_playerEntityID, m_statPoolType );
+			m_statPoolSystem.GetModifier( m_playerEntityID, m_statPoolType, gameStatPoolModificationTypes.Regeneration, m_regenMod );
+		}
+		if( m_regenMod.valuePerSec == 0.0 )
+		{
+			m_statPoolSystem.GetModifier( m_playerEntityID, m_statPoolType, gameStatPoolModificationTypes.Regeneration, m_regenMod );
+		}
+	}
+
+	public function EvaluateStatPoolCooldown()
+	{
+		var timeBankNewVal : Float;
+		var finalStatPoolValue : Float;
+		var spawnEffectEvent : entSpawnEffectEvent;
+		if( m_TimeBankValue <= 0.0 )
+		{
+			return;
+		}
+		if( m_TimeBankValue < ( m_maxStatPoolValue / m_regenMod.valuePerSec ) )
+		{
+			finalStatPoolValue = m_TimeBankValue * m_regenMod.valuePerSec;
+			timeBankNewVal = 0.0;
+		}
+		else
+		{
+			finalStatPoolValue = m_maxStatPoolValue;
+			timeBankNewVal = m_TimeBankValue - ( m_maxStatPoolValue / m_regenMod.valuePerSec );
+		}
+		m_statPoolSystem.RequestSettingStatPoolValue( m_playerEntityID, m_statPoolType, finalStatPoolValue, m_player, false );
+		m_statPoolSystem.RequestSettingStatPoolValue( m_playerEntityID, gamedataStatPoolType.TimeBank, timeBankNewVal, m_player, false );
+		spawnEffectEvent = new entSpawnEffectEvent;
+		spawnEffectEvent.effectName = 'time_bank';
+		m_player.QueueEvent( spawnEffectEvent );
+	}
+
+}
+

@@ -1,26 +1,118 @@
-importonly class DeviceAction extends Event
+importonly class PSChangedEvent extends Event
+{
+}
+
+importonly class PSDeviceChangedEvent extends Event
+{
+	import var persistentID : PersistentID;
+	import var className : CName;
+}
+
+import enum gamedeviceRequestType
+{
+	None,
+	External,
+	Remote,
+	Direct,
+	Internal,
+}
+
+importonly class DeviceStartPlayerCameraControlEvent extends Event
+{
+	import var playerController : weak< GameObject >;
+	import var initialRotation : Vector4;
+	import var minYaw : Float;
+	import var maxYaw : Float;
+	import var minPitch : Float;
+	import var maxPitch : Float;
+}
+
+importonly class DeviceEndPlayerCameraControlEvent extends Event
+{
+}
+
+importonly struct ActionPrereqs
 {
 	import var actionName : CName;
-	import var clearanceLevel : Int32;
-	import var localizedObjectName : String;
+	import var prereqs : array< IPrereq >;
+}
 
+importonly struct GetActionsContext
+{
+	import var clearance : Clearance;
+	import var requestorID : EntityID;
+	import var requestType : gamedeviceRequestType;
+	import var actionPrereqs : array< ActionPrereqs >;
+	import var interactionLayerTag : CName;
+	import var processInitiatorObject : weak< GameObject >;
+	import var ignoresAuthorization : Bool;
+	import var allowsRemoteAuthorization : Bool;
+	import var ignoresRPG : Bool;
+}
+
+importonly class Clearance extends IScriptable
+{
+	public import static function IsInRange( clearance : Clearance, clearanceLevel : Int32 ) : Bool;
+	public import static function CreateClearance( optional min : Int32, optional max : Int32 ) : Clearance;
+	public import static function ReadValues( clearance : Clearance, out min : Int32, out max : Int32 );
+	public import static function GetMaxClearanceLevel() : Int32;
+	public import static function GetMinClearanceLevel() : Int32;
+
+	import editable var min : Int32;
+	import editable var max : Int32;
+}
+
+struct ActionInteractivityInfo
+{
+	var isExternal : Bool;
+	var isRemote : Bool;
+	var isDirect : Bool;
+}
+
+class ResolveActionData
+{
+	var m_password : String;
+}
+
+importonly class DeviceAction extends Event
+{
 	public import function SetUp( const ps : PersistentState );
 	public import export virtual function GetProperties() : array< DeviceActionProperty >;
 	public import function GetPersistentID() : PersistentID;
 	public import function GetDeviceClassName() : CName;
 	public import const virtual function GetCurrentDisplayString() : String;
+
+	import var actionName : CName;
+	import var clearanceLevel : Int32;
+	import var localizedObjectName : String;
+}
+
+class PerformedAction extends Event
+{
+	var m_action : DeviceAction;
 }
 
 abstract class BaseScriptableAction extends DeviceAction
 {
 	protected var m_requesterID : EntityID;
 	protected var m_executor : weak< GameObject >;
+	protected var m_proxyExecutor : weak< GameObject >;
+	protected var m_costComponents : array< weak< ObjectActionCost_Record > >;
 	protected var m_objectActionID : TweakDBID;
 	protected var m_objectActionRecord : weak< ObjectAction_Record >;
 	protected var m_inkWidgetID : TweakDBID;
 	protected var interactionChoice : InteractionChoice;
 	protected var m_interactionLayer : CName;
 	protected var m_isActionRPGCheckDissabled : Bool;
+	protected var m_canSkipPayCost : Bool;
+	protected var m_calculatedBaseCost : Int32;
+	var m_deviceActionQueue : DeviceActionQueue;
+	var m_isActionQueueingUsed : Bool;
+	var m_isQueuedAction : Bool;
+	var m_isInactive : Bool;
+	var m_isTargetDead : Bool;
+	var m_activationTimeReduction : Float;
+	var m_IsAppliedByMonowire : Bool;
 
 	protected virtual function GetOwnerPS( game : GameInstance ) : PersistentState
 	{
@@ -54,6 +146,94 @@ abstract class BaseScriptableAction extends DeviceAction
 	public const function GetExecutor() : weak< GameObject >
 	{
 		return m_executor;
+	}
+
+	public function SetProxyExecutor( proxy : weak< GameObject > )
+	{
+		m_proxyExecutor = proxy;
+	}
+
+	public const function GetProxyExecutor() : weak< GameObject >
+	{
+		return m_proxyExecutor;
+	}
+
+	public const function GetDeviceActionQueue() : weak< DeviceActionQueue >
+	{
+		return m_deviceActionQueue;
+	}
+
+	public const function GetDeviceActionQueueSize() : Int32
+	{
+		if( m_deviceActionQueue )
+		{
+			return m_deviceActionQueue.GetQueueSize();
+		}
+		else
+		{
+			return 0;
+		}
+	}
+
+	public const function GetDeviceActionMaxQueueSize() : Int32
+	{
+		if( m_deviceActionQueue )
+		{
+			return m_deviceActionQueue.GetMaxQueueSize();
+		}
+		else
+		{
+			return 1;
+		}
+	}
+
+	public const function GetDeviceActionQueueNames() : array< CName >
+	{
+		var actionNames : array< CName >;
+		m_deviceActionQueue.GetAllQueuedActionNames( actionNames );
+		return actionNames;
+	}
+
+	public const function IsFirstUniqueCategoryInQueue( targetID : EntityID, category : gamedataHackCategory ) : Bool
+	{
+		var targetPuppet : ScriptedPuppet;
+		var currentlyUploadingAction : weak< ScriptableDeviceAction >;
+		var objectActionRecords : array< ObjectAction_Record >;
+		var deviceActionQueue : weak< DeviceActionQueue >;
+		var hackCategory : gamedataHackCategory;
+		var isNewCategory : Bool;
+		var i : Int32;
+		targetPuppet = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetExecutor().GetGame(), targetID ) ) );
+		isNewCategory = true;
+		if( !( targetPuppet ) )
+		{
+			return false;
+		}
+		currentlyUploadingAction = targetPuppet.GetCurrentlyUploadingAction();
+		if( ( currentlyUploadingAction == NULL ) || currentlyUploadingAction.m_isInactive )
+		{
+			return false;
+		}
+		hackCategory = currentlyUploadingAction.GetObjectActionRecord().HackCategory().Type();
+		if( hackCategory == category )
+		{
+			return false;
+		}
+		deviceActionQueue = currentlyUploadingAction.GetDeviceActionQueue();
+		if( deviceActionQueue )
+		{
+			deviceActionQueue.GetAllQueuedActionObjectRecords( objectActionRecords );
+			for( i = 0; i < objectActionRecords.Size(); i += 1 )
+			{
+				hackCategory = objectActionRecords[ i ].HackCategory().Type();
+				if( hackCategory == category )
+				{
+					isNewCategory = false;
+					break;
+				}
+			}
+		}
+		return isNewCategory;
 	}
 
 	public const function GetActionID() : CName
@@ -124,6 +304,7 @@ abstract class BaseScriptableAction extends DeviceAction
 		m_objectActionID = id;
 		m_objectActionRecord = NULL;
 		m_objectActionRecord = GetObjectActionRecord();
+		m_costComponents.Clear();
 		if( m_objectActionRecord )
 		{
 			actionName = m_objectActionRecord.ActionName();
@@ -240,7 +421,7 @@ abstract class BaseScriptableAction extends DeviceAction
 		}
 	}
 
-	public virtual function IsVisible( context : GetActionsContext, optional objectActionsCallbackController : weak< gameObjectActionsCallbackController > ) : Bool
+	public virtual function IsVisible( const context : ref< GetActionsContext >, optional objectActionsCallbackController : weak< gameObjectActionsCallbackController > ) : Bool
 	{
 		var actionRecord : weak< ObjectAction_Record >;
 		var instigatorPrereqs : array< weak< IPrereq_Record > >;
@@ -284,9 +465,17 @@ abstract class BaseScriptableAction extends DeviceAction
 		return false;
 	}
 
-	public virtual function ProcessRPGAction( gameInstance : GameInstance )
+	public virtual function ProcessRPGAction( gameInstance : GameInstance, optional gameplayRoleComponent : GameplayRoleComponent )
 	{
-		if( PayCost() )
+		SetProxyExecutor( GetExecutor().TryGetControlledProxy() );
+		if( GetActivationTime() > 0.0 )
+		{
+			if( PutActionInQuickhackQueue( gameInstance, gameplayRoleComponent ) )
+			{
+				return;
+			}
+		}
+		if( CanSkipPayCost( false ) || PayCost( true ) )
 		{
 			StartAction( gameInstance );
 			if( GetActivationTime() > 0.0 )
@@ -297,6 +486,7 @@ abstract class BaseScriptableAction extends DeviceAction
 			{
 				CompleteAction( gameInstance );
 			}
+			m_calculatedBaseCost = GetBaseCost();
 		}
 	}
 
@@ -343,6 +533,10 @@ abstract class BaseScriptableAction extends DeviceAction
 		if( actionRecord )
 		{
 			actionRecord.CompletionEffects( actionEffects );
+			if( actionRecord.HackCategory().Type() != gamedataHackCategory.NotAHack )
+			{
+				RPGManager.AwardExperienceFromQuickhack( ( ( PlayerPuppet )( GetExecutor() ) ), ( ( Float )( m_calculatedBaseCost ) ), m_requesterID, actionRecord.HackCategory().Type() );
+			}
 		}
 		ProcessStatusEffects( actionEffects, gameInstance );
 		ProcessEffectors( actionEffects, gameInstance );
@@ -353,20 +547,53 @@ abstract class BaseScriptableAction extends DeviceAction
 		return;
 	}
 
-	protected virtual function ProcessStatusEffects( actionEffects : array< weak< ObjectActionEffect_Record > >, gameInstance : GameInstance )
+	private function PutActionInQuickhackQueue( gameInstance : GameInstance, gameplayRoleComponent : GameplayRoleComponent ) : Bool
+	{
+		var isActionQueued : Bool;
+		var sAction : ScriptableDeviceAction;
+		var requesterObject : GameObject;
+		var slotName : CName;
+		isActionQueued = false;
+		sAction = ( ( ScriptableDeviceAction )( this ) );
+		if( sAction && sAction.IsQuickHack() )
+		{
+			requesterObject = ( ( GameObject )( GameInstance.FindEntityByID( gameInstance, m_requesterID ) ) );
+			if( requesterObject )
+			{
+				slotName = GetExecutor().GetQuickHackIndicatorSlotName();
+				isActionQueued = QuickHackableQueueHelper.PutActionInQuickhackQueue( sAction, gameplayRoleComponent, gameInstance, slotName, requesterObject );
+			}
+			if( !( sAction.m_isQueuedAction ) && sAction.GetExecutor().IsPlayer() )
+			{
+				RPGManager.IncrementQuickHackBlackboard( gameInstance, sAction.GetObjectActionID() );
+			}
+		}
+		return isActionQueued;
+	}
+
+	protected virtual function ProcessStatusEffects( const actionEffects : ref< array< weak< ObjectActionEffect_Record > > >, gameInstance : GameInstance )
 	{
 		var i : Int32;
 		var instigator : GameObject;
+		var proxy : GameObject;
+		var proxyId : EntityID;
 		instigator = GetExecutor();
+		proxy = GetProxyExecutor();
+		if( proxy )
+		{
+			proxyId = proxy.GetEntityID();
+		}
 		for( i = 0; i < actionEffects.Size(); i += 1 )
 		{
 			switch( actionEffects[ i ].Recipient().Type() )
 			{
 				case gamedataObjectActionReference.Instigator:
-					StatusEffectHelper.ApplyStatusEffect( GetExecutor(), actionEffects[ i ].StatusEffect().GetID(), instigator.GetEntityID() );
+					ResetStatusEffectIfActionIsQueued( instigator.GetEntityID(), actionEffects[ i ].StatusEffect(), gameInstance );
+				StatusEffectHelper.ApplyStatusEffect( instigator, actionEffects[ i ].StatusEffect().GetID(), instigator.GetEntityID(), proxyId );
 				break;
 				case gamedataObjectActionReference.Target:
-					GameInstance.GetStatusEffectSystem( gameInstance ).ApplyStatusEffect( m_requesterID, actionEffects[ i ].StatusEffect().GetID(), GameObject.GetTDBID( instigator ), instigator.GetEntityID() );
+					ResetStatusEffectIfActionIsQueued( m_requesterID, actionEffects[ i ].StatusEffect(), gameInstance );
+				GameInstance.GetStatusEffectSystem( gameInstance ).ApplyStatusEffect( m_requesterID, actionEffects[ i ].StatusEffect().GetID(), GameObject.GetTDBID( instigator ), instigator.GetEntityID(), 1, Vector4( 0.0, 0.0, 0.0, 0.0 ), true, proxyId );
 				break;
 				case gamedataObjectActionReference.Source:
 					break;
@@ -374,24 +601,39 @@ abstract class BaseScriptableAction extends DeviceAction
 		}
 	}
 
-	protected function ProcessEffectors( actionEffects : array< weak< ObjectActionEffect_Record > >, gameInstance : GameInstance )
+	protected function ProcessEffectors( const actionEffects : ref< array< weak< ObjectActionEffect_Record > > >, gameInstance : GameInstance )
 	{
 		var i : Int32;
 		var instigator : GameObject;
+		var proxy : GameObject;
+		var proxyId : EntityID;
 		instigator = GetExecutor();
+		proxy = GetProxyExecutor();
+		if( proxy )
+		{
+			proxyId = proxy.GetEntityID();
+		}
 		for( i = 0; i < actionEffects.Size(); i += 1 )
 		{
 			switch( actionEffects[ i ].Recipient().Type() )
 			{
 				case gamedataObjectActionReference.Instigator:
-					GameInstance.GetEffectorSystem( gameInstance ).ApplyEffector( GetExecutor().GetEntityID(), instigator, actionEffects[ i ].EffectorToTrigger().GetID() );
+					GameInstance.GetEffectorSystem( gameInstance ).ApplyEffector( GetExecutor().GetEntityID(), instigator, actionEffects[ i ].EffectorToTrigger().GetID(), TDBID.None(), proxyId );
 				break;
 				case gamedataObjectActionReference.Target:
-					GameInstance.GetEffectorSystem( gameInstance ).ApplyEffector( m_requesterID, instigator, actionEffects[ i ].EffectorToTrigger().GetID() );
+					GameInstance.GetEffectorSystem( gameInstance ).ApplyEffector( m_requesterID, instigator, actionEffects[ i ].EffectorToTrigger().GetID(), TDBID.None(), proxyId );
 				break;
 				case gamedataObjectActionReference.Source:
 					break;
 			}
+		}
+	}
+
+	protected function ResetStatusEffectIfActionIsQueued( entityID : EntityID, statusEffectRecord : StatusEffect_Record, gameInstance : GameInstance )
+	{
+		if( m_isActionQueueingUsed && !( QuickHackableQueueHelper.IsStatusEffectStackable( statusEffectRecord ) ) )
+		{
+			GameInstance.GetStatusEffectSystem( gameInstance ).RemoveStatusEffect( entityID, statusEffectRecord.GetID() );
 		}
 	}
 
@@ -416,6 +658,10 @@ abstract class BaseScriptableAction extends DeviceAction
 				uploadTime = RPGManager.CalculateStatModifiers( timeMods, executor.GetGame(), executor, GetRequesterID(), executor.GetEntityID() );
 			}
 		}
+		if( ( m_activationTimeReduction > 0.0 ) && ( m_activationTimeReduction < 1.0 ) )
+		{
+			uploadTime -= ( uploadTime * m_activationTimeReduction );
+		}
 		return uploadTime;
 	}
 
@@ -428,18 +674,35 @@ abstract class BaseScriptableAction extends DeviceAction
 		return 0.0;
 	}
 
-	public function CanPayCost( optional user : GameObject ) : Bool
+	public virtual function GetDurationTime() : Float
+	{
+		var timeMods : array< weak< StatModifier_Record > >;
+		var durationTime : Float;
+		var executor : GameObject;
+		if( GetObjectActionRecord() )
+		{
+			GetObjectActionRecord().DurationTime( timeMods );
+		}
+		executor = GetExecutor();
+		if( executor && ( timeMods.Size() > 0 ) )
+		{
+			durationTime = RPGManager.CalculateStatModifiers( timeMods, executor.GetGame(), executor, GetRequesterID(), executor.GetEntityID() );
+		}
+		return durationTime;
+	}
+
+	public function CanPayCost( optional user : GameObject, optional checkForOverclockedState : Bool ) : Bool
 	{
 		var statPoolSys : StatPoolsSystem;
 		var transactionSys : TransactionSystem;
 		var i : Int32;
-		var costs : array< weak< ObjectActionCost_Record > >;
 		var statPoolCost : weak< StatPoolCost_Record >;
 		var itemCost : weak< ItemCost_Record >;
 		var quantity : Int32;
 		var statPoolType : gamedataStatPoolType;
 		var executorQuantity : Int32;
 		var executor : GameObject;
+		var overclockIsActivated : Bool;
 		if( user )
 		{
 			executor = user;
@@ -448,12 +711,15 @@ abstract class BaseScriptableAction extends DeviceAction
 		{
 			executor = GetExecutor();
 		}
-		GetObjectActionRecord().Costs( costs );
-		for( i = 0; i < costs.Size(); i += 1 )
+		if( m_costComponents.Size() == 0 )
+		{
+			GetObjectActionRecord().Costs( m_costComponents );
+		}
+		for( i = 0; i < m_costComponents.Size(); i += 1 )
 		{
 			quantity = GetCost();
-			itemCost = ( ( ItemCost_Record )( costs[ i ] ) );
-			statPoolCost = ( ( StatPoolCost_Record )( costs[ i ] ) );
+			itemCost = ( ( ItemCost_Record )( m_costComponents[ i ] ) );
+			statPoolCost = ( ( StatPoolCost_Record )( m_costComponents[ i ] ) );
 			if( itemCost )
 			{
 				transactionSys = GameInstance.GetTransactionSystem( executor.GetGame() );
@@ -467,40 +733,100 @@ abstract class BaseScriptableAction extends DeviceAction
 			}
 			if( executorQuantity < quantity )
 			{
-				return false;
+				overclockIsActivated = QuickHackableHelper.IsOverclockedStateActive( GetExecutor() );
+				if( checkForOverclockedState && overclockIsActivated )
+				{
+					if( !( QuickHackableHelper.CanPayWithHealthInOverclockedState( GetExecutor(), quantity, 0.0 ) ) )
+					{
+						return false;
+					}
+				}
+				else
+				{
+					return false;
+				}
 			}
 		}
 		return true;
 	}
 
-	public virtual function PayCost() : Bool
+	public function CanSkipPayCost( isJustConsulting : Bool ) : Bool
+	{
+		var playerPuppet : PlayerPuppet;
+		var playerBlackboard : IBlackboard;
+		var playerFreeCostActionIDName : TweakDBID;
+		var amountOfFreeSimultaneousActions : Int32;
+		if( m_canSkipPayCost )
+		{
+			return true;
+		}
+		playerPuppet = ( ( PlayerPuppet )( GetExecutor() ) );
+		if( !( playerPuppet ) )
+		{
+			return false;
+		}
+		playerBlackboard = GameInstance.GetBlackboardSystem( playerPuppet.GetGame() ).GetLocalInstanced( playerPuppet.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		playerFreeCostActionIDName = ( ( TweakDBID )( playerBlackboard.GetVariant( GetAllBlackboardDefs().PlayerStateMachine.CostFreeActionID ) ) );
+		amountOfFreeSimultaneousActions = playerBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.AmountOfCostFreeActions );
+		if( GetObjectActionID() == playerFreeCostActionIDName )
+		{
+			if( amountOfFreeSimultaneousActions > 0 )
+			{
+				amountOfFreeSimultaneousActions -= 1;
+				playerBlackboard.SetInt( GetAllBlackboardDefs().PlayerStateMachine.AmountOfCostFreeActions, amountOfFreeSimultaneousActions );
+				if( amountOfFreeSimultaneousActions > 0 )
+				{
+					return true;
+				}
+			}
+			if( !( isJustConsulting ) )
+			{
+				playerBlackboard.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.CostFreeActionID, TDBID.None() );
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public virtual function PayCost( optional checkForOverclockedState : Bool ) : Bool
 	{
 		var statPoolSys : StatPoolsSystem;
 		var transactionSys : TransactionSystem;
 		var currValue : Float;
 		var newValue : Float;
-		var costs : array< weak< ObjectActionCost_Record > >;
 		var statPoolCost : weak< StatPoolCost_Record >;
 		var itemCost : weak< ItemCost_Record >;
 		var quantity : Int32;
 		var statPoolType : gamedataStatPoolType;
 		var executorQuantity : Int32;
+		var overclockIsActivated : Bool;
 		if( GetObjectActionRecord() )
 		{
-			GetObjectActionRecord().Costs( costs );
+			if( m_costComponents.Size() == 0 )
+			{
+				GetObjectActionRecord().Costs( m_costComponents );
+			}
 		}
-		if( costs[ 0 ] )
+		if( m_costComponents[ 0 ] )
 		{
 			quantity = GetCost();
-			itemCost = ( ( ItemCost_Record )( costs[ 0 ] ) );
-			statPoolCost = ( ( StatPoolCost_Record )( costs[ 0 ] ) );
+			itemCost = ( ( ItemCost_Record )( m_costComponents[ 0 ] ) );
+			statPoolCost = ( ( StatPoolCost_Record )( m_costComponents[ 0 ] ) );
+			overclockIsActivated = QuickHackableHelper.IsOverclockedStateActive( GetExecutor() );
 			if( itemCost )
 			{
 				transactionSys = GameInstance.GetTransactionSystem( GetExecutor().GetGame() );
 				executorQuantity = transactionSys.GetItemQuantity( GetExecutor(), ItemID.CreateQuery( itemCost.Item().GetID() ) );
 				if( executorQuantity < quantity )
 				{
-					return false;
+					if( checkForOverclockedState && overclockIsActivated )
+					{
+						return QuickHackableHelper.PayWithHealthInOverclockedState( GetExecutor(), quantity );
+					}
+					else
+					{
+						return false;
+					}
 				}
 				transactionSys.RemoveItem( GetExecutor(), ItemID.CreateQuery( itemCost.Item().GetID() ), quantity );
 			}
@@ -512,10 +838,18 @@ abstract class BaseScriptableAction extends DeviceAction
 				newValue = currValue - ( ( Float )( quantity ) );
 				if( newValue < 0.0 )
 				{
-					return false;
+					if( checkForOverclockedState && overclockIsActivated )
+					{
+						return QuickHackableHelper.PayWithHealthInOverclockedState( GetExecutor(), quantity );
+					}
+					else
+					{
+						return false;
+					}
 				}
 				statPoolSys.RequestSettingStatPoolValue( GetExecutor().GetEntityID(), statPoolType, newValue, GetExecutor(), false );
 			}
+			GameObject.PlaySoundEvent( GetExecutor(), 'ui_focus_mode_quickhack' );
 			return true;
 		}
 		return true;
@@ -523,13 +857,26 @@ abstract class BaseScriptableAction extends DeviceAction
 
 	public virtual function GetCost() : Int32
 	{
-		var costComponents : array< weak< ObjectActionCost_Record > >;
 		var costMods : array< weak< StatModifier_Record > >;
 		var targetID : EntityID;
-		var statPoolCost : weak< StatPoolCost_Record >;
+		var targetPuppet : ScriptedPuppet;
+		var statPoolCost : StatPoolCost_Record;
 		var cost, extraCost : Float;
+		var availableMemory : Float;
+		var stacks : Uint32;
 		var device : ScriptableDeviceComponentPS;
-		var hackCategory : weak< HackCategory_Record >;
+		var hackCategory : gamedataHackCategory;
+		var statsDataSystem : StatsDataSystem;
+		var currentlyUploadingAction : weak< ScriptableDeviceAction >;
+		var deviceActionQueue : weak< DeviceActionQueue >;
+		var objectActionRecords : array< ObjectAction_Record >;
+		var targetPos : Vector4;
+		var instigatorPos : Vector4;
+		var distance : Float;
+		var hackID : TweakDBID;
+		var shouldReduceCost : Bool;
+		var i : Int32;
+		hackID = GetObjectActionRecord().GetID();
 		if( GetExecutor() && ( GetObjectActionRecord().GetCostsCount() > 0 ) )
 		{
 			device = ( ( ScriptableDeviceComponentPS )( GetOwnerPS( GetExecutor().GetGame() ) ) );
@@ -539,10 +886,13 @@ abstract class BaseScriptableAction extends DeviceAction
 			}
 			else
 			{
-				GetObjectActionRecord().Costs( costComponents );
-				if( costComponents[ 0 ] )
+				if( m_costComponents.Size() == 0 )
 				{
-					GetCostMods( costComponents, costMods );
+					GetObjectActionRecord().Costs( m_costComponents );
+				}
+				if( m_costComponents[ 0 ] )
+				{
+					GetCostMods( m_costComponents, costMods );
 					if( EntityID.IsDefined( GetRequesterID() ) )
 					{
 						targetID = GetRequesterID();
@@ -552,20 +902,146 @@ abstract class BaseScriptableAction extends DeviceAction
 						targetID = PersistentID.ExtractEntityID( GetPersistentID() );
 					}
 					cost = RPGManager.CalculateStatModifiers( costMods, GetExecutor().GetGame(), GetExecutor(), targetID, GetExecutor().GetEntityID() );
-					statPoolCost = ( ( StatPoolCost_Record )( costComponents[ 0 ] ) );
+					statPoolCost = ( ( StatPoolCost_Record )( m_costComponents[ 0 ] ) );
 					if( statPoolCost.StatPool().StatPoolType() == gamedataStatPoolType.Memory )
 					{
-						hackCategory = GetObjectActionRecord().HackCategory();
-						extraCost = GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetPowerLevelDiff(), 'pl_diff_to_memory_cost_modifier' );
-						cost += extraCost;
-						if( hackCategory && hackCategory.EnumName() == 'UltimateHack' )
+						hackCategory = GetObjectActionRecord().HackCategory().Type();
+						if( hackCategory == gamedataHackCategory.VehicleHack )
 						{
+							if( GetObjectActionID() == T"DeviceAction.TakeControlVehicleClassHack" )
+							{
+								cost *= GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetExecutorLevel(), 'vehicle_quickhack_remotecontrol_memory_cost_multiplier' );
+							}
+							else if( GetObjectActionID() == T"DeviceAction.VehicleForceBrakesClassHack" )
+							{
+								cost *= GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetExecutorLevel(), 'vehicle_quickhack_forcebrakes_memory_cost_multiplier' );
+							}
+							else if( GetObjectActionID() == T"DeviceAction.VehicleExplodeClassHack" )
+							{
+								cost *= GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetExecutorLevel(), 'vehicle_quickhack_explode_memory_cost_multiplier' );
+							}
+							else if( GetObjectActionID() == T"DeviceAction.VehicleAccelerateClassHack" )
+							{
+								cost *= GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetExecutorLevel(), 'vehicle_quickhack_accelerate_memory_cost_multiplier' );
+							}
+						}
+						else
+						{
+							extraCost = GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetPowerLevelDiff(), 'pl_diff_to_memory_cost_modifier' );
 							cost += extraCost;
+							if( hackCategory == gamedataHackCategory.UltimateHack )
+							{
+								cost += extraCost;
+							}
+						}
+						if( PlayerDevelopmentSystem.GetData( GetExecutor() ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Left_Perk_3_1 ) && IsFirstUniqueCategoryInQueue( targetID, hackCategory ) )
+						{
+							cost -= GameInstance.GetStatsSystem( GetExecutor().GetGame() ).GetStatValue( GetExecutor().GetEntityID(), gamedataStatType.FirstHackOfTypeInQueueRAMDecrease );
+						}
+						if( hackCategory == gamedataHackCategory.DamageHack && PlayerDevelopmentSystem.GetData( GetExecutor() ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Central_Perk_2_2 ) )
+						{
+							shouldReduceCost = false;
+							if( ( GameInstance.GetStatusEffectSystem( GetExecutor().GetGame() ).HasStatusEffectWithTag( targetID, 'CovertQuickhacked' ) || GameInstance.GetStatusEffectSystem( GetExecutor().GetGame() ).HasStatusEffectWithTag( targetID, 'ControlQuickhacked' ) ) || GameInstance.GetStatusEffectSystem( GetExecutor().GetGame() ).HasStatusEffect( targetID, T"BaseStatusEffect.DistractionDuration" ) )
+							{
+								shouldReduceCost = true;
+							}
+							if( !( shouldReduceCost ) )
+							{
+								targetPuppet = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetExecutor().GetGame(), targetID ) ) );
+								if( targetPuppet )
+								{
+									currentlyUploadingAction = targetPuppet.GetCurrentlyUploadingAction();
+									if( currentlyUploadingAction.GetObjectActionRecord().HackCategory().Type() == gamedataHackCategory.CovertHack || currentlyUploadingAction.GetObjectActionRecord().HackCategory().Type() == gamedataHackCategory.ControlHack )
+									{
+										shouldReduceCost = true;
+									}
+									deviceActionQueue = currentlyUploadingAction.GetDeviceActionQueue();
+									deviceActionQueue.GetAllQueuedActionObjectRecords( objectActionRecords );
+									for( i = 0; i < objectActionRecords.Size(); i += 1 )
+									{
+										if( objectActionRecords[ i ].HackCategory().Type() == gamedataHackCategory.CovertHack || objectActionRecords[ i ].HackCategory().Type() == gamedataHackCategory.ControlHack )
+										{
+											shouldReduceCost = true;
+											break;
+										}
+									}
+								}
+							}
+							if( shouldReduceCost )
+							{
+								cost -= TDB.GetFloat( T"NewPerks.Intelligence_Central_Perk_2_2.memoryCostReduction", 0.0 );
+							}
+						}
+						if( ( ( ( hackCategory == gamedataHackCategory.CovertHack || hackCategory == gamedataHackCategory.ControlHack ) || hackCategory == gamedataHackCategory.DeviceHack ) && PlayerDevelopmentSystem.GetData( GetExecutor() ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Left_Milestone_1 ) ) && GetExecutor().TryGetControlledProxy() )
+						{
+							cost -= TDB.GetFloat( T"NewPerks.Intelligence_Left_Milestone_1.memoryCostReduction", 0.0 );
+						}
+						if( PlayerDevelopmentSystem.GetData( GetExecutor() ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Master_Perk_1 ) )
+						{
+							targetPuppet = ( ( ScriptedPuppet )( GameInstance.FindEntityByID( GetExecutor().GetGame(), targetID ) ) );
+							if( ( targetPuppet && targetPuppet.CanNewActionBeQueued() ) && ( targetPuppet.GetDeviceActionQueueSize() >= ( targetPuppet.GetDeviceActionMaxQueueSize() - 1 ) ) )
+							{
+								cost *= ( 1.0 - TDB.GetFloat( T"NewPerks.Intelligence_Master_Perk_1.memoryCostReduction", 0.0 ) );
+							}
+						}
+						if( ( GameInstance.GetStatPoolsSystem( GetExecutor().GetGame() ).GetStatPoolValue( GetExecutor().GetEntityID(), gamedataStatPoolType.QuickHackUpload, true ) > 0.0 ) && ( GameInstance.GetStatsSystem( GetExecutor().GetGame() ).GetStatValue( targetID, gamedataStatType.IsNetrunnerArchetype ) > 0.0 ) )
+						{
+							if( GameInstance.GetStatsSystem( GetExecutor().GetGame() ).GetStatValue( targetID, gamedataStatType.RevealNetrunnerWhenHacked ) > 0.0 )
+							{
+								if( PlayerDevelopmentSystem.GetData( GetExecutor() ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Left_Perk_2_1 ) )
+								{
+									cost -= TDB.GetFloat( T"NewPerks.Intelligence_Left_Perk_2_1.memoryCostReduction", 0.0 );
+								}
+							}
+						}
+						if( ( ( hackID == T"QuickHack.MadnessLvl3Hack" ) || ( hackID == T"QuickHack.MadnessLvl4Hack" ) ) || ( hackID == T"QuickHack.MadnessSetFriendlyHack" ) )
+						{
+							cost -= GetMadnessLvl3ProgramCostReduction( targetID );
+						}
+						if( ( hackID == T"QuickHack.BrainMeltLvl3Hack" ) || ( hackID == T"QuickHack.BrainMeltLvl4Hack" ) )
+						{
+							stacks = StatusEffectHelper.GetStatusEffectByID( GetPlayer( GetExecutor().GetGame() ), T"BaseStatusEffect.BrainMeltCostReductionSE" ).GetStackCount();
+							cost -= ( ( ( Float )( stacks ) ) * TDB.GetFloat( T"EquipmentGLP.BrainMeltProgramLvl3Passive.memoryCostReductionPerStack", 0.0 ) );
+						}
+						if( ( hackID == T"QuickHack.SystemCollapseLvl3Hack" ) || ( hackID == T"QuickHack.SystemCollapseLvl4Hack" ) )
+						{
+							stacks = StatusEffectHelper.GetStatusEffectByID( GetPlayer( GetExecutor().GetGame() ), T"BaseStatusEffect.SystemCollapseMemoryCostReduction" ).GetStackCount();
+							cost -= ( ( ( Float )( stacks ) ) * TDB.GetFloat( T"EquipmentGLP.SystemCollapseLvl3Program.memoryCostReductionPerStack", 0.0 ) );
+						}
+						if( ( GetObjectActionRecord().GetID() == T"QuickHack.GrenadeLvl3Hack" ) || ( GetObjectActionRecord().GetID() == T"QuickHack.GrenadeLvl4Hack" ) )
+						{
+							cost -= GetDetonateGranadeCostReduction( false );
+						}
+						else if( GetObjectActionRecord().GetID() == T"QuickHack.GrenadeLvl4PlusPlusHack" )
+						{
+							cost -= GetDetonateGranadeCostReduction( true );
+						}
+						if( ( hackID == T"QuickHack.SuicideLvl3Hack" ) || ( hackID == T"QuickHack.SuicideLvl4Hack" ) )
+						{
+							stacks = StatusEffectHelper.GetStatusEffectByID( GetPlayer( GetExecutor().GetGame() ), T"BaseStatusEffect.SuicideHackMemoryCostReduction" ).GetStackCount();
+							cost -= ( ( ( Float )( stacks ) ) * TDB.GetFloat( T"EquipmentGLP.SuicideLvl3Program.memoryCostReductionPerStack", 0.0 ) );
+						}
+						if( PlayerDevelopmentSystem.GetData( GetExecutor() ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Central_Perk_1_2 ) )
+						{
+							targetPos = GameInstance.FindEntityByID( GetExecutor().GetGame(), targetID ).GetWorldPosition();
+							instigatorPos = GetExecutor().GetWorldPosition();
+							distance = Vector4.Distance( targetPos, instigatorPos );
+							statsDataSystem = GameInstance.GetStatsDataSystem( GetExecutor().GetGame() );
+							cost *= ( 1.0 - statsDataSystem.GetValueFromCurve( 'hacking_passives', distance, 'distance_to_hacking_cost_reduction' ) );
+						}
+						if( QuickHackableHelper.IsOverclockedStateActive( GetExecutor() ) )
+						{
+							if( StrEndsWith( NameToString( actionName ), "BlackWall" ) )
+							{
+								availableMemory = GameInstance.GetStatPoolsSystem( GetExecutor().GetGame() ).GetStatPoolValue( GetExecutor().GetEntityID(), gamedataStatPoolType.Memory, false );
+								availableMemory = MinF( cost, ( ( Float )( FloorF( availableMemory ) ) ) );
+								cost = availableMemory + ( ( cost - availableMemory ) * TDB.GetFloat( T"QuickHack.BaseBlackWallHack.memoryCostReductionInOverclock", 1.0 ) );
+							}
 						}
 					}
 					if( costMods.Size() > 0 )
 					{
-						return Max( 1, CeilF( cost ) );
+						return Max( 2, CeilF( cost ) );
 					}
 					return Max( 0, CeilF( cost ) );
 				}
@@ -576,19 +1052,20 @@ abstract class BaseScriptableAction extends DeviceAction
 
 	public virtual function GetBaseCost() : Int32
 	{
-		var costComponents : array< weak< ObjectActionCost_Record > >;
 		var costMods : array< weak< StatModifier_Record > >;
 		var targetID : EntityID;
 		var statPoolCost : weak< StatPoolCost_Record >;
 		var cost, extraCost : Float;
 		var constantCostMods : array< weak< StatModifier_Record > >;
 		var i : Int32;
-		var hackCategory : weak< HackCategory_Record >;
 		if( GetExecutor() && ( GetObjectActionRecord().GetCostsCount() > 0 ) )
 		{
-			GetObjectActionRecord().Costs( costComponents );
-			GetCostMods( costComponents, costMods );
-			if( costComponents[ 0 ] )
+			if( m_costComponents.Size() == 0 )
+			{
+				GetObjectActionRecord().Costs( m_costComponents );
+			}
+			GetCostMods( m_costComponents, costMods );
+			if( m_costComponents[ 0 ] )
 			{
 				if( EntityID.IsDefined( GetRequesterID() ) )
 				{
@@ -606,13 +1083,12 @@ abstract class BaseScriptableAction extends DeviceAction
 					}
 				}
 				cost = RPGManager.CalculateStatModifiers( constantCostMods, GetExecutor().GetGame(), GetExecutor(), targetID, GetExecutor().GetEntityID() );
-				statPoolCost = ( ( StatPoolCost_Record )( costComponents[ 0 ] ) );
+				statPoolCost = ( ( StatPoolCost_Record )( m_costComponents[ 0 ] ) );
 				if( statPoolCost.StatPool().StatPoolType() == gamedataStatPoolType.Memory )
 				{
-					hackCategory = GetObjectActionRecord().HackCategory();
 					extraCost = GameInstance.GetStatsDataSystem( GetExecutor().GetGame() ).GetValueFromCurve( 'puppet_dynamic_scaling', GetPowerLevelDiff(), 'pl_diff_to_memory_cost_modifier' );
 					cost += extraCost;
-					if( hackCategory && hackCategory.EnumName() == 'UltimateHack' )
+					if( GetObjectActionRecord().HackCategory().Type() == gamedataHackCategory.UltimateHack )
 					{
 						cost += extraCost;
 					}
@@ -695,6 +1171,56 @@ abstract class BaseScriptableAction extends DeviceAction
 		return powerLevelDiff;
 	}
 
+	private function GetExecutorLevel() : Float
+	{
+		var statsSystem : StatsSystem;
+		var executorLevel : Float;
+		if( !( GetExecutor() ) )
+		{
+			return 0.0;
+		}
+		statsSystem = GameInstance.GetStatsSystem( GetExecutor().GetGame() );
+		executorLevel = statsSystem.GetStatValue( GetExecutor().GetEntityID(), gamedataStatType.PowerLevel );
+		return executorLevel;
+	}
+
+	private function GetMadnessLvl3ProgramCostReduction( targetID : EntityID ) : Float
+	{
+		var maxReduction : Float;
+		var stackReduction : Float;
+		var costReductors : array< TweakDBID >;
+		var costReductor : gamedataStatusEffectType;
+		var appliedStatusEffects : array< StatusEffect >;
+		var stacks : Uint32;
+		var i, j : Int32;
+		maxReduction = TweakDBInterface.GetFloat( T"Items.MadnessLvl3Program.maxCostReduction", 0.0 );
+		stackReduction = TweakDBInterface.GetFloat( T"Items.MadnessLvl3Program.costReductionPerReductorStack", 0.0 );
+		costReductors = TweakDBInterface.GetForeignKeyArray( T"Items.MadnessLvl3Program.statusEffectsTypeCostReductors" );
+		stacks = 0;
+		for( i = 0; i < costReductors.Size(); i += 1 )
+		{
+			appliedStatusEffects.Clear();
+			costReductor = TweakDBInterface.GetStatusEffectTypeRecord( costReductors[ i ] ).Type();
+			GameInstance.GetStatusEffectSystem( GetExecutor().GetGame() ).GetAppliedEffectsOfType( targetID, costReductor, appliedStatusEffects );
+			for( j = 0; j < appliedStatusEffects.Size(); j += 1 )
+			{
+				stacks += appliedStatusEffects[ j ].GetStackCount();
+			}
+		}
+		return MinF( maxReduction, ( ( Float )( stacks ) ) * stackReduction );
+	}
+
+	private function GetDetonateGranadeCostReduction( legendaryPlusPlus : Bool ) : Float
+	{
+		var stackSE : TweakDBID;
+		var stackReduction : Float;
+		var stacks : Uint32;
+		stackSE = ( ( legendaryPlusPlus ) ? ( T"BaseStatusEffect.ReduceUltimateSuicideWithGrenadeCostPlusPlus" ) : ( T"BaseStatusEffect.ReduceUltimateSuicideWithGrenadeCost" ) );
+		stackReduction = TweakDBInterface.GetFloat( ( ( legendaryPlusPlus ) ? ( T"BaseStatusEffect.ReduceUltimateSuicideWithGrenadeCostPlusPlus.costReductionPerStack" ) : ( T"BaseStatusEffect.ReduceUltimateSuicideWithGrenadeCost.costReductionPerStack" ) ), 0.0 );
+		stacks = StatusEffectHelper.GetStatusEffectByID( GetPlayer( GetExecutor().GetGame() ), stackSE ).GetStackCount();
+		return ( ( Float )( stacks ) ) * stackReduction;
+	}
+
 }
 
 abstract class ScriptableDeviceAction extends BaseScriptableAction
@@ -702,11 +1228,12 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 	var prop : DeviceActionProperty;
 	protected var m_actionWidgetPackage : SActionWidgetPackage;
 	protected var m_spiderbotActionLocationOverride : NodeRef;
-	private var m_duration : Float;
+	protected var m_duration : Float;
 	private var m_canTriggerStim : Bool;
 	default m_canTriggerStim = true;
 	private var m_wasPerformedOnOwner : Bool;
 	private var m_shouldActivateDevice : Bool;
+	private var m_disableSpread : Bool;
 	protected var m_isQuickHack : Bool;
 	protected var m_isSpiderbotAction : Bool;
 	protected var m_attachedProgram : TweakDBID;
@@ -714,6 +1241,7 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 	protected var m_interactionIconType : TweakDBID;
 	protected var m_hasInteraction : Bool;
 	protected var m_inactiveReason : String;
+	protected var m_widgetStyle : gamedataComputerUIStyle;
 
 	protected override function GetOwnerPS( game : GameInstance ) : ScriptableDeviceComponentPS
 	{
@@ -742,6 +1270,21 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 	public function SetShouldActivateDevice( value : Bool )
 	{
 		m_shouldActivateDevice = value;
+	}
+
+	public function SetDisableSpread( value : Bool )
+	{
+		m_disableSpread = value;
+	}
+
+	public function SetCanSkipPayCost( value : Bool )
+	{
+		m_canSkipPayCost = value;
+	}
+
+	public const function IsSpreadDisabled() : Bool
+	{
+		return m_disableSpread;
 	}
 
 	public const function CanTriggerStim() : Bool
@@ -818,7 +1361,7 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		return true;
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -837,7 +1380,7 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		return true;
 	}
 
-	public function AddDeviceName( deviceName : String )
+	public function AddDeviceName( const deviceName : ref< String > )
 	{
 		localizedObjectName = deviceName;
 	}
@@ -862,6 +1405,11 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		m_inkWidgetID = id;
 	}
 
+	public function SetWidgetStyle( style : gamedataComputerUIStyle )
+	{
+		m_widgetStyle = style;
+	}
+
 	public virtual function GetInkWidgetTweakDBID() : TweakDBID
 	{
 		if( TDBID.IsValid( m_inkWidgetID ) )
@@ -870,7 +1418,13 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		}
 		else
 		{
-			return T"DevicesUIDefinitions.GenericDeviceActionWidget";
+			switch( m_widgetStyle )
+			{
+				case gamedataComputerUIStyle.Orange:
+					return T"DevicesUIDefinitions.GenericDeviceActionWidgetOA";
+				default:
+					return T"DevicesUIDefinitions.GenericDeviceActionWidget";
+			}
 		}
 	}
 
@@ -939,6 +1493,7 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 	{
 		m_objectActionID = id;
 		m_objectActionRecord = TweakDBInterface.GetObjectActionRecord( id );
+		m_costComponents.Clear();
 		if( m_objectActionRecord )
 		{
 			actionName = m_objectActionRecord.ActionName();
@@ -951,6 +1506,28 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		m_isQuickHack = true;
 		m_wasPerformedOnOwner = wasExecutedAtLeastOnce;
 		ProduceInteractionParts();
+	}
+
+	public function GetAwarenessCost( gameInstance : GameInstance ) : Float
+	{
+		var awarenessCost : Float;
+		var hackStatRecord : weak< StatModifierGroup_Record >;
+		var hackActionRecord : weak< ObjectAction_Record >;
+		var player : PlayerPuppet;
+		var incrementModifiers : array< weak< StatModifier_Record > >;
+		awarenessCost = 0.0;
+		hackActionRecord = GetObjectActionRecord();
+		hackStatRecord = TweakDBInterface.GetStatModifierGroupRecord( TDB.GetForeignKey( hackActionRecord.GetID() + T".awarenessCost" ) );
+		if( TDBID.IsValid( hackStatRecord.GetID() ) )
+		{
+			hackStatRecord.StatModifiers( incrementModifiers );
+			player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( gameInstance ).GetLocalPlayerMainGameObject() ) );
+			if( !( player.IsInCombat() ) && ( GameInstance.GetStatsSystem( gameInstance ).GetStatValue( player.GetEntityID(), gamedataStatType.IgnoreAwarenessCostWhenOverclocked ) != 1.0 ) )
+			{
+				awarenessCost = RPGManager.CalculateStatModifiers( incrementModifiers, gameInstance, player, player.GetEntityID() );
+			}
+		}
+		return awarenessCost;
 	}
 
 	private function ProduceInteractionParts()
@@ -982,7 +1559,13 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		var actionUploadListener : QuickHackUploadListener;
 		var statMod : gameStatModifierData;
 		var setQuickHackAttempt : SetQuickHackAttemptEvent;
+		var progressBarBB : weak< IBlackboard >;
+		var hackingMinigameBB : IBlackboard;
+		progressBarBB = GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().UI_HUDProgressBar );
 		statPoolSys = GameInstance.GetStatPoolsSystem( gameInstance );
+		progressBarBB.SetFloat( GetAllBlackboardDefs().UI_HUDProgressBar.ProgressBump, 0.0 );
+		hackingMinigameBB = GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().HackingMinigame );
+		hackingMinigameBB.SetVector4( GetAllBlackboardDefs().HackingMinigame.LastPlayerHackPosition, GetPlayer( gameInstance ).GetWorldPosition() );
 		statMod = RPGManager.CreateStatModifier( gamedataStatType.QuickHackUpload, gameStatModifierType.Additive, 1.0 );
 		GameInstance.GetStatsSystem( gameInstance ).RemoveAllModifiers( m_requesterID, gamedataStatType.QuickHackUpload );
 		GameInstance.GetStatsSystem( gameInstance ).AddModifier( m_requesterID, statMod );
@@ -1002,6 +1585,10 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 	public override function CompleteAction( gameInstance : GameInstance )
 	{
 		var setQuickHack : SetQuickHackEvent;
+		if( m_isTargetDead )
+		{
+			return;
+		}
 		GameInstance.GetPersistencySystem( gameInstance ).QueuePSDeviceEvent( this );
 		super.CompleteAction( gameInstance );
 		if( IsQuickHack() )
@@ -1055,6 +1642,24 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		m_isSpiderbotAction = true;
 	}
 
+	public const function IsRemoteHack() : Bool
+	{
+		var actionType : gamedataObjectActionType;
+		var actionRecord : weak< ObjectAction_Record >;
+		var typeRecord : weak< ObjectActionType_Record >;
+		actionRecord = GetObjectActionRecord();
+		if( actionRecord )
+		{
+			typeRecord = actionRecord.ObjectActionType();
+		}
+		if( typeRecord )
+		{
+			actionType = typeRecord.Type();
+			return actionType == gamedataObjectActionType.Remote;
+		}
+		return false;
+	}
+
 	public const function IsQuickHack() : Bool
 	{
 		var actionType : gamedataObjectActionType;
@@ -1072,14 +1677,9 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		if( typeRecord )
 		{
 			actionType = typeRecord.Type();
-			return actionType == gamedataObjectActionType.DeviceQuickHack || actionType == gamedataObjectActionType.PuppetQuickHack;
+			return ( actionType == gamedataObjectActionType.DeviceQuickHack || actionType == gamedataObjectActionType.PuppetQuickHack ) || actionType == gamedataObjectActionType.VehicleQuickHack;
 		}
 		return false;
-	}
-
-	public override function GetActivationTime() : Float
-	{
-		return super.GetActivationTime();
 	}
 
 	public const function IsSpiderbotAction() : Bool
@@ -1232,9 +1832,9 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		}
 	}
 
-	public virtual function CreateCustomInteraction( optional actions : array< DeviceAction >, customName1 : String, customName2 : String, optional customID1 : TweakDBID, optional customID2 : TweakDBID ) {}
+	public virtual function CreateCustomInteraction( optional actions : array< DeviceAction >, const customName1 : ref< String >, const customName2 : ref< String >, optional customID1 : TweakDBID, optional customID2 : TweakDBID ) {}
 
-	public function SetInactiveWithReason( isActiveIf : Bool, reason : String )
+	public function SetInactiveWithReason( isActiveIf : Bool, const reason : ref< String > )
 	{
 		if( !( isActiveIf ) )
 		{
@@ -1243,7 +1843,7 @@ abstract class ScriptableDeviceAction extends BaseScriptableAction
 		}
 	}
 
-	public function SetInactiveReason( reasonStr : String )
+	public function SetInactiveReason( const reasonStr : ref< String > )
 	{
 		if( reasonStr != "" )
 		{
@@ -1324,7 +1924,7 @@ abstract class ActionBool extends ScriptableDeviceAction
 		}
 	}
 
-	public override function CreateCustomInteraction( optional actions : array< DeviceAction >, customName1 : String, customName2 : String, optional customID1 : TweakDBID, optional customID2 : TweakDBID )
+	public override function CreateCustomInteraction( optional actions : array< DeviceAction >, const customName1 : ref< String >, const customName2 : ref< String >, optional customID1 : TweakDBID, optional customID2 : TweakDBID )
 	{
 		var value : Bool;
 		var useTweakDB : Bool;
@@ -1380,17 +1980,6 @@ abstract class ActionBool extends ScriptableDeviceAction
 
 }
 
-class DelayEvent extends ActionBool
-{
-
-	public function SetProperties()
-	{
-		actionName = 'DelayEvent';
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'DelayEvent', true, 'DelayEvent', 'DelayEvent' );
-	}
-
-}
-
 abstract class ActionInt extends ScriptableDeviceAction
 {
 
@@ -1405,180 +1994,6 @@ abstract class ActionInt extends ScriptableDeviceAction
 	{
 		var str : String;
 		str = ( NameToString( prop.name ) + " " ) + IntToString( ( ( Int32 )prop.first ) );
-		return str;
-	}
-
-}
-
-abstract class ActionEnum extends ActionInt
-{
-}
-
-class BaseDeviceStatus extends ActionEnum
-{
-	var m_isRestarting : Bool;
-
-	public virtual function SetProperties( const deviceRef : ScriptableDeviceComponentPS )
-	{
-		m_isRestarting = deviceRef.IsRestarting();
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Int( 'STATUS', ( ( Int32 )( deviceRef.GetDeviceState() ) ) );
-	}
-
-	public const override function GetCurrentDisplayString() : String
-	{
-		var str : String;
-		var baseStateValue : Int32;
-		baseStateValue = 0;
-		if( prop.first.IsValid() )
-		{
-			baseStateValue = ( ( Int32 )prop.first );
-		}
-		if( m_isRestarting )
-		{
-			return "LocKey#17797";
-		}
-		switch( baseStateValue )
-		{
-			case -2:
-				Log( "BaseDeviceStatus / Wrong prop.value this should never happen" );
-			str = "LocKey#17796";
-			break;
-			case -1:
-				str = "LocKey#17793";
-			break;
-			case 0:
-				str = "LocKey#17794";
-			break;
-			case 1:
-				str = "LocKey#17795";
-			break;
-			default:
-				str = "Unknown Status - DEBUG";
-			Log( "BaseDeviceStatus / Device State unhandled" );
-			break;
-		}
-		return str;
-	}
-
-	public const function GetScannerStatusRecord() : TweakDBID
-	{
-		var baseStateValue : Int32;
-		var recordbase : String;
-		var ending : String;
-		var recordID : TweakDBID;
-		recordbase = "scanning_devices.";
-		baseStateValue = ( ( Int32 )prop.first );
-		if( m_isRestarting )
-		{
-			ending = "booting";
-		}
-		else
-		{
-			switch( baseStateValue )
-			{
-				case -2:
-					ending = "disabled";
-				Log( "BaseDeviceStatus / Wrong prop.value this should never happen" );
-				break;
-				case -1:
-					ending = "unpowered";
-				break;
-				case 0:
-					ending = "off";
-				break;
-				case 1:
-					ending = "on";
-				break;
-				default:
-					Log( "BaseDeviceStatus / Device State unhandled" );
-				break;
-			}
-		}
-		recordID = TDBID.Create( recordbase + ending );
-		return recordID;
-	}
-
-	public const virtual function GetStatusValue() : Int32
-	{
-		return ( ( Int32 )prop.first );
-	}
-
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
-	{
-		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public static function IsAvailable( device : ScriptableDeviceComponentPS ) : Bool
-	{
-		if( device.IsDisabled() )
-		{
-			return false;
-		}
-		return true;
-	}
-
-	public static function IsClearanceValid( requesterClearancer : Clearance ) : Bool
-	{
-		if( Clearance.IsInRange( requesterClearancer, DefaultActionsParametersHolder.GetStatusClearance() ) )
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public static function IsContextValid( context : GetActionsContext ) : Bool
-	{
-		if( context.requestType == gamedeviceRequestType.External )
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public override function GetTweakDBChoiceRecord() : String
-	{
-		return "wrong_action";
-	}
-
-}
-
-abstract class ActionName extends ScriptableDeviceAction
-{
-
-	public export override function GetProperties() : array< DeviceActionProperty >
-	{
-		var arr : array< DeviceActionProperty >;
-		arr.PushBack( prop );
-		return arr;
-	}
-
-	public const override function GetCurrentDisplayString() : String
-	{
-		var str : String;
-		str = ( NameToString( prop.name ) + " " ) + NameToString( ( ( CName )prop.first ) );
-		return str;
-	}
-
-}
-
-abstract class ActionEntityReference extends ScriptableDeviceAction
-{
-
-	public export override function GetProperties() : array< DeviceActionProperty >
-	{
-		var arr : array< DeviceActionProperty >;
-		arr.PushBack( prop );
-		return arr;
-	}
-
-	public const override function GetCurrentDisplayString() : String
-	{
-		var str : String;
-		str = NameToString( prop.name ) + " EntityReference (conversion to string not supported yet)";
 		return str;
 	}
 
@@ -1603,76 +2018,27 @@ abstract class ActionFloat extends ScriptableDeviceAction
 
 }
 
-importonly class PSChangedEvent extends Event
+abstract class ActionEnum extends ActionInt
 {
 }
 
-importonly class PSDeviceChangedEvent extends Event
+abstract class ActionName extends ScriptableDeviceAction
 {
-	import var persistentID : PersistentID;
-	import var className : CName;
-}
 
-importonly class DeviceStartPlayerCameraControlEvent extends Event
-{
-	import var playerController : weak< GameObject >;
-	import var initialRotation : Vector4;
-	import var minYaw : Float;
-	import var maxYaw : Float;
-	import var minPitch : Float;
-	import var maxPitch : Float;
-}
+	public export override function GetProperties() : array< DeviceActionProperty >
+	{
+		var arr : array< DeviceActionProperty >;
+		arr.PushBack( prop );
+		return arr;
+	}
 
-importonly class DeviceEndPlayerCameraControlEvent extends Event
-{
-}
+	public const override function GetCurrentDisplayString() : String
+	{
+		var str : String;
+		str = ( NameToString( prop.name ) + " " ) + NameToString( ( ( CName )prop.first ) );
+		return str;
+	}
 
-importonly struct ActionPrereqs
-{
-	import var actionName : CName;
-	import var prereqs : array< IPrereq >;
-}
-
-importonly struct GetActionsContext
-{
-	import var clearance : Clearance;
-	import var requestorID : EntityID;
-	import var requestType : gamedeviceRequestType;
-	import var actionPrereqs : array< ActionPrereqs >;
-	import var interactionLayerTag : CName;
-	import var processInitiatorObject : weak< GameObject >;
-	import var ignoresAuthorization : Bool;
-	import var allowsRemoteAuthorization : Bool;
-	import var ignoresRPG : Bool;
-}
-
-importonly class Clearance extends IScriptable
-{
-	import editable var min : Int32;
-	import editable var max : Int32;
-
-	public import static function IsInRange( clearance : Clearance, clearanceLevel : Int32 ) : Bool;
-	public import static function CreateClearance( optional min : Int32, optional max : Int32 ) : Clearance;
-	public import static function ReadValues( clearance : Clearance, out min : Int32, out max : Int32 );
-	public import static function GetMaxClearanceLevel() : Int32;
-	public import static function GetMinClearanceLevel() : Int32;
-}
-
-struct ActionInteractivityInfo
-{
-	var isExternal : Bool;
-	var isRemote : Bool;
-	var isDirect : Bool;
-}
-
-class ResolveActionData
-{
-	var m_password : String;
-}
-
-class PerformedAction extends Event
-{
-	var m_action : DeviceAction;
 }
 
 abstract class ActionNodeRef extends ScriptableDeviceAction
@@ -1689,6 +2055,25 @@ abstract class ActionNodeRef extends ScriptableDeviceAction
 	{
 		var str : String;
 		str = NameToString( prop.name ) + " NodeRef (conversion to string not supported yet)";
+		return str;
+	}
+
+}
+
+abstract class ActionEntityReference extends ScriptableDeviceAction
+{
+
+	public export override function GetProperties() : array< DeviceActionProperty >
+	{
+		var arr : array< DeviceActionProperty >;
+		arr.PushBack( prop );
+		return arr;
+	}
+
+	public const override function GetCurrentDisplayString() : String
+	{
+		var str : String;
+		str = NameToString( prop.name ) + " EntityReference (conversion to string not supported yet)";
 		return str;
 	}
 
@@ -1805,7 +2190,12 @@ abstract class ActionSkillCheck extends ActionBool
 		return m_skillcheckDescription;
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext, availableUnpowered : Bool ) : Bool
+	public const function SetSkillCheckReadyToPresentOnScreen()
+	{
+		m_skillCheck.GetBaseSkill().TrySetRequiredLevel( m_skillcheckDescription.requiredSkill );
+	}
+
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext >, availableUnpowered : Bool ) : Bool
 	{
 		if( IsAvailable( device, availableUnpowered ) && IsClearanceValid( context.clearance ) )
 		{
@@ -1985,6 +2375,134 @@ class ActionScavenge extends ActionInt
 	public override function GetTweakDBChoiceRecord() : String
 	{
 		return "ActionScavenge";
+	}
+
+}
+
+class BaseDeviceStatus extends ActionEnum
+{
+	var m_isRestarting : Bool;
+
+	public virtual function SetProperties( const deviceRef : ScriptableDeviceComponentPS )
+	{
+		m_isRestarting = deviceRef.IsRestarting();
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Int( 'STATUS', ( ( Int32 )( deviceRef.GetDeviceState() ) ) );
+	}
+
+	public const override function GetCurrentDisplayString() : String
+	{
+		var str : String;
+		var baseStateValue : Int32;
+		baseStateValue = 0;
+		if( prop.first.IsValid() )
+		{
+			baseStateValue = ( ( Int32 )prop.first );
+		}
+		if( m_isRestarting )
+		{
+			return "LocKey#17797";
+		}
+		switch( baseStateValue )
+		{
+			case -2:
+				str = "LocKey#17796";
+			break;
+			case -1:
+				str = "LocKey#17793";
+			break;
+			case 0:
+				str = "LocKey#17794";
+			break;
+			case 1:
+				str = "LocKey#17795";
+			break;
+			default:
+				str = "Unknown Status - DEBUG";
+			break;
+		}
+		return str;
+	}
+
+	public const function GetScannerStatusRecord() : TweakDBID
+	{
+		var baseStateValue : Int32;
+		var recordbase : String;
+		var ending : String;
+		var recordID : TweakDBID;
+		recordbase = "scanning_devices.";
+		baseStateValue = ( ( Int32 )prop.first );
+		if( m_isRestarting )
+		{
+			ending = "booting";
+		}
+		else
+		{
+			switch( baseStateValue )
+			{
+				case -2:
+					ending = "disabled";
+				break;
+				case -1:
+					ending = "unpowered";
+				break;
+				case 0:
+					ending = "off";
+				break;
+				case 1:
+					ending = "on";
+				break;
+				default:
+					break;
+			}
+		}
+		recordID = TDBID.Create( recordbase + ending );
+		return recordID;
+	}
+
+	public const virtual function GetStatusValue() : Int32
+	{
+		return ( ( Int32 )prop.first );
+	}
+
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
+	{
+		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsAvailable( device : ScriptableDeviceComponentPS ) : Bool
+	{
+		if( device.IsDisabled() )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static function IsClearanceValid( requesterClearancer : Clearance ) : Bool
+	{
+		if( Clearance.IsInRange( requesterClearancer, DefaultActionsParametersHolder.GetStatusClearance() ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
+	{
+		if( context.requestType == gamedeviceRequestType.External )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public override function GetTweakDBChoiceRecord() : String
+	{
+		return "wrong_action";
 	}
 
 }
@@ -2262,7 +2780,7 @@ class SetDeviceON extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'SetDeviceON', true, 'LocKey#255', 'LocKey#255' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2300,7 +2818,7 @@ class SetDeviceOFF extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'SetDeviceOFF', true, 'LocKey#256', 'LocKey#256' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2338,7 +2856,7 @@ class SetDeviceUnpowered extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'SetDeviceUnpowered', true, 'LocKey#258', 'LocKey#258' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2376,7 +2894,7 @@ class SetDevicePowered extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'SetDevicePowered', true, 'LocKey#257', 'LocKey#257' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2414,7 +2932,7 @@ class DisassembleDevice extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'DisassembleDevice', true, 'LocKey#264', 'LocKey#264' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( device.CanBeDisassembled() )
 		{
@@ -2457,7 +2975,7 @@ class FixDevice extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'FixDevice', true, 'LocKey#266', 'LocKey#266' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( device.CanBeFixed() )
 		{
@@ -2502,7 +3020,7 @@ class ToggleJuryrigTrap extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ToggleJuryrigTrap', isArmed, 'LocKey#270', 'LocKey#270' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return IsAvailable( device ) && IsContextValid( context );
 	}
@@ -2512,7 +3030,7 @@ class ToggleJuryrigTrap extends ActionBool
 		return device.CanBeTrapped() && device.GetJuryrigTrapState() == EJuryrigTrapState.UNARMED;
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		return context.requestType != gamedeviceRequestType.External;
 	}
@@ -2546,7 +3064,7 @@ class ToggleActivation extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ToggleActivation', disabled, 'LocKey#247', 'LocKey#245' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2629,7 +3147,7 @@ class TogglePower extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, unpowered, displayNameOnTrue, displayNameOnFalse );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2737,7 +3255,7 @@ class ToggleON extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ToggleOn', isOn, displayNameOnTrue, displayNameOnFalse );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2778,7 +3296,13 @@ class ToggleON extends ActionBool
 
 	public override function GetInkWidgetTweakDBID() : TweakDBID
 	{
-		return T"DevicesUIDefinitions.ToggleDeviceActionWidget";
+		switch( m_widgetStyle )
+		{
+			case gamedataComputerUIStyle.Orange:
+				return T"DevicesUIDefinitions.ToggleDeviceActionWidgetOA";
+			default:
+				return T"DevicesUIDefinitions.ToggleDeviceActionWidget";
+		}
 	}
 
 	public override function GetActivationTime() : Float
@@ -2794,6 +3318,7 @@ class ToggleON extends ActionBool
 
 class QuickHackToggleON extends ActionBool
 {
+	var Repeat : Bool;
 
 	public override function GetBaseCost() : Int32
 	{
@@ -2871,7 +3396,7 @@ class ToggleBlockade extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ToggleBlockade', isActive, displayNameOnTrue, displayNameOnFalse );
 	}
 
-	public static function IsDefaultConditionMet( device : RoadBlockControllerPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : RoadBlockControllerPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -2978,6 +3503,32 @@ class QuestForceDeactivate extends ActionBool
 
 }
 
+class QuickHackToggleActivate extends ToggleActivate
+{
+}
+
+class QuestPickUpCall extends ActionBool
+{
+
+	public function SetProperties()
+	{
+		actionName = 'PickUpCall';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'QuestPickUpCall', true, 'QuestPickUpCall', 'QuestPickUpCall' );
+	}
+
+}
+
+class QuestHangUpCall extends ActionBool
+{
+
+	public function SetProperties()
+	{
+		actionName = 'HangUpCall';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'QuestHangUpCall', true, 'QuestHangUpCall', 'QuestHangUpCall' );
+	}
+
+}
+
 class ToggleActivate extends ActionBool
 {
 	protected var m_TrueRecordName : String;
@@ -3040,35 +3591,9 @@ class ToggleActivate extends ActionBool
 		}
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
-	}
-
-}
-
-class QuickHackToggleActivate extends ToggleActivate
-{
-}
-
-class QuestPickUpCall extends ActionBool
-{
-
-	public function SetProperties()
-	{
-		actionName = 'PickUpCall';
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'QuestPickUpCall', true, 'QuestPickUpCall', 'QuestPickUpCall' );
-	}
-
-}
-
-class QuestHangUpCall extends ActionBool
-{
-
-	public function SetProperties()
-	{
-		actionName = 'HangUpCall';
-		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'QuestHangUpCall', true, 'QuestHangUpCall', 'QuestHangUpCall' );
 	}
 
 }
@@ -3093,7 +3618,7 @@ class ActivateDevice extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ActivateDevice', true, displayName, displayName );
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
 	}
@@ -3128,7 +3653,7 @@ class DeactivateDevice extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'DeactivateDevice', true, actionName, actionName );
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
 	}
@@ -3142,7 +3667,7 @@ class AuthorizeUser extends ActionBool
 	private var m_libraryName : CName;
 	private var m_isforced : Bool;
 
-	public function SetProperties( validPasswords : array< CName >, optional isforced : Bool )
+	public function SetProperties( const validPasswords : ref< array< CName > >, optional isforced : Bool )
 	{
 		actionName = 'AuthorizeUser';
 		m_validPasswords = validPasswords;
@@ -3178,7 +3703,7 @@ class AuthorizeUser extends ActionBool
 		return m_validPasswords;
 	}
 
-	public function CreateActionWidgetPackage( authorizationWidgetName : CName, authorizationDisplayNameOverride : String )
+	public function CreateActionWidgetPackage( authorizationWidgetName : CName, const authorizationDisplayNameOverride : ref< String > )
 	{
 		m_libraryName = authorizationWidgetName;
 		super.CreateActionWidgetPackage();
@@ -3192,7 +3717,7 @@ class AuthorizeUser extends ActionBool
 		}
 	}
 
-	public function CreateActionWidgetPackage( authorizationDisplayNameOverride : String )
+	public function CreateActionWidgetPackage( const authorizationDisplayNameOverride : ref< String > )
 	{
 		super.CreateActionWidgetPackage();
 		if( IsStringValid( authorizationDisplayNameOverride ) )
@@ -3276,7 +3801,7 @@ class SetAuthorizationModuleON extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, true, 'LocKey#262', 'LocKey#262' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -3314,7 +3839,7 @@ class SetAuthorizationModuleOFF extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, true, 'LocKey#263', 'LocKey#263' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -3402,7 +3927,7 @@ class SetExposeQuickHacks extends ActionBool
 		return false;
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		if( context.requestType == gamedeviceRequestType.Direct )
 		{
@@ -3411,6 +3936,14 @@ class SetExposeQuickHacks extends ActionBool
 		return false;
 	}
 
+}
+
+enum EPersonalLinkConnectionStatus
+{
+	NOT_CONNECTED = 0,
+	CONNECTING = 1,
+	CONNECTED = 2,
+	DISCONNECTING = 3,
 }
 
 class TogglePersonalLink extends ActionBool
@@ -3436,7 +3969,7 @@ class TogglePersonalLink extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'Personal Link', isPersonalLinkConnected, 'LocKey#284', 'LocKey#285' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( ( IsAvailable( device ) && IsClearanceValid( context.clearance ) ) && IsContextValid( context ) )
 		{
@@ -3459,7 +3992,7 @@ class TogglePersonalLink extends ActionBool
 		return false;
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		if( context.requestType == gamedeviceRequestType.Direct )
 		{
@@ -3512,7 +4045,7 @@ class OpenFullscreenUI extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'Zoom Interaction', isZoomInteraction, 'LocKey#288', 'LocKey#289' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return ( IsAvailable( device ) && IsClearanceValid( context.clearance ) ) && IsContextValid( context );
 	}
@@ -3527,7 +4060,7 @@ class OpenFullscreenUI extends ActionBool
 		return Clearance.IsInRange( clearance, DefaultActionsParametersHolder.GetInteractiveClearance() );
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		return context.requestType == gamedeviceRequestType.Direct;
 	}
@@ -3578,7 +4111,7 @@ class SpiderbotDistraction extends ActionBool
 		return false;
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		if( context.requestType == gamedeviceRequestType.Remote )
 		{
@@ -3664,7 +4197,7 @@ class SpiderbotBoolAction extends ActionBool
 		return false;
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		if( context.requestType == gamedeviceRequestType.Remote )
 		{
@@ -3684,7 +4217,7 @@ class ToggleZoomInteraction extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'Zoom Interaction', isZoomInteraction, 'LocKey#288', 'LocKey#289' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return ( IsAvailable( device ) && IsClearanceValid( context.clearance ) ) && IsContextValid( context );
 	}
@@ -3699,7 +4232,7 @@ class ToggleZoomInteraction extends ActionBool
 		return Clearance.IsInRange( clearance, DefaultActionsParametersHolder.GetInteractiveClearance() );
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		return context.requestType == gamedeviceRequestType.Direct;
 	}
@@ -3729,6 +4262,9 @@ class ToggleZoomInteraction extends ActionBool
 
 class SetDeviceAttitude extends ActionBool
 {
+	var Repeat : Bool;
+	var IgnoreHostiles : Bool;
+	var Attitude : EAIAttitude;
 
 	public override function GetBaseCost() : Int32
 	{
@@ -3807,7 +4343,13 @@ class ThumbnailUI extends ActionBool
 
 	public override function GetInkWidgetTweakDBID() : TweakDBID
 	{
-		return T"DevicesUIDefinitions.GenericDeviceThumnbnailWidget";
+		switch( m_widgetStyle )
+		{
+			case gamedataComputerUIStyle.Orange:
+				return T"DevicesUIDefinitions.GenericDeviceThumnbnailWidgetOA";
+			default:
+				return T"DevicesUIDefinitions.GenericDeviceThumnbnailWidget";
+		}
 	}
 
 	public function GetThumbnailWidgetPackage() : SThumbnailWidgetPackage
@@ -4013,7 +4555,7 @@ class ChangeMusicAction extends ActionBool
 		return false;
 	}
 
-	public static function IsContextValid( context : GetActionsContext ) : Bool
+	public static function IsContextValid( const context : ref< GetActionsContext > ) : Bool
 	{
 		if( context.requestType == gamedeviceRequestType.Remote )
 		{
@@ -4081,7 +4623,7 @@ class ToggleGlassTint extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( actionName, isActive, nameOnTrue, nameOnFalse );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -4183,7 +4725,7 @@ class PresetAction extends ActionBool
 		m_actionWidgetPackage.iconID = m_preset.GetIconName();
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -4231,7 +4773,7 @@ class ToggleAlarm extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ToggleAlarm', isOn, 'LocKey#346', 'LocKey#345' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) )
 		{
@@ -4321,6 +4863,17 @@ class MasterDeviceDestroyed extends ActionBool
 
 }
 
+class DelayEvent extends ActionBool
+{
+
+	public function SetProperties()
+	{
+		actionName = 'DelayEvent';
+		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'DelayEvent', true, 'DelayEvent', 'DelayEvent' );
+	}
+
+}
+
 class Distraction extends ActionBool
 {
 
@@ -4336,7 +4889,7 @@ class Distraction extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'LocKey#336', true, 'LocKey#336', 'LocKey#336' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( device.IsPowered() )
 		{
@@ -4364,7 +4917,7 @@ class TogglePlay extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'Play', isPlaying, 'LocKey#280', 'LocKey#281' );
 	}
 
-	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		if( IsAvailable( device ) && IsClearanceValid( context.clearance ) )
 		{
@@ -4419,7 +4972,7 @@ class OpenInteriorManager extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'OpenInteriorManager', true, 'LocKey#27969', 'LocKey#27969' );
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
 	}
@@ -4440,7 +4993,7 @@ class EnterLadder extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'EnterLadder', true, 'EnterLadder', 'EnterLadder' );
 	}
 
-	public static function IsPlayerInAcceptableState( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public static function IsPlayerInAcceptableState( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		var playerSMBlackboard : IBlackboard;
 		var isUsingLadder : Bool;
@@ -4493,7 +5046,7 @@ class EnterLadder extends ActionBool
 		return playerStateMachineBlackboard;
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
 	}
@@ -4514,7 +5067,7 @@ class ProgramSetDeviceOff extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ProgramSetDeviceOff', true, 'LocKey#256', 'LocKey#256' );
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
 	}
@@ -4530,7 +5083,7 @@ class ProgramSetDeviceAttitude extends ActionBool
 		prop = DeviceActionPropertyFunctions.SetUpProperty_Bool( 'ProgramSetDeviceAttitude', true, 'LocKey#362', 'LocKey#362' );
 	}
 
-	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, context : GetActionsContext ) : Bool
+	public constexpr static function IsDefaultConditionMet( device : ScriptableDeviceComponentPS, const context : ref< GetActionsContext > ) : Bool
 	{
 		return true;
 	}
@@ -4556,22 +5109,5 @@ class TargetAcquiredEvent extends Event
 class TargetLostEvent extends Event
 {
 	var target : weak< ScriptedPuppet >;
-}
-
-import enum gamedeviceRequestType
-{
-	None,
-	External,
-	Remote,
-	Direct,
-	Internal,
-}
-
-enum EPersonalLinkConnectionStatus
-{
-	NOT_CONNECTED = 0,
-	CONNECTING = 1,
-	CONNECTED = 2,
-	DISCONNECTING = 3,
 }
 

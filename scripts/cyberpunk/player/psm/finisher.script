@@ -1,0 +1,340 @@
+abstract class FinisherTransition extends DefaultTransition
+{
+}
+
+class FinisherLeapToTargetDecisions extends FinisherTransition
+{
+	const var stateMachineInitData : weak< FinisherInitData >;
+
+	protected const function ToFinisherAttack( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var result : StateResultFloat;
+		result = stateContext.GetConditionFloatParameter( 'SlideDuration' );
+		return result.valid && ( GetInStateTime() >= result.value );
+	}
+
+}
+
+class FinisherLeapToTargetEvents extends FinisherTransition
+{
+	const var stateMachineInitData : weak< FinisherInitData >;
+
+	public function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var playerPuppet : weak< PlayerPuppet >;
+		playerPuppet = ( ( PlayerPuppet )( scriptInterface.executionOwner ) );
+		StatusEffectHelper.ApplyStatusEffect( stateMachineInitData.target, T"BaseStatusEffect.DefeatedFinisherWorkspot" );
+		FinisherAttackEvents.ApplyFinisherBuffs( playerPuppet, true );
+		LeapToTarget( stateContext, scriptInterface );
+	}
+
+	private function LeapToTarget( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var adjustPosition : Vector4;
+		var vecToTarget : Vector4;
+		var safetyDisplacement : Vector4;
+		var scaledSafetyDisplacement : Vector4;
+		var playerPuppetOrientation : Quaternion;
+		var horizontalDistanceFromTarget : Float;
+		var additionalHorizontalDistance : Float;
+		var slideDuration : Float;
+		var exitTime : Float;
+		var distanceRadius : Float;
+		var target : weak< GameObject >;
+		var playerPuppet : weak< GameObject >;
+		var weapon : WeaponObject;
+		var enableVaultDuringLeaping : Bool;
+		target = stateMachineInitData.target;
+		playerPuppet = ( ( PlayerPuppet )( scriptInterface.executionOwner ) );
+		weapon = GameObject.GetActiveWeapon( playerPuppet );
+		vecToTarget = target.GetWorldPosition() - scriptInterface.executionOwner.GetWorldPosition();
+		playerPuppetOrientation = scriptInterface.executionOwner.GetWorldOrientation();
+		if( GetStaticBoolParameterDefault( "useSafetyDisplacement", false ) )
+		{
+			safetyDisplacement.Y = GetStaticFloatParameterDefault( "safetyDisplacement", 2.0 );
+			if( vecToTarget.Z > 0.0 )
+			{
+				safetyDisplacement.Y = safetyDisplacement.Y * -1.0;
+			}
+			horizontalDistanceFromTarget = Vector4.Length2D( vecToTarget );
+			if( horizontalDistanceFromTarget < GetStaticFloatParameterDefault( "minLeapDistance", 2.0 ) )
+			{
+				stateContext.SetConditionFloatParameter( 'SlideDuration', 0.0, true );
+				stateContext.SetConditionFloatParameter( 'LeapExitTime', 0.0, true );
+				return true;
+			}
+			additionalHorizontalDistance = MaxF( safetyDisplacement.Y - horizontalDistanceFromTarget, 0.0 );
+			scaledSafetyDisplacement = safetyDisplacement * additionalHorizontalDistance;
+			adjustPosition = Quaternion.Transform( playerPuppetOrientation, scaledSafetyDisplacement );
+		}
+		slideDuration = CalculateAdjustmentDuration( Vector4.Length( vecToTarget ) );
+		exitTime = slideDuration - GetStaticFloatParameterDefault( "attackStartupDuration", 0.0 );
+		stateContext.SetConditionFloatParameter( 'LeapExitTime', exitTime, true );
+		stateContext.SetConditionFloatParameter( 'SlideDuration', slideDuration, true );
+		distanceRadius = GetStaticFloatParameterDefault( "distanceRadiusToTarget", 0.89999998 );
+		if( weapon.IsThrowable() )
+		{
+			distanceRadius = GetStaticFloatParameterDefault( "distanceRadiusThrowables", 0.1 );
+		}
+		SpatialQueriesHelper.IsTargetReachable( scriptInterface.executionOwner, target, target.GetWorldPosition(), false, enableVaultDuringLeaping );
+		if( enableVaultDuringLeaping )
+		{
+			scriptInterface.localBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.MeleeLeap, true );
+			stateContext.SetPermanentBoolParameter( 'enableVaultFromleapAttack', true, true );
+		}
+		RequestPlayerPositionAdjustment( stateContext, scriptInterface, target, slideDuration, distanceRadius, GetStaticFloatParameterDefault( "rotationDuration", -1.0 ), adjustPosition, true );
+		return true;
+	}
+
+	private function CalculateAdjustmentDuration( distance : Float ) : Float
+	{
+		var minDist, maxDist : Float;
+		var minDur, maxDur : Float;
+		var duration : Float;
+		minDist = GetStaticFloatParameterDefault( "minDistToTarget", 1.0 );
+		maxDist = GetStaticFloatParameterDefault( "maxDistToTarget", 1.0 );
+		minDur = GetStaticFloatParameterDefault( "minAdjustmentDuration", 1.0 );
+		maxDur = GetStaticFloatParameterDefault( "maxAdjustmentDuration", 1.0 );
+		distance -= minDist;
+		maxDist -= minDist;
+		duration = LerpF( distance / maxDist, minDur, maxDur, true );
+		return duration;
+	}
+
+}
+
+class FinisherAttackDecisions extends FinisherTransition
+{
+}
+
+class FinisherAttackEvents extends FinisherTransition
+{
+	const var stateMachineInitData : weak< FinisherInitData >;
+
+	public function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		ApplyFinisher( ( ( PlayerPuppet )( scriptInterface.executionOwner ) ), stateMachineInitData.target );
+	}
+
+	private function ApplyFinisher( playerPuppet : PlayerPuppet, target : GameObject )
+	{
+		var newhitEvent : gameHitEvent;
+		var attackContext : AttackInitContext;
+		var attack : IAttack;
+		var weapon : WeaponObject;
+		var weaponRecord : Item_Record;
+		var tags : array< CName >;
+		var broadcaster : StimBroadcasterComponent;
+		var npcTarget : NPCPuppet;
+		weapon = GameObject.GetActiveWeapon( playerPuppet );
+		weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
+		tags = weaponRecord.Tags();
+		if( PlayFinisherGameEffect( target, playerPuppet, tags.Contains( 'FinisherFront' ), tags.Contains( 'FinisherBack' ) ) )
+		{
+			newhitEvent = new gameHitEvent;
+			newhitEvent.attackData = new AttackData;
+			newhitEvent.target = target;
+			attackContext.record = TweakDBInterface.GetAttackRecord( T"Attacks.Finisher_Fake_Attack" );
+			attackContext.instigator = playerPuppet;
+			attackContext.source = playerPuppet;
+			attackContext.weapon = weapon;
+			attack = IAttack.Create( attackContext );
+			newhitEvent.attackData.SetAttackDefinition( attack );
+			newhitEvent.attackData.AddFlag( hitFlag.DealNoDamage, 'Finisher' );
+			newhitEvent.attackData.AddFlag( hitFlag.FinisherTriggered, 'Finisher' );
+			newhitEvent.attackData.SetSource( playerPuppet );
+			newhitEvent.attackData.SetInstigator( playerPuppet );
+			newhitEvent.attackData.SetWeapon( weapon );
+			GameInstance.GetDamageSystem( target.GetGame() ).QueueHitEvent( newhitEvent, target );
+			RPGManager.AwardExperienceFromDamage( newhitEvent, 25.0 );
+			broadcaster = target.GetStimBroadcasterComponent();
+			if( broadcaster )
+			{
+				broadcaster.TriggerSingleBroadcast( target, gamedataStimType.Scream, 10.0 );
+			}
+			npcTarget = ( ( NPCPuppet )( target ) );
+			if( npcTarget )
+			{
+				npcTarget.MarkForDeath();
+			}
+		}
+	}
+
+	public function PlayFinisherGameEffect( const targetPuppet : GameObject, instigator : GameObject, const hasFromFront : Bool, const hasFromBack : Bool ) : Bool
+	{
+		var gameEffectInstance : EffectInstance;
+		var finisherName : CName;
+		var bodyTypeVarSetter : AnimWrapperWeightSetter;
+		var bodyType : CName;
+		var slotID : TweakDBID;
+		var itemInSlotID : ItemID;
+		if( !( GetFinisherNameBasedOnWeapon( targetPuppet, instigator, hasFromFront, hasFromBack, finisherName ) ) )
+		{
+			return false;
+		}
+		gameEffectInstance = GameInstance.GetGameEffectSystem( instigator.GetGame() ).CreateEffectStatic( 'playFinisher', finisherName, instigator );
+		if( !( gameEffectInstance ) )
+		{
+			return false;
+		}
+		slotID = T"AttachmentSlots.WeaponRight";
+		itemInSlotID = GameInstance.GetTransactionSystem( instigator.GetGame() ).GetItemInSlot( targetPuppet, slotID ).GetItemData().GetID();
+		if( RPGManager.GetItemType( itemInSlotID ) != gamedataItemType.Wea_Fists && RPGManager.GetItemType( itemInSlotID ) != gamedataItemType.Cyb_StrongArms )
+		{
+			ScriptedPuppet.DropWeaponFromSlot( targetPuppet, slotID );
+		}
+		AnimationControllerComponent.PushEventToObjAndHeldItems( instigator, 'ForceReady' );
+		bodyType = ( ( gamePuppet )( targetPuppet ) ).GetBodyType();
+		bodyTypeVarSetter = new AnimWrapperWeightSetter;
+		bodyTypeVarSetter.key = bodyType;
+		bodyTypeVarSetter.value = 1.0;
+		instigator.QueueEvent( bodyTypeVarSetter );
+		EffectData.SetVector( gameEffectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, targetPuppet.GetWorldPosition() );
+		EffectData.SetEntity( gameEffectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.entity, targetPuppet );
+		gameEffectInstance.Run();
+		AnimationControllerComponent.PushEventToObjAndHeldItems( instigator, 'ForceReady' );
+		return true;
+	}
+
+	private function GetFinisherNameBasedOnWeapon( const target : GameObject, const instigator : GameObject, const hasFromFront : Bool, const hasFromBack : Bool, out finisherName : CName ) : Bool
+	{
+		var weaponRecord : Item_Record;
+		var angle : Float;
+		var finisher : String;
+		var weaponTags : array< CName >;
+		var i : Int32;
+		var weapon : WeaponObject;
+		finisherName = 'finisher_default';
+		weapon = GameObject.GetActiveWeapon( instigator );
+		if( !( weapon ) )
+		{
+			return false;
+		}
+		weaponRecord = TDB.GetWeaponItemRecord( ItemID.GetTDBID( weapon.GetItemID() ) );
+		if( !( weaponRecord ) )
+		{
+			return true;
+		}
+		finisherName = weaponRecord.ItemType().Name();
+		if( weaponRecord.ItemType().Type() == gamedataItemType.Wea_Sword )
+		{
+			finisherName = EnumValueToName( 'gamedataItemType', ( ( Int32 )( gamedataItemType.Wea_Katana ) ) );
+		}
+		weaponTags = weaponRecord.Tags();
+		for( i = weaponTags.Size() - 1; i >= 0; i -= 1 )
+		{
+			if( GameInstance.GetGameEffectSystem( instigator.GetGame() ).HasEffect( 'playFinisher', weaponTags[ i ] ) )
+			{
+				finisherName = weaponTags[ i ];
+				break;
+			}
+		}
+		if( IsNameValid( finisherName ) )
+		{
+			angle = Vector4.GetAngleBetween( instigator.GetWorldForward(), target.GetWorldForward() );
+			if( hasFromBack && ( AbsF( angle ) < 90.0 ) )
+			{
+				finisher = NameToString( finisherName );
+				finisher += "_Back";
+				finisherName = StringToName( finisher );
+				return true;
+			}
+			else if( hasFromFront && ( AbsF( angle ) >= 90.0 ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static function SetCameraContext( target : GameObject, paramsName : CName )
+	{
+		var setCameraParamsEvent : SetCameraParamsEvent;
+		setCameraParamsEvent = new SetCameraParamsEvent;
+		setCameraParamsEvent.paramsName = paramsName;
+		target.QueueEvent( setCameraParamsEvent );
+	}
+
+	public static function GetGameplayCameraParameters( out cameraParameters : GameplayCameraData, const tweakDBPath : ref< String > )
+	{
+		cameraParameters = new GameplayCameraData;
+		cameraParameters.is_forward_offset = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "is_forward_offset" ), 0.0 );
+		cameraParameters.forward_offset_value = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "forward_offset_value" ), 0.0 );
+		cameraParameters.upperbody_pitch_weight = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "upperbody_pitch_weight" ), 0.0 );
+		cameraParameters.upperbody_yaw_weight = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "upperbody_yaw_weight" ), 0.0 );
+		cameraParameters.is_pitch_off = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "is_pitch_off" ), 0.0 );
+		cameraParameters.is_yaw_off = TDB.GetFloat( TDBID.Create( ( ( "player." + tweakDBPath ) + "." ) + "is_yaw_off" ), 0.0 );
+	}
+
+	public static function SetGameplayCameraParameters( player : GameObject, const tweakDBPath : ref< String > )
+	{
+		var cameraParameters : GameplayCameraData;
+		var animFeature : AnimFeature_CameraGameplay;
+		GetGameplayCameraParameters( cameraParameters, tweakDBPath );
+		animFeature = new AnimFeature_CameraGameplay;
+		animFeature.is_forward_offset = cameraParameters.is_forward_offset;
+		animFeature.forward_offset_value = cameraParameters.forward_offset_value;
+		animFeature.upperbody_pitch_weight = cameraParameters.upperbody_pitch_weight;
+		animFeature.upperbody_yaw_weight = cameraParameters.upperbody_yaw_weight;
+		animFeature.is_pitch_off = cameraParameters.is_pitch_off;
+		animFeature.is_yaw_off = cameraParameters.is_yaw_off;
+		AnimationControllerComponent.ApplyFeatureToReplicate( player, 'CameraGameplay', animFeature );
+	}
+
+	public static function ApplyFinisherBuffs( playerPuppet : weak< PlayerPuppet >, isWorkspotFinisher : Bool )
+	{
+		var weapon : WeaponObject;
+		weapon = GameObject.GetActiveWeapon( playerPuppet );
+		StatusEffectHelper.ApplyStatusEffect( playerPuppet, T"BaseStatusEffect.PlayerInFinisherWorkspot" );
+		if( PlayerDevelopmentSystem.GetData( playerPuppet ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Cool_Right_Perk_3_2 ) && weapon.IsThrowable() )
+		{
+			StatusEffectHelper.ApplyStatusEffect( playerPuppet, T"BaseStatusEffect.JugglerPerkRemoveKnifeCooldownsSE", playerPuppet.GetEntityID() );
+		}
+	}
+
+}
+
+class FinisherEndDecisions extends FinisherTransition
+{
+}
+
+class FinisherEndEvents extends FinisherTransition
+{
+
+	public function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var removeEvent : PSMRemoveOnDemandStateMachine;
+		var stateMachineIdentifier : StateMachineIdentifier;
+		stateMachineIdentifier.definitionName = 'Finisher';
+		removeEvent = new PSMRemoveOnDemandStateMachine;
+		removeEvent.stateMachineIdentifier = stateMachineIdentifier;
+		scriptInterface.executionOwner.QueueEvent( removeEvent );
+	}
+
+	public static function ApplyFinisherBuffs( playerPuppet : weak< PlayerPuppet >, isWorkspotFinisher : Bool )
+	{
+		var weapon : WeaponObject;
+		if( !( playerPuppet ) )
+		{
+			return;
+		}
+		weapon = GameObject.GetActiveWeapon( playerPuppet );
+		StatusEffectHelper.RemoveStatusEffect( playerPuppet, T"BaseStatusEffect.BlockFinisherStatusEffect" );
+		StatusEffectHelper.RemoveStatusEffect( playerPuppet, T"BaseStatusEffect.PlayerInFinisherWorkspot" );
+		if( isWorkspotFinisher )
+		{
+			StatusEffectHelper.ApplyStatusEffect( playerPuppet, T"BaseStatusEffect.BlockWorkspotFinisherStatusEffect", playerPuppet.GetEntityID() );
+		}
+		StatusEffectHelper.ApplyStatusEffect( playerPuppet, T"BaseStatusEffect.Finisher_Healing_Buff", playerPuppet.GetEntityID() );
+		if( weapon.IsMantisBlades() && ( PlayerDevelopmentSystem.GetData( playerPuppet ).IsNewPerkBought( gamedataNewPerkType.Espionage_Central_Milestone_1 ) > 0 ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( playerPuppet, T"BaseStatusEffect.Espionage_Central_Milestone_1_Buff_MantisBlades" );
+		}
+		if( weapon.IsBlade() && PlayerDevelopmentSystem.GetData( playerPuppet ).IsNewPerkBoughtAnyLevel( gamedataNewPerkType.Reflexes_Right_Perk_3_1 ) )
+		{
+			StatusEffectHelper.ApplyStatusEffect( playerPuppet, T"BaseStatusEffect.Reflexes_Right_Perk_3_1_Buff_Level_1", playerPuppet.GetEntityID() );
+		}
+	}
+
+}
+

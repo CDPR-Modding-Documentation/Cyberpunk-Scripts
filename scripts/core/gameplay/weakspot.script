@@ -2,6 +2,23 @@ importonly class WeakspotDestroyedEvent extends Event
 {
 }
 
+importonly struct WeakspotPhysicalDestructionProperties
+{
+	import var velocity : Float;
+}
+
+importonly struct WeakspotPhysicalDestructionComponent
+{
+	import var componentName : CName;
+	import var useDefaultOwnerProperties : Bool;
+	import var destructionProperties : WeakspotPhysicalDestructionProperties;
+}
+
+importonly class WeakspotDestroyPhysicalComponentsEvent extends Event
+{
+	import var components : array< WeakspotPhysicalDestructionComponent >;
+}
+
 class WeakspotOnDestroyEvent extends Event
 {
 	var weakspotRecordData : WeakspotRecordData;
@@ -12,19 +29,24 @@ class WeakspotOnDestroyEffector extends Effector
 
 	protected override function Initialize( record : TweakDBID, game : GameInstance, parentRecord : TweakDBID )
 	{
-		Log( "WeakspotOnDestroyEffector Initialize!" );
 	}
 
 	protected override function ActionOn( owner : GameObject )
 	{
-		Log( "WeakspotOnDestroyEffectorOn!" );
 	}
 
 	protected override function ActionOff( owner : GameObject )
 	{
-		Log( "WeakspotOnDestroyEffectorOff" );
 	}
 
+}
+
+class WeakspotRequestAttributeChangeEvent extends Event
+{
+	var blockDamage : Bool;
+	default blockDamage = false;
+	var blockHighlight : Bool;
+	default blockHighlight = false;
 }
 
 struct WeakspotOnDestroyProperties
@@ -51,9 +73,14 @@ struct WeakspotOnDestroyProperties
 	default m_destroyDelay = 0;
 	editable var m_useWeakspotDestroyStageVFX : Bool;
 	default m_useWeakspotDestroyStageVFX = false;
+	editable var m_DamageOwnerOnDestroy : Float;
+	default m_DamageOwnerOnDestroy = 0;
+	editable var m_customHitSFx : CName;
+	editable var m_customDestroySFx : CName;
 	[ customEditor = "TweakDBGroupInheritance;Attack_GameEffect" ]
 	editable var m_attackRecordID : TweakDBID;
 	editable var m_StatusEffectOnDestroyID : TweakDBID;
+	const editable var m_physicalDestructionComponents : array< WeakspotPhysicalDestructionComponent >;
 }
 
 struct WeakspotRecordData
@@ -63,11 +90,22 @@ struct WeakspotRecordData
 	var m_reducedMeleeDamage : Bool;
 }
 
-importonly class WeakspotObject extends GameObject
+import class WeakspotObject extends GameObject
 {
 	public import const function GetRecord() : weak< Weakspot_Record >;
 	public import function SetReplicationInstigator( instigator : weak< GameObject > );
 	public import const function GetReplicationInstigator() : weak< GameObject >;
+
+	public export virtual function IsInternal() : Bool
+	{
+		return false;
+	}
+
+	public export virtual function IsInvulnerable() : Bool
+	{
+		return GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.IsInvulnerable ) > 0.0;
+	}
+
 }
 
 class WeakspotHealthChangeListener extends CustomValueStatPoolsListener
@@ -100,6 +138,7 @@ class ScriptedWeakspotObject extends WeakspotObject
 	protected editable var m_weakspotOnDestroyProperties : WeakspotOnDestroyProperties;
 	protected var m_mesh : MeshComponent;
 	protected var m_interaction : InteractionComponent;
+	protected var m_targeting : TargetingComponent;
 	protected var m_collider : IPlacedComponent;
 	protected var m_instigator : weak< GameObject >;
 	protected var m_weakspotRecordData : WeakspotRecordData;
@@ -110,6 +149,38 @@ class ScriptedWeakspotObject extends WeakspotObject
 	private var m_statPoolSystem : StatPoolsSystem;
 	private var m_statPoolType : gamedataStatPoolType;
 	private var m_healthListener : WeakspotHealthChangeListener;
+	private var m_parentMaxhealth : Float;
+	private var m_blockHighlight : Bool;
+	default m_blockHighlight = false;
+	private var m_blockDamage : Bool;
+	default m_blockDamage = false;
+
+	public export override function IsInternal() : Bool
+	{
+		return m_weakspotOnDestroyProperties.m_isInternal;
+	}
+
+	public export override function IsInvulnerable() : Bool
+	{
+		if( m_weakspotRecordData.m_isInvulnerable )
+		{
+			return true;
+		}
+		return GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.IsInvulnerable ) > 0.0;
+	}
+
+	protected event OnSetOwner( owner : weak< GameObject > )
+	{
+		var register : HUDManagerAssociationRequest;
+		if( owner )
+		{
+			register = new HUDManagerAssociationRequest;
+			register.ownerID = GetEntityID();
+			register.associatedID = owner.GetEntityID();
+			register.isRegistering = true;
+			GameInstance.QueueScriptableSystemRequest( GetGame(), 'HUDManager', register );
+		}
+	}
 
 	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
 	{
@@ -123,6 +194,7 @@ class ScriptedWeakspotObject extends WeakspotObject
 		var selfGameObject : GameObject;
 		m_interaction = ( ( InteractionComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'choice' ) ) );
 		m_collider = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'ColliderComponent' ) ) );
+		m_targeting = ( ( TargetingComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'TargetingComponent' ) ) );
 		m_statPoolSystem = GameInstance.GetStatPoolsSystem( this.GetGame() );
 		selfGameObject = this;
 		if( m_weakspotOnDestroyProperties.m_useWeakspotDestroyStageVFX )
@@ -138,6 +210,12 @@ class ScriptedWeakspotObject extends WeakspotObject
 	protected export function WeakspotInitialized()
 	{
 		ResolveWeakspotOnLoad();
+	}
+
+	protected event OnGameAttached()
+	{
+		m_parentMaxhealth = m_statPoolSystem.GetStatPoolValue( this.GetEntityID(), gamedataStatPoolType.Health );
+		super.OnGameAttached();
 	}
 
 	public const override function IsDead() : Bool
@@ -225,17 +303,49 @@ class ScriptedWeakspotObject extends WeakspotObject
 	protected event OnWeakspotDestroy( evt : WeakspotDestroyedEvent )
 	{
 		var weakspotDestroyedDelayEvent : DestroyWeakspotDelayedEvent;
+		var register : HUDManagerAssociationRequest;
 		weakspotDestroyedDelayEvent = new DestroyWeakspotDelayedEvent;
 		if( m_weakspotOnDestroyProperties.m_addFact != '' )
 		{
 			AddFact( GetOwner().GetGame(), m_weakspotOnDestroyProperties.m_addFact );
 		}
 		GameInstance.GetDelaySystem( this.GetGame() ).DelayEvent( this, weakspotDestroyedDelayEvent, m_weakspotOnDestroyProperties.m_destroyDelay );
+		register = new HUDManagerAssociationRequest;
+		register.ownerID = GetEntityID();
+		GameInstance.QueueScriptableSystemRequest( GetGame(), 'HUDManager', register );
 	}
 
 	protected event OnWeakspotDestroyDelay( evt : DestroyWeakspotDelayedEvent )
 	{
 		DestroyWeakspot( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() );
+	}
+
+	protected event OnWeakspotRequestAttributeChange( evt : WeakspotRequestAttributeChangeEvent )
+	{
+		m_blockDamage = evt.blockDamage;
+		m_blockHighlight = evt.blockHighlight;
+		if( !( IsDead() ) && m_alive == true )
+		{
+			if( m_hasBeenScanned )
+			{
+				if( m_blockHighlight )
+				{
+					UnSetHighlight();
+				}
+				else
+				{
+					SetHighlight();
+				}
+			}
+			if( m_blockDamage )
+			{
+				DisableTargeting();
+			}
+			else
+			{
+				EnableTargeting();
+			}
+		}
 	}
 
 	private function ResolveWeakspotOnLoad()
@@ -252,79 +362,100 @@ class ScriptedWeakspotObject extends WeakspotObject
 			HitShapeUserDataBase.EnableHitShape( this, 'body', false );
 			HitShapeUserDataBase.DisableHitShape( this, 'body_destroyed', false );
 		}
+		m_targeting = ( ( TargetingComponent )( FindComponentByName( 'TargetingComponent' ) ) );
 	}
 
 	public function DestroyWeakspot( optional instigator : weak< GameObject > )
 	{
+		var weakspotDestroyPhysicalComponents : WeakspotDestroyPhysicalComponentsEvent;
 		var weakspotDestroyed : WeakspotOnDestroyEvent;
 		var player : GameObject;
-		if( instigator )
+		if( m_alive == true )
 		{
-			m_instigator = instigator;
+			if( instigator )
+			{
+				m_instigator = instigator;
+			}
+			if( m_weakspotOnDestroyProperties.m_disableCollider )
+			{
+				DisableCollider();
+			}
+			if( m_weakspotOnDestroyProperties.m_destroyMesh )
+			{
+				ChangeAppearance( 'destroyed' );
+			}
+			if( m_weakspotOnDestroyProperties.m_disableInteraction )
+			{
+				m_interaction.Toggle( false );
+			}
+			if( m_weakspotOnDestroyProperties.m_hideMeshParameterValue != '' )
+			{
+				SendHideMeshParameterValue( m_weakspotOnDestroyProperties.m_hideMeshParameterValue );
+			}
+			if( m_weakspotOnDestroyProperties.m_sendAIActionAnimFeatureName != '' )
+			{
+				SendAIActionAnimFeature( m_weakspotOnDestroyProperties.m_sendAIActionAnimFeatureName, m_weakspotOnDestroyProperties.m_sendAIActionAnimFeatureState );
+			}
+			if( TDBID.IsValid( m_weakspotOnDestroyProperties.m_StatusEffectOnDestroyID ) )
+			{
+				StatusEffectHelper.ApplyStatusEffect( GetOwner(), m_weakspotOnDestroyProperties.m_StatusEffectOnDestroyID, GetOwner().GetEntityID() );
+			}
+			if( m_weakspotOnDestroyProperties.m_customDestroySFx != '' )
+			{
+				GameObject.PlaySound( this.GetOwner(), m_weakspotOnDestroyProperties.m_customDestroySFx );
+			}
+			if( TDBID.IsValid( m_weakspotOnDestroyProperties.m_attackRecordID ) )
+			{
+				FireAttack();
+			}
+			if( m_weakspotOnDestroyProperties.m_physicalDestructionComponents.Size() > 0 )
+			{
+				weakspotDestroyPhysicalComponents = new WeakspotDestroyPhysicalComponentsEvent;
+				weakspotDestroyPhysicalComponents.components = m_weakspotOnDestroyProperties.m_physicalDestructionComponents;
+				GetOwner().QueueEvent( weakspotDestroyPhysicalComponents );
+			}
+			HitShapeUserDataBase.DisableHitShape( this, 'body', false );
+			HitShapeUserDataBase.EnableHitShape( this, 'body_destroyed', false );
+			if( m_weakspotOnDestroyProperties.m_useWeakspotDestroyStageVFX )
+			{
+				GameObject.BreakReplicatedEffectLoopEvent( this.GetOwner(), 'weakspot_damage_stage_01' );
+				GameObject.BreakReplicatedEffectLoopEvent( this.GetOwner(), 'weakspot_damage_stage_02' );
+			}
+			if( !( m_weakspotOnDestroyProperties.m_playDestroyedFxFromOwnerEntity ) )
+			{
+				GameObjectEffectHelper.StartEffectEvent( this, 'weakspot_destroyed' );
+			}
+			else
+			{
+				GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_destroyed' );
+			}
+			if( !( m_weakspotOnDestroyProperties.m_playBrokenFxFromOwnerEntity ) )
+			{
+				GameObjectEffectHelper.StartEffectEvent( this, 'weakspot_broken' );
+			}
+			else
+			{
+				GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_broken' );
+			}
+			if( m_weakspotOnDestroyProperties.m_DamageOwnerOnDestroy != 0.0 )
+			{
+				SetPercentLife();
+			}
+			GameObjectEffectHelper.BreakEffectLoopEvent( GetOwner(), 'weakspot_indicator' );
+			weakspotDestroyed = new WeakspotOnDestroyEvent;
+			weakspotDestroyed.weakspotRecordData = m_weakspotRecordData;
+			GetOwner().QueueEvent( weakspotDestroyed );
+			UnSetHighlight();
+			player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject();
+			TargetTrackingExtension.InjectThreat( ( ( ScriptedPuppet )( GetOwner() ) ), player );
+			DisableTargeting();
+			m_alive = false;
 		}
-		if( m_weakspotOnDestroyProperties.m_disableCollider )
-		{
-			DisableCollider();
-		}
-		if( m_weakspotOnDestroyProperties.m_destroyMesh )
-		{
-			ChangeAppearance( 'destroyed' );
-		}
-		if( m_weakspotOnDestroyProperties.m_disableInteraction )
-		{
-			m_interaction.Toggle( false );
-		}
-		if( m_weakspotOnDestroyProperties.m_hideMeshParameterValue != '' )
-		{
-			SendHideMeshParameterValue( m_weakspotOnDestroyProperties.m_hideMeshParameterValue );
-		}
-		if( m_weakspotOnDestroyProperties.m_sendAIActionAnimFeatureName != '' )
-		{
-			SendAIActionAnimFeature( m_weakspotOnDestroyProperties.m_sendAIActionAnimFeatureName, m_weakspotOnDestroyProperties.m_sendAIActionAnimFeatureState );
-		}
-		if( TDBID.IsValid( m_weakspotOnDestroyProperties.m_attackRecordID ) )
-		{
-			FireAttack();
-		}
-		if( TDBID.IsValid( m_weakspotOnDestroyProperties.m_StatusEffectOnDestroyID ) )
-		{
-			StatusEffectHelper.ApplyStatusEffect( GetOwner(), m_weakspotOnDestroyProperties.m_StatusEffectOnDestroyID, GetOwner().GetEntityID() );
-		}
-		HitShapeUserDataBase.DisableHitShape( this, 'body', false );
-		HitShapeUserDataBase.EnableHitShape( this, 'body_destroyed', false );
-		if( m_weakspotOnDestroyProperties.m_useWeakspotDestroyStageVFX )
-		{
-			GameObject.BreakReplicatedEffectLoopEvent( this.GetOwner(), 'weakspot_damage_stage_01' );
-			GameObject.BreakReplicatedEffectLoopEvent( this.GetOwner(), 'weakspot_damage_stage_02' );
-		}
-		if( !( m_weakspotOnDestroyProperties.m_playDestroyedFxFromOwnerEntity ) )
-		{
-			GameObjectEffectHelper.StartEffectEvent( this, 'weakspot_destroyed' );
-		}
-		else
-		{
-			GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_destroyed' );
-		}
-		if( !( m_weakspotOnDestroyProperties.m_playBrokenFxFromOwnerEntity ) )
-		{
-			GameObjectEffectHelper.StartEffectEvent( this, 'weakspot_broken' );
-		}
-		else
-		{
-			GameObjectEffectHelper.StartEffectEvent( GetOwner(), 'weakspot_broken' );
-		}
-		GameObjectEffectHelper.BreakEffectLoopEvent( GetOwner(), 'weakspot_indicator' );
-		weakspotDestroyed = new WeakspotOnDestroyEvent;
-		weakspotDestroyed.weakspotRecordData = m_weakspotRecordData;
-		GetOwner().QueueEvent( weakspotDestroyed );
-		UnSetHighlight();
-		player = GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject();
-		TargetTrackingExtension.InjectThreat( ( ( ScriptedPuppet )( GetOwner() ) ), player );
-		m_alive = false;
 	}
 
 	public function DestroyWeakspotOnLoad( optional instigator : weak< GameObject > )
 	{
+		var weakspotDestroyPhysicalComponents : WeakspotDestroyPhysicalComponentsEvent;
 		var weakspotDestroyed : WeakspotOnDestroyEvent;
 		var player : GameObject;
 		if( instigator )
@@ -354,6 +485,12 @@ class ScriptedWeakspotObject extends WeakspotObject
 		if( TDBID.IsValid( m_weakspotOnDestroyProperties.m_StatusEffectOnDestroyID ) )
 		{
 			StatusEffectHelper.ApplyStatusEffect( GetOwner(), m_weakspotOnDestroyProperties.m_StatusEffectOnDestroyID, GetOwner().GetEntityID() );
+		}
+		if( m_weakspotOnDestroyProperties.m_physicalDestructionComponents.Size() > 0 )
+		{
+			weakspotDestroyPhysicalComponents = new WeakspotDestroyPhysicalComponentsEvent;
+			weakspotDestroyPhysicalComponents.components = m_weakspotOnDestroyProperties.m_physicalDestructionComponents;
+			GetOwner().QueueEvent( weakspotDestroyPhysicalComponents );
 		}
 		HitShapeUserDataBase.DisableHitShape( this, 'body', false );
 		HitShapeUserDataBase.EnableHitShape( this, 'body_destroyed', false );
@@ -379,6 +516,13 @@ class ScriptedWeakspotObject extends WeakspotObject
 		GetOwner().QueueEvent( evt );
 	}
 
+	public function SetPercentLife()
+	{
+		var value : Float;
+		value = ( m_parentMaxhealth / 100.0 ) * m_weakspotOnDestroyProperties.m_DamageOwnerOnDestroy;
+		GameInstance.GetStatPoolsSystem( this.GetGame() ).RequestChangingStatPoolValue( this.GetEntityID(), gamedataStatPoolType.Health, -( value ), this, true );
+	}
+
 	public static function Kill( weakspot : weak< GameObject >, optional instigator : weak< GameObject > )
 	{
 		if( !( weakspot ) )
@@ -396,6 +540,16 @@ class ScriptedWeakspotObject extends WeakspotObject
 	protected function DisableCollider()
 	{
 		m_collider.Toggle( false );
+	}
+
+	protected function DisableTargeting()
+	{
+		m_targeting.Toggle( false );
+	}
+
+	protected function EnableTargeting()
+	{
+		m_targeting.Toggle( true );
 	}
 
 	protected function SendAIActionAnimFeature( animFeatureName : CName, value : Int32 )
@@ -434,7 +588,10 @@ class ScriptedWeakspotObject extends WeakspotObject
 		highlightData.inTransitionTime = 0.2;
 		highlightData.outTransitionTime = 0.2;
 		highlightData.patternType = VisionModePatternType.Netrunner;
-		ForceVisionAppearance( this, highlightData );
+		if( !( m_blockHighlight ) )
+		{
+			ForceVisionAppearance( this, highlightData );
+		}
 	}
 
 	public function UnSetHighlight()
@@ -456,6 +613,7 @@ class ScriptedWeakspotObject extends WeakspotObject
 	{
 		ReadTweakData();
 		m_instigator = evt.attackData.GetInstigator();
+		evt.attackData.AddFlag( hitFlag.WeakspotHit, 'ProcessLocalizedDamage' );
 		if( !( IsDead() ) )
 		{
 			if( !( m_weakspotOnDestroyProperties.m_playHitFxFromOwnerEntity ) )
@@ -486,19 +644,36 @@ class ScriptedWeakspotObject extends WeakspotObject
 	{
 		var owner : weak< GameObject >;
 		owner = GetOwner();
-		if( owner && GameObject.GetAttitudeTowards( owner, evt.attackData.GetInstigator() ) != EAIAttitude.AIA_Friendly )
+		if( owner )
 		{
-			super.OnHit( evt );
+			if( m_blockDamage )
+			{
+				return false;
+			}
+			if( GameObject.GetAttitudeTowards( owner, evt.attackData.GetInstigator() ) != EAIAttitude.AIA_Friendly )
+			{
+				super.OnHit( evt );
+			}
+		}
+		if( m_weakspotOnDestroyProperties.m_customHitSFx != '' && m_alive )
+		{
+			GameObject.PlaySound( owner, m_weakspotOnDestroyProperties.m_customHitSFx );
 		}
 	}
 
 	protected export override function DamagePipelineFinalized( evt : gameHitEvent )
 	{
 		var owner : weak< GameObject >;
+		var puppetOwner : ScriptedPuppet;
 		owner = GetOwner();
 		if( owner && GameObject.GetAttitudeTowards( owner, evt.attackData.GetInstigator() ) != EAIAttitude.AIA_Friendly )
 		{
 			super.DamagePipelineFinalized( evt );
+			puppetOwner = ( ( ScriptedPuppet )( owner ) );
+			if( puppetOwner )
+			{
+				puppetOwner.PuppetDamagePipelineFinalized( evt );
+			}
 		}
 	}
 

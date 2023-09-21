@@ -1,4 +1,86 @@
-abstract class InputContextTransitionDecisions extends DefaultTransition
+enum ActiveBaseContext
+{
+	None = 0,
+	Locomotion = 1,
+	Ladder = 2,
+	Swimming = 3,
+	BodyCarring = 4,
+	MeleeWeapon = 5,
+	RangedWeapon = 6,
+	BodyCarringWithRangedWeapon = 7,
+}
+
+abstract class InputContextTransition extends DefaultTransition
+{
+
+	private const function GetVehicle( const scriptInterface : StateGameScriptInterface, out vehicle : weak< VehicleObject > ) : Bool
+	{
+		var player : weak< GameObject >;
+		var vehicleID : EntityID;
+		player = ( ( GameObject )( scriptInterface.owner ) );
+		vehicleID = scriptInterface.localBlackboard.GetEntityID( GetAllBlackboardDefs().PlayerStateMachine.EntityIDVehicleRemoteControlled );
+		if( VehicleComponent.GetVehicleFromID( player.GetGame(), vehicleID, vehicle ) )
+		{
+			return true;
+		}
+		if( VehicleComponent.GetVehicle( player.GetGame(), player.GetEntityID(), vehicle ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected const function IsVehicleRemoteControlled( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( GetVehicle( scriptInterface, vehicle ) )
+		{
+			return vehicle.IsVehicleRemoteControlled();
+		}
+		return false;
+	}
+
+	protected const function ToggleVehicleRemoteControlCamera( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( GetVehicle( scriptInterface, vehicle ) && vehicle.IsVehicleRemoteControlled() )
+		{
+			vehicle.ToggleVehicleRemoteControlCamera();
+			return true;
+		}
+		return false;
+	}
+
+	protected const function SetVehicleRemoteControlled( const scriptInterface : StateGameScriptInterface, enable : Bool ) : Bool
+	{
+		var vehicle : weak< VehicleObject >;
+		if( GetVehicle( scriptInterface, vehicle ) && ( !( enable ) || vehicle.IsHackable() ) )
+		{
+			vehicle.SetVehicleRemoteControlled( enable, false, true );
+			return true;
+		}
+		return false;
+	}
+
+	protected const function GetDriverCombatType( const scriptInterface : StateGameScriptInterface ) : gamedataDriverCombatType
+	{
+		var vehicle : weak< VehicleObject >;
+		var vehicleRecord : Vehicle_Record;
+		VehicleComponent.GetVehicle( scriptInterface.owner.GetGame(), scriptInterface.executionOwner, vehicle );
+		if( vehicle )
+		{
+			vehicleRecord = TweakDBInterface.GetVehicleRecord( vehicle.GetRecordID() );
+			if( vehicleRecord.VehDataPackage() )
+			{
+				return vehicleRecord.VehDataPackage().DriverCombat().Type();
+			}
+		}
+		return gamedataDriverCombatType.Invalid;
+	}
+
+}
+
+abstract class InputContextTransitionDecisions extends InputContextTransition
 {
 
 	protected const virtual function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
@@ -23,49 +105,110 @@ abstract class InputContextTransitionDecisions extends DefaultTransition
 
 }
 
-abstract class InputContextTransitionEvents extends DefaultTransition
+abstract class InputContextTransitionEvents extends InputContextTransition
 {
 	var m_gameplaySettings : weak< GameplaySettingsSystem >;
+	var m_onInputSchemeUpdatedCallback : CallbackHandle;
+	var m_OnInputHintManagerInitializedChangedCallback : CallbackHandle;
+	var m_onInputSchemeChanged : Bool;
+	protected var m_hasControllerChanged : Bool;
+	protected var m_hasControllerSchemeChanged : Bool;
+	var m_isGameplayInputHintManagerInitialized : Bool;
+	var m_isGameplayInputHintRefreshRequired : Bool;
 
 	protected export function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
 	{
+		var inputSchemesBB : IBlackboard;
+		inputSchemesBB = GameInstance.GetBlackboardSystem( scriptInterface.GetGame() ).Get( GetAllBlackboardDefs().InputSchemes );
+		if( inputSchemesBB )
+		{
+			m_onInputSchemeUpdatedCallback = inputSchemesBB.RegisterListenerUint( GetAllBlackboardDefs().InputSchemes.Scheme, this, 'OnInputSchemeUpdated' );
+			m_OnInputHintManagerInitializedChangedCallback = inputSchemesBB.RegisterListenerVariant( GetAllBlackboardDefs().InputSchemes.InitializedInputHintManagerList, this, 'OnInputHintManagerInitializedChanged' );
+		}
 		m_gameplaySettings = GameplaySettingsSystem.GetGameplaySettingsSystemInstance( scriptInterface.executionOwner );
 	}
 
-	protected const function ShouldForceRefreshInputHints( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
 	{
-		var shouldForceRefresh : StateResultBool;
-		shouldForceRefresh = stateContext.GetTemporaryBoolParameter( 'forceRefreshInputHints' );
-		if( shouldForceRefresh.valid && shouldForceRefresh.value )
+		var inputSchemesBB : IBlackboard;
+		inputSchemesBB = GameInstance.GetBlackboardSystem( scriptInterface.GetGame() ).Get( GetAllBlackboardDefs().InputSchemes );
+		if( m_onInputSchemeUpdatedCallback )
 		{
-			return true;
+			inputSchemesBB.UnregisterListenerUint( GetAllBlackboardDefs().InputSchemes.Scheme, m_onInputSchemeUpdatedCallback );
 		}
-		return false;
+		if( m_OnInputHintManagerInitializedChangedCallback )
+		{
+			inputSchemesBB.UnregisterListenerVariant( GetAllBlackboardDefs().InputSchemes.InitializedInputHintManagerList, m_OnInputHintManagerInitializedChangedCallback );
+		}
+	}
+
+	protected event OnInputSchemeUpdated( value : Uint32 )
+	{
+		m_onInputSchemeChanged = true;
+	}
+
+	protected function OnInputHintManagerInitializedChanged( value : Variant )
+	{
+		var currentInitializedInputHintManagerList : array< CName >;
+		var isGameplayInputHintManagerInitialized : Bool;
+		var i : Int32;
+		currentInitializedInputHintManagerList = ( ( array< CName > )value );
+		for( i = 0; i < currentInitializedInputHintManagerList.Size(); i += 1 )
+		{
+			if( currentInitializedInputHintManagerList[ i ] == 'GameplayInputHelper' )
+			{
+				isGameplayInputHintManagerInitialized = true;
+				break;
+			}
+		}
+		m_isGameplayInputHintRefreshRequired = m_isGameplayInputHintManagerInitialized != isGameplayInputHintManagerInitialized && !( m_isGameplayInputHintManagerInitialized );
+		m_isGameplayInputHintManagerInitialized = isGameplayInputHintManagerInitialized;
+	}
+
+	protected const function ShouldForceRefreshInputHints( const stateContext : StateContext ) : Bool
+	{
+		var shouldForceRefreshInputHints : StateResultBool;
+		shouldForceRefreshInputHints = stateContext.GetTemporaryBoolParameter( 'ForceRefreshInputHints' );
+		return m_isGameplayInputHintRefreshRequired || ( shouldForceRefreshInputHints.valid && shouldForceRefreshInputHints.value );
 	}
 
 	protected const function ShowBodyCarryInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( !( scriptInterface.executionOwner.PlayerLastUsedKBM() ) )
+		var psmBodyCarrying : gamePSMBodyCarrying;
+		psmBodyCarrying = ( ( gamePSMBodyCarrying )( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying ) ) );
+		if( scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.CanThrowCarriedNPC ) )
 		{
-			if( scriptInterface.HasStatFlag( gamedataStatType.CanShootWhileCarryingBody ) )
+			ShowInputHint( scriptInterface, 'ThrowNPC', 'BodyCarry', "LocKey#17844", inkInputHintHoldIndicationType.Press );
+			stateContext.SetPermanentBoolParameter( 'isThrowCarriedNPCInputHintDisplayed', true, true );
+		}
+		if( psmBodyCarrying == gamePSMBodyCarrying.Carry )
+		{
+			if( scriptInterface.executionOwner.PlayerLastUsedPad() )
 			{
-				ShowInputHint( scriptInterface, 'DropCarriedObject', 'BodyCarry', "LocKey#43673", inkInputHintHoldIndicationType.FromInputConfig, true );
+				if( scriptInterface.HasStatFlag( gamedataStatType.CanShootWhileCarryingBody ) )
+				{
+					ShowInputHint( scriptInterface, 'DropCarriedObject', 'BodyCarry', "LocKey#43673", inkInputHintHoldIndicationType.FromInputConfig, true );
+				}
+				else
+				{
+					ShowInputHint( scriptInterface, 'DropCarriedObject', 'BodyCarry', "LocKey#43673" );
+				}
 			}
 			else
 			{
-				ShowInputHint( scriptInterface, 'DropCarriedObject', 'BodyCarry', "LocKey#43673" );
+				ShowInputHint( scriptInterface, 'DropCarriedObject', 'BodyCarry', "LocKey#43673", inkInputHintHoldIndicationType.Press );
 			}
-		}
-		else
-		{
-			ShowInputHint( scriptInterface, 'DropCarriedObject', 'BodyCarry', "LocKey#43673" );
 		}
 		stateContext.SetPermanentBoolParameter( 'isBodyCarryInputHintDisplayed', true, true );
 	}
 
 	protected const function RemoveBodyCarryInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'BodyCarry' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'BodyCarry' );
+		}
+		stateContext.RemovePermanentBoolParameter( 'isThrowCarriedNPCInputHintDisplayed' );
 		stateContext.RemovePermanentBoolParameter( 'isBodyCarryInputHintDisplayed' );
 	}
 
@@ -79,7 +222,10 @@ abstract class InputContextTransitionEvents extends DefaultTransition
 
 	protected const function RemoveLadderInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'Ladder' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'Ladder' );
+		}
 		stateContext.RemovePermanentBoolParameter( 'isLadderInputHintDisplayed' );
 	}
 
@@ -91,7 +237,10 @@ abstract class InputContextTransitionEvents extends DefaultTransition
 
 	protected const function RemoveTerminalInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'Terminal' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'Terminal' );
+		}
 		stateContext.RemovePermanentBoolParameter( 'isTerminalInputHintDisplayed' );
 	}
 
@@ -105,148 +254,307 @@ abstract class InputContextTransitionEvents extends DefaultTransition
 		{
 			ShowInputHint( scriptInterface, 'SwitchItem', 'Locomotion', "LocKey#45381" );
 		}
+		ShowCrouchInputHint( stateContext, scriptInterface, 'Locomotion' );
 		stateContext.SetPermanentBoolParameter( 'isLocomotionInputHintDisplayed', true, true );
 	}
 
 	protected function RemoveGenericExplorationInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'Locomotion' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'Locomotion' );
+		}
+		stateContext.RemovePermanentBoolParameter( 'isCrouchInputHintDisplayed' );
 		stateContext.RemovePermanentBoolParameter( 'isLocomotionInputHintDisplayed' );
 	}
 
-	protected const function ShowMeleeInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected const function ShowMeleeInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface, isThrowable : Bool )
 	{
-		ShowInputHint( scriptInterface, 'MeleeAttack', 'Melee', "LocKey#40351" );
-		ShowInputHint( scriptInterface, 'MeleeBlock', 'Melee', "LocKey#36191" );
-		if( scriptInterface.executionOwner.PlayerLastUsedKBM() )
+		ShowInputHint( scriptInterface, 'MeleeAttack', 'Melee', "LocKey#40351", inkInputHintHoldIndicationType.Press, false, 1 );
+		if( isThrowable )
 		{
-			ShowInputHint( scriptInterface, 'MoveX', 'Melee', "LocKey#36192" );
+			ShowInputHint( scriptInterface, 'MeleeBlock', 'Melee', "LocKey#45379", inkInputHintHoldIndicationType.FromInputConfig, true, 2 );
 		}
 		else
 		{
-			ShowInputHint( scriptInterface, 'Dodge', 'Melee', "LocKey#36192" );
+			ShowInputHint( scriptInterface, 'MeleeBlock', 'Melee', "LocKey#36191", inkInputHintHoldIndicationType.Press, false, 2 );
+		}
+		ShowDodgeInputHint( stateContext, scriptInterface, 'Melee' );
+		if( !( stateContext.GetBoolParameter( 'isCrouchInputHintDisplayed', true ) ) && ( ( gamePSMCombat )( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) ) ) != gamePSMCombat.InCombat )
+		{
+			ShowCrouchInputHint( stateContext, scriptInterface, 'Melee' );
 		}
 		stateContext.SetPermanentBoolParameter( 'isMeleeInputHintDisplayed', true, true );
 	}
 
 	protected function RemoveMeleeInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'Melee' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'Melee' );
+		}
 		stateContext.RemovePermanentBoolParameter( 'isMeleeInputHintDisplayed' );
+		stateContext.RemovePermanentBoolParameter( 'isCrouchInputHintDisplayed' );
 	}
 
 	protected const function ShowRangedInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( IsChargeRangedWeapon( scriptInterface ) )
+		var isChargeInputHintDisplayed : Bool;
+		var isChargeRangedWeapon : Bool;
+		isChargeInputHintDisplayed = stateContext.GetBoolParameter( 'isChargeInputHintDisplayed', true );
+		isChargeRangedWeapon = IsChargeRangedWeapon( scriptInterface );
+		if( !( isChargeInputHintDisplayed ) && isChargeRangedWeapon )
 		{
-			ShowInputHint( scriptInterface, 'RangedAttack', 'Ranged', "LocKey#47919" );
-			stateContext.SetPermanentBoolParameter( 'isChargeHintDisplayed', true, true );
+			ShowInputHint( scriptInterface, 'RangedAttack', 'Ranged', "LocKey#47919", inkInputHintHoldIndicationType.FromInputConfig, true, 0 );
+			stateContext.SetPermanentBoolParameter( 'isChargeInputHintDisplayed', true, true );
 		}
-		ShowInputHint( scriptInterface, 'Reload', 'Ranged', "LocKey#36198" );
-		ShowInputHint( scriptInterface, 'QuickMelee', 'Ranged', "LocKey#45380" );
-		stateContext.SetPermanentBoolParameter( 'isRangedInputHintDisplayed', true, true );
+		if( !( stateContext.GetBoolParameter( 'isQuickMeleeInputHintDisplayed', true ) ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'NoQuickMelee' ) ) )
+		{
+			ShowInputHint( scriptInterface, 'QuickMelee', 'Ranged', "LocKey#45380", inkInputHintHoldIndicationType.FromInputConfig, true, 1 );
+			stateContext.SetPermanentBoolParameter( 'isQuickMeleeInputHintDisplayed', true, true );
+		}
+		if( !( stateContext.GetBoolParameter( 'isRangedInputHintDisplayed', true ) ) )
+		{
+			ShowInputHint( scriptInterface, 'Reload', 'Ranged', "LocKey#36198", inkInputHintHoldIndicationType.FromInputConfig, true, 2 );
+			stateContext.SetPermanentBoolParameter( 'isRangedInputHintDisplayed', true, true );
+		}
+		if( ( ( !( stateContext.GetBoolParameter( 'isRangedDodgeInputHintDisplayed', true ) ) && scriptInterface.HasStatFlag( gamedataStatType.HasDodge ) ) && !( stateContext.IsStateActive( 'UpperBody', 'aimingState' ) ) ) || scriptInterface.HasStatFlag( gamedataStatType.CanAimWhileDodging ) )
+		{
+			ShowDodgeInputHint( stateContext, scriptInterface, 'Ranged' );
+			stateContext.SetPermanentBoolParameter( 'isRangedDodgeInputHintDisplayed', true, true );
+		}
+		if( !( stateContext.GetBoolParameter( 'isCrouchInputHintDisplayed', true ) ) && ( ( gamePSMCombat )( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) ) ) != gamePSMCombat.InCombat )
+		{
+			ShowCrouchInputHint( stateContext, scriptInterface, 'Ranged' );
+		}
 	}
 
 	protected function RemoveRangedInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'Ranged' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'Ranged' );
+		}
+		stateContext.RemovePermanentBoolParameter( 'isChargeInputHintDisplayed' );
+		stateContext.RemovePermanentBoolParameter( 'isQuickMeleeInputHintDisplayed' );
 		stateContext.RemovePermanentBoolParameter( 'isRangedInputHintDisplayed' );
-		stateContext.RemovePermanentBoolParameter( 'isChargeHintDisplayed' );
+		stateContext.RemovePermanentBoolParameter( 'isRangedDodgeInputHintDisplayed' );
+		stateContext.RemovePermanentBoolParameter( 'isCrouchInputHintDisplayed' );
+	}
+
+	protected const function ShowDodgeInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface, source : CName )
+	{
+		var gamepadInputSchemeBB : IBlackboard;
+		var gamepadInputScheme : Uint32;
+		gamepadInputSchemeBB = GameInstance.GetBlackboardSystem( scriptInterface.GetGame() ).Get( GetAllBlackboardDefs().InputSchemes );
+		gamepadInputScheme = gamepadInputSchemeBB.GetUint( GetAllBlackboardDefs().InputSchemes.Scheme );
+		if( scriptInterface.executionOwner.PlayerLastUsedKBM() )
+		{
+			ShowInputHint( scriptInterface, 'Dodge', source, "LocKey#87591", inkInputHintHoldIndicationType.FromInputConfig, true, 3 );
+		}
+		else
+		{
+			if( gamepadInputScheme == ( ( Uint32 )( InputScheme.LEGACY ) ) )
+			{
+				ShowInputHint( scriptInterface, 'UI_FakeDodge', source, "LocKey#36192", inkInputHintHoldIndicationType.Press, false, 3, inkInputHintKeyCombinationType.And );
+			}
+			else
+			{
+				ShowInputHint( scriptInterface, 'UI_FakeDodge', source, "LocKey#87591", inkInputHintHoldIndicationType.Press, false, 3, inkInputHintKeyCombinationType.And );
+			}
+		}
+	}
+
+	protected const function ShowCrouchInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface, source : CName )
+	{
+		if( !( stateContext.GetBoolParameter( 'isCrouchInputHintDisplayed', true ) ) )
+		{
+			ShowInputHint( scriptInterface, 'ToggleCrouch', source, "LocKey#36202", inkInputHintHoldIndicationType.FromInputConfig, true, ( ( Int32 )( gameuiInputHintSortingPriority.Bottom ) ) );
+			stateContext.SetPermanentBoolParameter( 'isCrouchInputHintDisplayed', true, true );
+		}
 	}
 
 	protected const function ShowVehicleDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		ShowInputHint( scriptInterface, 'ToggleVehCamera', 'VehicleDriver', "LocKey#36194" );
-		ShowVehicleExitInputHint( stateContext, scriptInterface, true );
+		ShowVehicleDrawWeaponInputHint( stateContext, scriptInterface );
+		ShowInputHint( scriptInterface, 'ToggleVehCamera', 'VehicleDriver', "LocKey#36194", inkInputHintHoldIndicationType.FromInputConfig, true, 2 );
+		ShowVehicleExitInputHint( stateContext, scriptInterface, 'VehicleDriver' );
 		stateContext.SetPermanentBoolParameter( 'isDriverInputHintDisplayed', true, true );
 	}
 
-	protected const function ShowVehicleRadioInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected const function RemoveVehicleDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		ShowInputHint( scriptInterface, 'VehicleInsideWheel', 'UI_DPad', "LocKey#49365", inkInputHintHoldIndicationType.FromInputConfig, true );
-		stateContext.SetPermanentBoolParameter( 'isVehicleRadioInputHintDisplayed', true, true );
-	}
-
-	protected const function RemoveVehicleRadioInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
-	{
-		RemoveInputHintsBySource( scriptInterface, 'UI_DPad' );
-		stateContext.RemovePermanentBoolParameter( 'isVehicleRadioInputHintDisplayed' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHint( scriptInterface, 'VehicleInsideWheel', 'UI_DPad' );
+			RemoveInputHintsBySource( scriptInterface, 'VehicleDriver' );
+		}
+		stateContext.RemovePermanentBoolParameter( 'isDriverInputHintDisplayed' );
 	}
 
 	protected const function ShowVehicleRestrictedInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		ShowInputHint( scriptInterface, 'ToggleVehCamera', 'VehicleDriver', "LocKey#36194", inkInputHintHoldIndicationType.FromInputConfig, true );
-		ShowVehicleExitInputHint( stateContext, scriptInterface, true );
+		ShowVehicleExitInputHint( stateContext, scriptInterface, 'VehicleDriver' );
 	}
 
 	protected const function RemoveVehicleRestrictedInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'VehicleDriver' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'VehicleDriver' );
+		}
 	}
 
 	protected const function ShowVehiclePassengerInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		ShowVehicleExitInputHint( stateContext, scriptInterface );
+		ShowVehicleExitInputHint( stateContext, scriptInterface, 'VehiclePassenger' );
 		stateContext.SetPermanentBoolParameter( 'isPassengerInputHintDisplayed', true, true );
 	}
 
 	protected const function RemoveVehiclePassengerInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHint( scriptInterface, 'VehicleInsideWheel', 'UI_DPad' );
-		RemoveInputHintsBySource( scriptInterface, 'VehiclePassenger' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHint( scriptInterface, 'VehicleInsideWheel', 'UI_DPad' );
+			RemoveInputHintsBySource( scriptInterface, 'VehiclePassenger' );
+		}
 		stateContext.RemovePermanentBoolParameter( 'isPassengerInputHintDisplayed' );
 	}
 
-	protected const function RemoveVehicleDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected const function ShowVehicleRemoteControlDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHint( scriptInterface, 'VehicleInsideWheel', 'UI_DPad' );
-		RemoveInputHintsBySource( scriptInterface, 'VehicleDriver' );
-		stateContext.RemovePermanentBoolParameter( 'isDriverInputHintDisplayed' );
+		ShowInputHint( scriptInterface, 'ToggleVehCamera', 'VehicleRemoteControlDrive', "LocKey#36194" );
+		ShowInputHint( scriptInterface, 'Exit', 'VehicleRemoteControlDrive', "LocKey#36196", inkInputHintHoldIndicationType.FromInputConfig, true );
+	}
+
+	protected const function RemoveVehicleRemoteControlDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'VehicleRemoteControlDrive' );
+		}
 	}
 
 	protected const function ShowVehicleDriverCombatInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		ShowInputHint( scriptInterface, 'Reload', 'VehicleDriverCombat', "LocKey#36198" );
-		ShowInputHint( scriptInterface, 'WeaponWheel', 'VehicleDriverCombat', "LocKey#36199" );
+		ShowVehicleDriverCombatInputHintsInternal( 'VehicleDriverCombat', stateContext, scriptInterface );
 	}
 
 	protected const function RemoveVehicleDriverCombatInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'VehicleDriverCombat' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'VehicleDriverCombat' );
+		}
+		stateContext.RemovePermanentBoolParameter( 'isDriverCombatScannerInputHintDisplayed' );
+		stateContext.RemovePermanentBoolParameter( 'isDriverCombatInputHintDisplayed' );
 	}
 
-	protected const function ShowVehicleExitInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface, optional driver : Bool )
+	protected const function ShowVehicleDriverCombatTPPInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		var vehicle : weak< GameObject >;
-		VehicleComponent.GetVehicle( scriptInterface.owner.GetGame(), scriptInterface.executionOwner, vehicle );
-		if( vehicle = ( ( BikeObject )( vehicle ) ) )
+		ShowVehicleDriverCombatInputHintsInternal( 'VehicleDriverCombatTPP', stateContext, scriptInterface );
+	}
+
+	protected const function RemoveVehicleDriverCombatTPPInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( m_isGameplayInputHintManagerInitialized )
 		{
-			ShowInputHint( scriptInterface, 'Exit', 'VehicleDriver', "LocKey#53066", inkInputHintHoldIndicationType.FromInputConfig, true );
+			RemoveInputHintsBySource( scriptInterface, 'VehicleDriverCombatTPP' );
+		}
+		stateContext.RemovePermanentBoolParameter( 'isDriverCombatScannerInputHintDisplayed' );
+		stateContext.RemovePermanentBoolParameter( 'isDriverCombatInputHintDisplayed' );
+	}
+
+	private const function ShowVehicleDriverCombatInputHintsInternal( source : CName, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var vehicleRecord : Vehicle_Record;
+		var vehicle : weak< VehicleObject >;
+		VehicleComponent.GetVehicle( scriptInterface.executionOwner.GetGame(), scriptInterface.executionOwner, vehicle );
+		vehicleRecord = vehicle.GetRecord();
+		if( stateContext.GetBoolParameter( 'inMeleeDriverCombat', true ) )
+		{
+			RemoveInputHint( scriptInterface, 'UI_FakeRangedAttack', source );
+			RemoveInputHint( scriptInterface, 'UI_FakeCameraAim', source );
+			ShowInputHint( scriptInterface, 'MeleeAttack', source, "LocKey#40351", inkInputHintHoldIndicationType.Press, true, 1 );
+			ShowInputHint( scriptInterface, 'MeleeBlock', source, "LocKey#36191", inkInputHintHoldIndicationType.Press, true, 2 );
 		}
 		else
 		{
-			if( driver )
-			{
-				ShowInputHint( scriptInterface, 'Exit', 'VehicleDriver', "LocKey#36196", inkInputHintHoldIndicationType.FromInputConfig, true );
-			}
-			else
-			{
-				ShowInputHint( scriptInterface, 'Exit', 'VehiclePassenger', "LocKey#36196", inkInputHintHoldIndicationType.FromInputConfig, true );
-			}
+			RemoveInputHint( scriptInterface, 'MeleeAttack', source );
+			RemoveInputHint( scriptInterface, 'MeleeBlock', source );
+			ShowInputHint( scriptInterface, 'UI_FakeRangedAttack', source, "LocKey#36197", inkInputHintHoldIndicationType.Press, false, 1 );
+			ShowInputHint( scriptInterface, 'UI_FakeCameraAim', source, "LocKey#45379", inkInputHintHoldIndicationType.FromInputConfig, true, 2 );
 		}
+		if( vehicleRecord.VehDataPackageHandle().DriverCombat().Type() != gamedataDriverCombatType.MountedWeapons || vehicle.CanSwitchWeapons() )
+		{
+			ShowInputHint( scriptInterface, 'SwitchItem', source, "LocKey#77771", inkInputHintHoldIndicationType.FromInputConfig, false, 3 );
+		}
+		ShowInputHint( scriptInterface, 'ExitCombatMode', source, "LocKey#87490", inkInputHintHoldIndicationType.FromInputConfig, true, 5 );
+		ShowInputHint( scriptInterface, 'ToggleVehCamera', source, "LocKey#36194", inkInputHintHoldIndicationType.FromInputConfig, true, 6 );
+		stateContext.SetPermanentBoolParameter( 'isDriverCombatInputHintDisplayed', true, true );
+		if( scriptInterface.executionOwner.PlayerLastUsedKBM() )
+		{
+			RemoveInputHint( scriptInterface, 'UI_FakeDriverCombatControllerVisionActivation', source );
+			stateContext.RemovePermanentBoolParameter( 'isDriverCombatScannerInputHintDisplayed' );
+		}
+		else if( EquipmentSystem.IsCyberdeckEquipped( scriptInterface.executionOwner ) && !( QuickhackModule.IsQuickhackBlockedByScene( scriptInterface.executionOwner ) ) )
+		{
+			ShowInputHint( scriptInterface, 'UI_FakeDriverCombatControllerVisionActivation', source, "LocKey#52040", inkInputHintHoldIndicationType.FromInputConfig, false, 4, inkInputHintKeyCombinationType.And );
+			stateContext.SetPermanentBoolParameter( 'isDriverCombatScannerInputHintDisplayed', true, true );
+		}
+	}
+
+	protected const function ShowVehicleDrawWeaponInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( IsVehicleBlockingCombat( scriptInterface ) || IsEmptyHandsForced( stateContext, scriptInterface ) )
+		{
+			stateContext.SetPermanentBoolParameter( 'IsVehicleCombatModeBlocked', true, true );
+		}
+		else
+		{
+			stateContext.SetPermanentBoolParameter( 'IsVehicleCombatModeBlocked', false, true );
+			ShowInputHint( scriptInterface, 'EnterCombatMode', 'VehicleDriver', "LocKey#45381", inkInputHintHoldIndicationType.FromInputConfig, true, 1 );
+		}
+	}
+
+	protected const function ShowVehicleExitInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface, source : CName )
+	{
+		var vehicle : weak< GameObject >;
+		if( IsExitVehicleBlocked( scriptInterface ) )
+		{
+			stateContext.SetPermanentBoolParameter( 'IsExitVehicleBlocked', true, true );
+			return;
+		}
+		VehicleComponent.GetVehicle( scriptInterface.owner.GetGame(), scriptInterface.executionOwner, vehicle );
+		if( vehicle = ( ( BikeObject )( vehicle ) ) )
+		{
+			ShowInputHint( scriptInterface, 'Exit', source, "LocKey#53066", inkInputHintHoldIndicationType.FromInputConfig, true, 127 );
+		}
+		else
+		{
+			ShowInputHint( scriptInterface, 'Exit', source, "LocKey#36196", inkInputHintHoldIndicationType.FromInputConfig, true, 127 );
+		}
+		stateContext.SetPermanentBoolParameter( 'IsExitVehicleBlocked', false, true );
 	}
 
 	protected const function ShowVehiclePassengerCombatInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		ShowInputHint( scriptInterface, 'RangedAttack', 'VehiclePassengerCombat', "LocKey#36197" );
 		ShowInputHint( scriptInterface, 'Reload', 'VehiclePassengerCombat', "LocKey#36198" );
-		ShowInputHint( scriptInterface, 'WeaponWheel', 'VehiclePassengerCombat', "LocKey#36199" );
+		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'VehicleScene' ) )
+		{
+			ShowInputHint( scriptInterface, 'WeaponWheel', 'VehiclePassengerCombat', "LocKey#36199" );
+		}
 		stateContext.SetPermanentBoolParameter( 'isPassengerCombatInputHintDisplayed', true, true );
 	}
 
 	protected const function RemoveVehiclePassengerCombatInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'VehiclePassengerCombat' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'VehiclePassengerCombat' );
+		}
 		stateContext.RemovePermanentBoolParameter( 'isPassengerCombatInputHintDisplayed' );
 	}
 
@@ -254,13 +562,16 @@ abstract class InputContextTransitionEvents extends DefaultTransition
 	{
 		ShowInputHint( scriptInterface, 'ToggleSprint', 'Swimming', "LocKey#40155" );
 		ShowInputHint( scriptInterface, 'Jump', 'Swimming', "LocKey#40158" );
-		ShowInputHint( scriptInterface, 'ToggleCrouch', 'Swimming', "LocKey#40157" );
+		ShowInputHint( scriptInterface, 'Dive', 'Swimming', "LocKey#40157" );
 		stateContext.SetPermanentBoolParameter( 'isSwimmingInputHintDisplayed', true, true );
 	}
 
 	protected const function RemoveSwimmingInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		RemoveInputHintsBySource( scriptInterface, 'Swimming' );
+		if( m_isGameplayInputHintManagerInitialized )
+		{
+			RemoveInputHintsBySource( scriptInterface, 'Swimming' );
+		}
 		stateContext.RemovePermanentBoolParameter( 'isSwimmingInputHintDisplayed' );
 	}
 
@@ -274,68 +585,182 @@ abstract class InputContextTransitionEvents extends DefaultTransition
 		RemoveSwimmingInputHints( stateContext, scriptInterface );
 		RemoveVehicleDriverInputHints( stateContext, scriptInterface );
 		RemoveVehicleDriverCombatInputHints( stateContext, scriptInterface );
+		RemoveVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+		RemoveVehicleRemoteControlDriverInputHints( stateContext, scriptInterface );
 		RemoveVehiclePassengerCombatInputHints( stateContext, scriptInterface );
 		RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
+		RemoveVehicleRemoteControlDriverInputHints( stateContext, scriptInterface );
 		RemoveVehicleRestrictedInputHints( stateContext, scriptInterface );
-		RemoveVehicleRadioInputHint( stateContext, scriptInterface );
 	}
 
-	protected function UpdateWeaponInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected function SetBaseContextInputHints( context : ActiveBaseContext, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		var isInExploration : Bool;
-		var isDeviceControlled : Bool;
-		var isMeleeWeaponEquipped : Bool;
-		var isRangedWeaponEquipped : Bool;
-		var inEquipState : Bool;
+		var activeWeapon : WeaponObject;
+		var player : weak< PlayerPuppet >;
+		player = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( scriptInterface.GetGame() ).GetLocalPlayerMainGameObject() ) );
+		activeWeapon = GameObject.GetActiveWeapon( player );
+		if( context == ActiveBaseContext.None )
+		{
+			return;
+		}
+		RemoveAllInputHints( stateContext, scriptInterface );
+		switch( context )
+		{
+			case ActiveBaseContext.Locomotion:
+			{
+				ShowGenericExplorationInputHints( stateContext, scriptInterface );
+				break;
+			}
+			case ActiveBaseContext.Ladder:
+			{
+				ShowLadderInputHints( stateContext, scriptInterface );
+				break;
+			}
+			case ActiveBaseContext.Swimming:
+			{
+				ShowSwimmingInputHints( stateContext, scriptInterface );
+				break;
+			}
+			case ActiveBaseContext.BodyCarring:
+			{
+				ShowBodyCarryInputHints( stateContext, scriptInterface );
+				break;
+			}
+			case ActiveBaseContext.MeleeWeapon:
+			{
+				ShowMeleeInputHints( stateContext, scriptInterface, activeWeapon.IsThrowable() );
+				break;
+			}
+			case ActiveBaseContext.RangedWeapon:
+			{
+				ShowRangedInputHints( stateContext, scriptInterface );
+				break;
+			}
+			case ActiveBaseContext.BodyCarringWithRangedWeapon:
+			{
+				ShowBodyCarryInputHints( stateContext, scriptInterface );
+				ShowRangedInputHints( stateContext, scriptInterface );
+				break;
+			}
+			default:
+			{
+				break;
+			}
+		}
+	}
+
+	protected function UpdateWeaponInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : ActiveBaseContext
+	{
+		var isExploring : Bool;
 		var isExaminingDevice : Bool;
+		var isDeviceControlled : Bool;
+		var inEquipState : Bool;
 		var rightHandWeapon : weak< WeaponObject >;
+		var isRangedWeaponEquipped : Bool;
+		var isMeleeWeaponEquipped : Bool;
+		var canDisplayChargeInputHint : Bool;
+		var canDisplayRangedDodgeInputHint : Bool;
+		var canDisplayCrouchInputHint : Bool;
+		var canDisplayThrowCarriedNPCInputHint : Bool;
 		var isMeleeInputHintDisplayed : Bool;
 		var isRangedInputHintDisplayed : Bool;
-		rightHandWeapon = GetActiveWeapon( scriptInterface );
-		isMeleeInputHintDisplayed = stateContext.GetBoolParameter( 'isMeleeInputHintDisplayed', true );
-		isRangedInputHintDisplayed = stateContext.GetBoolParameter( 'isRangedInputHintDisplayed', true );
+		var isChargeInputHintDisplayed : Bool;
+		var isRangedDodgeInputHintDisplayed : Bool;
+		var isCrouchInputHintDisplayed : Bool;
+		var isThrowCarriedNPCInputHintDisplayed : Bool;
+		var context : ActiveBaseContext;
+		isExploring = IsInHighLevelState( stateContext, 'exploration' );
 		isExaminingDevice = IsExaminingDevice( scriptInterface ) || IsInteractingWithTerminal( scriptInterface );
 		isDeviceControlled = scriptInterface.executionOwner.GetTakeOverControlSystem().IsDeviceControlled();
-		isInExploration = IsInHighLevelState( stateContext, 'exploration' );
 		inEquipState = ( IsRightHandInEquippedState( stateContext ) || IsRightHandInEquippingState( stateContext ) ) || IsInFirstEquip( stateContext );
+		rightHandWeapon = GetActiveWeapon( scriptInterface );
 		isRangedWeaponEquipped = inEquipState && rightHandWeapon.IsRanged();
 		isMeleeWeaponEquipped = ( inEquipState && !( isRangedWeaponEquipped ) ) && rightHandWeapon.IsMelee();
-		if( ( ( !( isMeleeInputHintDisplayed ) && !( isExaminingDevice ) ) && isInExploration ) && isMeleeWeaponEquipped )
+		canDisplayChargeInputHint = isRangedWeaponEquipped && IsChargeRangedWeapon( scriptInterface );
+		canDisplayRangedDodgeInputHint = ( !( isRangedWeaponEquipped ) || !( stateContext.IsStateActive( 'UpperBody', 'aimingState' ) ) ) || scriptInterface.HasStatFlag( gamedataStatType.CanAimWhileDodging );
+		canDisplayCrouchInputHint = ( ( gamePSMCombat )( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) ) ) != gamePSMCombat.InCombat;
+		canDisplayThrowCarriedNPCInputHint = scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.CanThrowCarriedNPC );
+		isMeleeInputHintDisplayed = stateContext.GetBoolParameter( 'isMeleeInputHintDisplayed', true );
+		isRangedInputHintDisplayed = stateContext.GetBoolParameter( 'isRangedInputHintDisplayed', true );
+		isChargeInputHintDisplayed = stateContext.GetBoolParameter( 'isChargeInputHintDisplayed', true );
+		isRangedDodgeInputHintDisplayed = stateContext.GetBoolParameter( 'isRangedDodgeInputHintDisplayed', true );
+		isCrouchInputHintDisplayed = stateContext.GetBoolParameter( 'isCrouchInputHintDisplayed', true );
+		isThrowCarriedNPCInputHintDisplayed = stateContext.GetBoolParameter( 'isThrowCarriedNPCInputHintDisplayed' );
+		if( ( ( isMeleeWeaponEquipped && isExploring ) && !( isExaminingDevice ) ) && !( isDeviceControlled ) )
 		{
-			ShowMeleeInputHints( stateContext, scriptInterface );
+			if( isCrouchInputHintDisplayed && !( canDisplayCrouchInputHint ) )
+			{
+				RemoveInputHint( scriptInterface, 'ToggleCrouch', 'Melee' );
+				stateContext.RemovePermanentBoolParameter( 'isCrouchInputHintDisplayed' );
+			}
+			if( ( ( !( isMeleeInputHintDisplayed ) || m_hasControllerChanged ) || m_hasControllerSchemeChanged ) || ( !( isCrouchInputHintDisplayed ) && canDisplayCrouchInputHint ) )
+			{
+				return ActiveBaseContext.MeleeWeapon;
+			}
 		}
-		else if( isMeleeInputHintDisplayed && ( ( ( ( ( !( isInExploration ) || !( isMeleeWeaponEquipped ) ) || isExaminingDevice ) || isDeviceControlled ) || ShouldForceRefreshInputHints( stateContext, scriptInterface ) ) || CheckForControllerChange( stateContext, scriptInterface ) ) )
+		else if( isMeleeInputHintDisplayed && ( ( ( !( isMeleeWeaponEquipped ) || !( isExploring ) ) || isExaminingDevice ) || isDeviceControlled ) )
 		{
 			RemoveMeleeInputHints( stateContext, scriptInterface );
 		}
-		else if( !( isRangedInputHintDisplayed ) && ( ( ( !( isExaminingDevice ) && isInExploration ) && isRangedWeaponEquipped ) && !( rightHandWeapon.IsHeavyWeapon() ) ) )
+		if( ( ( ( isRangedWeaponEquipped && !( rightHandWeapon.IsHeavyWeapon() ) ) && isExploring ) && !( isExaminingDevice ) ) && !( isDeviceControlled ) )
 		{
-			ShowRangedInputHints( stateContext, scriptInterface );
+			if( isChargeInputHintDisplayed && !( canDisplayChargeInputHint ) )
+			{
+				RemoveInputHint( scriptInterface, 'RangedAttack', 'Ranged' );
+				stateContext.RemovePermanentBoolParameter( 'isChargeInputHintDisplayed' );
+			}
+			if( isRangedDodgeInputHintDisplayed && !( canDisplayRangedDodgeInputHint ) )
+			{
+				RemoveInputHint( scriptInterface, 'Dodge', 'Ranged' );
+				stateContext.RemovePermanentBoolParameter( 'isRangedInputHintDisplayed' );
+			}
+			if( isCrouchInputHintDisplayed && !( canDisplayCrouchInputHint ) )
+			{
+				RemoveInputHint( scriptInterface, 'ToggleCrouch', 'Ranged' );
+				stateContext.RemovePermanentBoolParameter( 'isCrouchInputHintDisplayed' );
+			}
+			if( ( ( ( ( ( !( isRangedInputHintDisplayed ) || m_hasControllerChanged ) || m_hasControllerSchemeChanged ) || ( !( isChargeInputHintDisplayed ) && canDisplayChargeInputHint ) ) || ( !( isRangedDodgeInputHintDisplayed ) && canDisplayRangedDodgeInputHint ) ) || ( !( isCrouchInputHintDisplayed ) && canDisplayCrouchInputHint ) ) || ( !( isThrowCarriedNPCInputHintDisplayed ) && canDisplayThrowCarriedNPCInputHint ) )
+			{
+				if( stateContext.GetBoolParameter( 'isBodyCarryInputHintDisplayed', true ) )
+				{
+					return ActiveBaseContext.BodyCarringWithRangedWeapon;
+				}
+				else
+				{
+					return ActiveBaseContext.RangedWeapon;
+				}
+			}
 		}
-		else if( isRangedInputHintDisplayed && ( ( ( ( ( !( isInExploration ) || !( isRangedWeaponEquipped ) ) || isExaminingDevice ) || isDeviceControlled ) || ShouldForceRefreshInputHints( stateContext, scriptInterface ) ) || rightHandWeapon.GetCurrentTriggerMode().Type() == gamedataTriggerMode.Charge != stateContext.GetBoolParameter( 'isChargeHintDisplayed', true ) ) )
+		else if( isRangedInputHintDisplayed && ( ( ( ( !( isRangedWeaponEquipped ) || rightHandWeapon.GetCurrentTriggerMode().Type() == gamedataTriggerMode.Charge != isChargeInputHintDisplayed ) || !( isExploring ) ) || isExaminingDevice ) || isDeviceControlled ) )
 		{
 			RemoveRangedInputHints( stateContext, scriptInterface );
 		}
+		return context;
 	}
 
-	protected function CheckForControllerChange( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
+	protected function ConsumeControllerChange( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		var isKeyboard : Bool;
-		isKeyboard = scriptInterface.executionOwner.PlayerLastUsedKBM();
-		if( stateContext.GetBoolParameter( 'usingKeyboardAndMouse', true ) && !( isKeyboard ) )
+		var isKBMInputDevice : Bool;
+		isKBMInputDevice = scriptInterface.executionOwner.PlayerLastUsedKBM();
+		if( stateContext.GetBoolParameter( 'isKBMInputDevice', true ) && !( isKBMInputDevice ) )
 		{
-			stateContext.SetPermanentBoolParameter( 'usingKeyboardAndMouse', false, true );
+			stateContext.SetPermanentBoolParameter( 'isKBMInputDevice', false, true );
 			return true;
 		}
-		else if( !( stateContext.GetBoolParameter( 'usingKeyboardAndMouse', true ) ) && isKeyboard )
+		if( !( stateContext.GetBoolParameter( 'isKBMInputDevice', true ) ) && isKBMInputDevice )
 		{
-			stateContext.SetPermanentBoolParameter( 'usingKeyboardAndMouse', true, true );
+			stateContext.SetPermanentBoolParameter( 'isKBMInputDevice', true, true );
 			return true;
 		}
-		else
-		{
-			return false;
-		}
+		return false;
+	}
+
+	protected function ConsumeInputSchemeChange() : Bool
+	{
+		var oldValue : Bool;
+		oldValue = m_onInputSchemeChanged;
+		m_onInputSchemeChanged = false;
+		return oldValue;
 	}
 
 }
@@ -403,7 +828,6 @@ class DeviceControlContextEvents extends InputContextTransitionEvents
 		RemoveAllInputHints( stateContext, scriptInterface );
 	}
 
-	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface ) {}
 }
 
 class BraindanceContextDecisions extends InputContextTransitionDecisions
@@ -452,92 +876,123 @@ class DeadContextDecisions extends InputContextTransitionDecisions
 
 }
 
+class BaseContextDecisions extends InputContextTransitionDecisions
+{
+
+	protected export const function ToVehicleRemoteControlDriverContext( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var isVehicleRemoteControlled : Bool;
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
+		if( isVehicleRemoteControlled )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
 class BaseContextEvents extends InputContextTransitionEvents
 {
-	var m_slicingFrame : Int32;
-
-	protected function UpdateHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface, sliced : Bool )
-	{
-		if( ( m_slicingFrame == 0 ) || !( sliced ) )
-		{
-			UpdateGenericExplorationInputHints( stateContext, scriptInterface );
-		}
-		if( ( m_slicingFrame == 1 ) || !( sliced ) )
-		{
-			UpdateWeaponInputHints( stateContext, scriptInterface );
-		}
-		if( ( m_slicingFrame == 2 ) || !( sliced ) )
-		{
-			UpdateLadderInputHints( stateContext, scriptInterface );
-		}
-		if( ( m_slicingFrame == 3 ) || !( sliced ) )
-		{
-			UpdateSwimmingInputHints( stateContext, scriptInterface );
-		}
-		if( ( m_slicingFrame == 4 ) || !( sliced ) )
-		{
-			UpdateBodyCarryInputHints( stateContext, scriptInterface );
-		}
-		if( sliced )
-		{
-			m_slicingFrame += 1;
-			m_slicingFrame = m_slicingFrame % 6;
-		}
-	}
 
 	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( m_gameplaySettings.GetIsInputHintEnabled() )
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
 		{
-			UpdateHints( stateContext, scriptInterface, true );
+			UpdateHints( stateContext, scriptInterface );
 		}
 	}
 
-	protected function UpdateGenericExplorationInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	private function UpdateHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var context : ActiveBaseContext;
+		var contextTemp : ActiveBaseContext;
+		if( ShouldForceRefreshInputHints( stateContext ) )
+		{
+			RemoveGenericExplorationInputHints( stateContext, scriptInterface );
+			RemoveLadderInputHints( stateContext, scriptInterface );
+			RemoveSwimmingInputHints( stateContext, scriptInterface );
+			RemoveBodyCarryInputHints( stateContext, scriptInterface );
+			RemoveMeleeInputHints( stateContext, scriptInterface );
+			RemoveRangedInputHints( stateContext, scriptInterface );
+			m_isGameplayInputHintRefreshRequired = false;
+		}
+		m_hasControllerChanged = ConsumeControllerChange( stateContext, scriptInterface );
+		m_hasControllerSchemeChanged = ConsumeInputSchemeChange();
+		context = UpdateLocomotionInputHints( stateContext, scriptInterface );
+		if( context == ActiveBaseContext.None )
+		{
+			context = UpdateLadderInputHints( stateContext, scriptInterface );
+		}
+		if( context == ActiveBaseContext.None )
+		{
+			context = UpdateSwimmingInputHints( stateContext, scriptInterface );
+		}
+		if( context == ActiveBaseContext.None )
+		{
+			context = UpdateBodyCarryInputHints( stateContext, scriptInterface );
+		}
+		if( context == ActiveBaseContext.None || context == ActiveBaseContext.BodyCarring )
+		{
+			contextTemp = UpdateWeaponInputHints( stateContext, scriptInterface );
+			context = ( ( contextTemp != ActiveBaseContext.None ) ? ( contextTemp ) : ( context ) );
+		}
+		SetBaseContextInputHints( context, stateContext, scriptInterface );
+	}
+
+	protected function UpdateLocomotionInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : ActiveBaseContext
 	{
 		var isValidState : Bool;
 		isValidState = IsStateValidForExploration( stateContext, scriptInterface );
-		if( isValidState && !( stateContext.GetBoolParameter( 'isLocomotionInputHintDisplayed', true ) ) )
+		if( isValidState )
 		{
-			ShowGenericExplorationInputHints( stateContext, scriptInterface );
+			if( ( !( stateContext.GetBoolParameter( 'isLocomotionInputHintDisplayed', true ) ) || m_hasControllerChanged ) || m_hasControllerSchemeChanged )
+			{
+				return ActiveBaseContext.Locomotion;
+			}
 		}
-		else if( ( !( isValidState ) || ShouldForceRefreshInputHints( stateContext, scriptInterface ) ) && stateContext.GetBoolParameter( 'isLocomotionInputHintDisplayed', true ) )
+		else if( !( isValidState ) && stateContext.GetBoolParameter( 'isLocomotionInputHintDisplayed', true ) )
 		{
 			RemoveGenericExplorationInputHints( stateContext, scriptInterface );
 		}
+		return ActiveBaseContext.None;
 	}
 
-	protected function UpdateBodyCarryInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected function UpdateBodyCarryInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : ActiveBaseContext
 	{
-		var isInBodyCarry : Bool;
-		var ChoiceHubsActive : Bool;
-		isInBodyCarry = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying ) == ( ( Int32 )( gamePSMBodyCarrying.Carry ) );
-		ChoiceHubsActive = AreChoiceHubsActive( scriptInterface );
-		if( ( isInBodyCarry && !( ChoiceHubsActive ) ) && !( stateContext.GetBoolParameter( 'isBodyCarryInputHintDisplayed', true ) ) )
+		var psmBodyCarrying : gamePSMBodyCarrying;
+		var isCarryingBody : Bool;
+		var isBodyCarryInputHintDisplayed : Bool;
+		var isThrowCarriedNPCInputHintDisplayed : Bool;
+		var canDisplayThrowCarriedNPCInputHint : Bool;
+		psmBodyCarrying = ( ( gamePSMBodyCarrying )( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.BodyCarrying ) ) );
+		isCarryingBody = psmBodyCarrying == gamePSMBodyCarrying.Carry || psmBodyCarrying == gamePSMBodyCarrying.Aim;
+		isBodyCarryInputHintDisplayed = stateContext.GetBoolParameter( 'isBodyCarryInputHintDisplayed', true );
+		isThrowCarriedNPCInputHintDisplayed = stateContext.GetBoolParameter( 'isThrowCarriedNPCInputHintDisplayed' );
+		canDisplayThrowCarriedNPCInputHint = scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.CanThrowCarriedNPC );
+		if( isCarryingBody && !( AreChoiceHubsActive( scriptInterface ) ) )
 		{
-			ShowBodyCarryInputHints( stateContext, scriptInterface );
+			if( isThrowCarriedNPCInputHintDisplayed && !( canDisplayThrowCarriedNPCInputHint ) )
+			{
+				RemoveInputHint( scriptInterface, 'ThrowNPC', 'BodyCarry' );
+				stateContext.RemovePermanentBoolParameter( 'isThrowCarriedNPCInputHintDisplayed' );
+			}
+			if( !( isBodyCarryInputHintDisplayed ) || ( !( isThrowCarriedNPCInputHintDisplayed ) && canDisplayThrowCarriedNPCInputHint ) )
+			{
+				return ActiveBaseContext.BodyCarring;
+			}
 		}
-		else if( ( !( isInBodyCarry ) || ChoiceHubsActive ) && stateContext.GetBoolParameter( 'isBodyCarryInputHintDisplayed', true ) )
+		else
 		{
-			RemoveBodyCarryInputHints( stateContext, scriptInterface );
+			if( isBodyCarryInputHintDisplayed )
+			{
+				RemoveBodyCarryInputHints( stateContext, scriptInterface );
+			}
 		}
+		return ActiveBaseContext.None;
 	}
 
-	protected function UpdateTerminalInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
-	{
-		var isInteractingWithTerminal : Bool;
-		isInteractingWithTerminal = IsInteractingWithTerminal( scriptInterface );
-		if( isInteractingWithTerminal && !( stateContext.GetBoolParameter( 'isTerminalInputHintDisplayed', true ) ) )
-		{
-			ShowTerminalInputHints( stateContext, scriptInterface );
-		}
-		else if( !( isInteractingWithTerminal ) && stateContext.GetBoolParameter( 'isTerminalInputHintDisplayed', true ) )
-		{
-			RemoveTerminalInputHints( stateContext, scriptInterface );
-		}
-	}
-
-	protected function UpdateLadderInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected function UpdateLadderInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : ActiveBaseContext
 	{
 		var locomotionStateName : CName;
 		locomotionStateName = GetLocomotionState( stateContext );
@@ -545,7 +1000,7 @@ class BaseContextEvents extends InputContextTransitionEvents
 		{
 			if( !( stateContext.GetBoolParameter( 'isLadderInputHintDisplayed', true ) ) )
 			{
-				ShowLadderInputHints( stateContext, scriptInterface );
+				return ActiveBaseContext.Ladder;
 			}
 		}
 		else
@@ -555,28 +1010,33 @@ class BaseContextEvents extends InputContextTransitionEvents
 				RemoveLadderInputHints( stateContext, scriptInterface );
 			}
 		}
+		return ActiveBaseContext.None;
 	}
 
-	protected function UpdateSwimmingInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	protected function UpdateSwimmingInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : ActiveBaseContext
 	{
 		var isSwimming : Bool;
 		isSwimming = stateContext.IsStateMachineActive( 'LocomotionSwimming' );
-		if( isSwimming && !( stateContext.GetBoolParameter( 'isSwimmingInputHintDisplayed', true ) ) )
+		if( isSwimming )
 		{
-			ShowSwimmingInputHints( stateContext, scriptInterface );
+			if( !( stateContext.GetBoolParameter( 'isSwimmingInputHintDisplayed', true ) ) )
+			{
+				return ActiveBaseContext.Swimming;
+			}
 		}
-		else if( !( isSwimming ) && stateContext.GetBoolParameter( 'isSwimmingInputHintDisplayed', true ) )
+		else
 		{
-			RemoveSwimmingInputHints( stateContext, scriptInterface );
+			if( stateContext.GetBoolParameter( 'isSwimmingInputHintDisplayed', true ) )
+			{
+				RemoveSwimmingInputHints( stateContext, scriptInterface );
+			}
 		}
+		return ActiveBaseContext.None;
 	}
 
 	protected export virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( m_gameplaySettings.GetIsInputHintEnabled() )
-		{
-			UpdateHints( stateContext, scriptInterface, false );
-		}
+		UpdateHints( stateContext, scriptInterface );
 	}
 
 	private function IsStateValidForExploration( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) : Bool
@@ -714,9 +1174,13 @@ class AimingContextEvents extends InputContextTransitionEvents
 
 	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( m_gameplaySettings.GetIsInputHintEnabled() )
+		var context : ActiveBaseContext;
+		m_hasControllerChanged = ConsumeControllerChange( stateContext, scriptInterface );
+		m_hasControllerSchemeChanged = ConsumeInputSchemeChange();
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
 		{
-			UpdateWeaponInputHints( stateContext, scriptInterface );
+			context = UpdateWeaponInputHints( stateContext, scriptInterface );
+			SetBaseContextInputHints( context, stateContext, scriptInterface );
 		}
 	}
 
@@ -800,6 +1264,12 @@ class VisionContextDecisions extends InputContextTransitionDecisions
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		var vehicleID : EntityID;
+		vehicleID = scriptInterface.localBlackboard.GetEntityID( GetAllBlackboardDefs().PlayerStateMachine.EntityIDVehicleRemoteControlled );
+		if( EntityID.IsDefined( vehicleID ) )
+		{
+			return false;
+		}
 		if( m_isFocusing )
 		{
 			return true;
@@ -863,8 +1333,8 @@ class UiRadialContextEvents extends InputContextTransitionEvents
 		if( Vector4.Length( leftStick ) <= 0.40000001 )
 		{
 			leftStick = Vector4.EmptyVector();
-			m_mouse.X += ( ( scriptInterface.GetActionValue( 'mouse_x' ) * timeDelta ) * 100.0 );
-			m_mouse.Y += ( ( scriptInterface.GetActionValue( 'mouse_y' ) * timeDelta ) * 100.0 );
+			m_mouse.X += ( scriptInterface.GetActionValue( 'mouse_x' ) * MaxF( timeDelta, 0.005 ) );
+			m_mouse.Y += ( scriptInterface.GetActionValue( 'mouse_y' ) * MaxF( timeDelta, 0.005 ) );
 			m_mouse.X = ClampF( m_mouse.X, -1.0, 1.0 );
 			m_mouse.Y = ClampF( m_mouse.Y, -1.0, 1.0 );
 			if( Vector4.Length( m_mouse ) <= 0.40000001 )
@@ -895,11 +1365,22 @@ class UiQuickHackPanelContextDecisions extends InputContextTransitionDecisions
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( IsQuickHackPanelOpened( scriptInterface ) )
+		if( IsQuickHackPanelOpened( scriptInterface ) && CheckRequiredStates( scriptInterface ) )
 		{
 			return true;
 		}
 		return false;
+	}
+
+	protected const virtual function CheckRequiredStates( scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentState : Int32;
+		var vehicleID : EntityID;
+		var isDeviceControlled : Bool;
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		vehicleID = scriptInterface.localBlackboard.GetEntityID( GetAllBlackboardDefs().PlayerStateMachine.EntityIDVehicleRemoteControlled );
+		isDeviceControlled = scriptInterface.executionOwner.GetTakeOverControlSystem().IsDeviceControlled();
+		return !( EntityID.IsDefined( vehicleID ) ) && ( isDeviceControlled || ( ( currentState != ( ( Int32 )( gamePSMVehicle.Driving ) ) ) && ( currentState != ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) ) ) );
 	}
 
 }
@@ -910,6 +1391,95 @@ class UiQuickHackPanelContextEvents extends InputContextTransitionEvents
 	protected export virtual function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		RemoveAllInputHints( stateContext, scriptInterface );
+	}
+
+	protected function SetChangeTargetTooltipVisibility( scriptInterface : StateGameScriptInterface, value : Bool )
+	{
+		var uiScannerBlackboard : weak< IBlackboard >;
+		uiScannerBlackboard = GameInstance.GetBlackboardSystem( scriptInterface.owner.GetGame() ).Get( GetAllBlackboardDefs().UI_Scanner );
+		uiScannerBlackboard.SetBool( GetAllBlackboardDefs().UI_Scanner.scannerChangeTargetTooltipVisibility, value );
+	}
+
+}
+
+class UiQuickHackPanelContextDrivingDecisions extends UiQuickHackPanelContextDecisions
+{
+
+	protected const override function CheckRequiredStates( scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentState : Int32;
+		var isDeviceControlled : Bool;
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		isDeviceControlled = scriptInterface.executionOwner.GetTakeOverControlSystem().IsDeviceControlled();
+		return !( isDeviceControlled ) && ( currentState == ( ( Int32 )( gamePSMVehicle.Driving ) ) );
+	}
+
+}
+
+class UiQuickHackPanelContextDrivingEvents extends UiQuickHackPanelContextEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		SetChangeTargetTooltipVisibility( scriptInterface, false );
+	}
+
+	protected export virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetChangeTargetTooltipVisibility( scriptInterface, true );
+	}
+
+}
+
+class UiQuickHackPanelContextDriverCombatDecisions extends UiQuickHackPanelContextDecisions
+{
+
+	protected const override function CheckRequiredStates( scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentState : Int32;
+		var isDeviceControlled : Bool;
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		isDeviceControlled = scriptInterface.executionOwner.GetTakeOverControlSystem().IsDeviceControlled();
+		return !( isDeviceControlled ) && ( currentState == ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) );
+	}
+
+}
+
+class UiQuickHackPanelContextDriverCombatEvents extends UiQuickHackPanelContextEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
+		SetChangeTargetTooltipVisibility( scriptInterface, false );
+	}
+
+	protected export virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		SetChangeTargetTooltipVisibility( scriptInterface, true );
+	}
+
+}
+
+class UiQuickHackPanelContextRemoteControlDecisions extends UiQuickHackPanelContextDecisions
+{
+
+	protected const override function CheckRequiredStates( scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var vehicleID : EntityID;
+		vehicleID = scriptInterface.localBlackboard.GetEntityID( GetAllBlackboardDefs().PlayerStateMachine.EntityIDVehicleRemoteControlled );
+		return EntityID.IsDefined( vehicleID );
+	}
+
+}
+
+class UiQuickHackPanelContextRemoteControlEvents extends UiQuickHackPanelContextEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnEnter( stateContext, scriptInterface );
 	}
 
 }
@@ -938,16 +1508,18 @@ class UiPhoneContextDecisions extends InputContextTransitionDecisions
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		var psmResult : StateResultBool;
-		psmResult = stateContext.GetTemporaryBoolParameter( 'OnUIContactListContextActive' );
-		return psmResult.value;
+		var psmContactListResult, psmSmsMessengerResult : StateResultBool;
+		psmContactListResult = stateContext.GetTemporaryBoolParameter( 'OnUIContactListContextActive' );
+		psmSmsMessengerResult = stateContext.GetTemporaryBoolParameter( 'OnUISmsMessengerContextActive' );
+		return psmContactListResult.value || psmSmsMessengerResult.value;
 	}
 
 	protected const override function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		var psmResult : StateResultBool;
-		psmResult = stateContext.GetTemporaryBoolParameter( 'OnUIContactListContextInactive' );
-		return psmResult.value;
+		var psmContactListResult, psmSmsMessengerResult : StateResultBool;
+		psmContactListResult = stateContext.GetTemporaryBoolParameter( 'OnUIContactListContextInactive' );
+		psmSmsMessengerResult = stateContext.GetTemporaryBoolParameter( 'OnUISmsMessengerContextInactive' );
+		return psmContactListResult.value || psmSmsMessengerResult.value;
 	}
 
 }
@@ -1051,36 +1623,36 @@ class VehiclePassengerContextEvents extends InputContextTransitionEvents
 
 	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		UpdatePassengerInputHints( stateContext, scriptInterface );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			UpdatePassengerInputHints( stateContext, scriptInterface );
+		}
 	}
 
 	protected function UpdatePassengerInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		var currentState : Int32;
-		if( m_gameplaySettings.GetIsInputHintEnabled() )
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		if( ShouldForceRefreshInputHints( stateContext ) )
 		{
-			currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
-			if( ShouldForceRefreshInputHints( stateContext, scriptInterface ) && stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) )
-			{
-				RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
-				return;
-			}
-			if( stateContext.GetBoolParameter( 'doNotDisplayPassengerInputHint', true ) || StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.VehicleCombatNoInterruptions" ) )
-			{
-				if( stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) )
-				{
-					RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
-				}
-				return;
-			}
-			if( ( ( currentState != ( ( Int32 )( gamePSMVehicle.Scene ) ) ) && !( stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) ) ) && !( StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.VehicleCombatNoInterruptions" ) ) )
-			{
-				ShowVehiclePassengerInputHints( stateContext, scriptInterface );
-			}
-			else if( ( currentState == ( ( Int32 )( gamePSMVehicle.Scene ) ) ) && stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) )
+			RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
+			m_isGameplayInputHintRefreshRequired = false;
+		}
+		if( stateContext.GetBoolParameter( 'doNotDisplayPassengerInputHint', true ) || StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.VehicleCombatNoInterruptions" ) )
+		{
+			if( stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) )
 			{
 				RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
 			}
+			return;
+		}
+		if( ( ( currentState != ( ( Int32 )( gamePSMVehicle.Scene ) ) ) && !( stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) ) ) && !( StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.executionOwner, T"GameplayRestriction.VehicleCombatNoInterruptions" ) ) )
+		{
+			ShowVehiclePassengerInputHints( stateContext, scriptInterface );
+		}
+		else if( ( currentState == ( ( Int32 )( gamePSMVehicle.Scene ) ) ) && stateContext.GetBoolParameter( 'isPassengerInputHintDisplayed', true ) )
+		{
+			RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
 		}
 	}
 
@@ -1098,7 +1670,6 @@ class VehiclePassengerContextEvents extends InputContextTransitionEvents
 	protected export virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		RemoveVehiclePassengerInputHints( stateContext, scriptInterface );
-		RemoveVehicleRadioInputHint( stateContext, scriptInterface );
 		stateContext.RemovePermanentBoolParameter( 'doNotDisplayPassengerInputHint' );
 	}
 
@@ -1109,13 +1680,21 @@ class VehiclePassengerContextDecisions extends VehicleGameplayContextDecisions
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		var isVehicleRemoteControlled : Bool;
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
+		if( isVehicleRemoteControlled )
+		{
+			return false;
+		}
 		return true;
 	}
 
 	protected export const override function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		var currentState : Int32;
+		var isVehicleRemoteControlled : Bool;
 		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
 		if( currentState == ( ( Int32 )( gamePSMVehicle.Default ) ) )
 		{
 			return true;
@@ -1124,7 +1703,127 @@ class VehiclePassengerContextDecisions extends VehicleGameplayContextDecisions
 		{
 			return true;
 		}
+		if( isVehicleRemoteControlled )
+		{
+			return true;
+		}
 		return false;
+	}
+
+}
+
+class VehiclePassengerRemoteControlDriverContextEvents extends VehiclePassengerContextEvents
+{
+}
+
+class VehiclePassengerRemoteControlDriverContextDecisions extends VehicleGameplayContextDecisions
+{
+
+	protected export const function ToVehiclePassengerContext( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentState : Int32;
+		var isVehicleRemoteControlled : Bool;
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
+		if( isVehicleRemoteControlled )
+		{
+			return false;
+		}
+		if( currentState == ( ( Int32 )( gamePSMVehicle.Passenger ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentState : Int32;
+		var isVehicleRemoteControlled : Bool;
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
+		if( ( ( currentState == ( ( Int32 )( gamePSMVehicle.Scene ) ) ) || ( currentState == ( ( Int32 )( gamePSMVehicle.Passenger ) ) ) ) && isVehicleRemoteControlled )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected export const override function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var currentState : Int32;
+		var isVehicleRemoteControlled : Bool;
+		currentState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
+		if( currentState == ( ( Int32 )( gamePSMVehicle.Default ) ) )
+		{
+			return true;
+		}
+		if( ( currentState != ( ( Int32 )( gamePSMVehicle.Scene ) ) ) && ( currentState != ( ( Int32 )( gamePSMVehicle.Passenger ) ) ) )
+		{
+			return true;
+		}
+		if( !( isVehicleRemoteControlled ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class VehicleRemoteControlDriverContextEvents extends InputContextTransitionEvents
+{
+
+	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		if( scriptInterface.IsActionJustPressed( 'ToggleVehCamera' ) )
+		{
+			ToggleVehicleRemoteControlCamera( scriptInterface );
+		}
+		if( scriptInterface.IsActionJustPressed( 'Exit' ) )
+		{
+			SetVehicleRemoteControlled( scriptInterface, false );
+		}
+	}
+
+	protected virtual function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		RemoveAllInputHints( stateContext, scriptInterface );
+		ShowVehicleRemoteControlDriverInputHints( stateContext, scriptInterface );
+		SaveLocksManager.RequestSaveLockAdd( scriptInterface.owner.GetGame(), 'RemoteControl' );
+	}
+
+	protected export function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		OnCommonExit( stateContext, scriptInterface );
+	}
+
+	protected export virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		OnCommonExit( stateContext, scriptInterface );
+	}
+
+	private function OnCommonExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		RemoveVehicleRemoteControlDriverInputHints( stateContext, scriptInterface );
+		SaveLocksManager.RequestSaveLockRemove( scriptInterface.owner.GetGame(), 'RemoteControl' );
+	}
+
+}
+
+class VehicleRemoteControlDriverContextDecisions extends VehicleGameplayContextDecisions
+{
+
+	protected export const override function ToBaseContext( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var isVehicleRemoteControlled : Bool;
+		isVehicleRemoteControlled = IsVehicleRemoteControlled( scriptInterface );
+		if( isVehicleRemoteControlled )
+		{
+			return false;
+		}
+		return true;
 	}
 
 }
@@ -1137,11 +1836,7 @@ class VehicleNoDriveContextEvents extends InputContextTransitionEvents
 		RemoveVehicleDriverInputHints( stateContext, scriptInterface );
 	}
 
-	protected virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
-	{
-		ShowVehicleDriverInputHints( stateContext, scriptInterface );
-	}
-
+	protected virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface ) {}
 }
 
 class VehicleNoDriveContextDecisions extends InputContextTransitionDecisions
@@ -1257,54 +1952,44 @@ class VehicleDriverContextEvents extends InputContextTransitionEvents
 
 	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		UpdateVehicleDriverInputHints( stateContext, scriptInterface );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			UpdateVehicleDriverInputHints( stateContext, scriptInterface );
+		}
 	}
 
 	protected function UpdateVehicleDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( m_gameplaySettings.GetIsInputHintEnabled() )
+		if( ShouldForceRefreshInputHints( stateContext ) )
 		{
-			if( ShouldForceRefreshInputHints( stateContext, scriptInterface ) )
-			{
-				RemoveVehicleDriverInputHints( stateContext, scriptInterface );
-				UpdateRadioInputHint( stateContext, scriptInterface );
-				return;
-			}
-			if( !( stateContext.GetBoolParameter( 'isDriverInputHintDisplayed', true ) ) )
-			{
-				ShowVehicleDriverInputHints( stateContext, scriptInterface );
-				UpdateRadioInputHint( stateContext, scriptInterface );
-			}
+			RemoveVehicleDriverInputHints( stateContext, scriptInterface );
+			m_isGameplayInputHintRefreshRequired = false;
 		}
-	}
-
-	protected function UpdateRadioInputHint( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
-	{
-		var isRadioBlocked : Bool;
-		isRadioBlocked = StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'VehicleBlockRadioInput' );
-		if( !( stateContext.GetBoolParameter( 'isVehicleRadioInputHintDisplayed', true ) ) )
+		if( stateContext.GetBoolParameter( 'isDriverInputHintDisplayed', true ) )
 		{
-			if( !( isRadioBlocked ) )
+			if( stateContext.GetBoolParameter( 'IsExitVehicleBlocked', true ) )
 			{
-				ShowVehicleRadioInputHint( stateContext, scriptInterface );
+				ShowVehicleExitInputHint( stateContext, scriptInterface, 'VehicleDriver' );
+			}
+			if( stateContext.GetBoolParameter( 'IsVehicleCombatModeBlocked', true ) )
+			{
+				ShowVehicleDrawWeaponInputHint( stateContext, scriptInterface );
 			}
 		}
 		else
 		{
-			RemoveVehicleRadioInputHint( stateContext, scriptInterface );
+			ShowVehicleDriverInputHints( stateContext, scriptInterface );
 		}
 	}
 
 	protected export virtual function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		ShowVehicleDriverInputHints( stateContext, scriptInterface );
-		UpdateRadioInputHint( stateContext, scriptInterface );
 	}
 
 	protected export virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		RemoveVehicleDriverInputHints( stateContext, scriptInterface );
-		RemoveVehicleRadioInputHint( stateContext, scriptInterface );
 	}
 
 }
@@ -1334,8 +2019,19 @@ class VehicleDriverContextDecisions extends InputContextTransitionDecisions
 		EnableOnEnterCondition( value == ( ( Int32 )( gamePSMVehicle.Driving ) ) );
 	}
 
+	protected const virtual function DriverCombatTypeEnterCondition( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var driverCombatType : gamedataDriverCombatType;
+		driverCombatType = GetDriverCombatType( scriptInterface );
+		return driverCombatType != gamedataDriverCombatType.MountedWeapons;
+	}
+
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		if( !( DriverCombatTypeEnterCondition( scriptInterface ) ) )
+		{
+			return false;
+		}
 		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'VehicleOnlyForward' ) )
 		{
 			return false;
@@ -1349,17 +2045,84 @@ class VehicleDriverContextDecisions extends InputContextTransitionDecisions
 
 }
 
+class VehicleDriverMountedWeaponsContextEvents extends VehicleDriverContextEvents
+{
+}
+
+class VehicleDriverMountedWeaponsContextDecisions extends VehicleDriverContextDecisions
+{
+
+	protected const override function DriverCombatTypeEnterCondition( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var driverCombatType : gamedataDriverCombatType;
+		driverCombatType = GetDriverCombatType( scriptInterface );
+		return driverCombatType == gamedataDriverCombatType.MountedWeapons;
+	}
+
+}
+
 class VehicleDriverCombatContextEvents extends InputContextTransitionEvents
 {
+	protected var m_weapon : weak< WeaponObject >;
+
+	protected export function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		m_hasControllerChanged = ConsumeControllerChange( stateContext, scriptInterface );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			UpdateVehicleDriverInputHints( stateContext, scriptInterface );
+		}
+	}
+
+	protected function UpdateVehicleDriverInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		var weapon : weak< WeaponObject >;
+		var isDriverCombatMeleeInputHintDirty : Bool;
+		var canDisplayDriverCombatScannerInputHint : Bool;
+		weapon = GetActiveWeapon( scriptInterface );
+		isDriverCombatMeleeInputHintDirty = m_weapon.IsMelee() != weapon.IsMelee();
+		m_weapon = weapon;
+		if( m_hasControllerChanged || ShouldForceRefreshInputHints( stateContext ) )
+		{
+			RemoveVehicleDriverCombatInputHintsInternal( stateContext, scriptInterface );
+			m_isGameplayInputHintRefreshRequired = false;
+		}
+		else
+		{
+			canDisplayDriverCombatScannerInputHint = ( scriptInterface.executionOwner.PlayerLastUsedPad() && EquipmentSystem.IsCyberdeckEquipped( scriptInterface.executionOwner ) ) && !( QuickhackModule.IsQuickhackBlockedByScene( scriptInterface.executionOwner ) );
+			if( ( stateContext.GetBoolParameter( 'isDriverCombatInputHintDisplayed', true ) && !( isDriverCombatMeleeInputHintDirty ) ) && stateContext.GetBoolParameter( 'isDriverCombatScannerInputHintDisplayed', true ) == canDisplayDriverCombatScannerInputHint )
+			{
+				return;
+			}
+		}
+		stateContext.SetPermanentBoolParameter( 'inMeleeDriverCombat', m_weapon.IsMelee(), true );
+		UpdateVehicleDriverCombatInputHintsInternal( stateContext, scriptInterface );
+	}
+
+	protected virtual function UpdateVehicleDriverCombatInputHintsInternal( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		ShowVehicleDriverCombatInputHints( stateContext, scriptInterface );
+	}
+
+	protected virtual function RemoveVehicleDriverCombatInputHintsInternal( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		RemoveVehicleDriverCombatInputHints( stateContext, scriptInterface );
+	}
 
 	protected virtual function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		ShowVehicleDriverCombatInputHints( stateContext, scriptInterface );
+		m_weapon = GetActiveWeapon( scriptInterface );
+		stateContext.SetPermanentBoolParameter( 'inMeleeDriverCombat', m_weapon.IsMelee(), true );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			ShowVehicleDriverCombatInputHints( stateContext, scriptInterface );
+		}
 	}
 
 	protected virtual function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		RemoveVehicleDriverCombatInputHints( stateContext, scriptInterface );
+		stateContext.RemovePermanentBoolParameter( 'inMeleeDriverCombat' );
 	}
 
 }
@@ -1367,21 +2130,36 @@ class VehicleDriverCombatContextEvents extends InputContextTransitionEvents
 class VehicleDriverCombatContextDecisions extends InputContextTransitionDecisions
 {
 	private var m_callbackID : CallbackHandle;
+	private var m_tppCallbackID : CallbackHandle;
+	private var m_upperBodyCallbackID : CallbackHandle;
+	protected var m_inTpp : Bool;
+	protected var m_isAiming : Bool;
 
 	protected export function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
 	{
 		var allBlackboardDef : AllBlackboardDefinitions;
+		allBlackboardDef = GetAllBlackboardDefs();
 		if( scriptInterface.localBlackboard )
 		{
-			allBlackboardDef = GetAllBlackboardDefs();
-			m_callbackID = scriptInterface.localBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.Vehicle, this, 'OnVehicleStateChanged' );
-			OnVehicleStateChanged( scriptInterface.localBlackboard.GetInt( allBlackboardDef.PlayerStateMachine.Vehicle ) );
+			m_callbackID = scriptInterface.localBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.Vehicle, this, 'OnVehicleStateChanged', true );
+			m_tppCallbackID = scriptInterface.localBlackboard.RegisterListenerBool( allBlackboardDef.PlayerStateMachine.IsDriverCombatInTPP, this, 'OnVehiclePerspectiveChanged', true );
+			m_upperBodyCallbackID = scriptInterface.localBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.UpperBody, this, 'OnUpperBodyStateChanged', true );
 		}
 	}
 
 	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
 	{
+		var allBlackboardDef : AllBlackboardDefinitions;
+		allBlackboardDef = GetAllBlackboardDefs();
+		if( scriptInterface.localBlackboard )
+		{
+			scriptInterface.localBlackboard.UnregisterListenerInt( allBlackboardDef.PlayerStateMachine.Vehicle, m_callbackID );
+			scriptInterface.localBlackboard.UnregisterListenerBool( allBlackboardDef.PlayerStateMachine.IsDriverCombatInTPP, m_tppCallbackID );
+			scriptInterface.localBlackboard.UnregisterListenerInt( allBlackboardDef.PlayerStateMachine.UpperBody, m_upperBodyCallbackID );
+		}
 		m_callbackID = NULL;
+		m_tppCallbackID = NULL;
+		m_upperBodyCallbackID = NULL;
 	}
 
 	protected event OnVehicleStateChanged( value : Int32 )
@@ -1389,8 +2167,39 @@ class VehicleDriverCombatContextDecisions extends InputContextTransitionDecision
 		EnableOnEnterCondition( value == ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) );
 	}
 
+	protected event OnVehiclePerspectiveChanged( value : Bool )
+	{
+		m_inTpp = value;
+	}
+
+	protected event OnUpperBodyStateChanged( value : Int32 )
+	{
+		m_isAiming = value == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) );
+	}
+
+	protected const virtual function CameraPerspectiveEnterCondition() : Bool
+	{
+		return !( m_inTpp );
+	}
+
+	protected const virtual function IsAimingEnterCondition() : Bool
+	{
+		return !( m_isAiming );
+	}
+
+	protected const virtual function DriverCombatTypeEnterCondition( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var driverCombatType : gamedataDriverCombatType;
+		driverCombatType = GetDriverCombatType( scriptInterface );
+		return driverCombatType == gamedataDriverCombatType.Standard || driverCombatType == gamedataDriverCombatType.Doors;
+	}
+
 	protected const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		if( ( !( CameraPerspectiveEnterCondition() ) || !( IsAimingEnterCondition() ) ) || !( DriverCombatTypeEnterCondition( scriptInterface ) ) )
+		{
+			return false;
+		}
 		if( StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'VehicleOnlyForward' ) )
 		{
 			return false;
@@ -1400,6 +2209,109 @@ class VehicleDriverCombatContextDecisions extends InputContextTransitionDecision
 			return false;
 		}
 		return true;
+	}
+
+}
+
+class VehicleDriverCombatTPPContextEvents extends VehicleDriverCombatContextEvents
+{
+
+	protected override function UpdateVehicleDriverCombatInputHintsInternal( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		ShowVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+	}
+
+	protected override function RemoveVehicleDriverCombatInputHintsInternal( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		RemoveVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+	}
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		m_weapon = GetActiveWeapon( scriptInterface );
+		stateContext.SetPermanentBoolParameter( 'inMeleeDriverCombat', m_weapon.IsMelee(), true );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			ShowVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+		}
+	}
+
+	protected override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		RemoveVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+		stateContext.RemovePermanentBoolParameter( 'inMeleeDriverCombat' );
+	}
+
+}
+
+class VehicleDriverCombatTPPContextDecisions extends VehicleDriverCombatContextDecisions
+{
+
+	private const override function CameraPerspectiveEnterCondition() : Bool
+	{
+		return m_inTpp;
+	}
+
+}
+
+class VehicleDriverCombatAimContextEvents extends VehicleDriverCombatContextEvents
+{
+
+	protected override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		m_weapon = GetActiveWeapon( scriptInterface );
+		stateContext.SetPermanentBoolParameter( 'inMeleeDriverCombat', m_weapon.IsMelee(), true );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			ShowVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+		}
+	}
+
+	protected override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		RemoveVehicleDriverCombatTPPInputHints( stateContext, scriptInterface );
+		stateContext.RemovePermanentBoolParameter( 'inMeleeDriverCombat' );
+	}
+
+}
+
+class VehicleDriverCombatAimContextDecisions extends VehicleDriverCombatContextDecisions
+{
+
+	protected const override function IsAimingEnterCondition() : Bool
+	{
+		return m_isAiming;
+	}
+
+	protected const override function CameraPerspectiveEnterCondition() : Bool
+	{
+		return true;
+	}
+
+}
+
+class VehicleDriverCombatMountedWeaponsContextEvents extends VehicleDriverCombatContextEvents
+{
+}
+
+class VehicleDriverCombatMountedWeaponsContextDecisions extends VehicleDriverCombatContextDecisions
+{
+
+	protected const override function CameraPerspectiveEnterCondition() : Bool
+	{
+		return true;
+	}
+
+	protected const override function IsAimingEnterCondition() : Bool
+	{
+		return true;
+	}
+
+	protected const override function DriverCombatTypeEnterCondition( const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var driverCombatType : gamedataDriverCombatType;
+		driverCombatType = GetDriverCombatType( scriptInterface );
+		return driverCombatType == gamedataDriverCombatType.MountedWeapons;
 	}
 
 }
@@ -1445,21 +2357,22 @@ class VehicleCombatContextEvents extends InputContextTransitionEvents
 
 	protected function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		UpdateVehicleCombatInputHints( stateContext, scriptInterface );
+		if( m_gameplaySettings.GetIsInputHintEnabled() && m_isGameplayInputHintManagerInitialized )
+		{
+			UpdateVehicleCombatInputHints( stateContext, scriptInterface );
+		}
 	}
 
 	protected function UpdateVehicleCombatInputHints( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( m_gameplaySettings.GetIsInputHintEnabled() )
+		if( ShouldForceRefreshInputHints( stateContext ) )
 		{
-			if( ShouldForceRefreshInputHints( stateContext, scriptInterface ) )
-			{
-				RemoveVehiclePassengerCombatInputHints( stateContext, scriptInterface );
-			}
-			if( !( stateContext.GetBoolParameter( 'isPassengerCombatInputHintDisplayed', true ) ) )
-			{
-				ShowVehiclePassengerCombatInputHints( stateContext, scriptInterface );
-			}
+			RemoveVehiclePassengerCombatInputHints( stateContext, scriptInterface );
+			m_isGameplayInputHintRefreshRequired = false;
+		}
+		if( !( stateContext.GetBoolParameter( 'isPassengerCombatInputHintDisplayed', true ) ) )
+		{
+			ShowVehiclePassengerCombatInputHints( stateContext, scriptInterface );
 		}
 	}
 

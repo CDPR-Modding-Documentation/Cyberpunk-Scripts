@@ -1,25 +1,21 @@
-struct RadioStationsMap
-{
-	[ customEditor = "AudioEvent" ]
-	instanceeditable var soundEvent : CName;
-	instanceeditable var channelName : String;
-	instanceeditable var stationID : ERadioStationList;
-}
-
-struct RadioResaveData
-{
-	var m_mediaResaveData : MediaResaveData;
-	var m_stations : array< RadioStationsMap >;
-}
-
 class Radio extends InteractiveDevice
 {
 	default m_controllerTypeName = 'RadioController';
-	private var m_stations : array< RadioStationsMap >;
+	[ category = "High Pitch Noise Quick Hack Data" ]
+	private editable inlined var m_effectAction : ScriptableDeviceAction;
+	[ category = "High Pitch Noise Quick Hack Data" ]
+	private editable var m_effectRef : EffectRef;
+	[ category = "High Pitch Noise Quick Hack Data" ]
+	private editable var m_statusEffect : TweakDBID;
+	[ category = "Aoe Damage Quick Hack Data" ][ customEditor = "TweakDBGroupInheritance;Attacks.DeviceAttack" ]
+	private editable var m_damageType : TweakDBID;
 	private var m_startingStation : Int32;
 	private var m_isInteractive : Bool;
 	private var m_isShortGlitchActive : Bool;
 	private var m_shortGlitchDelayID : DelayID;
+	private var m_effectInstance : EffectInstance;
+	private var m_targets : array< weak< ScriptedPuppet > >;
+	private var m_vfxInstance : FxInstance;
 
 	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
 	{
@@ -56,22 +52,6 @@ class Radio extends InteractiveDevice
 		TriggerArreaEffectDistraction( GetDefaultDistractionAreaEffectData(), evt.GetExecutor() );
 	}
 
-	public export override function ResavePersistentData( ps : PersistentState ) : Bool
-	{
-		var psDevice : RadioControllerPS;
-		var mediaData : MediaResaveData;
-		var radioData : RadioResaveData;
-		super.ResavePersistentData( ps );
-		mediaData.m_mediaDeviceData.m_initialStation = m_startingStation;
-		mediaData.m_mediaDeviceData.m_amountOfStations = m_stations.Size();
-		mediaData.m_mediaDeviceData.m_activeChannelName = m_stations[ m_startingStation ].channelName;
-		mediaData.m_mediaDeviceData.m_isInteractive = m_isInteractive;
-		radioData.m_mediaResaveData = mediaData;
-		radioData.m_stations = m_stations;
-		psDevice.PushResaveData( radioData );
-		return true;
-	}
-
 	protected override function RestoreDeviceState()
 	{
 		super.RestoreDeviceState();
@@ -89,13 +69,13 @@ class Radio extends InteractiveDevice
 
 	private function PlayGivenStation()
 	{
-		var station : RadioStationsMap;
-		var stationIndex : Int32;
 		var isMetal : Bool;
-		stationIndex = GetDevicePS().GetActiveStationIndex();
-		station = GetDevicePS().GetStationByIndex( stationIndex );
-		AudioSwitch( this, 'radio_station', station.soundEvent, 'radio' );
-		isMetal = ( ( station.soundEvent == 'radio_station_11_metal' ) ? ( true ) : ( false ) );
+		var radioStation : ERadioStationList;
+		var stationEventName : CName;
+		radioStation = GetDevicePS().GetActiveRadioStation();
+		stationEventName = RadioStationDataProvider.GetStationName( radioStation );
+		AudioSwitch( this, 'radio_station', stationEventName, 'radio' );
+		isMetal = radioStation == ERadioStationList.METAL;
 		MetalItUp( isMetal );
 	}
 
@@ -246,6 +226,191 @@ class Radio extends InteractiveDevice
 		if( !( GetDevicePS().IsGlitching() ) )
 		{
 			StopGlitching();
+		}
+	}
+
+	protected event OnQuickHackHighPitchNoise( evt : QuickHackHighPitchNoise )
+	{
+		if( evt.IsStarted() )
+		{
+			StartStunEffect();
+		}
+		else
+		{
+			StopStunEffect();
+		}
+	}
+
+	protected event OnQuickHackAoeDamage( evt : QuickHackAoeDamage )
+	{
+		PlayAoeDamageSFX();
+		PlayAoeDamageVFX();
+		ApplyElectricDamage();
+		Die();
+	}
+
+	private function ApplyElectricDamage()
+	{
+		var attack : Attack_GameEffect;
+		attack = RPGManager.PrepareGameEffectAttack( GetGame(), this, this, m_damageType, GetAttackPosition() );
+		if( attack )
+		{
+			attack.StartAttack();
+		}
+	}
+
+	private function GetAttackPosition() : Vector4
+	{
+		return GetAcousticQuerryStartPoint();
+	}
+
+	private function StartStunEffect()
+	{
+		StopStunEffect();
+		CreateGameEffect();
+		PlayHighPitchNoiseSFX();
+		PlayHighPitchNoiseVFX();
+	}
+
+	private function StopStunEffect()
+	{
+		TryTerminateEffectInstance();
+		RemoveStatusEffectFromTargets();
+		ClearTargets();
+		TryStopVfx();
+	}
+
+	private function TryTerminateEffectInstance()
+	{
+		if( m_effectInstance )
+		{
+			m_effectInstance.Terminate();
+			m_effectInstance = NULL;
+		}
+	}
+
+	private function RemoveStatusEffectFromTargets()
+	{
+		var i : Int32;
+		if( IsStatusEffectValid() )
+		{
+			for( i = 0; i < m_targets.Size(); i += 1 )
+			{
+				RemoveStatusEffect( m_targets[ i ] );
+			}
+		}
+	}
+
+	private function ClearTargets()
+	{
+		m_targets.Clear();
+	}
+
+	private function CreateGameEffect()
+	{
+		m_effectInstance = GameInstance.GetGameEffectSystem( GetGame() ).CreateEffect( m_effectRef, this );
+		EffectData.SetFloat( m_effectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.radius, GetDevicePS().GetHighPitchNoiseRadius() );
+		EffectData.SetVector( m_effectInstance.GetSharedData(), GetAllBlackboardDefs().EffectSharedData.position, GetAttackPosition() );
+		m_effectInstance.Run();
+	}
+
+	private function PlayHighPitchNoiseSFX()
+	{
+		PlaySound( this, GetDevicePS().GetHighPitchNoiseSFX() );
+	}
+
+	private function PlayAoeDamageSFX()
+	{
+		PlaySound( this, GetDevicePS().GetAoeDamageSFX() );
+	}
+
+	private function PlayHighPitchNoiseVFX()
+	{
+		PlayVfx( GetDevicePS().GetHighPitchNoiseVFX() );
+	}
+
+	private function PlayAoeDamageVFX()
+	{
+		PlayVfx( GetDevicePS().GetAoeDamageVFX() );
+	}
+
+	private function PlayVfx( fxResource : FxResource )
+	{
+		TryStopVfx();
+		if( FxResource.IsValid( fxResource ) )
+		{
+			m_vfxInstance = CreateFxInstance( fxResource, GetCenterWorldTransform() );
+		}
+	}
+
+	private function GetCenterWorldTransform() : WorldTransform
+	{
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		WorldPosition.SetVector4( position, GetWorldPosition() );
+		WorldTransform.SetWorldPosition( transform, position );
+		return transform;
+	}
+
+	private function TryStopVfx()
+	{
+		if( m_vfxInstance )
+		{
+			m_vfxInstance.Kill();
+		}
+	}
+
+	private function ApplyStatusEffect( target : weak< GameObject > )
+	{
+		if( IsStatusEffectValid() )
+		{
+			StatusEffectHelper.ApplyStatusEffect( target, m_statusEffect, GetEntityID() );
+		}
+	}
+
+	private function RemoveStatusEffect( target : weak< GameObject > )
+	{
+		if( IsStatusEffectValid() )
+		{
+			StatusEffectHelper.RemoveStatusEffect( target, m_statusEffect );
+		}
+	}
+
+	private function IsStatusEffectValid() : Bool
+	{
+		return TDBID.IsValid( m_statusEffect );
+	}
+
+	protected event OnTargetAcquired( evt : TargetAcquiredEvent )
+	{
+		TryAddToTargets( evt.target );
+		ApplyStatusEffect( evt.target );
+	}
+
+	private function TryAddToTargets( target : weak< ScriptedPuppet > )
+	{
+		if( target && !( m_targets.Contains( target ) ) )
+		{
+			m_targets.PushBack( target );
+		}
+	}
+
+	protected event OnTargetLost( evt : TargetLostEvent )
+	{
+		RemoveStatusEffect( evt.target );
+		TryRemoveFromTargets( evt.target );
+	}
+
+	private function TryRemoveFromTargets( target : weak< ScriptedPuppet > )
+	{
+		var i : Int32;
+		if( target )
+		{
+			i = m_targets.FindFirst( target );
+			if( i >= 0 )
+			{
+				m_targets.EraseFast( i );
+			}
 		}
 	}
 

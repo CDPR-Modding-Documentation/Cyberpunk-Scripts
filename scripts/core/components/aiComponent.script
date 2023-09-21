@@ -10,6 +10,9 @@ import class AIComponent extends GameComponent
 	public import function CancelCommandById( cmdId : Uint32, optional doNotRepeat : Bool ) : Bool;
 	public import function StartExecutingCommand( cmd : AICommand ) : Bool;
 	public import function StopExecutingCommand( cmd : AICommand, success : Bool ) : Bool;
+	public import function StopExecutingCommandById( cmdId : Uint32, success : Bool ) : Bool;
+	public import function CancelOrInterruptCommand( commandName : CName, useInheritance : Bool, success : Bool ) : Bool;
+	public import function GetEnqueuedOrExecutingCommand( commandName : CName, useInheritance : Bool ) : AICommand;
 	public import const function IsCommandExecuting( commandName : CName, useInheritance : Bool ) : Bool;
 	public import const function IsCommandWaiting( commandName : CName, useInheritance : Bool ) : Bool;
 	public import const function GetCommandState( cmd : AICommand ) : AICommandState;
@@ -78,6 +81,95 @@ class StartGrenadeThrowQueryEvent extends Event
 	var queryParams : gameGrenadeThrowQueryParams;
 }
 
+import class DriveCommandUpdate extends IScriptable
+{
+	import var maxSpeed : Float;
+	import var minSpeed : Float;
+	import var clearTrafficOnPath : Bool;
+}
+
+import class DriveToPointAutonomousUpdate extends DriveCommandUpdate
+{
+	import var targetPosition : Vector4;
+	import var minimumDistanceToTarget : Float;
+	import var driveDownTheRoadIndefinitely : Bool;
+
+	public function CreateCmd() : AIVehicleDriveToPointAutonomousCommand
+	{
+		var cmd : AIVehicleDriveToPointAutonomousCommand;
+		cmd = new AIVehicleDriveToPointAutonomousCommand;
+		cmd.maxSpeed = maxSpeed;
+		cmd.minSpeed = minSpeed;
+		cmd.clearTrafficOnPath = clearTrafficOnPath;
+		cmd.minimumDistanceToTarget = minimumDistanceToTarget;
+		cmd.targetPosition = Vector4.Vector4To3( targetPosition );
+		cmd.driveDownTheRoadIndefinitely = driveDownTheRoadIndefinitely;
+		return cmd;
+	}
+
+}
+
+import class DrivePatrolUpdate extends DriveCommandUpdate
+{
+	import var numPatrolLoops : Uint32;
+	import var emergencyPatrol : Bool;
+
+	public function CreateCmd() : AIVehicleDrivePatrolCommand
+	{
+		var cmd : AIVehicleDrivePatrolCommand;
+		cmd = new AIVehicleDrivePatrolCommand;
+		cmd.maxSpeed = maxSpeed;
+		cmd.minSpeed = minSpeed;
+		cmd.clearTrafficOnPath = clearTrafficOnPath;
+		cmd.numPatrolLoops = numPatrolLoops;
+		cmd.emergencyPatrol = emergencyPatrol;
+		return cmd;
+	}
+
+}
+
+import class AIVehicleAgent extends AIComponent
+{
+	public import function SetDriveToPointAutonomousUpdate( update : DriveToPointAutonomousUpdate );
+	public import function SetDrivePatrolUpdate( update : DrivePatrolUpdate );
+	public import function TryReserveSeatOrFirstAvailable( reserver : EntityID, preferredSeatName : CName ) : CName;
+	public import function ReleaseSeat( seatName : CName );
+	public import function ReleaseSeatReservedBy( reserver : EntityID );
+	public import const function IsSeatReserved( seatName : CName ) : Bool;
+	public import const function GetReservedSeatsCount() : Uint32;
+
+	private var m_keepStrategyOnSearch : Bool;
+
+	public const function KeepStrategyOnSearch() : Bool
+	{
+		return m_keepStrategyOnSearch;
+	}
+
+	public function SetKeepStrategyOnSearch( keep : Bool )
+	{
+		m_keepStrategyOnSearch = keep;
+	}
+
+
+	private var m_initCmd : AIVehicleCommand;
+
+	public function GetInitCmd() : AIVehicleCommand
+	{
+		return m_initCmd;
+	}
+
+	public function SetInitCmd( cmd : AIVehicleCommand )
+	{
+		m_initCmd = cmd;
+	}
+
+	public const function InitCommandIsA( commandClassName : CName ) : Bool
+	{
+		return m_initCmd && m_initCmd.IsA( commandClassName );
+	}
+
+}
+
 import class AIHumanComponent extends AIComponent
 {
 	private var m_shootingBlackboard : weak< IBlackboard >;
@@ -86,6 +178,7 @@ import class AIHumanComponent extends AIComponent
 	private var m_actionBlackboard : weak< IBlackboard >;
 	private var m_patrolBlackboard : weak< IBlackboard >;
 	private var m_alertedPatrolBlackboard : weak< IBlackboard >;
+	private var m_prereqsBlackboard : weak< IBlackboard >;
 	private var m_friendlyFireCheckID : Uint32;
 	private var m_ffs : IFriendlyFireSystem;
 	private var m_LoSFinderCheckID : Uint32;
@@ -102,11 +195,13 @@ import class AIHumanComponent extends AIComponent
 	private var m_scriptContextInitialized : Bool;
 	private var m_kerenzikovAbilityRecord : GameplayAbility_Record;
 	private var m_highLevelCb : Uint32;
-	private var m_activeCommands : AIActiveCommandList;
+	private var m_lastReservedSeatVehicle : EntityID;
+	private var m_assignedVehicleStuck : Bool;
 
 	public import function SetMovementParams( params : MovementParameters );
 	public import function GetMovementParams( type : moveMovementType ) : MovementParameters;
 	public import function SetTDBMovementParams( paramsID : TweakDBID ) : Bool;
+	public import function WasForcedToEnterCrowd() : Bool;
 
 	public function GetFriendlyFireCheckID() : Uint32
 	{
@@ -149,17 +244,20 @@ import class AIHumanComponent extends AIComponent
 
 	private export function OnDetach()
 	{
+		ReleaseReservedSeat();
 		m_actionAnimationScriptProxy = NULL;
 		ResetBehaviorCoverArguments();
 	}
 
 	protected event OnDeath( evt : gameDeathEvent )
 	{
+		ReleaseReservedSeat();
 		ResetBehaviorCoverArguments();
 	}
 
 	protected event OnDefeated( evt : DefeatedEvent )
 	{
+		ReleaseReservedSeat();
 		ResetBehaviorCoverArguments();
 	}
 
@@ -172,9 +270,6 @@ import class AIHumanComponent extends AIComponent
 	{
 		InvokeBehaviorCallback( 'OnDelayPassiveConditionEvaluation' );
 	}
-
-	public import const function GetNPCRarity() : gamedataNPCRarity;
-	public import const function IsOfficer() : Bool;
 
 	public function GetCoverBlackboard() : IBlackboard
 	{
@@ -206,6 +301,11 @@ import class AIHumanComponent extends AIComponent
 		return GetOrCreateBlackboard( GetAllBlackboardDefs().AIAlertedPatrol, m_alertedPatrolBlackboard );
 	}
 
+	public function GetAIPrereqsBlackboard() : IBlackboard
+	{
+		return GetOrCreateBlackboard( GetAllBlackboardDefs().AIPrereqs, m_prereqsBlackboard );
+	}
+
 	public const function GetCurrentRole() : AIRole
 	{
 		return GetAIRole();
@@ -219,8 +319,19 @@ import class AIHumanComponent extends AIComponent
 	{
 		if( evt.name == 'Mount' )
 		{
+			m_assignedVehicleStuck = false;
 			VehicleComponent.SetAnimsetOverrideForPassenger( ( ( GameObject )( GetEntity() ) ), evt.data.mountParentEntityId, evt.data.slotName, 1.0 );
 		}
+	}
+
+	protected event OnStuckEvent( evt : VehicleStuckEvent )
+	{
+		m_assignedVehicleStuck = true;
+	}
+
+	public const function IsAssignedVehicleStuck() : Bool
+	{
+		return m_assignedVehicleStuck;
 	}
 
 	public const function GetAssignedVehicleData( out vehicleID : EntityID, out vehicleSlot : MountingSlotId ) : Bool
@@ -242,6 +353,59 @@ import class AIHumanComponent extends AIComponent
 		}
 		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( gi, GetAssignedVehicleId() ) ) );
 		return vehicle != NULL;
+	}
+
+	public function GetVehicleHandle( entityID : EntityID, out vehicle : VehicleObject ) : Bool
+	{
+		if( !( EntityID.IsDefined( entityID ) ) )
+		{
+			return false;
+		}
+		vehicle = ( ( VehicleObject )( GameInstance.FindEntityByID( GetGame(), entityID ) ) );
+		return vehicle != NULL;
+	}
+
+	protected event OnReserveAssignedSeat( evt : ReserveAssignedSeat )
+	{
+		var vehicle : VehicleObject;
+		var vehicleSlot : MountingSlotId;
+		var assignedVehicleID : EntityID;
+		var slotName : CName;
+		var ownerEntityID : EntityID;
+		vehicleSlot = GetAssignedVehicleSlot();
+		assignedVehicleID = GetAssignedVehicleId();
+		slotName = vehicleSlot.id;
+		ownerEntityID = GetEntity().GetEntityID();
+		if( !( GameInstance.GetMountingFacility( GetGame() ).IsMountedToAnything( ownerEntityID ) ) )
+		{
+			if( ( EntityID.IsDefined( assignedVehicleID ) && IsNameValid( slotName ) ) && GetVehicleHandle( assignedVehicleID, vehicle ) )
+			{
+				slotName = vehicle.GetAIComponent().TryReserveSeatOrFirstAvailable( ownerEntityID, slotName );
+				if( IsNameValid( slotName ) )
+				{
+					OnSeatReserved( assignedVehicleID );
+				}
+			}
+		}
+	}
+
+	public function ReleaseReservedSeat()
+	{
+		var vehicle : VehicleObject;
+		if( GetVehicleHandle( m_lastReservedSeatVehicle, vehicle ) )
+		{
+			vehicle.GetAIComponent().ReleaseSeatReservedBy( GetEntity().GetEntityID() );
+		}
+	}
+
+	public function OnSeatReserved( vehicleID : EntityID )
+	{
+		if( m_lastReservedSeatVehicle == vehicleID )
+		{
+			return;
+		}
+		ReleaseReservedSeat();
+		m_lastReservedSeatVehicle = vehicleID;
 	}
 
 	public static function GetLastUsedVehicleSlot( owner : weak< ScriptedPuppet >, out vehicleSlotName : CName ) : Bool
@@ -555,8 +719,8 @@ import class AIHumanComponent extends AIComponent
 		{
 			m_LoSFinderVisibleObject = visibleObject;
 			params = new LoSFinderParams;
-			params.SetSeeker( puppet );
-			params.SetTarget( visibleObject );
+			params.SetSeeker( puppet, GetIgnoredVisionBlockerTypes( GetGame(), puppet.GetEntityID() ) );
+			params.SetTarget( visibleObject, GetIgnoredVisionBlockerTypes( GetGame(), target.GetEntityID() ) );
 			params.SetTracesAmountMultiplier( ( ( ScriptedPuppet.IsPlayerCompanion( puppet ) ) ? ( ( ( Uint32 )( 2 ) ) ) : ( ( ( Uint32 )( 1 ) ) ) ) );
 			if( puppet && puppet.GetNPCType() == gamedataNPCType.Drone )
 			{
@@ -741,7 +905,7 @@ import class AIHumanComponent extends AIComponent
 		return true;
 	}
 
-	public const function CheckTweakCondition( ActionConditionName : String ) : Bool
+	public const function CheckTweakCondition( const ActionConditionName : ref< String > ) : Bool
 	{
 		var actionStringName : String;
 		var actionRecord : weak< AIAction_Record >;
@@ -765,21 +929,15 @@ import class AIHumanComponent extends AIComponent
 	{
 		var owner : ScriptedPuppet;
 		var aiEvent : StimuliEvent;
-		var dodge : Bool;
-		dodge = false;
 		owner = ( ( ScriptedPuppet )( GetEntity() ) );
-		if( owner )
-		{
-			dodge = owner.HasIndividualTimeDilation( TimeDilationHelper.GetSandevistanKey() );
-		}
-		if( ( !( dodge ) && AIActionHelper.CheckAbility( owner, m_kerenzikovAbilityRecord ) ) && CheckTweakCondition( "DodgeBulletSelectorCondition" ) )
+		if( ( owner && AIActionHelper.CheckAbility( owner, m_kerenzikovAbilityRecord ) ) && CheckTweakCondition( "DodgeBulletSelectorCondition" ) )
 		{
 			aiEvent = new StimuliEvent;
 			aiEvent.name = 'BulletDodgeOpportunity';
 			GetEntity().QueueEvent( aiEvent );
-			dodge = true;
+			return true;
 		}
-		return dodge;
+		return false;
 	}
 
 	protected event OnHitAiEventReceived( hitAIEvent : AIEvent )
@@ -866,6 +1024,9 @@ import class AIHumanComponent extends AIComponent
 			m_lastOwnerDodgedAttackEventID = GameInstance.GetDelaySystem( GetGame() ).DelayEvent( GetEntity(), request, 5.0 );
 		}
 	}
+
+
+	private var m_activeCommands : AIActiveCommandList;
 
 	public export function OnCommandStateChanged( command : AICommand, oldState : AICommandState, newState : AICommandState )
 	{
@@ -1020,5 +1181,9 @@ import class AIHumanComponent extends AIComponent
 		}
 	}
 
+}
+
+class ReserveAssignedSeat extends Event
+{
 }
 

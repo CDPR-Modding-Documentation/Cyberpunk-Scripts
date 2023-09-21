@@ -55,6 +55,14 @@ struct SecuritySystemMorphData
 	var entitiesAtGate : EntitiesAtGate;
 }
 
+class PSInitializeEvent extends Event
+{
+}
+
+class PSInstantiateEvent extends Event
+{
+}
+
 class SecuritySystemController extends DeviceSystemBaseController
 {
 
@@ -144,7 +152,14 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 
 	protected override function Initialize()
 	{
+		var evt : PSInitializeEvent;
 		super.Initialize();
+		evt = new PSInitializeEvent;
+		QueuePSEvent( this, evt );
+	}
+
+	public constexpr export function OnPSInitializeEvent( evt : PSInitializeEvent ) : EntityNotificationType
+	{
 		if( !( IsRegistryReady() ) )
 		{
 			InitiateAgentRegistry();
@@ -154,11 +169,19 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			SetSecuritySystemAttitudeGroup( T"Attitudes.Group_Neutral" );
 		}
 		NotifyAboutAttitudeChange();
+		return EntityNotificationType.DoNotNotifyEntity;
 	}
 
 	protected event OnInstantiated()
 	{
+		var evt : PSInstantiateEvent;
 		super.OnInstantiated();
+		evt = new PSInstantiateEvent;
+		QueuePSEvent( this, evt );
+	}
+
+	public constexpr export function OnPSInstantiateEvent( evt : PSInstantiateEvent ) : EntityNotificationType
+	{
 		m_attitudeChangeMode = EShouldChangeAttitude.TEMPORARLY;
 		if( !( IsRegistryReady() ) )
 		{
@@ -168,6 +191,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			PreventionSystem.PreventionPoliceSecuritySystemRequest( GetGameInstance(), GetID() );
 		}
+		return EntityNotificationType.DoNotNotifyEntity;
 	}
 
 	private const function IsRegistryReady() : Bool
@@ -218,7 +242,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		}
 	}
 
-	private function AddAgentRecord( agent : DeviceLink, connectedAreas : array< SecurityAreaControllerPS >, requestLatestOutput : Bool )
+	private function AddAgentRecord( agent : DeviceLink, const connectedAreas : ref< array< SecurityAreaControllerPS > >, requestLatestOutput : Bool )
 	{
 		m_agentsRegistry.RegisterAgent( agent, connectedAreas );
 		if( requestLatestOutput )
@@ -258,6 +282,11 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	public export quest const function IsSystemInCombat() : Bool
 	{
 		return m_securitySystemState == ESecuritySystemState.COMBAT;
+	}
+
+	private const function IsSystemSafeOrUninitialized() : Bool
+	{
+		return m_securitySystemState == ESecuritySystemState.SAFE || m_securitySystemState == ESecuritySystemState.UNINITIALIZED;
 	}
 
 	public const function IsHidden() : Bool
@@ -358,7 +387,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			return false;
 		}
-		Debug( false, false, TraceToString() );
 		if( m_agentsRegistry.IsAgent( suspect ) && GetAttitudeTowards( suspect ) != EAIAttitude.AIA_Hostile )
 		{
 			return false;
@@ -430,7 +458,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		var commonAreas, validAreas : array< SecurityAreaControllerPS >;
 		var breachLevel : ESecurityAccessLevel;
 		var i : Int32;
-		Debug( false, false, TraceToString() );
 		if( IsEntityBlacklistedForAtLeast( suspect, BlacklistReason.COMBAT ) )
 		{
 			return true;
@@ -656,10 +683,84 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( GetAttitudeSystem().GetAttitudeRelation( GetAttitudeSystem().GetAttitudeGroup( m_blacklist[ i ].GetEntityID() ), GetSecuritySystemAttitudeGroupName() ) == EAIAttitude.AIA_Friendly )
 			{
-				m_blacklist.Erase( i );
+				RemoveIndexFromBlacklist( i );
 			}
 		}
 		NotifyAboutAttitudeChange();
+	}
+
+	private function RemoveIndexFromBlacklist( index : Int32 )
+	{
+		var entityId : EntityID;
+		if( ( index >= 0 ) && ( index < m_blacklist.Size() ) )
+		{
+			entityId = m_blacklist[ index ].GetEntityID();
+			m_blacklist.Erase( index );
+			TryUpdateBlackboardAreaDataFor( entityId );
+		}
+	}
+
+	private function TryUpdateBlackboardAreaDataFor( entityId : EntityID )
+	{
+		if( IsPlayersEntityID( entityId ) )
+		{
+			UpdateBlackboardAreaDataForPlayer();
+		}
+	}
+
+	private function UpdateBlackboardAreaDataForPlayer()
+	{
+		var securityAreaData : SecurityAreaData;
+		var securityAreaController : SecurityAreaControllerPS;
+		var playerId : EntityID;
+		playerId = GetPlayerEntityID();
+		if( IsEntityInsideAnyArea( playerId ) )
+		{
+			securityAreaController = GetMostDangerousSecurityAreaForEntityID( playerId );
+			securityAreaData = GetSecurityDataForArea( securityAreaController );
+			UpdateSecurityZoneDataBlackboard( securityAreaData );
+		}
+	}
+
+	private function IsEntityInsideAnyArea( entityId : EntityID ) : Bool
+	{
+		var areasWithEntityInside : array< SecurityAreaControllerPS >;
+		areasWithEntityInside = GetSecurityAreasWithUserInside( entityId );
+		return areasWithEntityInside.Size() > 0;
+	}
+
+	private function UpdateSecurityZoneDataBlackboard( securityAreaData : SecurityAreaData )
+	{
+		var bbSystem : BlackboardSystem;
+		var playerId : EntityID;
+		var playerStateMachineBB : IBlackboard;
+		bbSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
+		playerId = GetPlayerEntityID();
+		playerStateMachineBB = bbSystem.GetLocalInstanced( playerId, GetAllBlackboardDefs().PlayerStateMachine );
+		if( playerStateMachineBB )
+		{
+			playerStateMachineBB.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, securityAreaData, true );
+		}
+	}
+
+	private function GetSecurityDataForArea( area : SecurityAreaControllerPS ) : SecurityAreaData
+	{
+		var securityAreaData : SecurityAreaData;
+		var playerId : EntityID;
+		if( area )
+		{
+			securityAreaData = area.GetSecurityAreaData();
+			playerId = GetPlayerEntityID();
+			if( IsEntityBlacklistedForAtLeast( playerId, BlacklistReason.COMBAT ) || HasSurpassedGlobalWarningsCount( playerId ) )
+			{
+				securityAreaData.securityAreaType = ESecurityAreaType.DANGEROUS;
+			}
+		}
+		else
+		{
+			securityAreaData = SecurityAreaData();
+		}
+		return securityAreaData;
 	}
 
 	protected function NotifyAboutAttitudeChange()
@@ -749,16 +850,13 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, input, ( ( "Security System state changed from: " + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( m_securitySystemState ) ) ) ) + " to: " ) + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( newState ) ) ) );
 		}
 		m_securitySystemState = newState;
 		if( input )
 		{
-			Debug( false, true, TraceToString(), , input );
 		}
 		else
 		{
-			Debug( false, false, TraceToString() );
 		}
 		NotifyParents();
 	}
@@ -833,8 +931,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		var mostDangerousArea : SecurityAreaControllerPS;
 		var securityAreaData : SecurityAreaData;
 		var securityAreaType : ESecurityAreaType;
-		var playerStateMachineBB : IBlackboard;
-		var bbSystem : BlackboardSystem;
 		var playerControlledObj : PlayerPuppet;
 		var modifyOverlapEvent : ModifyOverlappedSecurityAreas;
 		var secData : SecurityAreaData;
@@ -872,6 +968,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			secData = evt.GetSecurityAreaData();
 			areas.PushBack( secData.securityArea );
 			RequestTargetsAssessment( m_agentsRegistry.GetAgents( areas ), evt.GetWhoBreached() );
+			PropagateEventToAgents( evt );
 			if( evt.GetEnteredState() )
 			{
 				if( ( securityAreaType > ESecurityAreaType.SAFE ) && !( IsPoliceSecuritySystem() ) )
@@ -892,27 +989,14 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		playerControlledObj = ( ( PlayerPuppet )( evt.GetWhoBreached() ) );
 		if( playerControlledObj != NULL )
 		{
-			bbSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
-			playerStateMachineBB = bbSystem.GetLocalInstanced( evt.GetWhoBreached().GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
-			if( mostDangerousArea )
-			{
-				securityAreaData = mostDangerousArea.GetSecurityAreaData();
-				if( IsEntityBlacklistedForAtLeast( playerControlledObj.GetEntityID(), BlacklistReason.COMBAT ) || HasSurpassedGlobalWarningsCount( playerControlledObj.GetEntityID() ) )
-				{
-					securityAreaData.securityAreaType = ESecurityAreaType.DANGEROUS;
-				}
-			}
-			else
-			{
-				securityAreaData = SecurityAreaData();
-			}
 			modifyOverlapEvent = new ModifyOverlappedSecurityAreas;
-			securityAreaData.entered = evt.GetEnteredState();
 			modifyOverlapEvent.isEntering = evt.GetEnteredState();
 			modifyOverlapEvent.zoneID = evt.GetSecurityAreaID();
 			playerControlledObj.SetSecurityAreaTypeE3HACK( securityAreaType );
 			playerControlledObj.QueueEvent( modifyOverlapEvent );
-			playerStateMachineBB.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, securityAreaData, true );
+			securityAreaData = GetSecurityDataForArea( mostDangerousArea );
+			securityAreaData.entered = evt.GetEnteredState();
+			UpdateSecurityZoneDataBlackboard( securityAreaData );
 			if( !( evt.GetEnteredState() ) || ( securityAreaData.securityAreaType > ESecurityAreaType.SAFE ) )
 			{
 				if( evt.GetEnteredState() )
@@ -925,7 +1009,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				}
 			}
 		}
-		Debug( false, false, TraceToString() );
 		return EntityNotificationType.DoNotNotifyEntity;
 	}
 
@@ -1117,8 +1200,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 
 	private function DisableSecuritySystem( wasScheduled : Bool )
 	{
-		var bbSystem : BlackboardSystem;
-		var playerStateMachineBB : IBlackboard;
 		var securityAreaData : SecurityAreaData;
 		var areas : array< SecurityAreaControllerPS >;
 		var i : Int32;
@@ -1130,7 +1211,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		DisableDevice();
 		transition.transitionTo = ESecurityAreaType.DISABLED;
 		transition.transitionMode = ETransitionMode.FORCED;
-		Debug( false, false, TraceToString() );
 		areas = GetSecurityAreas();
 		for( i = 0; i < areas.Size(); i += 1 )
 		{
@@ -1153,14 +1233,9 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				QueuePSEvent( ps, new SecuritySystemDisabled );
 			}
 		}
-		bbSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
 		securityAreaData.securityAreaType = ESecurityAreaType.DISABLED;
 		securityAreaData.accessLevel = ESecurityAccessLevel.ESL_NONE;
-		playerStateMachineBB = bbSystem.GetLocalInstanced( GetPlayer( GetGameInstance() ).GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
-		if( playerStateMachineBB )
-		{
-			playerStateMachineBB.SetVariant( GetAllBlackboardDefs().PlayerStateMachine.SecurityZoneData, securityAreaData, true );
-		}
+		UpdateSecurityZoneDataBlackboard( securityAreaData );
 		CleanSecuritySystemMemory();
 		GetPersistencySystem().ForgetObject( GetID(), false );
 	}
@@ -1184,7 +1259,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		return true;
 	}
 
-	protected const function ProcessBreachNotificationWithRecipientsList( addresseeList : array< EntityID >, securitySystemInput : SecuritySystemInput )
+	protected const function ProcessBreachNotificationWithRecipientsList( const addresseeList : ref< array< EntityID > >, securitySystemInput : SecuritySystemInput )
 	{
 		securitySystemInput.AttachCustomRecipientsList( addresseeList );
 		QueuePSEvent( GetID(), GetClassName(), securitySystemInput );
@@ -1303,13 +1378,21 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 
 	public const function GetValidRecipients( input : SecuritySystemInput ) : array< SecuritySystemOutputData >
 	{
+		var notifier : SharedGameplayPS;
+		var secSysNotifier : SecuritySystemControllerPS;
 		var areasOfAgentInCombat : array< SecurityAreaControllerPS >;
 		var breachedAreas : array< SecurityAreaControllerPS >;
 		var recipients : array< SecuritySystemOutputData >;
 		var i : Int32;
-		if( ( ( ( SecurityGateControllerPS )( input.GetNotifierHandle() ) ) || input.GetNotificationType() == ESecurityNotificationType.ALARM ) || input.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+		notifier = input.GetNotifierHandle();
+		secSysNotifier = ( ( SecuritySystemControllerPS )( notifier ) );
+		if( ( input.GetNotificationType() == ESecurityNotificationType.QUEST && secSysNotifier ) && ( secSysNotifier == this ) )
 		{
-			breachedAreas = GetAgentAreas( input.GetNotifierHandle().GetID() );
+			breachedAreas = GetSecurityAreas();
+		}
+		else if( ( ( ( SecurityGateControllerPS )( notifier ) ) || input.GetNotificationType() == ESecurityNotificationType.ALARM ) || input.GetNotificationType() == ESecurityNotificationType.DEVICE_DESTROYED )
+		{
+			breachedAreas = GetAgentAreas( notifier.GetID() );
 		}
 		else
 		{
@@ -1317,7 +1400,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		}
 		if( input.GetNotificationType() == ESecurityNotificationType.COMBAT || GetAttitudeTowards( input.GetWhoBreached() ) == EAIAttitude.AIA_Hostile )
 		{
-			areasOfAgentInCombat = GetAgentAreas( input.GetNotifierHandle().GetID() );
+			areasOfAgentInCombat = GetAgentAreas( notifier.GetID() );
 			for( i = 0; i < areasOfAgentInCombat.Size(); i += 1 )
 			{
 				if( breachedAreas.Contains( areasOfAgentInCombat[ i ] ) )
@@ -1346,7 +1429,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		var agentData : AgentDistanceToTarget;
 		var agentsData : array< AgentDistanceToTarget >;
 		m_outputsSend += 1;
-		Debug( false, true, TraceToString(), , input );
 		output = new SecuritySystemOutput;
 		output = ActionSecuritySystemBreachResponse( input );
 		output.SetSecurityStateChanged( securityStateChanged );
@@ -1449,7 +1531,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, "Attitude towards target is hostile. RESOLUTION: COMBAT" );
 				}
 			}
 			return ESecuritySystemState.COMBAT;
@@ -1460,7 +1541,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, "Target has been spotted too many times. RESOLUTION: COMBAT" );
 				}
 			}
 			return ESecuritySystemState.COMBAT;
@@ -1471,7 +1551,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, "Target blacklisted for combat. RESOLUTION: COMBAT" );
 				}
 			}
 			return ESecuritySystemState.COMBAT;
@@ -1484,10 +1563,11 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				return ResolveTransitionFromAlerted( evt, isSimulation );
 			case ESecuritySystemState.COMBAT:
 				return ResolveTransitionFromCombat( evt, isSimulation );
+			default:
+				return ESecuritySystemState.UNINITIALIZED;
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, evt, "ResolveSecuritySystemState / Unknown state", ELogType.ERROR );
 		}
 	}
 
@@ -1501,7 +1581,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			logMessage += "and entity was already blacklisted for reprimand. Result: COMBAT";
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, evt, logMessage );
 			}
 			return ESecuritySystemState.COMBAT;
 		}
@@ -1510,7 +1589,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			logMessage += "Security Gate breached. Security Gate set to: REPRIMAND";
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, evt, logMessage );
 			}
 			return ESecuritySystemState.ALERTED;
 		}
@@ -1519,7 +1597,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			logMessage += "Someone is requesting ALARM";
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, evt, logMessage );
 			}
 			return ESecuritySystemState.ALERTED;
 		}
@@ -1529,7 +1606,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			logMessage += "breached area = dangerous or notification type = combat. Result: COMBAT";
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, evt, logMessage );
 			}
 			return ESecuritySystemState.COMBAT;
 		}
@@ -1539,7 +1615,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			logMessage += "Result: ALERTED";
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, evt, logMessage );
 			}
 			return ESecuritySystemState.ALERTED;
 		}
@@ -1551,7 +1626,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				logMessage += "and illegal action spotted. Result: ALERTED";
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, logMessage );
 				}
 				return ESecuritySystemState.ALERTED;
 			}
@@ -1559,7 +1633,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		logMessage += "Result: SAFE";
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, evt, logMessage );
 		}
 		return ESecuritySystemState.SAFE;
 	}
@@ -1577,7 +1650,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				logMessage += "breached area = dangerous or notification type = combat. Result: COMBAT";
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, logMessage );
 				}
 			}
 			return ESecuritySystemState.COMBAT;
@@ -1591,7 +1663,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 					logMessage += "reprimand successful. Result: SAFE";
 					if( !( IsFinal() ) )
 					{
-						LogDevices( this, evt, logMessage );
 					}
 				}
 				return ESecuritySystemState.SAFE;
@@ -1603,7 +1674,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 					logMessage += "and illegal action spotted. Result: COMBAT";
 					if( !( IsFinal() ) )
 					{
-						LogDevices( this, evt, logMessage );
 					}
 				}
 				return ESecuritySystemState.COMBAT;
@@ -1613,7 +1683,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				logMessage += "Result: ALERTED";
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, logMessage );
 				}
 			}
 			return ESecuritySystemState.ALERTED;
@@ -1627,7 +1696,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 					logMessage += "entity was already blacklisted for combat or illegal action noticed. Result: COMBAT";
 					if( !( IsFinal() ) )
 					{
-						LogDevices( this, evt, logMessage );
 					}
 				}
 				return ESecuritySystemState.COMBAT;
@@ -1639,7 +1707,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 					logMessage += "Result: ALERTED";
 					if( !( IsFinal() ) )
 					{
-						LogDevices( this, evt, logMessage );
 					}
 				}
 				return ESecuritySystemState.ALERTED;
@@ -1659,7 +1726,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				logMessage += "notification is not about deescalating. Result: COMBAT";
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, logMessage );
 				}
 			}
 			return ESecuritySystemState.COMBAT;
@@ -1674,7 +1740,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 					logMessage += " entity still within system and blacklisted for combat. Result: COMBAT";
 					if( !( IsFinal() ) )
 					{
-						LogDevices( this, evt, logMessage );
 					}
 				}
 				return ESecuritySystemState.COMBAT;
@@ -1685,7 +1750,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			logMessage += "entity left system vicinity. Result: ALERTED";
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, evt, logMessage );
 			}
 		}
 		return ESecuritySystemState.ALERTED;
@@ -1760,10 +1824,13 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			{
 				if( !( IsFinal() ) )
 				{
-					LogDevices( this, evt, "State Change ABORTED. Security System under strict quest control", ELogType.WARNING );
 				}
 				ProduceOutput( evt, changed );
 				return false;
+			}
+			if( newState == ESecuritySystemState.SAFE && ( m_securitySystemState > ESecuritySystemState.SAFE ) )
+			{
+				RemoveFromBlacklist( evt.GetWhoBreached() );
 			}
 			if( newState == ESecuritySystemState.ALERTED && ( m_securitySystemState < ESecuritySystemState.ALERTED ) )
 			{
@@ -1777,7 +1844,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			{
 				if( evt.GetNotifierHandle() )
 				{
-					LogDevices( this, evt, ( ( ( ( ( ( ( ( ( ( "State changed from: " + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( m_securitySystemState ) ) ) ) + " to " ) + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( newState ) ) ) ) + ". NOTIFIER(" ) + NameToString( evt.GetNotifierHandle().GetClassName() ) ) + " " ) + PersistentID.ToDebugString( evt.GetNotifierHandle().GetID() ) ) + ") " ) + " NOTIFICATION( " ) + EnumValueToString( "ESecurityNotificationType", ( ( Int32 )( evt.GetNotificationType() ) ) ) ) + ") " );
 				}
 			}
 			SetSecurityState( newState, evt, isComingFromQuest );
@@ -1818,6 +1884,17 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		for( i = 0; i < agents.Size(); i += 1 )
 		{
 			QueuePSEvent( GetPS( agents[ i ].link ), request );
+		}
+	}
+
+	public const function PropagateEventToAgents( evt : Event )
+	{
+		var agents : array< Agent >;
+		var i : Int32;
+		agents = m_agentsRegistry.GetAgents();
+		for( i = 0; i < agents.Size(); i += 1 )
+		{
+			QueuePSEvent( GetPS( agents[ i ].link ), evt );
 		}
 	}
 
@@ -1879,7 +1956,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		return GetOverlappingAreas( GetAgentAreas( input.GetNotifierHandle().GetID() ), GetSecurityAreasWithUserInside( input.GetWhoBreached().GetEntityID() ) );
 	}
 
-	private const function GetOverlappingAreas( bunch1 : array< SecurityAreaControllerPS >, bunch2 : array< SecurityAreaControllerPS > ) : array< SecurityAreaControllerPS >
+	private const function GetOverlappingAreas( const bunch1 : ref< array< SecurityAreaControllerPS > >, const bunch2 : ref< array< SecurityAreaControllerPS > > ) : array< SecurityAreaControllerPS >
 	{
 		var i, k : Int32;
 		var bunch3 : array< SecurityAreaControllerPS >;
@@ -1960,7 +2037,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		m_agentsRegistry.StoreReprimand( evt.GetNotifierHandle().GetID(), target, m_currentReprimandID, GetAttitudeSystem().GetAttitudeGroup( target ) );
 		reprimandUpdate = ReprimandUpdate.Construct( ( ( GameObject )( evt.GetNotifierHandle().GetOwnerEntityWeak() ) ), target, instructions, evt.GetLastKnownPosition() );
 		SendReprimandEvent( reprimandUpdate );
-		Debug( true, true, TraceToString(), instructions, evt );
 	}
 
 	private function ReleaseAllReprimands()
@@ -1974,7 +2050,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			reprimandUpdate = ReprimandUpdate.Construct( ( ( GameObject )( GetPS( agents[ i ].link ).GetOwnerEntityWeak() ) ), Agent.GetReprimandReceiver( agents[ i ] ), EReprimandInstructions.CONCLUDE_SUCCESSFUL );
 			SendReprimandEvent( reprimandUpdate );
 		}
-		Debug( false, false, TraceToString() );
 	}
 
 	private function ReleaseCurrentPerformerFromReprimand( instructions : EReprimandInstructions, target : EntityID )
@@ -1990,7 +2065,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "Someone is trying to release reprimand performer with wrong instruction. Debug", ELogType.WARNING );
 			}
 			return;
 		}
@@ -2004,7 +2078,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			SendReprimandEvent( reprimandUpdate );
 			m_agentsRegistry.ReleaseFromReprimandAgainst( target, DeviceLink.GetLinkID( agent.link ) );
 		}
-		Debug( true, false, TraceToString(), instructions );
 	}
 
 	private function SendReprimandEvent( evt : ReprimandUpdate )
@@ -2025,7 +2098,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			return false;
 		}
-		if( m_securitySystemState == ESecuritySystemState.SAFE || m_securitySystemState == ESecuritySystemState.UNINITIALIZED )
+		if( IsSystemSafeOrUninitialized() )
 		{
 			return false;
 		}
@@ -2043,7 +2116,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		CancelAutomaticDeescalationEvent();
 		autoDeescalate = new AutomaticDeescalationEvent;
 		autoDeescalate.originalNotification = evt;
-		m_deescalationEventID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( GetID(), GetClassName(), autoDeescalate, 30.0 );
+		m_deescalationEventID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( GetID(), GetClassName(), autoDeescalate, 25.0 );
 		m_delayIDValid = true;
 	}
 
@@ -2060,7 +2133,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 
 	public function OnAutomaticDeescalationEvent( evt : AutomaticDeescalationEvent ) : EntityNotificationType
 	{
-		if( GetSecurityState() == ESecuritySystemState.SAFE )
+		if( IsSystemSafeOrUninitialized() )
 		{
 			return EntityNotificationType.DoNotNotifyEntity;
 		}
@@ -2086,10 +2159,15 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		QueuePSEvent( GetID(), GetClassName(), deescalationEvent );
 	}
 
-	public export function OnDeescalate( evt : DeescalationEvent ) : EntityNotificationType
+	private export function OnDeescalation( evt : DeescalationEvent ) : EntityNotificationType
 	{
 		var newState : ESecuritySystemState;
 		var i : Int32;
+		if( IsSystemSafeOrUninitialized() )
+		{
+			ProduceOutput( evt.originalNotification, false );
+			return EntityNotificationType.DoNotNotifyEntity;
+		}
 		if( m_securitySystemState == ESecuritySystemState.COMBAT )
 		{
 			for( i = 0; i < m_blacklist.Size(); i += 1 )
@@ -2101,11 +2179,10 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				}
 			}
 		}
-		newState = ( ( ESecuritySystemState )( ( ( Int32 )( m_securitySystemState ) ) - 1 ) );
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, "Deescalating..." );
 		}
+		newState = ( ( ESecuritySystemState )( ( ( Int32 )( m_securitySystemState ) ) - 1 ) );
 		SetSecurityStateAndTriggerResponse( newState, evt.originalNotification );
 		if( m_securitySystemState != ESecuritySystemState.SAFE )
 		{
@@ -2118,7 +2195,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	{
 		var newEntry : BlacklistEntry;
 		var blacklistedEntityIndex : Int32;
-		var reasonChanged : Bool;
+		var addToBlacklistEvent : AddToBlacklistEvent;
 		if( !( EntityID.IsDefined( entityID ) ) )
 		{
 			return;
@@ -2126,45 +2203,53 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		newEntry = new BlacklistEntry;
 		newEntry.Initialize( entityID, reason, m_currentReprimandID );
 		blacklistedEntityIndex = GetEntityBlacklistIndex( entityID );
+		if( IsPlayersEntityID( entityID ) )
+		{
+			addToBlacklistEvent = new AddToBlacklistEvent;
+			addToBlacklistEvent.entityIDToAdd = entityID;
+			addToBlacklistEvent.isPlayerEntity = true;
+			addToBlacklistEvent.reason = reason;
+			PropagateEventToAgents( addToBlacklistEvent );
+		}
 		if( blacklistedEntityIndex >= 0 )
 		{
-			reasonChanged = m_blacklist[ blacklistedEntityIndex ].UpdateBlacklistEntry( reason, m_currentReprimandID );
-			if( reasonChanged )
+			if( m_blacklist[ blacklistedEntityIndex ].UpdateBlacklistEntry( reason, m_currentReprimandID ) )
 			{
-				TriggerBlacklistWipeCountdown( true, entityID );
+				TriggerBlacklistWipeCountdown( entityID );
 			}
-			return;
 		}
 		else
 		{
-			TriggerBlacklistWipeCountdown( true, entityID );
+			TriggerBlacklistWipeCountdown( entityID );
 			m_blacklist.PushBack( newEntry );
 		}
-		Debug( false, false, TraceToString() );
+		TryUpdateBlackboardAreaDataFor( entityID );
 	}
 
-	private function TriggerBlacklistWipeCountdown( start : Bool, entityID : EntityID )
+	private function TriggerBlacklistWipeCountdown( entityID : EntityID )
 	{
 		var blacklistWipe : BlacklistPeriodEnded;
 		if( !( IsPlayersEntityID( entityID ) ) )
 		{
 			return;
 		}
-		if( start )
+		ResetBlacklistWipeCountdown( entityID );
+		blacklistWipe = new BlacklistPeriodEnded;
+		blacklistWipe.entityID = entityID;
+		m_blacklistDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( GetID(), GetClassName(), blacklistWipe, 300.0, true );
+		m_blacklistDelayValid = true;
+	}
+
+	private function ResetBlacklistWipeCountdown( entityID : EntityID )
+	{
+		if( !( m_blacklistDelayValid ) || !( IsPlayersEntityID( entityID ) ) )
 		{
-			TriggerBlacklistWipeCountdown( false, entityID );
-			blacklistWipe = new BlacklistPeriodEnded;
-			blacklistWipe.entityID = entityID;
-			m_blacklistDelayID = GameInstance.GetDelaySystem( GetGameInstance() ).DelayPSEvent( GetID(), GetClassName(), blacklistWipe, 3600.0, false );
-			m_blacklistDelayValid = true;
+			return;
 		}
-		else if( m_blacklistDelayValid )
-		{
-			GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_blacklistDelayID );
-			GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_blacklistDelayID );
-			m_blacklistDelayValid = false;
-			m_blacklistDelayID = DelayID();
-		}
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelCallback( m_blacklistDelayID );
+		GameInstance.GetDelaySystem( GetGameInstance() ).CancelDelay( m_blacklistDelayID );
+		m_blacklistDelayValid = false;
+		m_blacklistDelayID = DelayID();
 	}
 
 	private function OnBlacklistPeriodEnded( evt : BlacklistPeriodEnded ) : EntityNotificationType
@@ -2203,11 +2288,12 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	private const function RemoveFromBlacklist( entityID : EntityID )
 	{
 		var removeFromBlacklist : RemoveFromBlacklistEvent;
-		removeFromBlacklist = new RemoveFromBlacklistEvent;
 		if( IsEntityBlacklisted( entityID ) )
 		{
 			removeFromBlacklist = new RemoveFromBlacklistEvent;
 			removeFromBlacklist.entityIDToRemove = entityID;
+			removeFromBlacklist.isPlayerEntity = IsPlayersEntityID( entityID );
+			PropagateEventToAgents( removeFromBlacklist );
 			GetPersistencySystem().QueuePSEvent( GetID(), GetClassName(), removeFromBlacklist );
 		}
 	}
@@ -2224,16 +2310,15 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	{
 		if( IsEntityBlacklisted( evt.entityIDToRemove ) )
 		{
-			m_blacklist.Erase( GetEntityBlacklistIndex( evt.entityIDToRemove ) );
+			RemoveIndexFromBlacklist( GetEntityBlacklistIndex( evt.entityIDToRemove ) );
 			m_agentsRegistry.WipeReprimandData( evt.entityIDToRemove );
-			TriggerBlacklistWipeCountdown( false, evt.entityIDToRemove );
-			Debug( false, false, TraceToString() );
+			ResetBlacklistWipeCountdown( evt.entityIDToRemove );
 			ResolvePotentialDeescalation();
 		}
 		return EntityNotificationType.DoNotNotifyEntity;
 	}
 
-	private function IsPlayersEntityID( entityID : EntityID ) : Bool
+	private const function IsPlayersEntityID( entityID : EntityID ) : Bool
 	{
 		var localPlayer : GameObject;
 		var mainPlayer : GameObject;
@@ -2263,10 +2348,11 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 				return ProvideAccessDataLevel_3();
 			case ESecurityAccessLevel.ESL_4:
 				return ProvideAccessDataLevel_4();
+			default:
+				return emptyData;
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( "SecuritySystemControllerPS: GetSecurityAccessData \ Unhandled security level" );
 		}
 	}
 
@@ -2406,7 +2492,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		return removeUserSuccessful;
 	}
 
-	private function AddAccessLevelEntry( out level : array< SecurityAccessLevelEntry >, optional password : CName, optional keycard : TweakDBID )
+	private function AddAccessLevelEntry( level : ref< array< SecurityAccessLevelEntry > >, optional password : CName, optional keycard : TweakDBID )
 	{
 		var newEntry : SecurityAccessLevelEntry;
 		if( TDBID.IsValid( keycard ) )
@@ -2414,7 +2500,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			newEntry.m_keycard = keycard;
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( "Keycard - " + GetKeycardLocalizedString( keycard ) ) + " added" );
 			}
 		}
 		if( IsNameValid( password ) )
@@ -2422,7 +2507,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			newEntry.m_password = password;
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, ( "Pasword - " + NameToString( password ) ) + " added" );
 			}
 		}
 		level.PushBack( newEntry );
@@ -2632,7 +2716,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		}
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( "Full Security System Restart Performed. Restart duration: " + IntToString( evt.m_restartDuration ) ) + " s" );
 		}
 		super.OnFullSystemRestart( evt );
 		SendActionToAllSlaves( evt );
@@ -2656,7 +2739,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 			QueuePSEvent( GetPS( agents[ i ].link ), new SecuritySystemEnabled );
 		}
 		NotifyParents();
-		Debug( false, false, TraceToString() );
 		return EntityNotificationType.DoNotNotifyEntity;
 	}
 
@@ -2688,9 +2770,10 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		m_currentReprimandID = 0;
 		m_blacklist.Clear();
 		m_securitySystemState = ESecuritySystemState.SAFE;
+		UpdateBlackboardAreaDataForPlayer();
 	}
 
-	private const function GetPS( agent : Agent ) : DeviceComponentPS
+	private const function GetPS( const agent : ref< Agent > ) : DeviceComponentPS
 	{
 		return GetPS( agent.link );
 	}
@@ -2787,7 +2870,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( "SM: Quest attempts to change attitude group from: " + NameToString( GetSecuritySystemAttitudeGroupName() ) ) + " to: " ) + NameToString( TweakDBInterface.GetAttitudeGroupRecord( evt.newAttitudeGroup ).Name() ) );
 		}
 		SetSecuritySystemAttitudeGroup( evt.newAttitudeGroup );
 	}
@@ -2895,7 +2977,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, ( ( "SM: Quest attemtps to change state from: " + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( m_securitySystemState ) ) ) ) + " to " ) + EnumValueToString( "ESecuritySystemState", ( ( Int32 )( evt.state ) ) ) );
 		}
 		SetSecurityStateAndTriggerResponse( evt.state, ActionSecurityBreachNotification( GetLocalPlayerControlledGameObject().GetWorldPosition(), GetLocalPlayerControlledGameObject(), ESecurityNotificationType.QUEST ), true );
 	}
@@ -2904,7 +2985,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	{
 		if( !( IsFinal() ) )
 		{
-			LogDevices( this, "SM: Security system under QUEST CONTROL: " + BoolToString( evt.forceSecuritySystemIntoStrictQuestControl ) );
 		}
 		m_isUnderStrictQuestControl = evt.forceSecuritySystemIntoStrictQuestControl;
 		RequestTargetsAssessment( , NULL );
@@ -2916,7 +2996,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "SM: Quest attempts to remove player from the blacklist" );
 			}
 			RemoveFromBlacklist( GetPlayerEntityID() );
 		}
@@ -2924,7 +3003,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "SM: Quest attempts to authorize player" );
 			}
 			AddUser( GetPlayerEntityID(), evt.ESL );
 		}
@@ -2932,7 +3010,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "SM: Quest attempts to deauthorize player" );
 			}
 			RemoveUser( GetPlayerEntityID() );
 		}
@@ -2944,7 +3021,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "SM: Quest attempts to deauthorize player" );
 			}
 			RemoveUser( GetPlayerEntityID() );
 		}
@@ -2952,7 +3028,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "SM: Quest attempts to blacklist player" );
 			}
 			BlacklistEntityID( GetPlayerEntityID(), evt.reason );
 		}
@@ -2960,7 +3035,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		{
 			if( !( IsFinal() ) )
 			{
-				LogDevices( this, "SM: Quest attempts to remove player from blacklist" );
 			}
 			RemoveFromBlacklist( GetPlayerEntityID() );
 		}
@@ -2974,26 +3048,6 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	public const function DebugGetInputsCount() : Int32
 	{
 		return m_inputsReceived;
-	}
-
-	private const function Debug( instructionAdded, inputAdded : Bool, trace : String, optional instruction : EReprimandInstructions, optional input : SecuritySystemInput )
-	{
-		var request : UpdateDebuggerRequest;
-		var debugger : SecSystemDebugger;
-		if( IsFinal() || ( GameInstance.GetQuestsSystem( GetGameInstance() ).GetFact( 'debugSS' ) == 0 ) )
-		{
-			return;
-		}
-		request = new UpdateDebuggerRequest;
-		request.m_system = this;
-		request.m_time = EngineTime.ToFloat( GameInstance.GetSimTime( GetGameInstance() ) );
-		request.m_instructionAttached = instructionAdded;
-		request.m_inputAttached = inputAdded;
-		request.m_callstack = StringToName( trace );
-		request.m_instruction = instruction;
-		request.m_recentInput = input;
-		debugger = ( ( SecSystemDebugger )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'SecSystemDebugger' ) ) );
-		debugger.QueueRequest( request );
 	}
 
 	public override function OnMaraudersMapDeviceDebug( sink : MaraudersMapDevicesSink )
@@ -3068,7 +3122,7 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 		return m_isUnderStrictQuestControl;
 	}
 
-	private const function SecuritySystemLog( message : String )
+	private const function SecuritySystemLog( const message : ref< String > )
 	{
 		GameInstance.GetActivityLogSystem( GetGameInstance() ).AddLog( "Security System: " + message );
 	}
@@ -3123,8 +3177,16 @@ class SecuritySystemControllerPS extends DeviceSystemBaseControllerPS
 	protected override function ActionThumbnailUI() : ThumbnailUI
 	{
 		var action : ThumbnailUI;
+		var tweak : TweakDBID;
 		action = super.ActionThumbnailUI();
-		action.CreateThumbnailWidgetPackage( T"DevicesUIDefinitions.SystemDeviceThumnbnailWidget", "LocKey#42210" );
+		switch( m_deviceUIStyle )
+		{
+			case gamedataComputerUIStyle.Orange:
+				tweak = T"DevicesUIDefinitions.SystemDeviceThumnbnailWidgetOA";
+			default:
+				tweak = T"DevicesUIDefinitions.SystemDeviceThumnbnailWidget";
+		}
+		action.CreateThumbnailWidgetPackage( tweak, "LocKey#42210" );
 		return action;
 	}
 

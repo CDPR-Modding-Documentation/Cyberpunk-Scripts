@@ -1,3 +1,10 @@
+enum EMissileRainPhase
+{
+	Init = 0,
+	Phase1 = 1,
+	Phase2 = 2,
+}
+
 class RainMissileProjectile extends BaseProjectile
 {
 	private var m_meshComponent : IComponent;
@@ -11,14 +18,14 @@ class RainMissileProjectile extends BaseProjectile
 	private editable var m_lifetime : Float;
 	private var m_alive : Bool;
 	default m_alive = true;
-	private var m_hit : Bool;
-	default m_hit = false;
 	private var m_arrived : Bool;
 	default m_arrived = false;
 	private var m_spawnPosition : Vector4;
 	private var m_phase1Duration : Float;
 	private editable var m_landIndicatorFX : FxResource;
 	private var m_fxInstance : FxInstance;
+	private var m_armingDistance : Float;
+	private var m_armed : Bool;
 	private var m_hasExploded : Bool;
 	default m_hasExploded = false;
 	private var m_missileDBID : TweakDBID;
@@ -97,7 +104,6 @@ class RainMissileProjectile extends BaseProjectile
 		m_timeToDestory = -1.0;
 		m_hasExploded = false;
 		m_alive = true;
-		m_hit = false;
 		m_phase = EMissileRainPhase.Init;
 		m_countTime = 0.0;
 		m_initialTargetPosition = Vector4.EmptyVector();
@@ -107,6 +113,8 @@ class RainMissileProjectile extends BaseProjectile
 		m_finalTargetOffset = Vector4.EmptyVector();
 		m_followTargetInPhase2 = false;
 		m_arrived = false;
+		m_armingDistance = AITweakParams.GetFloatFromTweak( m_missileDBID, "armingDistance" );
+		m_armed = m_armingDistance <= 0.0;
 		m_puppetBroadphaseHitRadiusSquared = AITweakParams.GetFloatFromTweak( m_missileDBID, "puppetBroadphaseHitRadiusSquared" );
 	}
 
@@ -118,6 +126,7 @@ class RainMissileProjectile extends BaseProjectile
 	protected event OnShoot( eventData : gameprojectileShootEvent )
 	{
 		var linearParams : LinearTrajectoryParams;
+		m_spawnPosition = eventData.startPoint;
 		if( m_owner.IsPlayer() )
 		{
 			linearParams = new LinearTrajectoryParams;
@@ -129,7 +138,6 @@ class RainMissileProjectile extends BaseProjectile
 		}
 		else
 		{
-			Log( "RainMissleProjectile : OnShoot called instead of OnShootTarget. This will not set a proper target position. Aborting projectile" );
 			DelayDestroyBullet();
 		}
 	}
@@ -144,7 +152,6 @@ class RainMissileProjectile extends BaseProjectile
 	{
 		if( !( m_weapon ) )
 		{
-			Log( "RainMissleProjectile : Projectile has no valid weapon that it is being fired from. Aborting projectile as rest of logic will not work correctly" );
 			DelayDestroyBullet();
 		}
 		m_targetComponent = eventData.params.trackedTargetComponent;
@@ -172,7 +179,16 @@ class RainMissileProjectile extends BaseProjectile
 
 	protected event OnTick( eventData : gameprojectileTickEvent )
 	{
+		var distanceTravelled : Float;
 		m_countTime += eventData.deltaTime;
+		if( !( m_armed ) && m_phase != EMissileRainPhase.Init )
+		{
+			distanceTravelled = Vector4.Distance( m_spawnPosition, eventData.position );
+			if( distanceTravelled > m_armingDistance )
+			{
+				m_armed = true;
+			}
+		}
 		if( m_phase == EMissileRainPhase.Phase1 )
 		{
 			if( ( m_finalTargetPositionCalculationDelay > 0.0 ) && ( m_countTime >= m_finalTargetPositionCalculationDelay ) )
@@ -217,6 +233,7 @@ class RainMissileProjectile extends BaseProjectile
 	{
 		var hitObject : Entity;
 		var hitPosition : Vector4;
+		var owner : weak< GameObject >;
 		hitObject = eventData.hitObject;
 		hitPosition = eventData.position;
 		if( ( m_puppetBroadphaseHitRadiusSquared >= 0.0 ) && ( ( ScriptedPuppet )( hitObject ) ) )
@@ -225,6 +242,11 @@ class RainMissileProjectile extends BaseProjectile
 			{
 				return false;
 			}
+		}
+		owner = m_weapon.GetOwner();
+		if( ( owner && ( owner == hitObject ) ) && !( m_armed ) )
+		{
+			return false;
 		}
 		OnCollideWithEntity( hitPosition );
 	}
@@ -247,7 +269,7 @@ class RainMissileProjectile extends BaseProjectile
 	{
 		if( m_alive )
 		{
-			KillLandVFX( m_fxInstance );
+			m_fxInstance.BreakLoop();
 			m_alive = false;
 			m_meshComponent.Toggle( false );
 			m_projectileComponent.ClearTrajectories();
@@ -259,6 +281,17 @@ class RainMissileProjectile extends BaseProjectile
 	private function Explode( projectilePosition : Vector4 )
 	{
 		var explosionAttackRecord : Attack_Record;
+		var explodeDuration : Float;
+		var aoeData : ProjectileHitAoEData;
+		var investigateData : stimInvestigateData;
+		var broadCaster : StimBroadcasterComponent;
+		explodeDuration = 0.2;
+		if( !( m_armed ) )
+		{
+			m_meshComponent.Toggle( false );
+			DelayDestroyBullet();
+			return;
+		}
 		if( !( m_hasExploded ) )
 		{
 			m_hasExploded = true;
@@ -266,7 +299,23 @@ class RainMissileProjectile extends BaseProjectile
 			explosionAttackRecord = IAttack.GetExplosiveHitAttack( m_missileAttackRecord );
 			if( explosionAttackRecord )
 			{
-				ProjectileGameEffectHelper.FillProjectileHitAoEData( m_user, m_user, projectilePosition, AITweakParams.GetFloatFromTweak( m_missileDBID, "explosionRadius" ), explosionAttackRecord, m_weapon );
+				aoeData.source = m_user;
+				aoeData.instigator = m_user;
+				aoeData.position = projectilePosition;
+				aoeData.radius = AITweakParams.GetFloatFromTweak( m_missileDBID, "explosionRadius" );
+				aoeData.duration = explodeDuration;
+				aoeData.attackRecord = explosionAttackRecord;
+				aoeData.weapon = m_weapon;
+				aoeData.enableImpulseFalloff = true;
+				ProjectileGameEffectHelper.FillProjectileHitAoEData( aoeData );
+				broadCaster = GetStimBroadcasterComponent();
+				if( broadCaster )
+				{
+					investigateData.attackInstigator = m_user;
+					investigateData.attackInstigatorPosition = m_user.GetWorldPosition();
+					investigateData.revealsInstigatorPosition = true;
+					broadCaster.TriggerSingleBroadcast( this, gamedataStimType.Explosion, aoeData.radius + 5.0, investigateData );
+				}
 				GameInstance.GetAudioSystem( GetGame() ).PlayShockwave( 'explosion', projectilePosition );
 			}
 		}
@@ -310,6 +359,7 @@ class RainMissileProjectile extends BaseProjectile
 			followCurveParams.angleInVerticalPlane = RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "p1AngleInVerticalPlane" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "p1AngleInVerticalPlane" ) );
 			followCurveParams.snapRadius = AITweakParams.GetFloatFromTweak( m_missileDBID, "p1SnapRadius" );
 			followCurveParams.sendFollowEvent = false;
+			followCurveParams.startVelocityDirectionCheck = AITweakParams.GetBoolFromTweak( m_missileDBID, "startVelocityDirectionCheck", followCurveParams.startVelocityDirectionCheck );
 			m_projectileComponent.AddFollowCurve( followCurveParams );
 			m_projectileComponent.SetOnCollisionAction( gameprojectileOnCollisionAction.Stop );
 			m_spiralParams.enabled = m_useSpiralParams;
@@ -321,6 +371,9 @@ class RainMissileProjectile extends BaseProjectile
 	protected function StartPhase2()
 	{
 		var followCurveParams : FollowCurveTrajectoryParams;
+		var p2HardCurve : Bool;
+		var inheritCarSpeed : Bool;
+		var vehicleOwner : VehicleObject;
 		followCurveParams = new FollowCurveTrajectoryParams;
 		m_phase = EMissileRainPhase.Phase2;
 		if( m_followTargetInPhase2 && m_targetComponent )
@@ -334,6 +387,15 @@ class RainMissileProjectile extends BaseProjectile
 		}
 		m_projectileComponent.ClearTrajectories();
 		followCurveParams.startVelocity = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2StartVelocity" );
+		inheritCarSpeed = AITweakParams.GetBoolFromTweak( m_missileDBID, "inheritVehicleSpeed" );
+		if( inheritCarSpeed && m_weapon )
+		{
+			vehicleOwner = ( ( VehicleObject )( m_weapon.GetOwner() ) );
+			if( vehicleOwner )
+			{
+				followCurveParams.startVelocity += vehicleOwner.GetCurrentSpeed();
+			}
+		}
 		followCurveParams.targetPosition = m_finalTargetPosition;
 		followCurveParams.bendTimeRatio = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2BendRation" );
 		followCurveParams.bendFactor = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2BendFactor" );
@@ -342,6 +404,17 @@ class RainMissileProjectile extends BaseProjectile
 		followCurveParams.shouldRotate = AITweakParams.GetBoolFromTweak( m_missileDBID, "p2ShouldRotate" );
 		followCurveParams.accuracy = 1.0;
 		followCurveParams.offset = m_finalTargetOffset;
+		p2HardCurve = AITweakParams.GetBoolFromTweak( m_missileDBID, "p2HardCurve" );
+		if( p2HardCurve )
+		{
+			followCurveParams.interpolationTimeRatio = AITweakParams.GetFloatFromTweak( m_missileDBID, "p2HardCurveInterpolationTimeRatio" );
+			if( followCurveParams.interpolationTimeRatio <= 0.0 )
+			{
+				followCurveParams.interpolationTimeRatio = 0.05;
+			}
+			followCurveParams.linearTimeRatio = 0.1;
+		}
+		followCurveParams.startVelocityDirectionCheck = AITweakParams.GetBoolFromTweak( m_missileDBID, "startVelocityDirectionCheck", followCurveParams.startVelocityDirectionCheck );
 		m_projectileComponent.AddFollowCurve( followCurveParams );
 		m_spiralParams.enabled = m_useSpiralParams;
 		m_projectileComponent.SetSpiral( m_spiralParams );
@@ -352,6 +425,8 @@ class RainMissileProjectile extends BaseProjectile
 	{
 		var offset : Float;
 		var directionOffset : Vector4;
+		var useTargetOffset : Bool;
+		useTargetOffset = false;
 		m_finalTargetOffset = m_initialTargetOffset;
 		if( m_targetComponent )
 		{
@@ -362,54 +437,25 @@ class RainMissileProjectile extends BaseProjectile
 		{
 			m_finalTargetPosition = m_initialTargetPosition;
 		}
-		offset = AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionOffset" );
-		if( offset > 0.0 )
+		useTargetOffset = m_targetComponent.IsA( 'gameTargetingComponent' ) || AITweakParams.GetBoolFromTweak( m_missileDBID, "usetargetOffsetWhenUntargeted" );
+		if( useTargetOffset )
 		{
-			directionOffset = m_spawnPosition - m_finalTargetPosition;
-			directionOffset = Vector4.Normalize( directionOffset ) * offset;
-			m_finalTargetOffset.X += directionOffset.X;
-			m_finalTargetOffset.Y += directionOffset.Y;
-			m_finalTargetOffset.X += RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) );
-			m_finalTargetOffset.Y += RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) );
+			offset = AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionOffset" );
+			if( offset > 0.0 )
+			{
+				directionOffset = m_spawnPosition - m_finalTargetPosition;
+				directionOffset = Vector4.Normalize( directionOffset ) * offset;
+				m_finalTargetOffset.X += directionOffset.X;
+				m_finalTargetOffset.Y += directionOffset.Y;
+				m_finalTargetOffset.X += RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) );
+				m_finalTargetOffset.Y += RandRangeF( -( AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) ), AITweakParams.GetFloatFromTweak( m_missileDBID, "targetPositionXYAdditive" ) );
+			}
 		}
 		if( !( m_followTargetInPhase2 ) || !( m_targetComponent ) )
 		{
-			SpawnLandVFXs( m_landIndicatorFX, m_finalTargetPosition + m_finalTargetOffset );
+			m_fxInstance = SpawnLandVFXs( m_landIndicatorFX, m_finalTargetPosition + m_finalTargetOffset );
 		}
 	}
 
-	private function SpawnLandVFXs( fx : FxResource, fxposition : Vector4 )
-	{
-		var transform : WorldTransform;
-		var position : WorldPosition;
-		if( FxResource.IsValid( fx ) )
-		{
-			WorldPosition.SetVector4( position, fxposition );
-			WorldTransform.SetWorldPosition( transform, position );
-			m_fxInstance = CreateFxInstance( fx, transform );
-		}
-	}
-
-	private function KillLandVFX( fxInstance : FxInstance )
-	{
-		fxInstance.BreakLoop();
-	}
-
-	private function CreateFxInstance( resource : FxResource, transform : WorldTransform ) : FxInstance
-	{
-		var fx : FxInstance;
-		var fxSystem : FxSystem;
-		fxSystem = GameInstance.GetFxSystem( GetGame() );
-		fx = fxSystem.SpawnEffect( resource, transform );
-		return fx;
-	}
-
-}
-
-enum EMissileRainPhase
-{
-	Init = 0,
-	Phase1 = 1,
-	Phase2 = 2,
 }
 

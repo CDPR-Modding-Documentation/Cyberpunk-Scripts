@@ -11,19 +11,55 @@ abstract class ZoomTransitionHelper
 abstract class ZoomTransition extends DefaultTransition
 {
 
-	public const function IsControllingDevice( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	public const function IsControllingDevice( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface, optional excludeSniperNest : Bool ) : Bool
 	{
-		return scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice );
+		var isControllingDevice : Bool;
+		var isValidDevice : Bool;
+		isControllingDevice = scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice );
+		isValidDevice = true;
+		if( excludeSniperNest )
+		{
+			isValidDevice = !( IsControllingSniperNestDevice( scriptInterface ) );
+		}
+		return isControllingDevice && isValidDevice;
 	}
 
-	public const function IsDeviceOrFocusActive( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	public const function IsControllingSniperNestDevice( const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		return IsControllingDevice( stateContext, scriptInterface ) || IsInVisionModeActiveState( stateContext, scriptInterface );
+		var blackboard : IBlackboard;
+		blackboard = scriptInterface.GetBlackboardSystem().Get( GetAllBlackboardDefs().SniperNestDeviceBlackboard );
+		return blackboard.GetBool( GetAllBlackboardDefs().SniperNestDeviceBlackboard.IsInTheSniperNest );
 	}
 
-	public const function IsDeviceAndFocusInactive( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	public const function IsGenericDeviceOrFocusActive( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( !( IsControllingDevice( stateContext, scriptInterface ) ) && !( IsInVisionModeActiveState( stateContext, scriptInterface ) ) )
+		return IsControllingDevice( stateContext, scriptInterface, true ) || IsInVisionModeActiveState( stateContext, scriptInterface );
+	}
+
+	public const function IsGenericDeviceAndFocusInactive( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( !( IsControllingDevice( stateContext, scriptInterface, true ) ) && !( IsInVisionModeActiveState( stateContext, scriptInterface ) ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public const function IsConsideredAiming( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( IsInVisionModeActiveState( stateContext, scriptInterface ) )
+		{
+			return false;
+		}
+		if( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody ) == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) ) )
+		{
+			return true;
+		}
+		if( stateContext.GetStateMachineCurrentState( 'LeftHandCyberware' ) == 'leftHandCyberwareCharge' )
+		{
+			return true;
+		}
+		if( IsControllingSniperNestDevice( scriptInterface ) && ( scriptInterface.GetActionValue( 'CameraAim' ) != 0.0 ) )
 		{
 			return true;
 		}
@@ -44,7 +80,7 @@ abstract class ZoomTransition extends DefaultTransition
 	{
 		var stateName : CName;
 		stateName = GetStateName();
-		if( scriptInterface.owner.IsControlledByAnotherClient() || IsServer() )
+		if( scriptInterface.GetTimeSystem().IsTimeDilationActive() )
 		{
 			return false;
 		}
@@ -52,7 +88,7 @@ abstract class ZoomTransition extends DefaultTransition
 		{
 			return false;
 		}
-		if( IsControllingDevice( stateContext, scriptInterface ) || IsInVisionModeActiveState( stateContext, scriptInterface ) )
+		if( IsControllingDevice( stateContext, scriptInterface, true ) || IsInVisionModeActiveState( stateContext, scriptInterface ) )
 		{
 			return true;
 		}
@@ -124,7 +160,9 @@ abstract class ZoomTransition extends DefaultTransition
 	protected function SetShouldUseWeaponZoomData( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		var flag : Bool;
-		if( ( GetActiveWeapon( scriptInterface ) && !( IsInVisionModeActiveState( stateContext, scriptInterface ) ) ) && !( stateContext.IsStateActive( 'Weapon', 'safe' ) ) )
+		var isPlayerInFPP : Bool;
+		isPlayerInFPP = !( scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsDriverCombatInTPP ) ) || !( stateContext.IsStateMachineActive( 'Vehicle' ) );
+		if( isPlayerInFPP && ( ( GetActiveWeapon( scriptInterface ) && !( IsInVisionModeActiveState( stateContext, scriptInterface ) ) ) && !( stateContext.IsStateActive( 'Weapon', 'safe' ) ) ) )
 		{
 			flag = true;
 		}
@@ -236,8 +274,22 @@ class ZoomDecisionsTransition extends ZoomTransition
 
 	public const virtual function ToNextZoomLevel( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		var currentZoomLevel, kiroshiMaxZoomLevel : Float;
 		if( scriptInterface.IsActionJustPressed( 'ZoomIn' ) )
 		{
+			currentZoomLevel = GetCurrentZoomLevel( stateContext );
+			kiroshiMaxZoomLevel = GameInstance.GetStatsSystem( scriptInterface.owner.GetGame() ).GetStatValue( scriptInterface.owner.GetEntityID(), gamedataStatType.KiroshiMaxZoomLevel );
+			if( IsControllingSniperNestDevice( scriptInterface ) )
+			{
+				if( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vision ) != ( ( Int32 )( gamePSMVision.Focus ) ) )
+				{
+					return false;
+				}
+			}
+			else if( currentZoomLevel >= kiroshiMaxZoomLevel )
+			{
+				return false;
+			}
 			if( !( IsControllingDevice( stateContext, scriptInterface ) ) )
 			{
 				if( !( scriptInterface.HasStatFlag( gamedataStatType.CanUseZoom ) ) )
@@ -252,7 +304,14 @@ class ZoomDecisionsTransition extends ZoomTransition
 				{
 					return false;
 				}
-				if( ( GetCurrentZoomLevel( stateContext ) != 1.0 ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'NoZooming' ) )
+				if( scriptInterface.IsActionJustPressed( 'DriverCombatControllerActivateVisionHold' ) )
+				{
+					if( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vision ) != ( ( Int32 )( gamePSMVision.Focus ) ) )
+					{
+						return false;
+					}
+				}
+				if( ( currentZoomLevel != 1.0 ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'NoZooming' ) )
 				{
 					return false;
 				}
@@ -273,6 +332,10 @@ class ZoomDecisionsTransition extends ZoomTransition
 					return false;
 				}
 			}
+			if( IsControllingSniperNestDevice( scriptInterface ) )
+			{
+				return false;
+			}
 			return true;
 		}
 		return false;
@@ -289,10 +352,6 @@ class ZoomDecisionsTransition extends ZoomTransition
 		{
 			return false;
 		}
-		if( ( GetCurrentZoomLevel( stateContext ) > 1.5 ) && StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'NoZooming' ) )
-		{
-			return true;
-		}
 		if( IsWeaponStateBlockingAiming( scriptInterface ) )
 		{
 			return true;
@@ -306,16 +365,9 @@ class ZoomDecisionsTransition extends ZoomTransition
 		{
 			return true;
 		}
-		if( ( !( IsInUpperBodyState( stateContext, 'aimingState' ) ) && IsDeviceAndFocusInactive( stateContext, scriptInterface ) ) && stateContext.GetStateMachineCurrentState( 'LeftHandCyberware' ) != 'leftHandCyberwareCharge' )
+		if( IsGenericDeviceAndFocusInactive( stateContext, scriptInterface ) && !( IsConsideredAiming( stateContext, scriptInterface ) ) )
 		{
 			return true;
-		}
-		if( IsDeviceAndFocusInactive( stateContext, scriptInterface ) )
-		{
-			if( ( scriptInterface.GetActionValue( 'CameraAim' ) == 0.0 ) && stateContext.GetStateMachineCurrentState( 'LeftHandCyberware' ) != 'leftHandCyberwareCharge' )
-			{
-				return true;
-			}
 		}
 		if( stateContext.GetBoolParameter( 'ReevaluateAiming', false ) )
 		{
@@ -333,12 +385,17 @@ class ZoomEventsTransition extends ZoomTransition
 	{
 		var zoomLevelNumber : Int32;
 		zoomLevelNumber = GetStaticIntParameterDefault( "zoomLevelNumber", 1 );
+		if( IsControllingSniperNestDevice( scriptInterface ) && ( scriptInterface.GetActionValue( 'CameraAim' ) != 0.0 ) )
+		{
+			zoomLevelNumber = 6;
+			PlaySound( 'w_gun_sniper_tech_rasetsu_aim_enter', scriptInterface );
+		}
 		SetPreviousZoomLevel( stateContext, GetCurrentZoomLevel( stateContext ) );
 		SetCurrentZoomLevel( stateContext, zoomLevelNumber );
 		SetZoomLevelNumber( stateContext, zoomLevelNumber );
 		SetBlackboardFloatVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.ZoomLevel, GetCurrentZoomLevel( stateContext ) );
 		SendZoomAnimFeatureData( stateContext, scriptInterface );
-		if( !( IsInVisionModeActiveState( stateContext, scriptInterface ) ) )
+		if( !( IsInVisionModeActiveState( stateContext, scriptInterface ) ) && !( IsControllingSniperNestDevice( scriptInterface ) ) )
 		{
 			if( zoomLevelNumber > 1 )
 			{
@@ -353,7 +410,11 @@ class ZoomEventsTransition extends ZoomTransition
 
 	public virtual function OnExitToZoomLevelBase( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( ShouldPlayZoomExitSound() && scriptInterface.HasStatFlag( gamedataStatType.CanUseZoom ) )
+		if( IsControllingSniperNestDevice( scriptInterface ) )
+		{
+			PlaySound( 'w_gun_sniper_tech_rasetsu_aim_enter', scriptInterface );
+		}
+		else if( ShouldPlayZoomExitSound() && scriptInterface.HasStatFlag( gamedataStatType.CanUseZoom ) )
 		{
 			PlaySound( 'ui_focus_mode_zooming_in_exit', scriptInterface );
 		}
@@ -388,9 +449,9 @@ class ZoomBlockedDecisions extends ZoomDecisionsTransition
 
 	public export const function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( stateContext.IsStateMachineActive( 'Vehicle' ) && ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel ) != ( ( Int32 )( gamePSMHighLevel.SceneTier3 ) ) ) )
+		if( ( stateContext.IsStateMachineActive( 'Vehicle' ) && ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle ) != ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) ) ) && ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.HighLevel ) != ( ( Int32 )( gamePSMHighLevel.SceneTier3 ) ) ) )
 		{
-			if( !( IsDeviceOrFocusActive( stateContext, scriptInterface ) ) && !( IsInUpperBodyState( stateContext, 'aimingState' ) ) )
+			if( !( IsGenericDeviceOrFocusActive( stateContext, scriptInterface ) ) && !( IsInUpperBodyState( stateContext, 'aimingState' ) ) )
 			{
 				return true;
 			}
@@ -432,10 +493,16 @@ class ZoomBlockedEvents extends ZoomEventsTransition
 
 	protected function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		if( stateContext.IsStateMachineActive( 'Vehicle' ) )
+		var isInDriverCombat : Bool;
+		isInDriverCombat = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle ) == ( ( Int32 )( gamePSMVehicle.DriverCombat ) );
+		if( stateContext.IsStateMachineActive( 'Vehicle' ) && !( isInDriverCombat ) )
 		{
 			previousCameraPerspective = GetMountedVehicle( scriptInterface.executionOwner ).GetCameraManager().GetActivePerspective();
 			previousCameraPerspectiveValid = true;
+		}
+		else
+		{
+			previousCameraPerspectiveValid = false;
 		}
 	}
 
@@ -451,23 +518,15 @@ class ZoomLevelBaseDecisions extends ZoomDecisionsTransition
 
 	protected export const function ToZoomLevelAim( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( ToNextZoomLevel( stateContext, scriptInterface ) && IsDeviceOrFocusActive( stateContext, scriptInterface ) )
+		if( ToNextZoomLevel( stateContext, scriptInterface ) )
 		{
+			if( IsControllingSniperNestDevice( scriptInterface ) )
+			{
+				return false;
+			}
 			return true;
 		}
-		if( IsControllingDevice( stateContext, scriptInterface ) )
-		{
-			return false;
-		}
-		if( IsInVisionModeActiveState( stateContext, scriptInterface ) )
-		{
-			return false;
-		}
-		if( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody ) == ( ( Int32 )( gamePSMUpperBodyStates.Aim ) ) )
-		{
-			return true;
-		}
-		if( stateContext.GetStateMachineCurrentState( 'LeftHandCyberware' ) == 'leftHandCyberwareCharge' )
+		if( IsConsideredAiming( stateContext, scriptInterface ) )
 		{
 			return true;
 		}
@@ -503,7 +562,7 @@ class ZoomLevelAimDecisions extends ZoomDecisionsTransition
 		{
 			return true;
 		}
-		if( IsDeviceOrFocusActive( stateContext, scriptInterface ) && ToPreviousZoomLevel( stateContext, scriptInterface ) )
+		if( IsGenericDeviceOrFocusActive( stateContext, scriptInterface ) && ToPreviousZoomLevel( stateContext, scriptInterface ) )
 		{
 			return true;
 		}
@@ -513,6 +572,10 @@ class ZoomLevelAimDecisions extends ZoomDecisionsTransition
 	public export const function ToScanZoomLevel( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		var adsZoomIndex : StateResultInt;
+		if( IsControllingSniperNestDevice( scriptInterface ) )
+		{
+			return false;
+		}
 		adsZoomIndex = stateContext.GetConditionIntParameter( 'adsZoomIndex' );
 		if( !( adsZoomIndex.valid ) )
 		{
@@ -528,6 +591,10 @@ class ZoomLevelAimDecisions extends ZoomDecisionsTransition
 	public export const function ToZoomLevel3( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		var adsZoomIndex : StateResultInt;
+		if( IsControllingSniperNestDevice( scriptInterface ) )
+		{
+			return false;
+		}
 		adsZoomIndex = stateContext.GetConditionIntParameter( 'adsZoomIndex' );
 		if( !( adsZoomIndex.valid ) )
 		{
@@ -547,6 +614,10 @@ class ZoomLevelAimDecisions extends ZoomDecisionsTransition
 	public export const function ToZoomLevel4( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		var adsZoomIndex : StateResultInt;
+		if( IsControllingSniperNestDevice( scriptInterface ) )
+		{
+			return false;
+		}
 		adsZoomIndex = stateContext.GetConditionIntParameter( 'adsZoomIndex' );
 		if( !( adsZoomIndex.valid ) )
 		{
@@ -589,9 +660,8 @@ class ZoomLevelAimEvents extends ZoomEventsTransition
 	{
 		var prevZoomLevel : Float;
 		isAmingWithWeapon = GetActiveWeapon( scriptInterface );
-		if( !( IsControllingDevice( stateContext, scriptInterface ) ) && stateContext.IsStateMachineActive( 'Vehicle' ) )
+		if( !( IsControllingDevice( stateContext, scriptInterface, true ) ) && stateContext.IsStateMachineActive( 'Vehicle' ) )
 		{
-			RequestVehicleCameraPerspective( scriptInterface, vehicleCameraPerspective.FPP );
 			SetZoomStateAnimFeature( scriptInterface, true );
 		}
 		SetShouldUseWeaponZoomData( stateContext, scriptInterface );
@@ -696,6 +766,10 @@ class ZoomLevelScanDecisions extends ZoomDecisionsTransition
 	{
 		var adsZoomIndex : StateResultInt;
 		adsZoomIndex = stateContext.GetConditionIntParameter( 'adsZoomIndex' );
+		if( IsControllingSniperNestDevice( scriptInterface ) )
+		{
+			return false;
+		}
 		if( !( adsZoomIndex.valid ) )
 		{
 			return false;
@@ -794,7 +868,7 @@ class ZoomLevel4Decisions extends ZoomDecisionsTransition
 		{
 			return ToPreviousZoomLevel( stateContext, scriptInterface );
 		}
-		else if( adsZoomIndex.value > 4 )
+		else if( adsZoomIndex.value > 5 )
 		{
 			return ToNextZoomLevel( stateContext, scriptInterface );
 		}
@@ -817,6 +891,126 @@ class ZoomLevel4Decisions extends ZoomDecisionsTransition
 }
 
 class ZoomLevel4Events extends ZoomEventsTransition
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		PlaySound( 'ui_focus_mode_zooming_in_step_change', scriptInterface );
+		StartZoomEffect( stateContext, scriptInterface );
+		super.OnEnter( stateContext, scriptInterface );
+	}
+
+	public function OnExitToZoomLevelAim( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		PlaySound( 'ui_focus_mode_zooming_in_exit', scriptInterface );
+		StartZoomEffect( stateContext, scriptInterface );
+	}
+
+	public function OnExitToBaseZoom( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		PlaySound( 'ui_focus_mode_zooming_in_exit', scriptInterface );
+	}
+
+}
+
+class ZoomLevel5Decisions extends ZoomDecisionsTransition
+{
+
+	protected const function ToZoomLevelAim( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var adsZoomIndex : StateResultInt;
+		adsZoomIndex = stateContext.GetConditionIntParameter( 'adsZoomIndex' );
+		if( !( adsZoomIndex.valid ) )
+		{
+			return false;
+		}
+		else if( adsZoomIndex.value == 5 )
+		{
+			return ToPreviousZoomLevel( stateContext, scriptInterface );
+		}
+		else if( adsZoomIndex.value > 6 )
+		{
+			return ToNextZoomLevel( stateContext, scriptInterface );
+		}
+		return false;
+	}
+
+	public const override function ToBaseZoom( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( scriptInterface.IsActionJustPressed( 'RangedAttack' ) )
+		{
+			return true;
+		}
+		if( super.ToBaseZoom( stateContext, scriptInterface ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class ZoomLevel5Events extends ZoomEventsTransition
+{
+
+	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		PlaySound( 'ui_focus_mode_zooming_in_step_change', scriptInterface );
+		StartZoomEffect( stateContext, scriptInterface );
+		super.OnEnter( stateContext, scriptInterface );
+	}
+
+	public function OnExitToZoomLevelAim( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		PlaySound( 'ui_focus_mode_zooming_in_exit', scriptInterface );
+		StartZoomEffect( stateContext, scriptInterface );
+	}
+
+	public function OnExitToBaseZoom( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		PlaySound( 'ui_focus_mode_zooming_in_exit', scriptInterface );
+	}
+
+}
+
+class ZoomLevel6Decisions extends ZoomDecisionsTransition
+{
+
+	protected const function ToZoomLevelAim( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		var adsZoomIndex : StateResultInt;
+		adsZoomIndex = stateContext.GetConditionIntParameter( 'adsZoomIndex' );
+		if( !( adsZoomIndex.valid ) )
+		{
+			return false;
+		}
+		else if( adsZoomIndex.value == 6 )
+		{
+			return ToPreviousZoomLevel( stateContext, scriptInterface );
+		}
+		else if( adsZoomIndex.value > 6 )
+		{
+			return ToNextZoomLevel( stateContext, scriptInterface );
+		}
+		return false;
+	}
+
+	public const override function ToBaseZoom( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
+	{
+		if( scriptInterface.IsActionJustPressed( 'RangedAttack' ) )
+		{
+			return true;
+		}
+		if( super.ToBaseZoom( stateContext, scriptInterface ) )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class ZoomLevel6Events extends ZoomEventsTransition
 {
 
 	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )

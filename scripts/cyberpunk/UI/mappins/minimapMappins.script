@@ -17,6 +17,9 @@ import class BaseMinimapMappinController extends BaseMappinBaseController
 
 	protected import function SetForceShow( value : Bool );
 	protected import function SetForceHide( value : Bool );
+	protected import function IsForceShow() : Bool;
+	protected import function IsForceHide() : Bool;
+	protected import function LockIconRotation( value : Bool );
 
 	protected event OnInitialize()
 	{
@@ -100,14 +103,12 @@ import class BaseMinimapMappinController extends BaseMappinBaseController
 import class MinimapStealthMappinController extends BaseMinimapMappinController
 {
 	protected import var visionConeWidget : inkImageRef;
-	protected editable var m_pulseWidget : inkWidgetRef;
 	private var m_stealthMappin : weak< StealthMappin >;
 	private var m_fadeOutAnim : inkAnimProxy;
 	private var m_isTagged : Bool;
 	private var m_wasVisible : Bool;
-	private var m_attitudeState : CName;
+	private var m_mappinState : CName;
 	private var m_preventionState : CName;
-	private var m_pulsing : Bool;
 	private var m_hasBeenLooted : Bool;
 	private var m_isAggressive : Bool;
 	private var m_detectionAboveZero : Bool;
@@ -131,7 +132,6 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 	private var m_adjustedOpacity : Float;
 	private var m_defaultConeOpacity : Float;
 	private var m_detectingConeOpacity : Float;
-	private var m_numberOfShotAttempts : Uint32;
 	private var m_highestLootQuality : Uint32;
 	private var m_lockLootQuality : Bool;
 	private var m_highLevelState : gamedataNPCHighLevelState;
@@ -142,12 +142,18 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 	private var m_isInVehicleStance : Bool;
 	private var m_stanceStateCb : CallbackHandle;
 	private var m_policeChasePrototypeEnabled : Bool;
+	private var m_preventionMinimapMappinComponent : PreventionMinimapMappinComponent;
+	private editable var m_preventionVisionConeColor : CName;
+	default m_preventionVisionConeColor = 'MainColors.EnemyMinimapBase';
+	private var m_preventionDetectionDropThreshold : Float;
+	private var m_wasMaxDetectionReached : Bool;
 	private var m_showAnim : inkAnimProxy;
 	private var m_alertedAnim : inkAnimProxy;
 	private var m_preventionAnimProxy : inkAnimProxy;
 
 	protected event OnInitialize()
 	{
+		m_preventionDetectionDropThreshold = TweakDBInterface.GetFloatDefault( T"RTDB.MappinUIPreventionSettings.preventionDetectionThresholdForVisionCone" );
 		Initialize();
 	}
 
@@ -186,19 +192,23 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 			m_isCamera = ( gameObject.IsDevice() && gameObject.IsSensor() ) && !( gameObject.IsTurret() );
 			m_isTurret = gameObject.IsTurret();
 			m_isNetrunner = m_stealthMappin.IsNetrunner();
-			m_policeChasePrototypeEnabled = GameInstance.GetPreventionSpawnSystem( gameObject.GetGame() ).IsPreventionVehiclePrototypeEnabled();
+			m_policeChasePrototypeEnabled = GameInstance.GetPreventionSpawnSystem( gameObject.GetGame() ).IsPreventionVehicleEnabled();
 			if( m_isPrevention && m_policeChasePrototypeEnabled )
 			{
+				m_preventionMinimapMappinComponent = new PreventionMinimapMappinComponent;
+				m_preventionMinimapMappinComponent.OnInitialize( this, gameObject );
 				npcPuppet = ( ( NPCPuppet )( gameObject ) );
 				if( npcPuppet )
 				{
 					m_puppetStateBlackboard = npcPuppet.GetPuppetStateBlackboard();
 					if( m_puppetStateBlackboard )
 					{
-						m_isInVehicleStance = IsVehicleStance( ( ( gamedataNPCStanceState )( m_puppetStateBlackboard.GetInt( GetAllBlackboardDefs().PuppetState.Stance ) ) ) );
+						m_isInVehicleStance = GameInstance.GetMountingFacility( gameObject.GetGame() ).IsMountedToAnything( gameObject.GetEntityID() );
 						m_stanceStateCb = m_puppetStateBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PuppetState.Stance, this, 'OnStanceStateChanged' );
 					}
 				}
+				inkImageRef.Get( visionConeWidget ).BindProperty( 'tintColor', m_preventionVisionConeColor );
+				inkImageRef.SetTexturePart( iconWidget, 'enemyMappin-1' );
 			}
 		}
 		m_isCrowdNPC = m_stealthMappin.IsCrowdNPC();
@@ -232,7 +242,7 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		}
 		m_wasAlive = true;
 		m_cautious = false;
-		m_lockLootQuality = false;
+		m_lockLootQuality = true;
 		super.Intro();
 	}
 
@@ -242,10 +252,17 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		var gameDevice : weak< Device >;
 		var shouldShowMappin : Bool;
 		var isOnSameFloor, hasBeenSeen, isCompanion, hasItems, isHighlighted, isUsingSenseCone, isTagged : Bool;
-		var canSeePlayer, numberOfCombatantsAboveZero, wasDetectionAboveZero, shouldShowVisionCone : Bool;
+		var canSeePlayer, numberOfCombatantsAboveZero, wasDetectionAboveZero : Bool;
 		var attitude : EAIAttitude;
 		var vertRelation : gamemappinsVerticalPositioning;
-		var shotAttempts : Uint32;
+		var ownerSenseComponent : SenseComponent;
+		var willStartDetectingPlayer : Bool;
+		var isInactiveGameDevice : Bool;
+		var isNonHostilePreventionTurret : Bool;
+		var isPlayerInterestingFromSecuritySystemPOV : Bool;
+		var playerDetectionValue : Float;
+		willStartDetectingPlayer = false;
+		isInactiveGameDevice = false;
 		gameObject = m_stealthMappin.GetGameObject();
 		m_isAlive = m_stealthMappin.IsAlive();
 		isTagged = m_stealthMappin.IsTagged();
@@ -253,35 +270,32 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		isCompanion = ( gameObject != NULL ) && ScriptedPuppet.IsPlayerCompanion( gameObject );
 		attitude = m_stealthMappin.GetAttitudeTowardsPlayer();
 		vertRelation = GetVerticalRelationToPlayer();
-		shotAttempts = m_stealthMappin.GetNumberOfShotAttempts();
 		m_highLevelState = m_stealthMappin.GetHighLevelState();
 		isHighlighted = m_stealthMappin.IsHighlighted();
 		m_isSquadInCombat = m_stealthMappin.IsSquadInCombat();
 		canSeePlayer = m_stealthMappin.CanSeePlayer();
 		m_detectionAboveZero = m_stealthMappin.GetDetectionProgress() > 0.0;
 		wasDetectionAboveZero = m_stealthMappin.WasDetectionAboveZero();
+		playerDetectionValue = m_stealthMappin.GetDetectionProgress();
 		numberOfCombatantsAboveZero = m_stealthMappin.GetNumberOfCombatants() > ( ( Uint32 )( 0 ) );
 		isUsingSenseCone = m_stealthMappin.IsUsingSenseCone();
 		m_isHacking = m_stealthMappin.HasHackingStatusEffect();
+		isPlayerInterestingFromSecuritySystemPOV = m_stealthMappin.IsPlayerInterestingFromSecuritySystemPOV();
 		if( m_isDevice )
 		{
 			m_isAggressive = attitude != EAIAttitude.AIA_Friendly;
 			if( m_isAggressive )
 			{
 				gameDevice = ( ( Device )( gameObject ) );
-				if( gameDevice )
-				{
-					isUsingSenseCone = gameDevice.GetDevicePS().IsON();
-				}
+				isInactiveGameDevice = gameDevice && !( gameDevice.GetDevicePS().IsON() );
 				if( m_isCamera && numberOfCombatantsAboveZero )
 				{
 					canSeePlayer = false;
-					isUsingSenseCone = false;
 				}
 				else if( m_isTurret )
 				{
-					isUsingSenseCone = isUsingSenseCone && ( attitude == EAIAttitude.AIA_Hostile || !( m_isPrevention ) );
-					if( !( isUsingSenseCone ) )
+					isNonHostilePreventionTurret = attitude != EAIAttitude.AIA_Hostile && m_isPrevention;
+					if( isInactiveGameDevice || isNonHostilePreventionTurret )
 					{
 						m_isSquadInCombat = false;
 					}
@@ -301,7 +315,6 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 			if( ( ( ( ( !( m_isDevice ) && m_highLevelState != gamedataNPCHighLevelState.Relaxed ) && m_highLevelState != gamedataNPCHighLevelState.Any ) && !( m_isSquadInCombat ) ) && m_isAlive ) && m_isAggressive )
 			{
 				m_cautious = true;
-				PulseContinuous( true );
 			}
 		}
 		else
@@ -309,7 +322,6 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 			if( ( ( m_highLevelState == gamedataNPCHighLevelState.Relaxed || m_highLevelState == gamedataNPCHighLevelState.Any ) || m_isSquadInCombat ) || !( m_isAlive ) )
 			{
 				m_cautious = false;
-				PulseContinuous( false );
 			}
 		}
 		if( m_hasBeenLooted || m_stealthMappin.IsHiddenByQuestOnMinimap() )
@@ -338,23 +350,31 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 				}
 			}
 		}
+		if( shouldShowMappin && m_preventionMinimapMappinComponent )
+		{
+			shouldShowMappin = m_preventionMinimapMappinComponent.CanShowMappin( GetDistanceToPlayer() );
+		}
 		SetForceHide( !( shouldShowMappin ) );
 		if( shouldShowMappin )
 		{
-			if( !( m_isAlive ) )
+			if( !( m_isAlive ) && m_stealthMappin.HasLootProcessed() )
 			{
-				if( m_wasAlive )
-				{
-					if( !( m_isCamera ) )
-					{
-						inkImageRef.SetTexturePart( iconWidget, 'enemy_icon_4' );
-						inkImageRef.SetScale( iconWidget, Vector2( 0.75, 0.75 ) );
-					}
-					m_defaultOpacity = MinF( m_defaultOpacity, 0.5 );
-					m_wasAlive = false;
-				}
 				hasItems = m_stealthMappin.HasItems();
-				if( !( hasItems ) || m_isDevice )
+				if( hasItems )
+				{
+					if( m_wasAlive )
+					{
+						if( !( m_isCamera ) )
+						{
+							inkImageRef.SetTexturePart( iconWidget, 'enemy_icon_4' );
+							inkImageRef.SetScale( iconWidget, Vector2( 0.75, 0.75 ) );
+						}
+						m_defaultOpacity = MinF( m_defaultOpacity, 0.5 );
+						m_wasAlive = false;
+						m_lockLootQuality = false;
+					}
+				}
+				else
 				{
 					FadeOut();
 				}
@@ -375,41 +395,38 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 				}
 			}
 			m_isTagged = isTagged;
-			if( ( m_isSquadInCombat && !( m_wasSquadInCombat ) ) || ( m_numberOfShotAttempts != shotAttempts ) )
-			{
-				m_numberOfShotAttempts = shotAttempts;
-				Pulse( 2 );
-			}
 			isOnSameFloor = vertRelation == gamemappinsVerticalPositioning.Same;
 			m_adjustedOpacity = ( ( isOnSameFloor ) ? ( m_defaultOpacity ) : ( 0.30000001 * m_defaultOpacity ) );
-			shouldShowVisionCone = ( m_isAlive && isUsingSenseCone ) && m_isAggressive;
-			if( m_shouldShowVisionCone != shouldShowVisionCone )
+			if( !( m_isAlive ) || isInactiveGameDevice )
 			{
-				m_shouldShowVisionCone = shouldShowVisionCone;
-				m_stealthMappin.UpdateSenseConeAvailable( m_shouldShowVisionCone );
-				if( m_shouldShowVisionCone )
-				{
-					m_stealthMappin.UpdateSenseCone();
-				}
+				ToggleVisionConeVisibility( false );
 			}
-			if( m_shouldShowVisionCone )
+			else if( m_isPrevention && m_stealthMappin.IsPlayerWanted() )
 			{
-				if( canSeePlayer != m_couldSeePlayer || ( m_isSquadInCombat && !( m_wasSquadInCombat ) ) )
+				if( playerDetectionValue == 100.0 )
 				{
-					if( canSeePlayer && !( m_isSquadInCombat ) )
-					{
-						inkImageRef.SetOpacity( visionConeWidget, m_detectingConeOpacity );
-						inkImageRef.SetScale( visionConeWidget, Vector2( 1.5, 1.5 ) );
-					}
-					else
-					{
-						inkImageRef.SetOpacity( visionConeWidget, m_defaultConeOpacity );
-						inkImageRef.SetScale( visionConeWidget, Vector2( 1.0, 1.0 ) );
-					}
-					m_couldSeePlayer = canSeePlayer;
+					m_wasMaxDetectionReached = true;
 				}
+				else if( playerDetectionValue < m_preventionDetectionDropThreshold )
+				{
+					m_wasMaxDetectionReached = false;
+				}
+				ToggleVisionConeVisibility( !( m_wasMaxDetectionReached ) || !( ( playerDetectionValue > m_preventionDetectionDropThreshold ) ) );
 			}
-			inkImageRef.SetVisible( visionConeWidget, m_shouldShowVisionCone );
+			else if( numberOfCombatantsAboveZero || !( isUsingSenseCone ) )
+			{
+				ToggleVisionConeVisibility( false );
+			}
+			else
+			{
+				ownerSenseComponent = gameObject.GetSensesComponent();
+				willStartDetectingPlayer = ( ownerSenseComponent && ownerSenseComponent.GetShouldStartDetectingPlayerCached() ) || m_isCamera;
+				if( !( willStartDetectingPlayer ) && gameObject.IsConnectedToSecuritySystem() )
+				{
+					willStartDetectingPlayer = isPlayerInterestingFromSecuritySystemPOV;
+				}
+				ToggleVisionConeVisibility( willStartDetectingPlayer );
+			}
 			if( !( m_wasVisible ) )
 			{
 				if( m_showAnim )
@@ -444,9 +461,15 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		{
 			m_highestLootQuality = m_stealthMappin.GetHighestLootQuality();
 		}
-		m_attitudeState = GetStateForAttitude( attitude, canSeePlayer );
+		if( m_stealthMappin.IsPrevention() )
+		{
+			m_mappinState = GetPreventionMapinState();
+		}
+		else
+		{
+			m_mappinState = GetStateForAttitude( attitude, canSeePlayer );
+		}
 		m_stealthMappin.SetVisibleOnMinimap( shouldShowMappin );
-		m_stealthMappin.SetIsPulsing( m_pulsing );
 		m_clampingAvailable = m_isTagged || ( m_isAggressive && ( m_isSquadInCombat || m_detectionAboveZero ) );
 		OverrideClamp( m_clampingAvailable );
 		m_wasCompanion = isCompanion;
@@ -455,21 +478,62 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		super.Update();
 	}
 
+	private function ToggleVisionConeVisibility( shouldShowVisionCone : Bool )
+	{
+		if( m_shouldShowVisionCone == shouldShowVisionCone )
+		{
+			return;
+		}
+		m_shouldShowVisionCone = shouldShowVisionCone;
+		m_stealthMappin.UpdateSenseConeAvailable( m_shouldShowVisionCone );
+		if( m_shouldShowVisionCone )
+		{
+			m_stealthMappin.UpdateSenseCone();
+			inkImageRef.SetOpacity( visionConeWidget, m_defaultConeOpacity );
+			inkImageRef.SetScale( visionConeWidget, Vector2( 1.0, 1.0 ) );
+		}
+		inkImageRef.SetVisible( visionConeWidget, m_shouldShowVisionCone );
+	}
+
+	public function UpdateVisionWidgetVisiblity()
+	{
+		if( m_preventionMinimapMappinComponent )
+		{
+			Update();
+		}
+	}
+
+	public function RequestUpdateRootState()
+	{
+		UpdateRootState();
+	}
+
 	protected override function UpdateClamping()
 	{
-		if( IsClamped() )
+		var canClamp : Bool;
+		canClamp = true;
+		if( m_preventionMinimapMappinComponent )
+		{
+			canClamp = m_preventionMinimapMappinComponent.CanShowMappin( GetDistanceToPlayer() );
+		}
+		if( canClamp && IsClamped() )
 		{
 			m_root.SetOpacity( 1.0 );
 			inkImageRef.SetVisible( iconWidget, false );
-			inkWidgetRef.SetVisible( m_pulseWidget, false );
 			inkImageRef.SetVisible( visionConeWidget, false );
 			inkWidgetRef.SetVisible( clampArrowWidget, m_clampingAvailable );
+		}
+		else if( !( canClamp ) && IsClamped() )
+		{
+			m_root.SetOpacity( 0.0 );
+			inkImageRef.SetVisible( iconWidget, false );
+			inkImageRef.SetVisible( visionConeWidget, false );
+			inkWidgetRef.SetVisible( clampArrowWidget, false );
 		}
 		else
 		{
 			m_root.SetOpacity( m_adjustedOpacity );
 			inkImageRef.SetVisible( iconWidget, true );
-			inkWidgetRef.SetVisible( m_pulseWidget, m_pulsing );
 			inkImageRef.SetVisible( visionConeWidget, m_shouldShowVisionCone );
 			inkWidgetRef.SetVisible( clampArrowWidget, false );
 		}
@@ -491,47 +555,9 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		}
 	}
 
-	protected function Pulse( count : Int32 )
-	{
-		var animOptions : inkAnimOptions;
-		if( !( m_alertedAnim ) || !( m_alertedAnim.IsPlaying() ) )
-		{
-			m_pulsing = true;
-			inkWidgetRef.SetVisible( m_pulseWidget, true );
-			inkWidgetRef.SetOpacity( m_pulseWidget, 1.0 );
-			animOptions.loopType = inkanimLoopType.Cycle;
-			animOptions.loopCounter = ( ( Uint32 )( count ) );
-			m_alertedAnim = PlayLibraryAnimation( 'Alerted', animOptions );
-			m_alertedAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPulsingAnimFinished' );
-		}
-	}
-
-	protected function PulseContinuous( enabled : Bool )
-	{
-		var animOptions : inkAnimOptions;
-		if( m_alertedAnim && m_alertedAnim.IsPlaying() )
-		{
-			m_alertedAnim.Stop();
-		}
-		if( enabled )
-		{
-			m_pulsing = true;
-			inkWidgetRef.SetVisible( m_pulseWidget, true );
-			inkWidgetRef.SetOpacity( m_pulseWidget, 0.5 );
-			animOptions.loopType = inkanimLoopType.Cycle;
-			animOptions.loopInfinite = true;
-			m_alertedAnim = PlayLibraryAnimation( 'Alerted', animOptions );
-		}
-		else
-		{
-			m_pulsing = false;
-			inkWidgetRef.SetVisible( m_pulseWidget, false );
-		}
-	}
-
 	protected override function ComputeRootState() : CName
 	{
-		return m_attitudeState;
+		return m_mappinState;
 	}
 
 	protected function FadeOut()
@@ -548,12 +574,12 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 
 	protected function GetStateForAttitude( attitude : EAIAttitude, canSeePlayer : Bool ) : CName
 	{
-		if( !( m_isAlive ) && ( m_highestLootQuality > ( ( Uint32 )( 0 ) ) ) )
+		if( ( !( m_isAlive ) && ( m_highestLootQuality >= 0 ) ) && m_stealthMappin.HasItems() )
 		{
 			switch( m_highestLootQuality )
 			{
 				case 0:
-					return 'Quality_Common';
+					return 'Neutral_Aggressive';
 				case 1:
 					return 'Quality_Uncommon';
 				case 2:
@@ -599,6 +625,23 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 		}
 	}
 
+	protected function GetPreventionMapinState() : CName
+	{
+		var puppet : ScriptedPuppet;
+		var isInCombatWithPlayer : Bool;
+		puppet = ( ( ScriptedPuppet )( m_stealthMappin.GetGameObject() ) );
+		isInCombatWithPlayer = ( ( puppet ) ? ( NPCPuppet.IsInCombatWithTarget( puppet, GetPlayerObject( puppet.GetGame() ) ) ) : ( m_stealthMappin.IsInCombat() ) );
+		if( m_isAlive && m_stealthMappin )
+		{
+			if( isInCombatWithPlayer )
+			{
+				return 'Prevention_Red';
+			}
+			return 'Prevention_LightBlue';
+		}
+		return 'Prevention_Blue';
+	}
+
 	private function PlayPreventionAnim()
 	{
 		var initialState : CName;
@@ -640,14 +683,6 @@ import class MinimapStealthMappinController extends BaseMinimapMappinController
 	{
 		MappinUIUtils.CyclePreventionState( m_preventionState );
 		UpdateRootState();
-	}
-
-	protected event OnPulsingAnimFinished( proxy : inkAnimProxy )
-	{
-		m_alertedAnim.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnPulsingAnimFinished' );
-		inkWidgetRef.SetVisible( m_pulseWidget, false );
-		m_pulsing = false;
-		Update();
 	}
 
 	protected event OnFadeOutAnimFinished( proxy : inkAnimProxy )
@@ -1017,16 +1052,18 @@ import class MinimapPingSystemMappinController extends BaseMinimapMappinControll
 
 class MinimapPOIMappinController extends BaseMinimapMappinController
 {
-	private editable var m_pulseWidget : inkWidgetRef;
-	private editable var m_pingAnimationOnStateChange : Bool;
+	protected editable var m_pulseWidget : inkWidgetRef;
+	protected editable var m_pingAnimationOnStateChange : Bool;
 	private var m_poiMappin : weak< PointOfInterestMappin >;
 	private var m_questMappin : weak< QuestMappin >;
 	private var m_isCompletedPhase : Bool;
 	default m_isCompletedPhase = false;
 	private var m_mappinPhase : gamedataMappinPhase;
 	private var m_pingAnim : inkAnimProxy;
+	private var m_mappinVariant : gamedataMappinVariant;
 	private const var c_pingAnimCount : Uint32;
 	default c_pingAnimCount = 3;
+	private var m_isNcpdScanner : Bool;
 	private var m_vehicleMinimapMappinComponent : VehicleMinimapMappinComponent;
 	private var m_keepIconOnClamping : Bool;
 	default m_keepIconOnClamping = false;
@@ -1049,8 +1086,8 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 		}
 		m_poiMappin = ( ( PointOfInterestMappin )( GetMappin() ) );
 		m_questMappin = ( ( QuestMappin )( GetMappin() ) );
-		UpdateIcon();
 		super.Intro();
+		UpdateIcon();
 	}
 
 	protected event OnUninitialize()
@@ -1064,30 +1101,37 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 	protected override function Update()
 	{
 		var newMappinPhase : gamedataMappinPhase;
-		newMappinPhase = m_mappin.GetPhase();
-		if( m_mappinPhase != newMappinPhase )
+		var phaseChanged : Bool;
+		if( m_mappin )
+		{
+			newMappinPhase = m_mappin.GetPhase();
+			phaseChanged = m_mappinPhase != newMappinPhase;
+		}
+		if( phaseChanged )
 		{
 			m_mappinPhase = newMappinPhase;
-			if( m_mappinPhase == gamedataMappinPhase.DiscoveredPhase && m_pingAnimationOnStateChange )
-			{
-				PlayPingAnimation();
-			}
 		}
-		UpdateVisibility();
+		m_isCompletedPhase = m_mappinPhase == gamedataMappinPhase.CompletedPhase;
 		UpdateIcon();
+		UpdateVisibility();
 		super.Update();
+		if( ( ( !( m_isNcpdScanner ) && phaseChanged ) && m_mappinPhase == gamedataMappinPhase.DiscoveredPhase ) && m_pingAnimationOnStateChange )
+		{
+			PlayPingAnimation();
+		}
 	}
 
-	public function PlayPingAnimation( optional loopInfinite : Bool )
+	public function PlayPingAnimation( optional loopInfinite : Bool, optional overrideAnimName : CName ) : Bool
 	{
 		var animOptions : inkAnimOptions;
 		StopPingAnimation();
 		animOptions.loopType = inkanimLoopType.Cycle;
 		animOptions.loopInfinite = loopInfinite;
 		animOptions.loopCounter = c_pingAnimCount;
-		m_pingAnim = PlayLibraryAnimation( 'Pulse', animOptions );
+		m_pingAnim = PlayLibraryAnimation( ( ( IsNameValid( overrideAnimName ) ) ? ( overrideAnimName ) : ( 'Pulse' ) ), animOptions );
 		m_pingAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnPulseAnimLoop' );
 		inkWidgetRef.SetVisible( m_pulseWidget, true );
+		return m_pingAnim.IsValid();
 	}
 
 	public function StopPingAnimation( optional goToEnd : Bool )
@@ -1107,6 +1151,11 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 		}
 	}
 
+	public function RequestUpdateRootState()
+	{
+		UpdateRootState();
+	}
+
 	protected event OnQuestMappinHighlight( evt : QuestMappinHighlightEvent )
 	{
 		var poiMappin : PointOfInterestMappin;
@@ -1120,13 +1169,23 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 	protected event OnPulseAnimLoop( anim : inkAnimProxy )
 	{
 		inkWidgetRef.SetVisible( m_pulseWidget, false );
+		if( m_vehicleMinimapMappinComponent )
+		{
+			m_vehicleMinimapMappinComponent.OnAnimEnd();
+		}
 	}
 
 	protected function UpdateVisibility()
 	{
 		var isInArea : Bool;
 		var shouldHide : Bool;
-		m_isCompletedPhase = m_mappinPhase == gamedataMappinPhase.CompletedPhase;
+		if( m_isNcpdScanner )
+		{
+			shouldHide = !( IsTracked() );
+			SetForceHide( shouldHide );
+			inkWidgetRef.SetVisible( m_pulseWidget, false );
+			return;
+		}
 		if( m_questMappin != NULL )
 		{
 			isInArea = m_questMappin.IsInsideTrigger();
@@ -1148,14 +1207,14 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 
 	protected function UpdateIcon()
 	{
-		var mappinVariant : gamedataMappinVariant;
 		var texturePart : CName;
 		var iconID : TweakDBID;
 		var roleMappinData : GameplayRoleMappinData;
 		if( m_mappin )
 		{
 			roleMappinData = ( ( GameplayRoleMappinData )( m_mappin.GetScriptData() ) );
-			mappinVariant = m_mappin.GetVariant();
+			m_mappinVariant = m_mappin.GetVariant();
+			m_isNcpdScanner = IsNcpdScanner( m_mappinVariant );
 		}
 		if( roleMappinData )
 		{
@@ -1163,7 +1222,7 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 		}
 		if( !( TDBID.IsValid( iconID ) ) )
 		{
-			texturePart = MappinUIUtils.MappinToTexturePart( mappinVariant, m_mappinPhase );
+			texturePart = MappinUIUtils.MappinToTexturePart( m_mappinVariant, m_mappinPhase );
 			inkImageRef.SetTexturePart( iconWidget, texturePart );
 		}
 		else
@@ -1201,9 +1260,193 @@ class MinimapPOIMappinController extends BaseMinimapMappinController
 		return m_keepIconOnClamping;
 	}
 
-	public function SetPulseWidgetTint( color : HDRColor )
+	private function IsNcpdScanner( variant : gamedataMappinVariant ) : Bool
 	{
-		inkWidgetRef.SetTintColor( m_pulseWidget, color );
+		if( ( ( ( variant == gamedataMappinVariant.MinorActivityVariant || variant == gamedataMappinVariant.Zzz06_NCPDGigVariant ) || variant == gamedataMappinVariant.GangWatchVariant ) || variant == gamedataMappinVariant.OutpostVariant ) || variant == gamedataMappinVariant.HiddenStashVariant )
+		{
+			return true;
+		}
+		return false;
+	}
+
+}
+
+class RoadBlockadeMappinController extends MinimapPOIMappinController
+{
+
+	protected override function KeepIconOnClamping() : Bool
+	{
+		return true;
+	}
+
+}
+
+import class MinimapPreventionVehicleMappinController extends BaseMinimapMappinController
+{
+	[ category = "Prevention" ]
+	protected editable var m_pulseWidget : inkWidgetRef;
+	[ category = "Prevention" ]
+	protected editable var m_visionWidget : inkWidgetRef;
+	[ category = "Icon" ]
+	private editable var m_outerIcon : inkImageRef;
+	[ category = "Icon" ]
+	private editable var m_maxTackIcon : inkImageRef;
+	[ category = "Animation" ]
+	private editable var m_fadeInAnimName : CName;
+	[ category = "Animation" ]
+	private editable var m_fadeOutAnimName : CName;
+	private var m_fadeAnimProxy : inkAnimProxy;
+	private var m_UIWantedBarBB : weak< IBlackboard >;
+	private var m_UIWantedBarDef : UI_WantedBarDef;
+	private var m_currentWantedStateCallback : CallbackHandle;
+	private var m_playerEscapingPursuit : Bool;
+	private var m_playerWanted : Bool;
+	private var m_mappinState : CName;
+	default m_mappinState = 'Prevention_LightBlue';
+	private var m_keepIconOnClamping : Bool;
+	default m_keepIconOnClamping = true;
+	private var m_maxVisibilityDistance : Float;
+	private var m_currentChaseState : CName;
+	private var m_detectionDropThreshold : Float;
+	private var m_wasMaxDetectionReached : Bool;
+	default m_wasMaxDetectionReached = false;
+	private var m_vehicle : weak< VehicleObject >;
+	private var m_isMaxTacAV : Bool;
+
+	protected override function Initialize()
+	{
+		m_maxVisibilityDistance = TweakDBInterface.GetFloatDefault( T"RTDB.MappinUIPreventionSettings.preventionVehicleMappinMaxDistance" );
+		m_detectionDropThreshold = TweakDBInterface.GetFloatDefault( T"RTDB.MappinUIPreventionSettings.preventionDetectionThresholdForVisionCone" );
+		super.Initialize();
+		inkWidgetRef.SetVisible( m_pulseWidget, false );
+		inkImageRef.SetVisible( m_maxTackIcon, false );
+	}
+
+	public function OnUninitialize()
+	{
+		if( m_currentWantedStateCallback )
+		{
+			m_UIWantedBarBB.UnregisterListenerName( m_UIWantedBarDef.CurrentChaseState, m_currentWantedStateCallback );
+		}
+		m_fadeAnimProxy.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnFadeOutFinished' );
+	}
+
+	protected override function Intro()
+	{
+		var vehicleMappin : weak< VehicleMappin >;
+		var vehicle : weak< VehicleObject >;
+		super.Intro();
+		vehicleMappin = ( ( weak< weak< VehicleMappin > > )( GetMappin() ) );
+		if( vehicleMappin )
+		{
+			vehicle = vehicleMappin.GetVehicle();
+			m_vehicle = vehicle;
+			m_isMaxTacAV = m_vehicle == ( ( AVObject )( m_vehicle ) );
+			LockIconRotation( m_isMaxTacAV );
+			inkImageRef.SetVisible( m_maxTackIcon, m_isMaxTacAV );
+			inkImageRef.SetVisible( m_outerIcon, !( m_isMaxTacAV ) );
+			inkImageRef.SetVisible( iconWidget, !( m_isMaxTacAV ) );
+			m_UIWantedBarDef = GetAllBlackboardDefs().UI_WantedBar;
+			m_UIWantedBarBB = GameInstance.GetBlackboardSystem( vehicle.GetGame() ).Get( m_UIWantedBarDef );
+			m_currentWantedStateCallback = m_UIWantedBarBB.RegisterListenerName( m_UIWantedBarDef.CurrentChaseState, this, 'OnCurrentWantedStateChanged' );
+			m_currentChaseState = m_UIWantedBarBB.GetName( m_UIWantedBarDef.CurrentChaseState );
+			UpdatePlayerEscapingPursuit( m_currentChaseState );
+			UpdatePlayerWanted( m_currentChaseState );
+		}
+		Update();
+		m_fadeAnimProxy = PlayLibraryAnimation( m_fadeInAnimName );
+	}
+
+	protected override function ComputeRootState() : CName
+	{
+		return m_mappinState;
+	}
+
+	protected override function Update()
+	{
+		var vehicleMappin : weak< VehicleMappin >;
+		var playerDetectionValue : Float;
+		var shouldShowWidget : Bool;
+		playerDetectionValue = 0.0;
+		UpdateVisiblity();
+		vehicleMappin = ( ( weak< weak< VehicleMappin > > )( GetMappin() ) );
+		if( vehicleMappin )
+		{
+			playerDetectionValue = vehicleMappin.GetPlayerDetectionValue();
+			if( playerDetectionValue == 100.0 )
+			{
+				m_wasMaxDetectionReached = true;
+			}
+			else if( playerDetectionValue < m_detectionDropThreshold )
+			{
+				m_wasMaxDetectionReached = false;
+			}
+		}
+		if( m_isMaxTacAV || ( m_playerWanted && VehicleComponent.HasPassengersWithThreatOnPlayer( m_vehicle.GetGame(), m_vehicle.GetEntityID() ) ) )
+		{
+			m_mappinState = 'Prevention_Red';
+		}
+		else
+		{
+			m_mappinState = 'Prevention_LightBlue';
+		}
+		shouldShowWidget = !( m_isMaxTacAV ) && ( !( m_wasMaxDetectionReached ) || !( VehicleComponent.HasPassengersWithThreatOnPlayer( m_vehicle.GetGame(), m_vehicle.GetEntityID() ) ) );
+		inkWidgetRef.SetVisible( m_visionWidget, ( !( IsClamped() ) && m_playerWanted ) && shouldShowWidget );
+		super.Update();
+	}
+
+	private function UpdateVisiblity()
+	{
+		if( CanShowMappin( GetDistanceToPlayer() ) )
+		{
+			if( IsForceHide() )
+			{
+				SetForceHide( false );
+			}
+		}
+		else
+		{
+			if( !( IsForceHide() ) )
+			{
+				SetForceHide( true );
+			}
+		}
+	}
+
+	private function CanShowMappin( distance : Float ) : Bool
+	{
+		return distance <= m_maxVisibilityDistance;
+	}
+
+	private function UpdatePlayerWanted( value : CName )
+	{
+		if( ( value == 'Searching' || value == 'Dropping' ) || value == 'Active' )
+		{
+			m_playerWanted = true;
+		}
+		else
+		{
+			m_playerWanted = false;
+		}
+	}
+
+	private function UpdatePlayerEscapingPursuit( value : CName )
+	{
+		if( value == 'Searching' || value == 'Dropping' )
+		{
+			m_playerEscapingPursuit = true;
+		}
+		else
+		{
+			m_playerEscapingPursuit = false;
+		}
+	}
+
+	protected event OnCurrentWantedStateChanged( value : CName )
+	{
+		UpdatePlayerWanted( value );
+		UpdatePlayerEscapingPursuit( value );
+		Update();
 	}
 
 }
@@ -1213,6 +1456,11 @@ import class MinimapDynamicEventMappinController extends BaseMinimapMappinContro
 	private import var pulseWidget : inkWidgetRef;
 	private import var pulseEnabled : Bool;
 	private var m_pulseAnim : inkAnimProxy;
+
+	protected override function ComputeRootState() : CName
+	{
+		return ( ( m_mappin.GetVariant() == gamedataMappinVariant.Zzz09_CourierSandboxActivityVariant ) ? ( 'Gigs' ) : ( 'Default' ) );
+	}
 
 	private function PlayPulseAnimation()
 	{
@@ -1256,10 +1504,11 @@ import class MinimapDynamicEventMappinController extends BaseMinimapMappinContro
 class VehicleMinimapMappinComponent
 {
 	private var m_minimapPOIMappinController : weak< MinimapPOIMappinController >;
-	private var m_uiWantedBarBB : weak< IBlackboard >;
-	private var m_UIWantedBarDef : UI_WantedBarDef;
-	private var m_currentWantedLevelCallback : CallbackHandle;
-	private var m_playerWanted : Bool;
+	private var m_vehicle : weak< VehicleObject >;
+	private var m_uiVehicleBB : weak< IBlackboard >;
+	private var m_vehicleBBDef : VehicleDef;
+	private var m_deleteAnimCallback : CallbackHandle;
+	private var m_destroyMappinOnAnimEnd : Bool;
 	private var m_vehicleIsLatestSummoned : Bool;
 	default m_vehicleIsLatestSummoned = false;
 	private var m_vehicleEntityID : EntityID;
@@ -1269,37 +1518,35 @@ class VehicleMinimapMappinComponent
 
 	public function OnInitialize( minimapPOIMappinController : weak< MinimapPOIMappinController >, vehicleMappin : weak< VehicleMappin > )
 	{
-		var vehicle : weak< VehicleObject >;
 		m_minimapPOIMappinController = minimapPOIMappinController;
-		vehicle = vehicleMappin.GetVehicle();
-		if( vehicle.IsPrevention() )
-		{
-			m_UIWantedBarDef = GetAllBlackboardDefs().UI_WantedBar;
-			m_uiWantedBarBB = GameInstance.GetBlackboardSystem( vehicle.GetGame() ).Get( m_UIWantedBarDef );
-			m_currentWantedLevelCallback = m_uiWantedBarBB.RegisterListenerInt( m_UIWantedBarDef.CurrentWantedLevel, this, 'OnCurrentWantedLevelChanged' );
-			m_playerWanted = m_uiWantedBarBB.GetInt( m_UIWantedBarDef.CurrentWantedLevel ) > 0;
-			m_minimapPOIMappinController.SetPulseWidgetTint( HDRColor( 1.0, 0.0, 0.0, 0.0 ) );
-			ActivatePingAnimation( m_playerWanted );
-		}
-		else
-		{
-			m_vehicleEntityID = vehicle.GetEntityID();
-			m_vehicleSummonDataDef = GetAllBlackboardDefs().VehicleSummonData;
-			m_vehicleSummonDataBB = GameInstance.GetBlackboardSystem( vehicle.GetGame() ).Get( m_vehicleSummonDataDef );
-			m_vehicleSummonStateCallback = m_vehicleSummonDataBB.RegisterListenerUint( m_vehicleSummonDataDef.SummonState, this, 'OnVehicleSummonStateChanged' );
-			m_minimapPOIMappinController.OverrideClamp( VehicleIsLatestSummoned() );
-		}
+		m_vehicle = vehicleMappin.GetVehicle();
+		m_uiVehicleBB = m_vehicle.GetBlackboard();
+		m_vehicleBBDef = GetAllBlackboardDefs().Vehicle;
+		m_deleteAnimCallback = m_uiVehicleBB.RegisterListenerName( m_vehicleBBDef.MinimapMappinDeleteAnim, this, 'OnDeleteAnimSet' );
+		m_vehicleEntityID = m_vehicle.GetEntityID();
+		m_vehicleSummonDataDef = GetAllBlackboardDefs().VehicleSummonData;
+		m_vehicleSummonDataBB = GameInstance.GetBlackboardSystem( m_vehicle.GetGame() ).Get( m_vehicleSummonDataDef );
+		m_vehicleSummonStateCallback = m_vehicleSummonDataBB.RegisterListenerUint( m_vehicleSummonDataDef.SummonState, this, 'OnVehicleSummonStateChanged' );
+		m_minimapPOIMappinController.OverrideClamp( VehicleIsLatestSummoned() );
 	}
 
 	public function OnUninitialize()
 	{
-		if( m_currentWantedLevelCallback )
+		if( m_deleteAnimCallback )
 		{
-			m_uiWantedBarBB.UnregisterListenerInt( m_UIWantedBarDef.CurrentWantedLevel, m_currentWantedLevelCallback );
+			m_uiVehicleBB.UnregisterListenerName( m_vehicleBBDef.MinimapMappinDeleteAnim, m_deleteAnimCallback );
 		}
 		if( m_vehicleSummonStateCallback )
 		{
 			m_vehicleSummonDataBB.UnregisterListenerUint( m_vehicleSummonDataDef.SummonState, m_vehicleSummonStateCallback );
+		}
+	}
+
+	public function OnAnimEnd()
+	{
+		if( m_destroyMappinOnAnimEnd )
+		{
+			m_vehicle.GetVehicleComponent().DestroyMappin();
 		}
 	}
 
@@ -1312,8 +1559,7 @@ class VehicleMinimapMappinComponent
 	{
 		if( activate )
 		{
-			m_minimapPOIMappinController.SetPulseWidgetTint( HDRColor( 1.0, 0.0, 0.0, 0.0 ) );
-			m_minimapPOIMappinController.PlayPingAnimation( true );
+			m_minimapPOIMappinController.PlayPingAnimation( true, 'Pulse_red_weak' );
 		}
 		else
 		{
@@ -1321,14 +1567,19 @@ class VehicleMinimapMappinComponent
 		}
 	}
 
-	protected event OnCurrentWantedLevelChanged( value : Int32 )
+	protected event OnDeleteAnimSet( deleteAnimName : CName )
 	{
-		var playerWanted : Bool;
-		playerWanted = value > 0;
-		if( m_playerWanted != playerWanted )
+		var animLaunched : Bool;
+		animLaunched = false;
+		if( IsNameValid( deleteAnimName ) )
 		{
-			ActivatePingAnimation( playerWanted );
-			m_playerWanted = playerWanted;
+			m_destroyMappinOnAnimEnd = true;
+			m_minimapPOIMappinController.StopPingAnimation( true );
+			animLaunched = m_minimapPOIMappinController.PlayPingAnimation( false, deleteAnimName );
+		}
+		if( !( animLaunched ) )
+		{
+			m_vehicle.GetVehicleComponent().DestroyMappin();
 		}
 	}
 
@@ -1341,6 +1592,65 @@ class VehicleMinimapMappinComponent
 		{
 			m_minimapPOIMappinController.PlayPingAnimation();
 		}
+	}
+
+}
+
+class PreventionMinimapMappinComponent
+{
+	private var m_minimapStealthMappinController : weak< MinimapStealthMappinController >;
+	private var m_uiWantedBarBB : weak< IBlackboard >;
+	private var m_uiWantedBarBBDef : UI_WantedBarDef;
+	private var m_currentWantedStateCallback : CallbackHandle;
+	private var m_playerWanted : Bool;
+	private var m_playerEscapingPursuit : Bool;
+	private var m_maxVisibilityDistance : Float;
+
+	public function OnInitialize( minimapStealthMappinController : weak< MinimapStealthMappinController >, gameObject : weak< GameObject > )
+	{
+		m_maxVisibilityDistance = TweakDBInterface.GetFloatDefault( T"RTDB.MappinUIPreventionSettings.preventionMappinMaxDistance" );
+		m_minimapStealthMappinController = minimapStealthMappinController;
+		m_uiWantedBarBBDef = GetAllBlackboardDefs().UI_WantedBar;
+		m_uiWantedBarBB = GameInstance.GetBlackboardSystem( gameObject.GetGame() ).Get( m_uiWantedBarBBDef );
+		m_currentWantedStateCallback = m_uiWantedBarBB.RegisterListenerName( m_uiWantedBarBBDef.CurrentChaseState, this, 'OnCurrentWantedStateChanged' );
+		m_playerWanted = m_uiWantedBarBB.GetInt( m_uiWantedBarBBDef.CurrentWantedLevel ) > 0;
+		UpdatePlayerEscapingPursuit( m_uiWantedBarBB.GetName( m_uiWantedBarBBDef.CurrentChaseState ) );
+	}
+
+	public function OnUninitialize()
+	{
+		if( m_currentWantedStateCallback )
+		{
+			m_uiWantedBarBB.UnregisterListenerName( m_uiWantedBarBBDef.CurrentChaseState, m_currentWantedStateCallback );
+		}
+	}
+
+	public function IsPlayerEscapingPursuit() : Bool
+	{
+		return m_playerEscapingPursuit;
+	}
+
+	public function CanShowMappin( distance : Float ) : Bool
+	{
+		return distance <= m_maxVisibilityDistance;
+	}
+
+	private function UpdatePlayerEscapingPursuit( value : CName )
+	{
+		if( value == 'Searching' || value == 'Dropping' )
+		{
+			m_playerEscapingPursuit = true;
+		}
+		else
+		{
+			m_playerEscapingPursuit = false;
+		}
+	}
+
+	protected event OnCurrentWantedStateChanged( value : CName )
+	{
+		UpdatePlayerEscapingPursuit( value );
+		m_minimapStealthMappinController.UpdateVisionWidgetVisiblity();
 	}
 
 }

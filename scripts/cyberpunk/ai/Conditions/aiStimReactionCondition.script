@@ -164,6 +164,10 @@ class PlayInitFearAnimation extends AIbehaviorconditionScript
 		{
 			return false;
 		}
+		if( activeReactionData.stimRecord.TagsContains( 'NoInitFearAnimation' ) )
+		{
+			return false;
+		}
 		return true;
 	}
 
@@ -205,28 +209,61 @@ class IsWorkspotReaction extends AIbehaviorconditionScript
 
 class IsValidCombatTarget extends AIbehaviorconditionScript
 {
+	editable var m_considerSourceAVehicleDriver : Bool;
 
 	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
 	{
+		var puppet : ScriptedPuppet;
+		var stimReactionComp : ReactionManagerComponent;
 		var activeReactionData : AIReactionData;
-		if( GetPuppet( context ).IsPrevention() )
+		var investigateData : stimInvestigateData;
+		var instigator : ScriptedPuppet;
+		var source : ScriptedPuppet;
+		var vehicle : VehicleObject;
+		var driverInstigator : weak< GameObject >;
+		puppet = GetPuppet( context );
+		stimReactionComp = puppet.GetStimReactionComponent();
+		activeReactionData = stimReactionComp.GetActiveOrDesiredReactionData();
+		stimReactionComp.LogStart( EReactLogSource.BehaviorCombatCheck, "IsValidCombatTarget check" );
+		if( activeReactionData.stimRecord.TagsContains( 'NoAutoCombatStart' ) )
 		{
+			stimReactionComp.LogFailure( "this stim can not start combat" );
 			return false;
 		}
-		activeReactionData = GetPuppet( context ).GetStimReactionComponent().GetActiveReactionData();
-		if( !( activeReactionData ) )
+		investigateData = activeReactionData.stimInvestigateData;
+		instigator = ( ( ScriptedPuppet )( investigateData.attackInstigator ) );
+		source = ( ( ScriptedPuppet )( activeReactionData.stimEventData.source ) );
+		vehicle = ( ( VehicleObject )( activeReactionData.stimEventData.source ) );
+		if( ( !( source ) && vehicle ) && m_considerSourceAVehicleDriver )
 		{
-			activeReactionData = GetPuppet( context ).GetStimReactionComponent().GetDesiredReactionData();
+			driverInstigator = VehicleComponent.GetDriver( puppet.GetGame(), vehicle, vehicle.GetEntityID() );
+			source = ( ( ScriptedPuppet )( driverInstigator ) );
 		}
-		if( activeReactionData.stimType == gamedataStimType.Dying )
+		if( puppet.IsPrevention() && !( IsValidForPrevention( instigator, source ) ) )
 		{
+			stimReactionComp.LogFailure( "non-player combat stim can't start prevention combat" );
 			return false;
 		}
-		if( activeReactionData.stimType == gamedataStimType.CombatHit )
+		if( stimReactionComp.ShouldIgnoreCombatStim( activeReactionData.stimType, instigator, source, activeReactionData.stimSource, true ) )
 		{
+			stimReactionComp.LogFailure( "combat stim explicitely ignored" );
 			return false;
 		}
+		stimReactionComp.LogSuccess( "combat can be started" );
 		return true;
+	}
+
+	private function IsValidForPrevention( instigator : ScriptedPuppet, source : ScriptedPuppet ) : Bool
+	{
+		if( source )
+		{
+			return source.IsPlayer();
+		}
+		if( instigator )
+		{
+			return instigator.IsPlayer();
+		}
+		return false;
 	}
 
 }
@@ -282,12 +319,29 @@ class CheckLastTriggeredStimuli extends AIbehaviorconditionScript
 	{
 		var stimSourcePos : Vector4;
 		var stimuliCache : array< StimEventTaskData >;
+		var stimuliEvent : StimuliEvent;
 		stimuliCache = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetStimReactionComponent().GetStimuliCache();
 		if( stimuliCache.Size() != 0 )
 		{
-			stimSourcePos = stimuliCache[ stimuliCache.Size() - 1 ].cachedEvt.sourcePosition;
+			stimuliEvent = stimuliCache[ stimuliCache.Size() - 1 ].cachedEvt;
+			if( stimuliEvent.GetStimType() == gamedataStimType.Whistle || stimuliEvent.GetStimType() == gamedataStimType.CombatWhistle )
+			{
+				return false;
+			}
+			stimSourcePos = stimuliEvent.sourcePosition;
 			if( !( Vector4.IsZero( stimSourcePos ) ) )
 			{
+				if( stimuliEvent.GetStimType() == gamedataStimType.CrimeWitness )
+				{
+					if( PreventionSystem.IsChasingPlayer( ScriptExecutionContext.GetOwner( context ).GetGame() ) && ( stimuliEvent.sourceObject.GetEntityID() == PreventionSystem.GetLastKnownPlayerVehicle( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetEntityID() ) )
+					{
+						PreventionSystem.SetLastKnownPlayerPosition( ScriptExecutionContext.GetOwner( context ).GetGame(), PreventionSystem.GetLastKnownPlayerVehicle( ScriptExecutionContext.GetOwner( context ).GetGame() ).GetWorldPosition() );
+						if( !( VehicleComponent.IsMountedToVehicle( ScriptExecutionContext.GetOwner( context ).GetGame(), ScriptExecutionContext.GetOwner( context ) ) ) )
+						{
+							return false;
+						}
+					}
+				}
 				ScriptExecutionContext.SetArgumentVector( context, 'StimSource', stimSourcePos );
 				return true;
 			}
@@ -395,39 +449,41 @@ class ShouldNPCContinueInAlerted extends AIbehaviorconditionScript
 	protected export override function Check( context : ScriptExecutionContext ) : AIbehaviorConditionOutcomes
 	{
 		var puppet : ScriptedPuppet;
-		var reactionComponent : ReactionManagerComponent;
 		var aiComponent : AIHumanComponent;
-		var NPCIgnoreList : array< EntityID >;
-		var timestamp : Float;
+		var reactionComponent : ReactionManagerComponent;
+		var npcIgnoreList : array< EntityID >;
+		var alertedWithCorpses : Bool;
+		var searchEndTimestamp : Float;
+		alertedWithCorpses = false;
 		puppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
-		reactionComponent = puppet.GetStimReactionComponent();
-		NPCIgnoreList = reactionComponent.GetIgnoreList();
-		if( puppet.IsConnectedToSecuritySystem() )
-		{
-			if( reactionComponent.IsAlertedByDeadBody() )
-			{
-				return true;
-			}
-			if( puppet.GetSecuritySystem().IsReprimandOngoing() )
-			{
-				return true;
-			}
-			if( NPCIgnoreList.Size() != 0 )
-			{
-				return true;
-			}
-		}
 		aiComponent = puppet.GetAIControllerComponent();
 		if( ( aiComponent && aiComponent.GetAIRole().GetRoleEnum() == EAIRole.Patrol ) && aiComponent.GetAIPatrolBlackboard().GetBool( GetAllBlackboardDefs().AIPatrol.forceAlerted ) )
 		{
 			return true;
 		}
-		timestamp = ScriptExecutionContext.GetArgumentFloat( context, 'SearchingStarted' );
-		if( ( timestamp + 15.0 ) > EngineTime.ToFloat( GameInstance.GetSimTime( ScriptExecutionContext.GetOwner( context ).GetGame() ) ) )
+		if( puppet.IsConnectedToSecuritySystem() )
 		{
-			return true;
+			if( puppet.GetSecuritySystem().IsReprimandOngoing() )
+			{
+				return true;
+			}
+			reactionComponent = puppet.GetStimReactionComponent();
+			npcIgnoreList = reactionComponent.GetIgnoreList();
+			if( reactionComponent.IsAlertedByDeadBody() || ( npcIgnoreList.Size() > 0 ) )
+			{
+				alertedWithCorpses = true;
+			}
 		}
-		return false;
+		searchEndTimestamp = ScriptExecutionContext.GetArgumentFloat( context, 'SearchingStarted' );
+		if( alertedWithCorpses )
+		{
+			searchEndTimestamp += TweakDBInterface.GetFloat( T"AIGeneralSettings.alertedSearchDurationWithCorpses", 5.0 );
+		}
+		else
+		{
+			searchEndTimestamp += TweakDBInterface.GetFloat( T"AIGeneralSettings.alertedSearchDurationNormal", 5.0 );
+		}
+		return searchEndTimestamp > EngineTime.ToFloat( GameInstance.GetSimTime( ScriptExecutionContext.GetOwner( context ).GetGame() ) );
 	}
 
 }
@@ -587,6 +643,10 @@ class ReactAfterDodge extends AIbehaviorconditionScript
 		var mountInfo : MountingInfo;
 		var ownerPuppet : ScriptedPuppet;
 		ownerPuppet = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		if( ScriptedPuppet.IsPlayerFollower( ScriptExecutionContext.GetOwner( context ) ) )
+		{
+			return false;
+		}
 		if( ownerPuppet.IsCrowd() )
 		{
 			return true;

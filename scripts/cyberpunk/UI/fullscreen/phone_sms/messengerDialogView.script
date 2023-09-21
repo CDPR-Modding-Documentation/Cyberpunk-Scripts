@@ -1,6 +1,10 @@
 class DelayedJournalUpdate extends Event
 {
 	var m_newMessageSpawned : Bool;
+	var m_typing : Bool;
+	var m_delay : Float;
+	var m_entryHash : Uint32;
+	var m_parentHash : Int32;
 }
 
 class MessageThreadReadEvent extends Event
@@ -8,27 +12,48 @@ class MessageThreadReadEvent extends Event
 	var m_parentHash : Int32;
 }
 
+class TypingDelayEvent extends Event
+{
+	var m_conversationHash : Int32;
+	var m_contactHash : Int32;
+}
+
 class MessengerDialogViewController extends inkLogicController
 {
 	private editable var m_messagesList : inkCompoundRef;
 	private editable var m_choicesList : inkCompoundRef;
 	private editable var m_replayFluff : inkCompoundRef;
+	private editable var m_typingFluff : inkWidgetRef;
+	private editable var m_typingIndicator : inkWidgetRef;
 	private var m_messagesListController : weak< JournalEntriesListController >;
 	private var m_choicesListController : weak< JournalEntriesListController >;
 	private var m_scrollController : weak< inkScrollController >;
+	private var m_typingIndicatorController : weak< MessengerTypingIndicator >;
 	private var m_journalManager : weak< JournalManager >;
+	private var m_playerObject : weak< GameObject >;
+	private var m_delaySystem : weak< DelaySystem >;
+	private var m_delayedTypingCallbackId : DelayID;
 	private var m_replyOptions : array< weak< JournalEntry > >;
 	private var m_messages : array< weak< JournalEntry > >;
 	private var m_parentEntry : weak< JournalEntry >;
+	private var m_parentHash : Int32;
+	private var m_typingAnimProxy : inkAnimProxy;
+	private var m_delayTypingAnimProxy : inkAnimProxy;
 	private var m_singleThreadMode : Bool;
-	private var m_newMessageAninmProxy : inkAnimProxy;
+	private var m_hasFocus : Bool;
+	var m_audioSystem : weak< AudioSystem >;
+	private var m_minimumTypingDelay : Float;
+	default m_minimumTypingDelay = 0;
 
 	protected event OnInitialize()
 	{
+		m_typingIndicatorController = ( ( MessengerTypingIndicator )( inkWidgetRef.GetControllerByType( m_typingIndicator, 'MessengerTypingIndicator' ) ) );
 		m_messagesListController = ( ( JournalEntriesListController )( inkCompoundRef.GetController( m_messagesList ) ) );
 		m_choicesListController = ( ( JournalEntriesListController )( inkCompoundRef.GetController( m_choicesList ) ) );
 		m_scrollController = ( ( inkScrollController )( GetRootWidget().GetControllerByType( 'inkScrollController' ) ) );
 		m_choicesListController.RegisterToCallback( 'OnItemActivated', this, 'OnPlayerReplyActivated' );
+		inkWidgetRef.SetVisible( m_typingFluff, false );
+		PlayDotsAnimation();
 	}
 
 	protected event OnUninitialize()
@@ -40,6 +65,14 @@ class MessengerDialogViewController extends inkLogicController
 	{
 		m_journalManager = journalManager;
 		m_journalManager.RegisterScriptCallback( this, 'OnJournalUpdate', gameJournalListenerType.State );
+		m_journalManager.RegisterScriptCallback( this, 'OnJournalUpdateDelayed', gameJournalListenerType.StateDelay );
+	}
+
+	public function InitDelaySystem( playerObject : weak< GameObject > )
+	{
+		m_playerObject = playerObject;
+		m_delaySystem = GameInstance.GetDelaySystem( m_playerObject.GetGame() );
+		m_audioSystem = GameInstance.GetAudioSystem( m_playerObject.GetGame() );
 	}
 
 	public function DetachJournalManager()
@@ -47,32 +80,52 @@ class MessengerDialogViewController extends inkLogicController
 		if( m_journalManager )
 		{
 			m_journalManager.UnregisterScriptCallback( this, 'OnJournalUpdate' );
+			m_journalManager.UnregisterScriptCallback( this, 'OnJournalUpdateDelayed' );
 			m_journalManager = NULL;
 		}
 	}
 
 	public function ShowDialog( contact : weak< JournalEntry > )
 	{
+		ShowDialog( contact, true );
+	}
+
+	public function ShowDialog( contact : weak< JournalEntry >, setVisited : Bool )
+	{
 		m_singleThreadMode = false;
 		m_parentEntry = contact;
+		m_parentHash = m_journalManager.GetEntryHash( m_parentEntry );
 		m_replyOptions.Clear();
 		m_messages.Clear();
-		UpdateData();
+		UpdateData( false, setVisited );
 	}
 
 	public function ShowThread( thread : weak< JournalEntry > )
 	{
+		ShowThread( thread, true );
+	}
+
+	public function ShowThread( thread : weak< JournalEntry >, setVisited : Bool )
+	{
 		m_singleThreadMode = true;
 		m_parentEntry = thread;
+		m_parentHash = m_journalManager.GetEntryHash( m_parentEntry );
 		m_replyOptions.Clear();
 		m_messages.Clear();
-		UpdateData();
+		UpdateData( false, setVisited );
 	}
 
 	public function UpdateData( optional animateLastMessage : Bool )
 	{
+		UpdateData( animateLastMessage, true );
+	}
+
+	public function UpdateData( animateLastMessage : Bool, setVisited : Bool )
+	{
 		var countMessages : Int32;
 		var lastMessageWidget : weak< inkWidget >;
+		var widgetState : CName;
+		StopDotsAnimation();
 		if( m_singleThreadMode )
 		{
 			m_journalManager.GetMessagesAndChoices( m_parentEntry, m_messages, m_replyOptions );
@@ -82,27 +135,34 @@ class MessengerDialogViewController extends inkLogicController
 			m_journalManager.GetFlattenedMessagesAndChoices( m_parentEntry, m_messages, m_replyOptions );
 		}
 		inkCompoundRef.SetVisible( m_replayFluff, m_replyOptions.Size() > 0 );
-		SetVisited( m_messages );
+		if( setVisited )
+		{
+			SetVisited( m_messages );
+		}
 		m_messagesListController.Clear();
 		m_messagesListController.PushEntries( m_messages );
 		m_choicesListController.Clear();
 		m_choicesListController.PushEntries( m_replyOptions );
 		if( m_replyOptions.Size() > 0 )
 		{
+			SetFocus( m_hasFocus );
 			m_choicesListController.SetSelectedIndex( 0 );
 		}
-		if( m_newMessageAninmProxy )
-		{
-			m_newMessageAninmProxy.Stop();
-			m_newMessageAninmProxy = NULL;
-		}
 		countMessages = m_messagesListController.Size();
-		if( animateLastMessage && ( countMessages > 0 ) )
+		if( countMessages > 0 )
 		{
 			lastMessageWidget = m_messagesListController.GetItemAt( countMessages - 1 );
 			if( lastMessageWidget )
 			{
-				m_newMessageAninmProxy = PlayLibraryAnimationOnAutoSelectedTargets( 'new_message', lastMessageWidget );
+				widgetState = lastMessageWidget.GetState();
+				if( widgetState == 'Player' || widgetState == 'Quest' )
+				{
+					PlayLibraryAnimationOnAutoSelectedTargets( 'reply_sent', lastMessageWidget );
+				}
+				else if( animateLastMessage )
+				{
+					PlayLibraryAnimationOnAutoSelectedTargets( 'reply_sent', lastMessageWidget );
+				}
 			}
 		}
 		m_scrollController.SetScrollPosition( 1.0 );
@@ -111,22 +171,67 @@ class MessengerDialogViewController extends inkLogicController
 	protected event OnJournalUpdate( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType )
 	{
 		var updateEvent : DelayedJournalUpdate;
+		var parentEntryHash : Int32;
 		if( ( className == 'gameJournalPhoneMessage' || className == 'gameJournalPhoneChoiceGroup' ) || className == 'gameJournalPhoneChoiceEntry' )
 		{
+			parentEntryHash = GetParentEntryHash( entryHash );
 			updateEvent = new DelayedJournalUpdate;
 			updateEvent.m_newMessageSpawned = className == 'gameJournalPhoneMessage' || className == 'gameJournalPhoneChoiceEntry';
+			updateEvent.m_typing = false;
+			updateEvent.m_parentHash = parentEntryHash;
+			QueueEvent( updateEvent );
+		}
+	}
+
+	protected event OnJournalUpdateDelayed( entryHash : Uint32, className : CName, notifyOption : JournalNotifyOption, changeType : JournalChangeType, delay : Float )
+	{
+		var updateEvent : DelayedJournalUpdate;
+		var parentEntryHash : Int32;
+		if( className == 'gameJournalPhoneMessage' )
+		{
+			parentEntryHash = GetParentEntryHash( entryHash );
+			updateEvent = new DelayedJournalUpdate;
+			updateEvent.m_newMessageSpawned = false;
+			updateEvent.m_typing = true;
+			updateEvent.m_entryHash = entryHash;
+			updateEvent.m_delay = delay;
+			updateEvent.m_parentHash = parentEntryHash;
 			QueueEvent( updateEvent );
 		}
 	}
 
 	protected event OnDelayedJournalUpdate( evt : DelayedJournalUpdate )
 	{
-		UpdateData( evt.m_newMessageSpawned );
+		if( !( evt.m_typing ) )
+		{
+			UpdateData( evt.m_newMessageSpawned && ( evt.m_parentHash == m_parentHash ) );
+			if( evt.m_newMessageSpawned )
+			{
+				PlayRumble( RumbleStrength.SuperLight, RumbleType.Pulse, RumblePosition.Left );
+				m_audioSystem.Play( 'ui_messenger_recieved' );
+			}
+		}
+		else
+		{
+			TriggerDotsAnimation( evt.m_delay, evt.m_entryHash );
+		}
 	}
 
 	protected event OnPlayerReplyActivated( index : Int32, target : ListItemController )
 	{
+		m_audioSystem.Play( 'ui_messenger_select' );
 		ActivateReply( target );
+	}
+
+	private function GetParentEntryHash( entryHash : Uint32 ) : Int32
+	{
+		var entry : JournalEntry;
+		var parentEntry : JournalEntry;
+		var parentEntryHash : Int32;
+		entry = m_journalManager.GetEntry( entryHash );
+		parentEntry = m_journalManager.GetParentEntry( entry );
+		parentEntryHash = m_journalManager.GetEntryHash( parentEntry );
+		return parentEntryHash;
 	}
 
 	public function ActivateSelectedReplyOption()
@@ -138,7 +243,14 @@ class MessengerDialogViewController extends inkLogicController
 			itemWidget = m_choicesListController.GetItemAt( m_choicesListController.GetSelectedIndex() );
 			target = ( ( ListItemController )( itemWidget.GetController() ) );
 			ActivateReply( target );
+			m_audioSystem.Play( 'ui_messenger_select' );
+			PlayRumble( RumbleStrength.SuperLight, RumbleType.Pulse, RumblePosition.Right );
 		}
+	}
+
+	public function ScrollMessages( value : Float, isMouseWheel : Bool )
+	{
+		m_scrollController.Scroll( value, isMouseWheel );
 	}
 
 	public function NavigateReplyOptions( isUp : Bool )
@@ -180,7 +292,34 @@ class MessengerDialogViewController extends inkLogicController
 		m_journalManager.ChangeEntryStateByHash( ( ( Uint32 )( m_journalManager.GetEntryHash( data.m_entry ) ) ), gameJournalEntryState.Succeeded, JournalNotifyOption.Notify );
 	}
 
-	private function SetVisited( records : array< weak< JournalEntry > > )
+	public function SetFocus( focused : Bool )
+	{
+		m_hasFocus = focused;
+		RefreshChoicesFocus();
+	}
+
+	private function RefreshChoicesFocus()
+	{
+		var i : Int32;
+		var renderer : weak< MessangerReplyItemRenderer >;
+		var widget : weak< inkWidget >;
+		for( i = 0; i < m_choicesListController.Size(); i += 1 )
+		{
+			widget = m_choicesListController.GetItemAt( i );
+			renderer = ( ( MessangerReplyItemRenderer )( widget.GetController() ) );
+			if( renderer != NULL )
+			{
+				renderer.SetActive( m_hasFocus );
+			}
+		}
+	}
+
+	public function SetCurrentMessagesAsVisited()
+	{
+		SetVisited( m_messages );
+	}
+
+	private function SetVisited( const records : ref< array< weak< JournalEntry > > > )
 	{
 		var threadReadEvent : MessageThreadReadEvent;
 		var entry : weak< JournalEntry >;
@@ -199,8 +338,159 @@ class MessengerDialogViewController extends inkLogicController
 		if( needEvent )
 		{
 			threadReadEvent = new MessageThreadReadEvent;
-			threadReadEvent.m_parentHash = m_journalManager.GetEntryHash( m_parentEntry );
+			threadReadEvent.m_parentHash = m_parentHash;
 			QueueEvent( threadReadEvent );
+		}
+	}
+
+	private function TriggerDotsAnimation( delay : Float, hash : Uint32 )
+	{
+		var delayedEvent : TypingDelayEvent;
+		var lastMsg : weak< JournalPhoneMessage >;
+		var newMsg : weak< JournalPhoneMessage >;
+		var contact : weak< JournalContact >;
+		var conversationEntry : weak< JournalPhoneConversation >;
+		var currentTypingDuration : Float;
+		if( m_delaySystem )
+		{
+			m_delaySystem.CancelCallback( m_delayedTypingCallbackId );
+			lastMsg = ( ( JournalPhoneMessage )( m_messages.Last() ) );
+			newMsg = ( ( JournalPhoneMessage )( m_journalManager.GetEntry( hash ) ) );
+			contact = m_journalManager.GetContactByMessage( newMsg );
+			conversationEntry = ( ( JournalPhoneConversation )( m_journalManager.GetParentEntry( newMsg ) ) );
+			if( newMsg.GetSender() == gameMessageSender.Player )
+			{
+				m_typingIndicatorController.SetPlayerTypingStyle( true );
+			}
+			else
+			{
+				m_typingIndicatorController.SetPlayerTypingStyle( false );
+				m_typingIndicatorController.SetName( contact.GetLocalizedName( m_journalManager ) );
+			}
+			if( delay > m_minimumTypingDelay )
+			{
+				if( lastMsg.GetSender() != newMsg.GetSender() )
+				{
+					currentTypingDuration = delay * 0.5;
+				}
+				else
+				{
+					currentTypingDuration = ( delay * 0.34999999 ) * RandF();
+				}
+				delayedEvent = new TypingDelayEvent;
+				delayedEvent.m_conversationHash = ( ( conversationEntry != NULL ) ? ( m_journalManager.GetEntryHash( conversationEntry ) ) : ( -1 ) );
+				delayedEvent.m_contactHash = m_journalManager.GetEntryHash( contact );
+				m_delayedTypingCallbackId = m_delaySystem.DelayEvent( m_playerObject, delayedEvent, currentTypingDuration, false );
+			}
+			else
+			{
+				PlayDotsAnimation();
+			}
+		}
+	}
+
+	public function PlayDotsAnimation()
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.loopInfinite = true;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		m_typingAnimProxy = PlayLibraryAnimation( 'TypigDots', playbackOptions );
+		inkWidgetRef.SetVisible( m_typingFluff, true );
+		m_audioSystem.Play( 'ui_messenger_typing' );
+	}
+
+	private function StopDotsAnimation()
+	{
+		if( m_typingAnimProxy )
+		{
+			m_typingAnimProxy.Stop();
+		}
+		if( m_delaySystem )
+		{
+			m_delaySystem.CancelCallback( m_delayedTypingCallbackId );
+		}
+		inkWidgetRef.SetVisible( m_typingFluff, false );
+	}
+
+
+	private var m_breakingTypingAnimProxy : inkAnimProxy;
+
+	protected event OnBreakingTypingShown( proxy : inkAnimProxy )
+	{
+		var anim : inkAnimDef;
+		var interop : inkAnimTransparency;
+		if( m_breakingTypingAnimProxy )
+		{
+			m_breakingTypingAnimProxy.Stop();
+		}
+		anim = new inkAnimDef;
+		interop = new inkAnimTransparency;
+		interop.SetStartTransparency( 1.0 );
+		interop.SetEndTransparency( 1.0 );
+		interop.SetDuration( 1.5 );
+		anim.AddInterpolator( interop );
+		m_breakingTypingAnimProxy = inkWidgetRef.PlayAnimation( m_typingFluff, anim );
+		m_breakingTypingAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnBreakingTypingHiden' );
+		inkWidgetRef.SetOpacity( m_typingFluff, 1.0 );
+	}
+
+	protected event OnBreakingTypingHiden( proxy : inkAnimProxy )
+	{
+		var anim : inkAnimDef;
+		var interop : inkAnimTransparency;
+		anim = new inkAnimDef;
+		interop = new inkAnimTransparency;
+		interop.SetStartTransparency( 1.0 );
+		interop.SetEndTransparency( 1.0 );
+		interop.SetDuration( 0.5 );
+		anim.AddInterpolator( interop );
+		m_breakingTypingAnimProxy = inkWidgetRef.PlayAnimation( m_typingFluff, anim );
+		m_breakingTypingAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnBreakingTypingFinal' );
+		inkWidgetRef.SetOpacity( m_typingFluff, 0.002 );
+	}
+
+	protected event OnBreakingTypingFinal( proxy : inkAnimProxy )
+	{
+		inkWidgetRef.SetOpacity( m_typingFluff, 1.0 );
+	}
+
+}
+
+class MessengerTypingIndicator extends inkLogicController
+{
+	private editable var m_container : inkWidgetRef;
+	private editable var m_nameText : inkTextRef;
+	private var m_textParams : inkTextParams;
+
+	protected event OnInitialize() {}
+
+	public function SetName( const contactName : ref< String > )
+	{
+		if( !( m_textParams ) )
+		{
+			m_textParams = new inkTextParams;
+			m_textParams.AddString( "contact_name", GetLocalizedText( contactName ) );
+			inkTextRef.SetLocalizedText( m_nameText, 'UI-Phone-isTyping', m_textParams );
+		}
+		else
+		{
+			m_textParams.UpdateString( "contact_name", GetLocalizedText( contactName ) );
+		}
+	}
+
+	public function SetPlayerTypingStyle( isPlayer : Bool )
+	{
+		if( isPlayer )
+		{
+			inkWidgetRef.SetState( m_container, 'Player' );
+			inkWidgetRef.SetHAlign( m_container, inkEHorizontalAlign.Right );
+			inkTextRef.SetVisible( m_nameText, false );
+		}
+		else
+		{
+			inkWidgetRef.SetState( m_container, 'Default' );
+			inkWidgetRef.SetHAlign( m_container, inkEHorizontalAlign.Left );
+			inkTextRef.SetVisible( m_nameText, true );
 		}
 	}
 

@@ -1,3 +1,42 @@
+import enum inkLifePath : Uint8
+{
+	Corporate,
+	StreetKid,
+	Nomad,
+	Invalid,
+}
+
+import enum inkSaveType : Uint8
+{
+	ManualSave,
+	QuickSave,
+	AutoSave,
+	PointOfNoReturn,
+	EndGameSave,
+}
+
+import enum inkSaveStatus : Uint8
+{
+	Invalid,
+	Local,
+	Upload,
+	Cloud,
+	InSync,
+}
+
+import enum inkSaveTransferStatus : Uint8
+{
+	ExportStarted,
+	ExportSuccess,
+	ExportFailed,
+	ImportChecking,
+	ImportStarted,
+	ImportSuccess,
+	ImportNoSave,
+	ImportFailed,
+	ImportNotEnoughSpace,
+}
+
 import class SaveMetadataInfo extends IScriptable
 {
 	import var saveIndex : Int32;
@@ -17,6 +56,13 @@ import class SaveMetadataInfo extends IScriptable
 	import var isValid : Bool;
 	import var isModded : Bool;
 	import var platform : String;
+	import var additionalContentIds : array< CName >;
+
+	public function IsEp1Save() : Bool
+	{
+		return additionalContentIds.Contains( 'EP1' );
+	}
+
 }
 
 class LoadGameMenuGameController extends gameuiSaveHandlingController
@@ -29,6 +75,7 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private editable var m_animDelayBetweenSlots : Float;
 	private editable var m_animDelayForMainSlot : Float;
 	private editable var m_enableLoadingTransition : Bool;
+	default m_enableLoadingTransition = true;
 	private editable var m_gogButtonWidgetRef : inkWidgetRef;
 	private editable var m_gogContainer : inkWidgetRef;
 	private editable var m_laodingSpinner : inkWidgetRef;
@@ -38,6 +85,7 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private var m_saveInfo : SaveMetadataInfo;
 	private var m_buttonHintsController : weak< ButtonHints >;
 	private var m_saveToLoadIndex : Int32;
+	private var m_saveToLoadID : Uint64;
 	private var m_isInputDisabled : Bool;
 	private var m_saveTransferPopupToken : inkGameNotificationToken;
 	private var m_saves : array< String >;
@@ -46,6 +94,9 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private var m_onlineSystem : weak< IOnlineSystem >;
 	private var m_systemHandler : weak< inkISystemRequestsHandler >;
 	private var m_pendingRegistration : Bool;
+	private var m_isEp1Enabled : Bool;
+	private var m_animProxy : inkAnimProxy;
+	private var m_sourceIndex : Int32;
 
 	protected event OnInitialize()
 	{
@@ -56,6 +107,7 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		m_systemHandler.RegisterToCallback( 'OnSaveDeleted', this, 'OnSaveDeleted' );
 		m_systemHandler.RegisterToCallback( 'OnGogLoginStatusChanged', this, 'OnGogLoginStatusChanged' );
 		m_systemHandler.RegisterToCallback( 'OnCloudSavesQueryStatusChanged', this, 'OnCloudSavesQueryStatusChanged' );
+		m_systemHandler.RegisterToCallback( 'OnCloudSaveUploadFinish', this, 'OnCloudSaveUploadFinish' );
 		m_systemHandler.RequestSavesForLoad();
 		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
 		PlayLibraryAnimation( 'intro' );
@@ -64,12 +116,11 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		m_isInputDisabled = false;
 		InitCrossProgression();
 		PlayLoadingAnimation();
+		m_isEp1Enabled = IsEP1();
 	}
 
 	protected event OnUninitialize()
 	{
-		m_systemHandler.CancelSavesRequest();
-		m_systemHandler.CancelSavedGameScreenshotRequests();
 		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
 		if( GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ) )
 		{
@@ -165,7 +216,7 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		}
 	}
 
-	private function SetupLoadItems( saves : array< String > )
+	private function SetupLoadItems( const saves : ref< array< String > > )
 	{
 		var i : Int32;
 		for( i = 0; i < saves.Size(); i += 1 )
@@ -219,7 +270,6 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private function LoadGame( controller : LoadListItem )
 	{
 		var animOptions : inkAnimOptions;
-		var animProxy : inkAnimProxy;
 		if( controller.IsModded() )
 		{
 			LoadModdedSave( controller.Index() );
@@ -227,12 +277,13 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		else if( GetSystemRequestsHandler().IsPreGame() )
 		{
 			PreSpawnInitialLoadingScreen( controller.GetInitialLoadingID() );
-			animProxy = PlayLibraryAnimation( m_transitToLoadingAnimName, animOptions );
+			m_animProxy = PlayLibraryAnimation( m_transitToLoadingAnimName, animOptions );
 			if( m_enableLoadingTransition )
 			{
-				PlayTransitionAnimOnButtons( controller.Index() );
-				animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnTransitionFinished' );
+				PlayTransitionAnimOnButtons( controller.Index(), false );
+				m_animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnTransitionFinishedPreGame' );
 				m_saveToLoadIndex = controller.Index();
+				m_saveToLoadID = controller.GetInitialLoadingID();
 				m_isInputDisabled = true;
 			}
 			else
@@ -242,36 +293,49 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		}
 		else
 		{
+			m_animProxy = PlayLibraryAnimation( m_transitToLoadingAnimName, animOptions );
 			LoadSaveInGame( controller.Index() );
+			if( m_enableLoadingTransition )
+			{
+				PlayTransitionAnimOnButtons( controller.Index(), false );
+			}
 		}
 	}
 
-	private function PlayTransitionAnimOnButtons( sourceIndex : Int32 )
+	private function PlayTransitionAnimOnButtons( sourceIndex : Int32, reverse : Bool )
 	{
 		var i : Int32;
+		m_sourceIndex = sourceIndex;
 		for( i = 0; i < sourceIndex; i += 1 )
 		{
-			PlayTransitionAnimOnButton( i, sourceIndex - i );
+			PlayTransitionAnimOnButton( i, sourceIndex - i, reverse );
 		}
 		for( i = sourceIndex + 1; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
 		{
-			PlayTransitionAnimOnButton( i, i - sourceIndex );
+			PlayTransitionAnimOnButton( i, i - sourceIndex, reverse );
 		}
-		PlayTransitionAnimOnButton( sourceIndex, m_animDelayForMainSlot );
 	}
 
-	private function PlayTransitionAnimOnButton( index : Int32, distanceFromSource : Int32 )
+	private function PlayTransitionAnimOnButton( index : Int32, distanceFromSource : Int32, reverse : Bool )
 	{
-		PlayTransitionAnimOnButton( index, m_animDelayBetweenSlots * ( ( Float )( distanceFromSource ) ) );
+		PlayTransitionAnimOnButton( index, m_animDelayBetweenSlots * ( ( Float )( distanceFromSource ) ), reverse );
 	}
 
-	private function PlayTransitionAnimOnButton( index : Int32, delay : Float )
+	protected event OnLoadSaveInGameCanceled()
+	{
+		PlayTransitionAnimOnButtons( m_sourceIndex, true );
+	}
+
+	private function PlayTransitionAnimOnButton( index : Int32, delay : Float, reverse : Bool )
 	{
 		var animOptions : inkAnimOptions;
 		var targetWidget : weak< inkWidget >;
+		var targetController : weak< LoadListItem >;
 		animOptions.executionDelay = delay;
+		animOptions.playReversed = reverse;
 		targetWidget = inkCompoundRef.GetWidgetByIndex( m_list, index );
-		targetWidget.GetController().PlayLibraryAnimation( m_transitToLoadingSlotAnimName, animOptions );
+		targetController = ( ( LoadListItem )( targetWidget.GetController() ) );
+		targetController.PlayTransitionAnimation( m_transitToLoadingSlotAnimName, animOptions );
 	}
 
 	private function GogLogin()
@@ -314,6 +378,12 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		LoadSaveInGame( m_saveToLoadIndex );
 	}
 
+	protected event OnTransitionFinishedPreGame( anim : inkAnimProxy )
+	{
+		PreSpawnInitialLoadingScreen( m_saveToLoadID );
+		LoadSaveInGame( m_saveToLoadIndex );
+	}
+
 	protected event OnSaveDeleted( result : Bool, idx : Int32 )
 	{
 		var i : Int32;
@@ -342,7 +412,6 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	{
 		var handler : weak< inkISystemRequestsHandler >;
 		handler = GetSystemRequestsHandler();
-		handler.CancelSavesRequest();
 		handler.RequestSavesForLoad();
 	}
 
@@ -357,6 +426,13 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	{
 		m_cloudSynced = true;
 		UpdateSavesList();
+	}
+
+	protected event OnCloudSaveUploadFinish( success : Bool )
+	{
+		var handler : weak< inkISystemRequestsHandler >;
+		handler = GetSystemRequestsHandler();
+		handler.RequestSavesForLoad();
 	}
 
 	private function UpdateSavesList()
@@ -391,7 +467,7 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 			{
 				if( info.isValid )
 				{
-					controller.SetMetadata( info );
+					controller.SetMetadata( info, m_isEp1Enabled );
 					controller.CheckThumbnailCensorship( !( characterCustomizationSystem.IsNudityAllowed() ) );
 				}
 				else
@@ -443,6 +519,7 @@ class LoadListItem extends AnimatedListItemController
 	private var m_metadata : SaveMetadataInfo;
 	private const var m_defaultAtlasPath : ResRef;
 	default m_defaultAtlasPath = R"base\gameplay\gui\fullscreen\load_game\save_game.inkatlas";
+	private var m_tranistionAnimProxy : inkAnimProxy;
 
 	protected event OnInitialize()
 	{
@@ -468,7 +545,16 @@ class LoadListItem extends AnimatedListItemController
 		inkTextRef.SetLocalizedText( m_gameVersion, 'UI-Settings-Audio-GameVersion', m_versionParams );
 	}
 
-	public function SetMetadata( metadata : SaveMetadataInfo )
+	public function PlayTransitionAnimation( animName : CName, animOptions : inkAnimOptions )
+	{
+		if( m_tranistionAnimProxy.IsPlaying() )
+		{
+			m_tranistionAnimProxy.GotoEndAndStop();
+		}
+		m_tranistionAnimProxy = PlayLibraryAnimation( animName, animOptions );
+	}
+
+	public function SetMetadata( metadata : SaveMetadataInfo, optional isEp1Enabled : Bool )
 	{
 		var hrs, mins, lvl : Int32;
 		var shrs, smins : String;
@@ -488,9 +574,20 @@ class LoadListItem extends AnimatedListItemController
 		inkTextRef.SetVisible( m_characterLevel, true );
 		inkTextRef.SetVisible( m_characterLevelLabel, true );
 		inkTextRef.SetVisible( m_gameVersion, true );
-		inkTextRef.SetText( m_label, metadata.trackedQuest );
-		inkTextRef.SetText( m_quest, metadata.internalName );
-		inkTextRef.SetText( m_type, metadata.locationName );
+		if( !( isEp1Enabled ) && metadata.IsEp1Save() )
+		{
+			inkTextRef.SetText( m_label, "LocKey#92500" );
+			inkTextRef.SetVisible( m_quest, false );
+			inkTextRef.SetVisible( m_type, false );
+			SetEnabled( false );
+		}
+		else
+		{
+			inkTextRef.SetText( m_label, metadata.trackedQuest );
+			inkTextRef.SetText( m_quest, metadata.internalName );
+			inkTextRef.SetText( m_type, metadata.locationName );
+			SetEnabled( true );
+		}
 		m_versionParams.UpdateString( "version_num", metadata.gameVersion );
 		m_initialLoadingID = metadata.initialLoadingScreenID;
 		playthroughTime = MaxF( ( ( Float )( metadata.playthroughTime ) ), ( ( Float )( metadata.playTime ) ) );
@@ -566,7 +663,7 @@ class LoadListItem extends AnimatedListItemController
 		}
 	}
 
-	public function SetInvalid( label : String )
+	public function SetInvalid( const label : ref< String > )
 	{
 		m_validSlot = false;
 		inkWidgetRef.SetVisible( m_wrapper, true );
@@ -576,7 +673,7 @@ class LoadListItem extends AnimatedListItemController
 		inkTextRef.SetText( m_quest, label );
 	}
 
-	public function SetData( index : Int32, optional emptySlot : Bool )
+	public function SetData( index : Int32, optional emptySlot : Bool, optional allSlotsTaken : Bool )
 	{
 		m_index = index;
 		if( emptySlot )
@@ -584,6 +681,7 @@ class LoadListItem extends AnimatedListItemController
 			m_emptySlot = true;
 			inkWidgetRef.SetVisible( m_wrapper, false );
 			inkWidgetRef.SetVisible( m_emptySlotWrapper, true );
+			inkWidgetRef.SetState( m_emptySlotWrapper, ( ( allSlotsTaken ) ? ( 'Unavailable' ) : ( 'Default' ) ) );
 		}
 		else
 		{
@@ -652,44 +750,5 @@ class LoadListItem extends AnimatedListItemController
 		}
 	}
 
-}
-
-import enum inkLifePath : Uint8
-{
-	Corporate,
-	StreetKid,
-	Nomad,
-	Invalid,
-}
-
-import enum inkSaveType : Uint8
-{
-	ManualSave,
-	QuickSave,
-	AutoSave,
-	PointOfNoReturn,
-	EndGameSave,
-}
-
-import enum inkSaveStatus : Uint8
-{
-	Invalid,
-	Local,
-	Upload,
-	Cloud,
-	InSync,
-}
-
-import enum inkSaveTransferStatus : Uint8
-{
-	ExportStarted,
-	ExportSuccess,
-	ExportFailed,
-	ImportChecking,
-	ImportStarted,
-	ImportSuccess,
-	ImportNoSave,
-	ImportFailed,
-	ImportNotEnoughSpace,
 }
 
