@@ -87,6 +87,7 @@ import class SenseComponent extends IPlacedComponent
 	private var m_mainPreset : TweakDBID;
 	private var m_secondaryPreset : TweakDBID;
 	private var m_puppetBlackboard : weak< IBlackboard >;
+	private var m_uiWantedBarBB : weak< IBlackboard >;
 	private var m_hideUIElements : Bool;
 	private var m_enabledSenses : Bool;
 	private var m_shouldStartDetectingPlayerCached : Bool;
@@ -94,20 +95,15 @@ import class SenseComponent extends IPlacedComponent
 	private var m_logSource : ESenseLogSource;
 	default m_logSource = ESenseLogSource.Undefined;
 
+	private const function LogEnabled() : Bool
+	{
+		return AIComponent.DebugLogEnabled( GetConstOwnerPuppet() );
+	}
+
 	private const function Log( category : CName, message : String )
 	{
-		var puppet : weak< ScriptedPuppet >;
 		var aiComponent : AIHumanComponent;
-		if( IsFinal() )
-		{
-			return;
-		}
-		puppet = GetConstOwnerPuppet();
-		if( !( puppet ) )
-		{
-			return;
-		}
-		aiComponent = puppet.GetAIControllerComponent();
+		aiComponent = GetConstOwnerPuppet().GetAIControllerComponent();
 		if( aiComponent )
 		{
 			aiComponent.DebugLog( category, message );
@@ -116,10 +112,6 @@ import class SenseComponent extends IPlacedComponent
 
 	private const function LogBySource( category : CName, message : String )
 	{
-		if( IsFinal() )
-		{
-			return;
-		}
 		switch( m_logSource )
 		{
 			case ESenseLogSource.AddToBlacklistEvent:
@@ -140,10 +132,6 @@ import class SenseComponent extends IPlacedComponent
 	private const function LogCategory( suffix : String ) : CName
 	{
 		var cat : String;
-		if( IsFinal() )
-		{
-			return '';
-		}
 		cat = "senses";
 		switch( m_logSource )
 		{
@@ -165,16 +153,28 @@ import class SenseComponent extends IPlacedComponent
 	public function LogStart( source : ESenseLogSource, message : String )
 	{
 		m_logSource = source;
+		if( !( LogEnabled() ) )
+		{
+			return;
+		}
 		LogBySource( LogCategory( "start" ), message );
 	}
 
 	public const function LogInfo( message : String )
 	{
+		if( !( LogEnabled() ) )
+		{
+			return;
+		}
 		LogBySource( LogCategory( "info" ), message );
 	}
 
 	public const function LogTrueFalse( message : String, value : Bool )
 	{
+		if( !( LogEnabled() ) )
+		{
+			return;
+		}
 		LogBySource( LogCategory( "info" ), ( message + " = " ) + ( ( value ) ? ( "TRUE" ) : ( "FALSE" ) ) );
 	}
 
@@ -334,8 +334,12 @@ import class SenseComponent extends IPlacedComponent
 			{
 				m_highLevelCb = m_puppetBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PuppetState.HighLevel, this, 'OnHighLevelChanged' );
 				m_reactionCb = m_puppetBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PuppetState.ReactionBehavior, this, 'OnReactionChanged' );
-				m_wantedLevelChangedCb = m_puppetBlackboard.RegisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, this, 'OnWantedLevelChanged' );
 				m_wasPlayerLastReactionTarget = false;
+			}
+			m_uiWantedBarBB = GameInstance.GetBlackboardSystem( puppet.GetGame() ).Get( GetAllBlackboardDefs().UI_WantedBar );
+			if( m_uiWantedBarBB )
+			{
+				m_wantedLevelChangedCb = m_uiWantedBarBB.RegisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, this, 'OnCurrentWantedLevelChanged' );
 			}
 		}
 	}
@@ -353,7 +357,11 @@ import class SenseComponent extends IPlacedComponent
 			{
 				m_puppetBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PuppetState.ReactionBehavior, m_reactionCb );
 				m_puppetBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PuppetState.HighLevel, m_highLevelCb );
-				m_puppetBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, m_wantedLevelChangedCb );
+			}
+			m_uiWantedBarBB = GameInstance.GetBlackboardSystem( puppet.GetGame() ).Get( GetAllBlackboardDefs().UI_WantedBar );
+			if( m_uiWantedBarBB )
+			{
+				m_uiWantedBarBB.UnregisterListenerInt( GetAllBlackboardDefs().UI_WantedBar.CurrentWantedLevel, m_wantedLevelChangedCb );
 			}
 		}
 		if( m_playerInPerception )
@@ -380,14 +388,32 @@ import class SenseComponent extends IPlacedComponent
 		}
 	}
 
-	private function OnWantedLevelChanged( value : Int32 )
+	protected event OnCurrentWantedLevelChanged( value : Int32 )
 	{
 		var wantedLevel : EPreventionHeatStage;
-		wantedLevel = ( ( EPreventionHeatStage )( value ) );
-		if( wantedLevel == EPreventionHeatStage.Heat_0 )
+		var hasDeescalated : Bool;
+		var reevaluatedInterest : Bool;
+		if( !( GetOwner().IsPrevention() ) )
 		{
-			ReevaluateDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
+			return true;
 		}
+		wantedLevel = ( ( EPreventionHeatStage )( value ) );
+		hasDeescalated = wantedLevel == EPreventionHeatStage.Heat_0;
+		if( !( hasDeescalated ) )
+		{
+			return true;
+		}
+		ReevaluateDetectionOverwrite( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() );
+		reevaluatedInterest = ReevaluatePlayerInterestFromSecuritySystemPOV();
+		if( reevaluatedInterest )
+		{
+			LogInfo( "set player INTERESTING from Security System POV" );
+		}
+		else
+		{
+			LogInfo( "set player NOT INTERESTING from Security System POV" );
+		}
+		SetIsPlayerInterestingFromSecuritySystemPOV( reevaluatedInterest );
 	}
 
 	protected event OnDeath( evt : gameDeathEvent )
