@@ -1,22 +1,29 @@
 class VehiclesManagerDataView extends ScriptableDataView
 {
 
-	public override function SortItem( left : IScriptable, right : IScriptable ) : Bool
+	public override function SortItem( lhs : IScriptable, rhs : IScriptable ) : Bool
 	{
-		var leftData : VehicleListItemData;
-		var rightData : VehicleListItemData;
-		var leftStr : String;
-		var rightStr : String;
-		leftData = ( ( VehicleListItemData )( left ) );
-		rightData = ( ( VehicleListItemData )( right ) );
-		leftStr = GetLocalizedTextByKey( leftData.m_displayName );
-		rightStr = GetLocalizedTextByKey( rightData.m_displayName );
-		return UnicodeStringLessThan( leftStr, rightStr );
-	}
-
-	public override function FilterItem( data : IScriptable ) : Bool
-	{
-		return true;
+		var lhsData : VehicleListItemData;
+		var rhsData : VehicleListItemData;
+		var lhsName : String;
+		var rhsName : String;
+		lhsData = ( ( VehicleListItemData )( lhs ) );
+		rhsData = ( ( VehicleListItemData )( rhs ) );
+		lhsName = GetLocalizedTextByKey( lhsData.m_displayName );
+		rhsName = GetLocalizedTextByKey( rhsData.m_displayName );
+		if( lhsData.m_data.uiFavoriteIndex == rhsData.m_data.uiFavoriteIndex )
+		{
+			return UnicodeStringLessThan( lhsName, rhsName );
+		}
+		if( lhsData.m_data.uiFavoriteIndex == -1 )
+		{
+			return false;
+		}
+		if( rhsData.m_data.uiFavoriteIndex == -1 )
+		{
+			return true;
+		}
+		return lhsData.m_data.uiFavoriteIndex < rhsData.m_data.uiFavoriteIndex;
 	}
 
 }
@@ -33,6 +40,7 @@ class VehiclesManagerPopupGameController extends BaseModalListPopupGameControlle
 	private var m_dataSource : ScriptableDataSource;
 	private var m_quickSlotsManager : weak< QuickSlotsManager >;
 	private var m_scrollController : weak< inkScrollController >;
+	private var m_selectAnimProxy : inkAnimProxy;
 
 	protected event OnPlayerAttach( player : GameObject )
 	{
@@ -40,11 +48,44 @@ class VehiclesManagerPopupGameController extends BaseModalListPopupGameControlle
 		m_quickSlotsManager = ( ( PlayerPuppet )( m_playerPuppet ) ).GetQuickSlotsManager();
 		m_scrollController = ( ( inkScrollController )( inkWidgetRef.GetControllerByType( m_scrollControllerWidget, 'inkScrollController' ) ) );
 		inkScrollAreaRef.RegisterToCallback( m_scrollArea, 'OnScrollChanged', this, 'OnScrollChanged' );
+		player.RegisterInputListener( this, 'secondaryAction' );
 	}
 
 	protected event OnScrollChanged( value : Vector2 )
 	{
 		m_scrollController.UpdateScrollPositionFromScrollArea();
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		if( super.OnAction( action, consumer ) )
+		{
+			return true;
+		}
+		if( ListenerAction.GetName( action ) == 'secondaryAction' && ListenerAction.IsButtonJustPressed( action ) )
+		{
+			ListenerActionConsumer.Consume( consumer );
+			ToggleFavorite();
+		}
+	}
+
+	private function ToggleFavorite()
+	{
+		var selectedVehicle : VehiclesManagerListItemController;
+		var selectedVehicleData : VehicleListItemData;
+		var index : Uint32;
+		selectedVehicle = ( ( VehiclesManagerListItemController )( m_listController.GetSelectedItem() ) );
+		selectedVehicleData = selectedVehicle.GetVehicleData();
+		index = m_listController.GetSelectedIndex();
+		if( m_selectAnimProxy != NULL )
+		{
+			return;
+		}
+		if( GameInstance.GetVehicleSystem( m_playerPuppet.GetGame() ).TogglePlayerFavoriteVehicle( selectedVehicleData.m_data.recordID ) )
+		{
+			m_dataSource.Reset( VehiclesManagerDataHelper.GetVehicles( m_playerPuppet ) );
+			m_listController.SelectItem( index );
+		}
 	}
 
 	protected override function Select( previous : inkVirtualCompoundItemController, next : inkVirtualCompoundItemController )
@@ -67,6 +108,12 @@ class VehiclesManagerPopupGameController extends BaseModalListPopupGameControlle
 		m_listController.SetSource( m_dataView );
 	}
 
+	protected event OnShowAnimFinished( proxy : inkAnimProxy )
+	{
+		m_listController.SelectItem( 0 );
+		m_canPlaySwitchAnimation = true;
+	}
+
 	protected override function CleanVirtualList()
 	{
 		m_dataView.SetSource( NULL );
@@ -87,12 +134,19 @@ class VehiclesManagerPopupGameController extends BaseModalListPopupGameControlle
 		var selectedVehicleData : VehicleListItemData;
 		selectedVehicle = ( ( VehiclesManagerListItemController )( m_listController.GetSelectedItem() ) );
 		selectedVehicleData = selectedVehicle.GetVehicleData();
-		if( selectedVehicleData.m_repairTimeRemaining > 0.0 )
+		if( ( m_selectAnimProxy != NULL ) || ( selectedVehicleData.m_repairTimeRemaining > 0.0 ) )
 		{
 			return;
 		}
 		m_quickSlotsManager.SetActiveVehicle( selectedVehicleData.m_data );
 		m_quickSlotsManager.SummonVehicle( true );
+		m_selectAnimProxy = PlayLibraryAnimationOnTargets( 'selected', SelectWidgets( selectedVehicle.GetRootWidget() ) );
+		m_selectAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnSelectAnimFinished' );
+	}
+
+	protected event OnSelectAnimFinished( proxy : inkAnimProxy )
+	{
+		m_selectAnimProxy = NULL;
 		Close();
 	}
 
@@ -149,6 +203,7 @@ class VehiclesManagerListItemController extends inkVirtualCompoundItemController
 		{
 			inkTextRef.SetVisible( m_repairTime, false );
 			GetRootWidget().SetState( 'Default' );
+			inkImageRef.SetState( m_typeIcon, ( ( m_vehicleData.m_data.uiFavoriteIndex >= 0 ) ? ( 'Favorite' ) : ( 'Default' ) ) );
 		}
 	}
 
@@ -169,6 +224,7 @@ class VehiclesManagerListItemController extends inkVirtualCompoundItemController
 		if( m_vehicleData.m_repairTimeRemaining == 0.0 )
 		{
 			GetRootWidget().SetState( 'Default' );
+			inkImageRef.SetState( m_typeIcon, ( ( m_vehicleData.m_data.uiFavoriteIndex >= 0 ) ? ( 'Favorite' ) : ( 'Default' ) ) );
 		}
 		else
 		{

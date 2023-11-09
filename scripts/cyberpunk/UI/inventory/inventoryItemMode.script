@@ -71,27 +71,16 @@ class InventoryItemModeLogicController extends inkLogicController
 	private var m_timeoutPeroid : Float;
 	default m_timeoutPeroid = 0.5f;
 	private var m_tokenPopup : inkGameNotificationToken;
-	private var m_gridUpdatePending : Bool;
-	private var m_nextFrameCheckRequested : Bool;
+	private var m_refreshRequested : Bool;
+	private var m_currentFilter : ItemFilterCategory;
+	private var m_viewMode : ItemViewModes;
 
 	protected event OnInitialize()
 	{
-		var virtualGrid : inkGridController;
 		m_itemModeInventoryListenerCallback = new ItemModeInventoryListenerCallback;
 		m_itemModeInventoryListenerCallback.Setup( ( ( weak< weak< InventoryItemModeLogicController > > )( this ) ) );
 		inkCompoundRef.RemoveAllChildren( m_itemCategoryList );
-		m_itemGridContainerController = ( ( ItemModeGridContainer )( inkWidgetRef.GetController( m_itemGridContainer ) ) );
-		m_itemGridClassifier = new ItemModeGridClassifier;
-		m_itemGridDataView = new ItemModeGridView;
-		m_itemGridDataSource = new ScriptableDataSource;
-		m_itemsPositionProvider = new ItemPositionProvider;
-		virtualGrid = ( ( inkGridController )( m_itemGridContainerController.GetItemsWidget().GetController() ) );
-		virtualGrid.SetClassifier( m_itemGridClassifier );
-		virtualGrid.SetSource( m_itemGridDataView );
-		m_itemGridDataView.SetSource( m_itemGridDataSource );
-		virtualGrid.SetProvider( m_itemsPositionProvider );
-		virtualGrid.RegisterToCallback( 'OnAllElementsSpawned', this, 'OnAllElementsSpawned' );
-		m_itemGridDataView.EnableSorting();
+		SetupVirutalGrid();
 		inkWidgetRef.SetVisible( m_itemGridContainer, false );
 		m_animContainer = new inGameMenuAnimContainer;
 		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
@@ -99,21 +88,54 @@ class InventoryItemModeLogicController extends inkLogicController
 
 	protected event OnUninitialize()
 	{
-		var virtualGrid : inkGridController;
 		m_delaySystem.CancelCallback( m_delayedTimeoutCallbackId );
 		UnregisterBlackboard();
-		m_itemGridDataView.SetSource( NULL );
-		virtualGrid = ( ( inkGridController )( m_itemGridContainerController.GetItemsWidget().GetController() ) );
-		virtualGrid.SetSource( NULL );
-		virtualGrid.SetClassifier( NULL );
-		virtualGrid.SetProvider( NULL );
-		m_itemGridClassifier = NULL;
-		m_itemGridDataView = NULL;
-		m_itemGridDataSource = NULL;
+		CleanupVirtualGrid();
 		GameInstance.GetTransactionSystem( m_player.GetGame() ).UnregisterInventoryListener( m_player, m_itemModeInventoryListener );
 		m_itemModeInventoryListener = NULL;
 		m_itemModeInventoryListenerRegistered = false;
 		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+	}
+
+
+	private var m_virtualGridInitialized : Bool;
+
+	private function SetupVirutalGrid()
+	{
+		var virtualGrid : inkGridController;
+		if( !( m_virtualGridInitialized ) )
+		{
+			m_itemGridContainerController = ( ( ItemModeGridContainer )( inkWidgetRef.GetController( m_itemGridContainer ) ) );
+			m_itemGridClassifier = new ItemModeGridClassifier;
+			m_itemGridDataView = new ItemModeGridView;
+			m_itemGridDataSource = new ScriptableDataSource;
+			m_itemsPositionProvider = new ItemPositionProvider;
+			virtualGrid = ( ( inkGridController )( m_itemGridContainerController.GetItemsWidget().GetController() ) );
+			virtualGrid.SetClassifier( m_itemGridClassifier );
+			virtualGrid.SetSource( m_itemGridDataView );
+			m_itemGridDataView.SetSource( m_itemGridDataSource );
+			virtualGrid.SetProvider( m_itemsPositionProvider );
+			virtualGrid.RegisterToCallback( 'OnAllElementsSpawned', this, 'OnAllElementsSpawned' );
+			m_itemGridDataView.EnableSorting();
+			m_virtualGridInitialized = true;
+		}
+	}
+
+	private function CleanupVirtualGrid()
+	{
+		var virtualGrid : inkGridController;
+		if( m_virtualGridInitialized )
+		{
+			m_itemGridDataView.SetSource( NULL );
+			virtualGrid = ( ( inkGridController )( m_itemGridContainerController.GetItemsWidget().GetController() ) );
+			virtualGrid.SetSource( NULL );
+			virtualGrid.SetClassifier( NULL );
+			virtualGrid.SetProvider( NULL );
+			m_itemGridClassifier = NULL;
+			m_itemGridDataView = NULL;
+			m_itemGridDataSource = NULL;
+			m_virtualGridInitialized = false;
+		}
 	}
 
 	protected function RegisterBlackboard()
@@ -217,6 +239,8 @@ class InventoryItemModeLogicController extends inkLogicController
 			}
 			m_InventoryManager.RemoveInventoryItemFromCache( itemChooser.GetModifiedItemID() );
 			itemChooser.RefreshItems();
+			m_viewMode = ItemViewModes.Item;
+			m_currentFilter = ItemFilterCategory.Invalid;
 			RefreshAvailableItems();
 			m_comparisonResolver.FlushCache();
 		}
@@ -242,7 +266,9 @@ class InventoryItemModeLogicController extends inkLogicController
 		isMainItemSelected = itemChooser.GetSelectedItem() == itemChooser.GetModifiedItem();
 		itemChooser.RefreshSelectedItem();
 		this.itemChooser.RefreshItems();
-		RefreshAvailableItems( ( ( isMainItemSelected ) ? ( ItemViewModes.Item ) : ( ItemViewModes.Mod ) ) );
+		m_viewMode = ( ( isMainItemSelected ) ? ( ItemViewModes.Item ) : ( ItemViewModes.Mod ) );
+		m_currentFilter = ItemFilterCategory.Invalid;
+		RefreshAvailableItems();
 		NotifyItemUpdate();
 	}
 
@@ -278,7 +304,9 @@ class InventoryItemModeLogicController extends inkLogicController
 		{
 			m_currentHotkey = EHotkey.INVALID;
 			SetEquipmentArea( e.itemEquipmentArea );
-			RefreshAvailableItems( itemViewMode );
+			m_viewMode = itemViewMode;
+			m_currentFilter = ItemFilterCategory.Invalid;
+			RefreshAvailableItems();
 		}
 		( ( inkScrollController )( inkWidgetRef.GetController( m_itemGridScrollControllerWidget ) ) ).SetScrollPosition( 0.0 );
 	}
@@ -506,6 +534,7 @@ class InventoryItemModeLogicController extends inkLogicController
 
 	public function SetupMode( displayData : InventoryItemDisplayData, dataSource : InventoryDataManagerV2, optional inventoryController : weak< gameuiInventoryGameController > )
 	{
+		SetupVirutalGrid();
 		itemChooser = CreateItemChooser( displayData, dataSource );
 		m_inventoryController = inventoryController;
 		inkTextRef.SetText( m_itemCategoryHeader, m_inventoryController.GetCategoryHeader( displayData ) );
@@ -530,6 +559,7 @@ class InventoryItemModeLogicController extends inkLogicController
 		{
 			inkCompoundRef.RemoveAllChildren( m_itemCategoryList );
 		}
+		CleanupVirtualGrid();
 		return result;
 	}
 
@@ -690,6 +720,7 @@ class InventoryItemModeLogicController extends inkLogicController
 		m_activeFilter = controller;
 		m_activeFilter.SetActive( true );
 		m_savedFilter = controller.GetFilterType();
+		m_currentFilter = m_savedFilter;
 		m_itemGridDataView.SetFilterTypeAndSortMode( controller.GetFilterType(), m_itemGridDataView.GetSortMode() );
 	}
 
@@ -791,36 +822,27 @@ class InventoryItemModeLogicController extends inkLogicController
 		if( doRefresh )
 		{
 			m_InventoryManager.MarkToRebuild();
-			RefreshAvailableItems( itemViewMode, tryToPreserveFilter );
+			m_viewMode = itemViewMode;
+			RefreshAvailableItems();
 		}
 	}
 
-	protected event OnRetryRefreshGrid( evt : RetryRefreshGridEvent )
+	protected event OnDelayedRefreshItems( evt : DelayedRefreshItems )
 	{
-		m_nextFrameCheckRequested = false;
-		RefreshAvailableItems( evt.viewMode, evt.tryToPreserveFilter );
+		m_refreshRequested = false;
+		UpdateAvailableItems();
 	}
 
-	private function RefreshAvailableItems( optional viewMode : ItemViewModes, optional tryToPreserveFilter : Bool )
+	private function RefreshAvailableItems()
 	{
 		var itemsToSkip : array< ItemID >;
-		var evt : RetryRefreshGridEvent;
 		if( m_currentHotkey == EHotkey.INVALID )
 		{
-			if( m_gridUpdatePending )
+			if( !( m_refreshRequested ) )
 			{
-				if( m_nextFrameCheckRequested )
-				{
-					return;
-				}
-				m_nextFrameCheckRequested = true;
-				evt = new RetryRefreshGridEvent;
-				evt.viewMode = viewMode;
-				evt.tryToPreserveFilter = tryToPreserveFilter;
-				QueueEvent( evt );
-				return;
+				m_refreshRequested = true;
+				QueueEvent( new DelayedRefreshItems );
 			}
-			UpdateAvailableItems( viewMode, m_lastEquipmentAreas, tryToPreserveFilter );
 		}
 		else
 		{
@@ -872,7 +894,7 @@ class InventoryItemModeLogicController extends inkLogicController
 		CreateFilterButtons( m_itemGridContainerController.GetFiltersGrid() );
 	}
 
-	private function UpdateAvailableItems( viewMode : ItemViewModes, const equipmentAreas : ref< array< gamedataEquipmentArea > >, optional tryToPreserveFilter : Bool )
+	private function UpdateAvailableItems()
 	{
 		var i : Int32;
 		var availableItems : array< InventoryItemData >;
@@ -881,13 +903,13 @@ class InventoryItemModeLogicController extends inkLogicController
 		var attachmentsToCheck : array< TweakDBID >;
 		var targetFilter : Int32;
 		var modifiedItemData : weak< gameItemData >;
-		isWeapon = IsEquipmentAreaWeapon( equipmentAreas );
-		isClothing = IsEquipmentAreaClothing( equipmentAreas );
-		isOutfit = equipmentAreas.Contains( gamedataEquipmentArea.Outfit );
+		isWeapon = IsEquipmentAreaWeapon( m_lastEquipmentAreas );
+		isClothing = IsEquipmentAreaClothing( m_lastEquipmentAreas );
+		isOutfit = m_lastEquipmentAreas.Contains( gamedataEquipmentArea.Outfit );
 		m_itemGridContainerController.SetSize( ( ( isOutfit ) ? ( ItemModeGridSize.Outfit ) : ( ItemModeGridSize.Default ) ) );
 		if( isWeapon || isClothing )
 		{
-			m_InventoryManager.GetPlayerInventoryDataRef( equipmentAreas, true, m_itemDropQueue, availableItems );
+			m_InventoryManager.GetPlayerInventoryDataRef( m_lastEquipmentAreas, true, m_itemDropQueue, availableItems );
 			attachments = InventoryItemData.GetAttachments( itemChooser.GetModifiedItemData() );
 			if( TDBID.IsValid( itemChooser.GetSelectedSlotID() ) )
 			{
@@ -907,13 +929,13 @@ class InventoryItemModeLogicController extends inkLogicController
 		}
 		else
 		{
-			if( viewMode == ItemViewModes.Mod )
+			if( m_viewMode == ItemViewModes.Mod )
 			{
 				availableItems = m_InventoryManager.GetPlayerInventoryPartsForItem( ( ( InventoryCyberwareItemChooser )( itemChooser ) ).GetModifiedItemID(), itemChooser.GetSelectedItem().GetSlotID() );
 			}
 			else
 			{
-				m_InventoryManager.GetPlayerInventoryDataRef( equipmentAreas, true, m_itemDropQueue, availableItems );
+				m_InventoryManager.GetPlayerInventoryDataRef( m_lastEquipmentAreas, true, m_itemDropQueue, availableItems );
 			}
 		}
 		m_itemGridDataView.DisableSorting();
@@ -923,16 +945,16 @@ class InventoryItemModeLogicController extends inkLogicController
 		if( isWeapon || isClothing )
 		{
 			m_lastSelectedDisplay = itemChooser.GetSelectedItem();
-			if( viewMode == ItemViewModes.Mod && ( GetFilterButtonIndex( ItemFilterCategory.Attachments ) >= 0 ) )
+			if( m_viewMode == ItemViewModes.Mod && ( GetFilterButtonIndex( ItemFilterCategory.Attachments ) >= 0 ) )
 			{
 				SelectFilterButton( ItemFilterCategory.Attachments );
 			}
 			else
 			{
 				targetFilter = 0;
-				if( tryToPreserveFilter )
+				if( m_currentFilter != ItemFilterCategory.Invalid )
 				{
-					targetFilter = GetFilterButtonIndex( m_itemGridDataView.GetFilterType() );
+					targetFilter = GetFilterButtonIndex( m_currentFilter );
 				}
 				else
 				{
@@ -974,10 +996,6 @@ class InventoryItemModeLogicController extends inkLogicController
 		var itemChooserItem : InventoryItemData;
 		var sortData : InventoryItemSortData;
 		inkTextRef.SetVisible( m_emptyInventoryText, availableItems.Size() <= 0 );
-		if( availableItems.Size() > 0 )
-		{
-			m_gridUpdatePending = true;
-		}
 		( ( weak< weak< inkCompoundWidget > > )( m_cyberwareGridContainerController.GetItemsWidget() ) ).RemoveAllChildren();
 		inkWidgetRef.SetVisible( m_itemGridContainer, true );
 		itemChooserItem = itemChooser.GetSelectedItem().GetItemData();
@@ -1011,11 +1029,6 @@ class InventoryItemModeLogicController extends inkLogicController
 			m_filterManager.AddItem( InventoryItemData.GetGameItemData( data.ItemData ) );
 		}
 		m_itemGridDataSource.Reset( virtualWrappedData );
-	}
-
-	protected event OnAllElementsSpawned()
-	{
-		m_gridUpdatePending = false;
 	}
 
 	private function UnequipItem( controller : InventoryItemDisplayController, const itemData : ref< InventoryItemData > )
@@ -1252,6 +1265,8 @@ class InventoryItemModeLogicController extends inkLogicController
 		if( hotkey != EHotkey.INVALID )
 		{
 			m_equipmentSystem.GetPlayerData( m_player ).AssignItemToHotkey( InventoryItemData.GetID( itemData ), hotkey );
+			m_viewMode = ItemViewModes.Item;
+			m_currentFilter = ItemFilterCategory.Invalid;
 			RefreshAvailableItems();
 			NotifyItemUpdate();
 			return;
@@ -1318,6 +1333,8 @@ class InventoryItemModeLogicController extends inkLogicController
 		if( m_currentHotkey != EHotkey.INVALID )
 		{
 			m_equipmentSystem.GetPlayerData( m_player ).ClearItemFromHotkey( m_currentHotkey );
+			m_viewMode = ItemViewModes.Item;
+			m_currentFilter = ItemFilterCategory.Invalid;
 			RefreshAvailableItems();
 			NotifyItemUpdate();
 			itemChooser.RefreshItems();
@@ -1568,13 +1585,13 @@ class InventoryItemModeLogicController extends inkLogicController
 					item.itemID = InventoryItemData.GetID( itemData );
 					item.quantity = 1;
 					AddToDropQueue( item );
-					RefreshAvailableItems( ItemViewModes.Item, true );
+					RefreshAvailableItems();
 					PlaySound( 'Item', 'OnDrop' );
 					PlayRumble( RumbleStrength.SuperLight, RumbleType.Pulse, RumblePosition.Right );
 				}
 			}
 		}
-		else if( actionName.IsAction( 'preview_item' ) )
+		else if( ( actionName.IsAction( 'preview_item' ) && ( InventoryItemData.IsWeapon( itemData ) || InventoryItemData.IsGarment( itemData ) ) ) && !( InventoryItemData.IsEmpty( itemData ) ) )
 		{
 			isClothing = IsEquipmentAreaClothing( InventoryItemData.GetEquipmentArea( itemData ) ) || InventoryItemData.GetEquipmentArea( itemData ) == gamedataEquipmentArea.Outfit;
 			m_itemPreviewPopupToken = ItemPreviewHelper.ShowPreviewItem( this, itemData, isClothing, 'OnItemPreviewPopup' );
@@ -1606,6 +1623,8 @@ class InventoryItemModeLogicController extends inkLogicController
 			itemChooser.RefreshItems( shouldUpdate, -1 );
 			if( !( InventoryItemData.IsPart( itemData ) ) )
 			{
+				m_viewMode = ItemViewModes.Item;
+				m_currentFilter = ItemFilterCategory.Invalid;
 				RefreshAvailableItems();
 			}
 			NotifyItemUpdate();
@@ -1643,6 +1662,8 @@ class InventoryItemModeLogicController extends inkLogicController
 		item.itemID = InventoryItemData.GetID( data.itemData );
 		item.quantity = data.choosenQuantity;
 		AddToDropQueue( item );
+		m_viewMode = ItemViewModes.Item;
+		m_currentFilter = ItemFilterCategory.Invalid;
 		RefreshAvailableItems();
 		PlaySound( 'Item', 'OnDrop' );
 		PlayRumble( RumbleStrength.SuperLight, RumbleType.Pulse, RumblePosition.Right );
@@ -2348,9 +2369,7 @@ class DelayedItemEquipped extends Event
 {
 }
 
-class RetryRefreshGridEvent extends Event
+class DelayedRefreshItems extends Event
 {
-	var viewMode : ItemViewModes;
-	var tryToPreserveFilter : Bool;
 }
 
