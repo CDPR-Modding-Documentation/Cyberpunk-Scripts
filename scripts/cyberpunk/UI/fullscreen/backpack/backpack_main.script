@@ -10,6 +10,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private editable var m_sortingDropdown : inkWidgetRef;
 	private editable var m_itemsListScrollAreaContainer : inkWidgetRef;
 	private editable var m_itemNotificationRoot : inkWidgetRef;
+	private editable var m_disassembleJunkButton : inkWidgetRef;
 	private var m_virtualBackpackItemsListController : weak< inkGridController >;
 	private var m_TooltipsManager : weak< gameuiTooltipsManager >;
 	private var m_buttonHintsController : weak< ButtonHints >;
@@ -18,6 +19,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private var m_player : weak< PlayerPuppet >;
 	private var m_itemDropQueueItems : array< ItemID >;
 	private var m_itemDropQueue : array< ItemModParams >;
+	private var m_junkItems : array< UIInventoryItem >;
 	private var m_craftingMaterialsListItems : array< weak< CrafringMaterialItemController > >;
 	private var m_DisassembleCallback : UI_CraftingDef;
 	private var m_DisassembleBlackboard : weak< IBlackboard >;
@@ -40,6 +42,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private var m_backpackItemsPositionProvider : ItemPositionProvider;
 	private var m_equipSlotChooserPopupToken : inkGameNotificationToken;
 	private var m_quantityPickerPopupToken : inkGameNotificationToken;
+	private var m_disassembleJunkPopupToken : inkGameNotificationToken;
 	private var m_equipRequested : Bool;
 	private var m_psmBlackboard : weak< IBlackboard >;
 	private var playerState : gamePSMVehicle;
@@ -51,6 +54,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private var m_lastItemHoverOverEvent : ItemDisplayHoverOverEvent;
 	private var m_isComparisonDisabled : Bool;
 	private var m_immediateNotificationListener : BakcpackImmediateNotificationListener;
+	private var m_lastDisassembledWidget : weak< InventoryItemDisplayController >;
 
 	protected event OnInitialize()
 	{
@@ -67,6 +71,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		AsyncSpawnFromExternal( inkWidgetRef.Get( m_itemNotificationRoot ), R"base\gameplay\gui\widgets\activity_log\activity_log_panels.inkwidget", 'RootVert' );
 		PlayLibraryAnimation( 'backpack_intro' );
 		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+		inkWidgetRef.RegisterToCallback( m_disassembleJunkButton, 'OnRelease', this, 'OnDisassembleJunkButtonClick' );
 		playerPuppet = ( ( PlayerPuppet )( GetOwnerEntity() ) );
 		m_psmBlackboard = GetPSMBlackboard( playerPuppet );
 		playerState = ( ( gamePSMVehicle )( m_psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle ) ) );
@@ -83,6 +88,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		GameInstance.GetTransactionSystem( m_player.GetGame() ).UnregisterInventoryListener( m_player, m_backpackInventoryListener );
 		m_backpackInventoryListener = NULL;
 		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+		inkWidgetRef.UnregisterFromCallback( m_disassembleJunkButton, 'OnRelease', this, 'OnDisassembleJunkButtonClick' );
 		super.OnUninitialize();
 	}
 
@@ -280,19 +286,35 @@ import class BackpackMainGameController extends gameuiMenuGameController
 
 	protected event OnDisassembleComplete( value : Variant )
 	{
-		var i, limit : Int32;
+		var i, limit, quantity : Int32;
 		var itemID : ItemID;
 		var action : CraftingCommands;
 		var updatedIngredients : array< IngredientData >;
 		var ingredientID : ItemID;
-		var controller : weak< ItemDisplayVirtualController >;
+		var inventoryItem : weak< UIInventoryItem >;
+		var dropItem : ItemModParams;
 		action = ( ( CraftingCommands )( m_DisassembleBlackboard.GetVariant( m_DisassembleCallback.lastCommand ) ) );
 		if( action == CraftingCommands.DisassemblingFinished )
 		{
 			itemID = ( ( ItemID )( m_DisassembleBlackboard.GetVariant( m_DisassembleCallback.lastItem ) ) );
-			controller = ( ( weak< weak< ItemDisplayVirtualController > > )( m_virtualWidgets.Get( ItemID.GetCombinedHash( itemID ) ) ) );
-			controller.GetItemView().GetUIInventoryItem().GetQuantity( true );
-			controller.Update();
+			inventoryItem = m_uiInventorySystem.GetPlayerItem( itemID );
+			quantity = inventoryItem.GetQuantity( true );
+			if( m_itemDropQueueItems.Contains( itemID ) )
+			{
+				dropItem = GetDropQueueItem( itemID );
+				if( dropItem.quantity >= quantity )
+				{
+					RefreshUI();
+				}
+				else
+				{
+					inventoryItem.SetQuantity( quantity - dropItem.quantity );
+				}
+			}
+			if( ( m_lastDisassembledWidget.GetUIInventoryItem() != NULL ) && ( m_lastDisassembledWidget.GetUIInventoryItem().ID == itemID ) )
+			{
+				m_lastDisassembledWidget.InvalidateQuantity();
+			}
 			updatedIngredients = ( ( array< IngredientData > )value );
 			for( i = 0, limit = updatedIngredients.Size(); i < limit; i += 1 )
 			{
@@ -384,6 +406,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		m_uiInventorySystem.FlushTempData();
 		playerItems = m_uiInventorySystem.GetPlayerItemsMap();
 		playerItems.GetValues( values );
+		m_junkItems.Clear();
 		for( i = 0, limit = values.Size(); i < limit; i += 1 )
 		{
 			uiInventoryItem = ( ( UIInventoryItem )( values[ i ] ) );
@@ -408,9 +431,14 @@ import class BackpackMainGameController extends gameuiMenuGameController
 					uiInventoryItem.SetQuantity( quantity - dropItem.quantity );
 				}
 			}
+			if( uiInventoryItem.IsJunk() )
+			{
+				m_junkItems.PushBack( uiInventoryItem );
+			}
 			wrappedItem = new WrappedInventoryItemData;
 			wrappedItem.DisplayContextData = m_itemDisplayContext;
-			wrappedItem.IsNew = m_uiScriptableSystem.IsInventoryItemNew( uiInventoryItem.ID );
+			wrappedItem.IsNew = uiInventoryItem.IsNew();
+			wrappedItem.IsPlayerFavourite = uiInventoryItem.IsPlayerFavourite();
 			wrappedItem.Item = uiInventoryItem;
 			wrappedItem.NotificationListener = m_immediateNotificationListener;
 			filterManager.AddItem( uiInventoryItem.GetFilterCategory() );
@@ -625,6 +653,23 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		return result;
 	}
 
+	private function GetBackpackItemQuantity( inventoryItem : weak< UIInventoryItem > ) : Int32
+	{
+		var result : Int32;
+		var dropItem : ItemModParams;
+		result = inventoryItem.GetQuantity( true );
+		if( m_itemDropQueueItems.Contains( inventoryItem.GetID() ) )
+		{
+			dropItem = GetDropQueueItem( inventoryItem.GetID() );
+			if( dropItem.quantity >= result )
+			{
+				return 0;
+			}
+			result -= dropItem.quantity;
+		}
+		return result;
+	}
+
 	protected event OnSortingButtonClicked( evt : inkPointerEvent )
 	{
 		var controller : DropdownListController;
@@ -642,11 +687,17 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		var isUsable : Bool;
 		var isWeapon : Bool;
 		var isGarment : Bool;
+		var setPlayerFavouriteRequest : UIScriptableSystemSetItemPlayerFavourite;
 		if( evt.actionName.IsAction( 'drop_item' ) )
 		{
 			if( ( playerState == gamePSMVehicle.Default && RPGManager.CanItemBeDropped( m_player, evt.uiInventoryItem.GetItemData() ) ) && InventoryGPRestrictionHelper.CanDrop( evt.uiInventoryItem, m_player ) )
 			{
-				if( evt.uiInventoryItem.GetQuantity() > 1 )
+				if( evt.display.GetIsPlayerFavourite() )
+				{
+					ShowNotification( m_player.GetGame(), UIMenuNotificationType.InventoryActionBlocked );
+					return false;
+				}
+				if( GetBackpackItemQuantity( evt.uiInventoryItem ) > 1 )
 				{
 					OpenQuantityPicker( evt.uiInventoryItem, QuantityPickerActionType.Drop );
 				}
@@ -682,6 +733,15 @@ import class BackpackMainGameController extends gameuiMenuGameController
 				m_itemPreviewPopupToken = ItemPreviewHelper.ShowPreviewItem( this, evt.uiInventoryItem, isGarment, 'OnItemPreviewPopup' );
 			}
 		}
+		else if( evt.actionName.IsAction( 'favourite_item' ) && evt.uiInventoryItem.IsWeapon() )
+		{
+			setPlayerFavouriteRequest = new UIScriptableSystemSetItemPlayerFavourite;
+			setPlayerFavouriteRequest.itemID = evt.uiInventoryItem.ID;
+			setPlayerFavouriteRequest.favourite = !( evt.display.GetIsPlayerFavourite() );
+			m_uiScriptableSystem.QueueRequest( setPlayerFavouriteRequest );
+			evt.display.SetIsPlayerFavourite( setPlayerFavouriteRequest.favourite );
+			UpdateFavouriteHint( setPlayerFavouriteRequest.favourite );
+		}
 		else if( evt.actionName.IsAction( 'use_item' ) )
 		{
 			isUsable = ( ( ( ItemActionsHelper.GetConsumeAction( evt.uiInventoryItem.GetID() ) || ItemActionsHelper.GetEatAction( evt.uiInventoryItem.GetID() ) ) || ItemActionsHelper.GetDrinkAction( evt.uiInventoryItem.GetID() ) ) || ItemActionsHelper.GetLearnAction( evt.uiInventoryItem.GetID() ) ) || ItemActionsHelper.GetDownloadFunds( evt.uiInventoryItem.GetID() );
@@ -707,6 +767,59 @@ import class BackpackMainGameController extends gameuiMenuGameController
 				RefreshUI();
 			}
 		}
+	}
+
+	protected event OnDisassembleJunkButtonClick( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) )
+		{
+			OpenDisassembleJunkConfirmation();
+		}
+	}
+
+	private function OpenDisassembleJunkConfirmation()
+	{
+		var data : VendorSellJunkPopupData;
+		var i, limit, numberOfItems : Int32;
+		if( m_junkItems.Size() )
+		{
+			for( i = 0, limit = m_junkItems.Size(); i < limit; i += 1 )
+			{
+				numberOfItems += m_junkItems[ i ].GetQuantity( true );
+			}
+			data = new VendorSellJunkPopupData;
+			data.notificationName = 'base\gameplay\gui\widgets\notifications\vendor_sell_junk_confirmation.inkwidget';
+			data.isBlocking = true;
+			data.useCursor = true;
+			data.queueName = 'modal_popup';
+			data.itemsQuantity = numberOfItems;
+			data.actionType = VendorSellJunkActionType.Disassemble;
+			m_disassembleJunkPopupToken = ShowGameNotification( data );
+			m_disassembleJunkPopupToken.RegisterListener( this, 'OnDisassembleJunkPopupClosed' );
+			m_buttonHintsController.Hide();
+		}
+	}
+
+	protected event OnDisassembleJunkPopupClosed( data : inkGameNotificationData )
+	{
+		var i, limit : Int32;
+		var sellJunkData : VendorSellJunkPopupCloseData;
+		m_disassembleJunkPopupToken = NULL;
+		sellJunkData = ( ( VendorSellJunkPopupCloseData )( data ) );
+		if( sellJunkData.confirm )
+		{
+			for( i = 0, limit = m_junkItems.Size(); i < limit; i += 1 )
+			{
+				ItemActionsHelper.DisassembleItem( m_player, m_junkItems[ i ].GetID(), m_junkItems[ i ].GetQuantity() );
+			}
+			PlaySound( 'Item', 'OnDisassemble' );
+			m_TooltipsManager.HideTooltips();
+		}
+		else
+		{
+			PlaySound( 'Button', 'OnPress' );
+		}
+		m_buttonHintsController.Show();
 	}
 
 	private function DetermineUIMenuNotificationType() : UIMenuNotificationType
@@ -981,7 +1094,13 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		{
 			if( RPGManager.CanItemBeDisassembled( m_player.GetGame(), evt.uiInventoryItem.GetItemData() ) )
 			{
-				if( evt.uiInventoryItem.GetQuantity() > 1 )
+				if( evt.display.GetIsPlayerFavourite() )
+				{
+					ShowNotification( m_player.GetGame(), UIMenuNotificationType.InventoryActionBlocked );
+					return false;
+				}
+				m_lastDisassembledWidget = evt.display;
+				if( GetBackpackItemQuantity( evt.uiInventoryItem ) > 1 )
 				{
 					OpenQuantityPicker( evt.uiInventoryItem, QuantityPickerActionType.Disassembly );
 				}
@@ -1098,6 +1217,10 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		{
 			m_buttonHintsController.AddButtonHint( 'preview_item', "UI-UserActions-ItemPreview" );
 		}
+		if( itemData.IsWeapon() )
+		{
+			UpdateFavouriteHint( m_uiScriptableSystem.IsItemPlayerFavourite( itemData.GetID() ) );
+		}
 		if( cursorData.GetActionsListSize() >= 0 )
 		{
 			SetCursorContext( 'Hover', cursorData );
@@ -1163,6 +1286,10 @@ import class BackpackMainGameController extends gameuiMenuGameController
 			{
 				m_buttonHintsController.AddButtonHint( 'preview_item', "UI-UserActions-ItemPreview" );
 			}
+			if( InventoryItemData.IsWeapon( displayingData ) )
+			{
+				UpdateFavouriteHint( m_uiScriptableSystem.IsItemPlayerFavourite( InventoryItemData.GetID( displayingData ) ) );
+			}
 			if( cursorData.GetActionsListSize() >= 0 )
 			{
 				SetCursorContext( 'Hover', cursorData );
@@ -1178,12 +1305,25 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		}
 	}
 
+	private function UpdateFavouriteHint( state : Bool )
+	{
+		if( state )
+		{
+			m_buttonHintsController.AddButtonHint( 'favourite_item', "UI-UserActions-ItemRemoveFavourite" );
+		}
+		else
+		{
+			m_buttonHintsController.AddButtonHint( 'favourite_item', "UI-UserActions-ItemAddFavourite" );
+		}
+	}
+
 	private function SetInventoryItemButtonHintsHoverOut()
 	{
 		m_buttonHintsController.RemoveButtonHint( 'disassemble_item' );
 		m_buttonHintsController.RemoveButtonHint( 'use_item' );
 		m_buttonHintsController.RemoveButtonHint( 'drop_item' );
 		m_buttonHintsController.RemoveButtonHint( 'preview_item' );
+		m_buttonHintsController.RemoveButtonHint( 'favourite_item' );
 		SetCursorContext( 'Default' );
 	}
 
@@ -1203,6 +1343,7 @@ class WrappedInventoryItemData extends IScriptable
 	var ItemData : InventoryItemData;
 	var ComparisonState : ItemComparisonState;
 	var IsNew : Bool;
+	var IsPlayerFavourite : Bool;
 	var ItemTemplate : Uint32;
 	var DisplayContext : ItemDisplayContext;
 	var NotificationListener : ImmediateNotificationListener;
@@ -1317,10 +1458,12 @@ class ItemDisplayVirtualController extends inkVirtualCompoundItemController
 		if( m_wrappedData.Item )
 		{
 			itemView.Setup( m_wrappedData.Item, m_wrappedData.DisplayContextData );
+			itemView.SetIsPlayerFavourite( m_wrappedData.Item.IsPlayerFavourite() );
 		}
 		else
 		{
 			itemView.Setup( m_data, m_wrappedData.DisplayContext );
+			itemView.SetIsPlayerFavourite( m_wrappedData.IsPlayerFavourite );
 		}
 		itemView.SetComparisonState( m_wrappedData.ComparisonState );
 		itemView.SetIsNew( m_wrappedData.IsNew, m_wrappedData );
@@ -1474,19 +1617,19 @@ class BackpackDataView extends ScriptableDataView
 		switch( m_itemSortMode )
 		{
 			case ItemSortMode.NewItems:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NewItem().QualityDesc().ItemType().NameAsc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NewItem().FavouriteItem().QualityDesc().ItemType().NameAsc().GetBool();
 			case ItemSortMode.NameAsc:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NameAsc().QualityDesc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.NameDesc:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).NameDesc().QualityDesc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().NameDesc().QualityDesc().GetBool();
 			case ItemSortMode.DpsAsc:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).DPSAsc().QualityDesc().NameAsc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().DPSAsc().QualityDesc().NameAsc().GetBool();
 			case ItemSortMode.DpsDesc:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).DPSDesc().QualityDesc().NameDesc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().DPSDesc().QualityDesc().NameDesc().GetBool();
 			case ItemSortMode.QualityAsc:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().NameAsc().QualityDesc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().QualityDesc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.QualityDesc:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).QualityAsc().NameAsc().QualityDesc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().QualityAsc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.WeightAsc:
 				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).WeightAsc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.WeightDesc:
@@ -1496,9 +1639,9 @@ class BackpackDataView extends ScriptableDataView
 			case ItemSortMode.PriceDesc:
 				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).PriceDesc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.ItemType:
-				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).ItemType().NameAsc().QualityDesc().GetBool();
+				return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).ItemType().FavouriteItem().NameAsc().QualityDesc().GetBool();
 		}
-		return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().ItemType().NameAsc().GetBool();
+		return NewPreSortingInjection( NewItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().QualityDesc().ItemType().NameAsc().GetBool();
 	}
 
 	public override function SortItem( left : IScriptable, right : IScriptable ) : Bool
@@ -1530,19 +1673,19 @@ class BackpackDataView extends ScriptableDataView
 		switch( m_itemSortMode )
 		{
 			case ItemSortMode.NewItems:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DLCAddedItem().NewItem( m_uiScriptableSystem ).QualityDesc().ItemType().NameAsc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DLCAddedItem().FavouriteItem().NewItem( m_uiScriptableSystem ).QualityDesc().ItemType().NameAsc().GetBool();
 			case ItemSortMode.NameAsc:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).NameAsc().QualityDesc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.NameDesc:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).NameDesc().QualityDesc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().NameDesc().QualityDesc().GetBool();
 			case ItemSortMode.DpsAsc:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DPSAsc().QualityDesc().NameAsc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().DPSAsc().QualityDesc().NameAsc().GetBool();
 			case ItemSortMode.DpsDesc:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).DPSDesc().QualityDesc().NameDesc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().DPSDesc().QualityDesc().NameDesc().GetBool();
 			case ItemSortMode.QualityAsc:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().NameAsc().QualityDesc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().QualityDesc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.QualityDesc:
-				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).QualityAsc().NameAsc().QualityDesc().GetBool();
+				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().QualityAsc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.WeightAsc:
 				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).WeightAsc().NameAsc().QualityDesc().GetBool();
 			case ItemSortMode.WeightDesc:
@@ -1554,7 +1697,7 @@ class BackpackDataView extends ScriptableDataView
 			case ItemSortMode.ItemType:
 				return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).ItemType().NameAsc().QualityDesc().GetBool();
 		}
-		return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).QualityDesc().ItemType().NameAsc().GetBool();
+		return PreSortingInjection( ItemCompareBuilder.Make( leftItem, rightItem ) ).FavouriteItem().QualityDesc().ItemType().NameAsc().GetBool();
 	}
 
 	public export override function FilterItem( data : IScriptable ) : Bool

@@ -6,8 +6,10 @@ import class gameuiNewPhoneRelatedGameController extends inkGameController
 import class gameuiNewPhoneRelatedHUDGameController extends inkHUDGameController
 {
 	protected var m_player : weak< PlayerPuppet >;
+	protected var m_isRemoteControllingVehicle : Bool;
 	protected var m_visibilityFact1ListenerId : Uint32;
 	protected var m_visibilityFact2ListenerId : Uint32;
+	protected var m_remoteControlledVehicleDataCallback : CallbackHandle;
 	protected import var isNewPhoneEnabled : Bool;
 
 	protected event OnPlayerAttach( player : GameObject )
@@ -25,6 +27,27 @@ import class gameuiNewPhoneRelatedHUDGameController extends inkHUDGameController
 	{
 		GameInstance.GetQuestsSystem( m_player.GetGame() ).UnregisterListener( 'dpad_hints_visibility_enabled', m_visibilityFact1ListenerId );
 		GameInstance.GetQuestsSystem( m_player.GetGame() ).UnregisterListener( 'q000_started', m_visibilityFact2ListenerId );
+	}
+
+	protected function RegisterCommonBlackboardListeners()
+	{
+		var blackboardSystem : BlackboardSystem;
+		var uiActiveVehicleBlackboard : weak< IBlackboard >;
+		blackboardSystem = GetBlackboardSystem();
+		uiActiveVehicleBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+		m_remoteControlledVehicleDataCallback = uiActiveVehicleBlackboard.RegisterListenerVariant( GetAllBlackboardDefs().UI_ActiveVehicleData.RemoteControlledVehicleData, this, 'OnRemoteControlledVehicleChanged', true );
+	}
+
+	protected function UnregisterCommonBlackboardListeners()
+	{
+		var blackboardSystem : BlackboardSystem;
+		var uiActiveVehicleBlackboard : weak< IBlackboard >;
+		blackboardSystem = GetBlackboardSystem();
+		uiActiveVehicleBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ActiveVehicleData );
+		if( m_remoteControlledVehicleDataCallback )
+		{
+			uiActiveVehicleBlackboard.UnregisterListenerVariant( GetAllBlackboardDefs().UI_ActiveVehicleData.RemoteControlledVehicleData, m_remoteControlledVehicleDataCallback );
+		}
 	}
 
 	protected function OnGameStarted( value : Int32 )
@@ -57,6 +80,17 @@ import class gameuiNewPhoneRelatedHUDGameController extends inkHUDGameController
 		return true;
 	}
 
+	protected virtual function UpdateCurrentItem() {}
+
+	protected event OnRemoteControlledVehicleChanged( value : Variant )
+	{
+		var data : RemoteControlDrivingUIData;
+		data = ( ( RemoteControlDrivingUIData )value );
+		m_isRemoteControllingVehicle = data.remoteControlledVehicle != NULL;
+		UpdateVisibility();
+		UpdateCurrentItem();
+	}
+
 	protected function GameStarted() : Bool
 	{
 		var qs : QuestsSystem;
@@ -79,6 +113,11 @@ import class gameuiNewPhoneRelatedHUDGameController extends inkHUDGameController
 		return false;
 	}
 
+	protected function CanUseOverclock() : Bool
+	{
+		return QuickHackableHelper.CanActivateOverclockedState( m_player );
+	}
+
 }
 
 import class gameuiNewHudPhoneGameController extends gameuiGenericNotificationGameController
@@ -99,6 +138,7 @@ import enum gameuiActivePhoneElement
 	Contacts,
 	SmsMessenger,
 	Notifications,
+	InVehicle,
 	None,
 }
 
@@ -290,9 +330,12 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 	var m_isSingleThread : Bool;
 	var m_isShowingAllMessages : Bool;
 	default m_isShowingAllMessages = false;
+	var m_keepOpenWhenInHubMenu : Bool;
+	default m_keepOpenWhenInHubMenu = false;
 	var m_audioSystem : weak< AudioSystem >;
 	private var m_isRemoteControllingDevice : Bool;
 	private var m_psmIsControllingDeviceCallback : CallbackHandle;
+	private var m_vehicleEnterCallback : CallbackHandle;
 
 	public export override function GetShouldSaveState() : Bool
 	{
@@ -339,6 +382,7 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 		if( psmBlackboard )
 		{
 			m_psmIsControllingDeviceCallback = psmBlackboard.RegisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, this, 'OnPSMIsControllingDeviceChanged', true );
+			m_vehicleEnterCallback = psmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, this, 'OnPlayerEnteredVehicle', true );
 		}
 		m_bbUiSystemDef = GetAllBlackboardDefs().UI_System;
 		m_bbUiSystem = m_bbSystem.Get( m_bbUiSystemDef );
@@ -401,6 +445,10 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 		{
 			GetBlackboardSystem().GetLocalInstanced( m_player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine ).UnregisterListenerBool( GetAllBlackboardDefs().PlayerStateMachine.IsControllingDevice, m_psmIsControllingDeviceCallback );
 		}
+		if( m_vehicleEnterCallback )
+		{
+			GetBlackboardSystem().GetLocalInstanced( m_player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine ).UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, m_vehicleEnterCallback );
+		}
 		uiBlackboard = GetUIBlackboard();
 		if( uiBlackboard )
 		{
@@ -430,6 +478,18 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 	protected event OnPlayerDetach( playerPuppet : GameObject )
 	{
 		playerPuppet.UnregisterInputListener( this );
+	}
+
+	protected event OnPlayerEnteredVehicle( value : Int32 )
+	{
+		if( ( value != ( ( Int32 )( gamePSMVehicle.Default ) ) ) && ( value != ( ( Int32 )( gamePSMVehicle.Transition ) ) ) )
+		{
+			ActivatePhoneElement( gameuiActivePhoneElement.InVehicle );
+		}
+		else
+		{
+			DeactivatePhoneElement( gameuiActivePhoneElement.InVehicle );
+		}
 	}
 
 	public function OnPhoneEnabledChanged( enabled : Bool )
@@ -542,10 +602,10 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			}
 			switch( actionName )
 			{
-				case 'popup_moveDownSms':
+				case 'popup_moveDown':
 					m_contactListLogicController.NavigateDown();
 				break;
-				case 'popup_moveUpSms':
+				case 'popup_moveUp':
 					m_contactListLogicController.NavigateUp();
 				break;
 				case 'popup_moveUp_left_stick_down':
@@ -564,10 +624,10 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			}
 			switch( actionName )
 			{
-				case 'popup_moveDownSms':
+				case 'popup_moveDown':
 					m_contactListLogicController.NavigateDown();
 				break;
-				case 'popup_moveUpSms':
+				case 'popup_moveUp':
 					m_contactListLogicController.NavigateUp();
 				break;
 				case 'popup_moveUp_left_stick_down':
@@ -1082,6 +1142,10 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 		var controller : weak< IncomingCallLogicController >;
 		if( widget )
 		{
+			if( holoAudioCallElement.widget != NULL )
+			{
+				m_holoAudioCallLogicController.Hide();
+			}
 			incomingCallElement.widget = widget;
 			incomingCallElement.widget.RegisterToCallback( 'OnIncomingCallFinished', this, 'OnIncomingCallFinished' );
 			ActivatePhoneElement( gameuiActivePhoneElement.IncomingCall );
@@ -1238,10 +1302,9 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 				case EHudPhoneFunction.Holocall:
 					m_holoAudioCallLogicController.StartHolocall( avatarID, contactName );
 				break;
-			}
-			if( newFunction == EHudPhoneFunction.Inactive )
-			{
-				m_holoAudioCallLogicController.ShowEndCallContact( avatarID, contactName );
+				case EHudPhoneFunction.Inactive:
+					m_holoAudioCallLogicController.ShowEndCallContact( avatarID, contactName );
+				break;
 			}
 		}
 		if( incomingCallElement.widget != NULL )
@@ -1256,6 +1319,39 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 	public function CachePredefinedRestrictions()
 	{
 		PlayerGameplayRestrictions.AcquireHotkeyRestrictionTags( EHotkey.DPAD_DOWN, m_gameplayRestrictions );
+	}
+
+	protected event OnTimeSkip( evt : TimeSkipFinishEvent )
+	{
+		if( IsPhoneActive() )
+		{
+			CloseContactList();
+		}
+	}
+
+	protected event OnKeepPhoneOpenWhenInHubMenu( evt : KeepPhoneOpenWhenInHubMenuEvent )
+	{
+		m_keepOpenWhenInHubMenu = true;
+	}
+
+	protected event OnHUBMenuChanged( evt : inkMenuLayer_SetMenuModeEvent )
+	{
+		var mode : inkMenuMode;
+		var state : inkMenuState;
+		mode = evt.GetMenuMode();
+		state = evt.GetMenuState();
+		if( !( IsPhoneActive() ) || mode != inkMenuMode.HubMenu )
+		{
+			return false;
+		}
+		if( state == inkMenuState.Enabled && !( m_keepOpenWhenInHubMenu ) )
+		{
+			CloseContactList();
+		}
+		else
+		{
+			m_keepOpenWhenInHubMenu = m_bbUiSystem.GetBool( m_bbUiSystemDef.IsInMenu );
+		}
 	}
 
 	protected event OnContactsActive( value : Bool )
@@ -1471,8 +1567,8 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			DisableContactsInput();
 			m_messagesPanelVisible = false;
 			m_messagesPanelSpawned = false;
-			m_isShowingAllMessages = false;
 			m_threadsVisible = false;
+			m_keepOpenWhenInHubMenu = false;
 			m_repeatingScrollActionEnabled = false;
 			m_audioSystem.Play( 'ui_phone_incoming_call_negative' );
 			m_contactListLogicController.Hide();
@@ -1566,8 +1662,8 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 
 	public function EnableContactsInput()
 	{
-		m_player.RegisterInputListener( this, 'popup_moveDownSms' );
-		m_player.RegisterInputListener( this, 'popup_moveUpSms' );
+		m_player.RegisterInputListener( this, 'popup_moveDown' );
+		m_player.RegisterInputListener( this, 'popup_moveUp' );
 		m_player.RegisterInputListener( this, 'popup_moveUp_left_stick_up' );
 		m_player.RegisterInputListener( this, 'popup_moveUp_left_stick_down' );
 		m_player.RegisterInputListener( this, 'popup_goto_messenger' );
@@ -1584,8 +1680,8 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 
 	public function DisableContactsInput()
 	{
-		m_player.UnregisterInputListener( this, 'popup_moveDownSms' );
-		m_player.UnregisterInputListener( this, 'popup_moveUpSms' );
+		m_player.UnregisterInputListener( this, 'popup_moveDown' );
+		m_player.UnregisterInputListener( this, 'popup_moveUp' );
 		m_player.UnregisterInputListener( this, 'popup_moveUp_left_stick_up' );
 		m_player.UnregisterInputListener( this, 'popup_moveUp_left_stick_down' );
 		m_player.UnregisterInputListener( this, 'popup_goto_messenger' );
@@ -1658,6 +1754,7 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 		userData.threadHash = m_journalMgr.GetEntryHash( msgConversation );
 		userData.contactHash = m_journalMgr.GetEntryHash( msgContact );
 		userData.title = msgContact.GetLocalizedName( m_journalMgr );
+		userData.SMSLocKey = msgEntry.GetText();
 		userData.SMSText = GetLocalizedText( msgEntry.GetText() );
 		userData.action = action;
 		userData.animation = 'notification_phone_MSG';
@@ -1723,7 +1820,7 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 	{
 		if( !( TestPhoneElement( element ) ) )
 		{
-			if( !( m_activePhoneElements ) )
+			if( !( AnyElementExceptInVehicle() ) && element != gameuiActivePhoneElement.InVehicle )
 			{
 				if( phoneIconElement.widget )
 				{
@@ -1745,7 +1842,7 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			notElement = ~( ( ( Uint32 )( element ) ) );
 			m_activePhoneElements = m_activePhoneElements & notElement;
 			m_bbUiComDevice.SetUint( m_bbUiComDeviceDef.ActivatePhoneElements, m_activePhoneElements );
-			if( !( m_activePhoneElements ) )
+			if( !( AnyElementExceptInVehicle() ) )
 			{
 				if( phoneIconElement.widget )
 				{
@@ -1755,6 +1852,11 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			PlayPhoneIconAnim( element, true );
 			PlayBackgroundAnim( element, true );
 		}
+	}
+
+	private function AnyElementExceptInVehicle() : Bool
+	{
+		return m_activePhoneElements & ~( ( ( Uint32 )( gameuiActivePhoneElement.InVehicle ) ) );
 	}
 
 	private function TestPhoneElement( element : gameuiActivePhoneElement ) : Bool
@@ -1811,6 +1913,9 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			case gameuiActivePhoneElement.Notifications:
 				m_phoneIconAnimProxy = PlayLibraryAnimation( '2Notifications' );
 			break;
+			case gameuiActivePhoneElement.InVehicle:
+				m_phoneIconAnimProxy = PlayLibraryAnimation( '2Vehicle' );
+			break;
 			case gameuiActivePhoneElement.None:
 				m_phoneIconAnimProxy = PlayLibraryAnimation( '2Phone' );
 			break;
@@ -1846,6 +1951,31 @@ class NewHudPhoneGameController extends gameuiNewHudPhoneGameController
 			return true;
 		}
 		return false;
+	}
+
+	public export function StopPhoneIconAnim()
+	{
+		if( m_phoneIconAnimProxy && m_phoneIconAnimProxy.IsPlaying() )
+		{
+			m_phoneIconAnimProxy.Stop();
+			m_phoneIconAnimProxy = NULL;
+		}
+	}
+
+	public export function GetTopmostActivePhoneElement() : gameuiActivePhoneElement
+	{
+		var i, count : Int32;
+		var value : gameuiActivePhoneElement;
+		count = ( ( Int32 )( gameuiActivePhoneElement.None ) );
+		for( i = 0; i < count; i = i + 1 )
+		{
+			value = ( ( gameuiActivePhoneElement )( i ) );
+			if( TestPhoneElement( value ) )
+			{
+				return value;
+			}
+		}
+		return gameuiActivePhoneElement.None;
 	}
 
 }

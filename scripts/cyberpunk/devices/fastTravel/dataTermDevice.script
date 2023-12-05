@@ -1,3 +1,8 @@
+class ChangeSubwayGateStateEvent extends Event
+{
+	var open : Bool;
+}
+
 class DataTerm extends InteractiveDevice
 {
 	default m_controllerTypeName = 'DataTermController';
@@ -5,17 +10,25 @@ class DataTerm extends InteractiveDevice
 	private instanceeditable inlined var m_linkedFastTravelPoint : FastTravelPointData;
 	[ category = "Fast Travel" ]
 	private instanceeditable var m_exitNode : NodeRef;
+	[ category = "Subway" ]
+	private instanceeditable var m_metroAnimationNode : NodeRef;
+	[ category = "Subway" ]
+	private instanceeditable var m_SubwayGateBroken : Bool;
 	private var m_fastTravelComponent : FastTravelComponent;
 	private var m_lockColiderComponent : IPlacedComponent;
 	private var m_mappinID : NewMappinID;
 	private var m_isShortGlitchActive : Bool;
 	private var m_shortGlitchDelayID : DelayID;
+	private var m_hologramMeshGreen : IPlacedComponent;
+	private var m_hologramMeshRed : IPlacedComponent;
 
 	protected event OnRequestComponents( ri : EntityRequestComponentsInterface )
 	{
 		EntityRequestComponentsInterface.RequestComponent( ri, 'dataTerm_ui', 'worlduiWidgetComponent', true );
 		EntityRequestComponentsInterface.RequestComponent( ri, 'fastTravel', 'FastTravelComponent', true );
 		EntityRequestComponentsInterface.RequestComponent( ri, 'lock', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'gate_holo_green', 'IPlacedComponent', false );
+		EntityRequestComponentsInterface.RequestComponent( ri, 'gate_holo_red', 'IPlacedComponent', false );
 		super.OnRequestComponents( ri );
 	}
 
@@ -24,6 +37,8 @@ class DataTerm extends InteractiveDevice
 		m_uiComponent = ( ( worlduiWidgetComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'dataTerm_ui' ) ) );
 		m_fastTravelComponent = ( ( FastTravelComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'fastTravel' ) ) );
 		m_lockColiderComponent = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'lock' ) ) );
+		m_hologramMeshGreen = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'gate_holo_green' ) ) );
+		m_hologramMeshRed = ( ( IPlacedComponent )( EntityResolveComponentsInterface.GetComponent( ri, 'gate_holo_red' ) ) );
 		super.OnTakeControl( ri );
 		m_controller = ( ( DataTermController )( EntityResolveComponentsInterface.GetComponent( ri, 'controller' ) ) );
 	}
@@ -43,6 +58,7 @@ class DataTerm extends InteractiveDevice
 		{
 			RegisterMappin();
 		}
+		ProcessSubwayGateNPCPresence( false );
 	}
 
 	protected event OnDetach()
@@ -54,6 +70,11 @@ class DataTerm extends InteractiveDevice
 	protected override function CreateBlackboard()
 	{
 		m_blackboard = IBlackboard.Create( GetAllBlackboardDefs().DataTermDeviceBlackboard );
+	}
+
+	protected const override function IsReadyForUI() : Bool
+	{
+		return m_isVisible || GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate;
 	}
 
 	public const override function GetBlackboardDef() : DataTermDeviceBlackboardDef
@@ -74,7 +95,7 @@ class DataTerm extends InteractiveDevice
 	protected event OnLogicReady( evt : SetLogicReadyEvent )
 	{
 		super.OnLogicReady( evt );
-		if( IsUIdirty() && m_isInsideLogicArea )
+		if( ( IsUIdirty() && m_isInsideLogicArea ) || GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate )
 		{
 			RefreshUI();
 		}
@@ -116,6 +137,10 @@ class DataTerm extends InteractiveDevice
 		var operationsContainer : DeviceOperationsContainer;
 		if( m_uiComponent )
 		{
+			if( GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate )
+			{
+				return;
+			}
 			m_uiComponent.Toggle( false );
 		}
 		operationsContainer = GetDevicePS().GetDeviceOperationsContainer();
@@ -154,28 +179,178 @@ class DataTerm extends InteractiveDevice
 	protected event OnAreaEnter( evt : AreaEnteredEvent )
 	{
 		var activator : GameObject;
-		if( evt.componentName != 'fastTravelArea' )
+		if( evt.componentName == 'fastTravelArea' )
 		{
-			return false;
+			if( GetDevicePS().GetFastravelTriggerType() != EFastTravelTriggerType.Auto )
+			{
+				return false;
+			}
+			if( ( m_linkedFastTravelPoint == NULL ) || ( m_linkedFastTravelPoint && !( m_linkedFastTravelPoint.IsValid() ) ) )
+			{
+				return false;
+			}
+			if( GetFastTravelSystem().IsFastTravelEnabledOnMap() )
+			{
+				return false;
+			}
+			activator = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
+			if( activator.IsPlayer() )
+			{
+				RequestFastTravelMenu();
+				TeleportToExitNode( activator );
+			}
 		}
-		if( GetDevicePS().GetFastravelTriggerType() != EFastTravelTriggerType.Auto )
+		else
 		{
-			return false;
+			if( evt.componentName == 'SubwayGateArea' && GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate )
+			{
+				activator = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
+				if( ( ( ScriptedPuppet )( activator ) ).IsCrowd() )
+				{
+					ProcessSubwayGateNPCPresence( true );
+				}
+				else
+				{
+					if( activator.IsPlayer() && GetDeviceState() == EDeviceStatus.ON )
+					{
+						if( ( m_linkedFastTravelPoint == NULL ) || ( m_linkedFastTravelPoint && !( m_linkedFastTravelPoint.IsValid() ) ) )
+						{
+							return false;
+						}
+						if( GetFastTravelSystem().IsFastTravelEnabledOnMap() )
+						{
+							return false;
+						}
+						SetFactValue( GetGame(), 'ue_metro_display_options', 1 );
+						SendThisSubwayGateToFastTravelSystem();
+						PrepareMetroAnimEntityPosition();
+					}
+				}
+			}
 		}
-		if( ( m_linkedFastTravelPoint == NULL ) || ( m_linkedFastTravelPoint && !( m_linkedFastTravelPoint.IsValid() ) ) )
+	}
+
+	private function SendThisSubwayGateToFastTravelSystem()
+	{
+		var blackboard : IBlackboard;
+		blackboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().FastTRavelSystem );
+		if( blackboard != NULL )
 		{
-			return false;
+			blackboard.SetEntityID( GetAllBlackboardDefs().FastTRavelSystem.LastSubwayGateUsed, GetEntityID() );
 		}
-		if( GetFastTravelSystem().IsFastTravelEnabledOnMap() )
+	}
+
+	protected event OnAreaExit( evt : AreaExitedEvent )
+	{
+		var activator : GameObject;
+		if( evt.componentName == 'SubwayGateArea' )
 		{
-			return false;
+			activator = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
+			if( ( ( ScriptedPuppet )( activator ) ).IsCivilian() || ( ( ScriptedPuppet )( activator ) ).IsCrowd() )
+			{
+				ProcessSubwayGateNPCPresence( false );
+			}
+			else
+			{
+				if( activator.IsPlayer() )
+				{
+					SetFactValue( GetGame(), 'ue_metro_display_options', 0 );
+				}
+			}
 		}
-		activator = ( ( GameObject )( EntityGameInterface.GetEntity( evt.activator ) ) );
-		if( activator.IsPlayer() )
+	}
+
+	protected event OnChangeSubwayGateStateEvent( evt : ChangeSubwayGateStateEvent )
+	{
+		if( evt.open == true )
 		{
-			RequestFastTravelMenu();
-			TeleportToExitNode( activator );
+			OpenSubwayGate();
 		}
+		else
+		{
+			CloseSubwayGate();
+		}
+	}
+
+	public function OpenSubwayGate()
+	{
+		if( GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate && !( IsSubwayGateOpen() ) )
+		{
+			GetDevicePS().GetDeviceOperationsContainer().Execute( 'UnlockGate', this );
+			GetBlackboard().SetBool( GetAllBlackboardDefs().DataTermDeviceBlackboard.subwayGateOpen, true, true );
+		}
+	}
+
+	public function CloseSubwayGate()
+	{
+		if( GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate && IsSubwayGateOpen() )
+		{
+			GetDevicePS().GetDeviceOperationsContainer().Execute( 'LockGate', this );
+			GetBlackboard().SetBool( GetAllBlackboardDefs().DataTermDeviceBlackboard.subwayGateOpen, false, true );
+		}
+	}
+
+	private function ProcessSubwayGateNPCPresence( increase : Bool )
+	{
+		var NPCsPresentNumber : Int32;
+		NPCsPresentNumber = GetBlackboard().GetInt( GetAllBlackboardDefs().DataTermDeviceBlackboard.passengerCount );
+		if( increase )
+		{
+			NPCsPresentNumber += 1;
+		}
+		else
+		{
+			NPCsPresentNumber -= 1;
+		}
+		if( NPCsPresentNumber <= 0 )
+		{
+			NPCsPresentNumber = 0;
+			if( IsSubwayGateOpen() )
+			{
+				GetDevicePS().GetDeviceOperationsContainer().Execute( 'LockGate', this );
+				GetBlackboard().SetBool( GetAllBlackboardDefs().DataTermDeviceBlackboard.subwayGateOpen, false, true );
+			}
+		}
+		else
+		{
+			if( !( IsSubwayGateOpen() ) )
+			{
+				GetDevicePS().GetDeviceOperationsContainer().Execute( 'UnlockGate', this );
+				GetBlackboard().SetBool( GetAllBlackboardDefs().DataTermDeviceBlackboard.subwayGateOpen, true, true );
+			}
+		}
+		GetBlackboard().SetInt( GetAllBlackboardDefs().DataTermDeviceBlackboard.passengerCount, NPCsPresentNumber, true );
+	}
+
+	private function PrepareMetroAnimEntityPosition() : Bool
+	{
+		var position : Vector4;
+		var rotation : Quaternion;
+		var entityID : EntityID;
+		entityID = ( ( EntityID )( ResolveNodeRefWithEntityID( m_metroAnimationNode, GetEntityID() ) ) );
+		if( EntityID.IsDefined( entityID ) == true )
+		{
+			position = GetWorldPosition();
+			rotation = GetWorldOrientation();
+			GameInstance.GetTeleportationFacility( GetGame() ).Teleport( ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), entityID ) ) ), position, Quaternion.ToEulerAngles( rotation ) );
+			return true;
+		}
+		return false;
+	}
+
+	public const function IsSubwayGateBroken() : Bool
+	{
+		return m_SubwayGateBroken;
+	}
+
+	private const function IsSubwayGateOpen() : Bool
+	{
+		return GetBlackboard().GetBool( GetAllBlackboardDefs().DataTermDeviceBlackboard.subwayGateOpen );
+	}
+
+	private const function AreCharacterPresentAtSubwayGate() : Bool
+	{
+		return GetBlackboard().GetInt( GetAllBlackboardDefs().DataTermDeviceBlackboard.passengerCount ) > 0;
 	}
 
 	private function TeleportToExitNode( activator : GameObject )
@@ -198,13 +373,18 @@ class DataTerm extends InteractiveDevice
 		}
 	}
 
+	public const function GetFastravelDeviceType() : EFastTravelDeviceType
+	{
+		return GetDevicePS().GetFastravelDeviceType();
+	}
+
 	private function ResolveGateApperance()
 	{
-		if( GetDevicePS().GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate )
+		var deviceState : EDeviceStatus;
+		if( GetFastravelDeviceType() == EFastTravelDeviceType.SubwayGate )
 		{
 			if( !( GetFastTravelSystem().IsFastTravelEnabled() ) )
 			{
-				SetMeshAppearance( 'bars' );
 				if( m_lockColiderComponent && GetDevicePS().GetFastravelTriggerType() == EFastTravelTriggerType.Auto )
 				{
 					m_lockColiderComponent.Toggle( true );
@@ -212,11 +392,21 @@ class DataTerm extends InteractiveDevice
 			}
 			else
 			{
-				SetMeshAppearance( 'default' );
 				if( m_lockColiderComponent && GetDevicePS().GetFastravelTriggerType() == EFastTravelTriggerType.Auto )
 				{
 					m_lockColiderComponent.Toggle( false );
 				}
+			}
+			deviceState = GetDevicePS().GetDeviceState();
+			if( deviceState == EDeviceStatus.ON )
+			{
+				m_hologramMeshGreen.Toggle( true );
+				m_hologramMeshRed.Toggle( false );
+			}
+			else
+			{
+				m_hologramMeshGreen.Toggle( false );
+				m_hologramMeshRed.Toggle( true );
 			}
 		}
 	}
@@ -241,7 +431,14 @@ class DataTerm extends InteractiveDevice
 		if( !( IsMappinRegistered() ) )
 		{
 			mappinData.mappinType = T"Mappins.FastTravelDynamicMappin";
-			mappinData.variant = gamedataMappinVariant.FastTravelVariant;
+			if( m_linkedFastTravelPoint.IsSubway() )
+			{
+				mappinData.variant = gamedataMappinVariant.Zzz17_NCARTVariant;
+			}
+			else
+			{
+				mappinData.variant = gamedataMappinVariant.FastTravelVariant;
+			}
 			mappinData.visibleThroughWalls = false;
 			m_mappinID = GetMappinSystem().RegisterMappinWithObject( mappinData, this, 'poi_mappin' );
 		}

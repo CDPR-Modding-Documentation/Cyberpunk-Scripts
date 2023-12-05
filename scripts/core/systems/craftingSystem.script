@@ -178,6 +178,18 @@ class CraftingSystem extends ScriptableSystem
 			AddAmmoRecipes();
 			SetFactValue( GetGameInstance(), 'AmmoRecipesRefreshed', 1 );
 		}
+		factVal = GetFact( GetGameInstance(), 'GritModsPurged' );
+		if( ( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2099 ) ) && ( saveVersion <= 257 ) )
+		{
+			ProcessGritModsPurge();
+			SetFactValue( GetGameInstance(), 'GritModsPurged', 1 );
+		}
+		factVal = GetFact( GetGameInstance(), 'AmmoRecipesRefreshed_UE' );
+		if( ( factVal <= 0 ) && ( ( ( Int32 )( gameGameVersion.Current ) ) >= 2099 ) )
+		{
+			AddAmmoRecipes();
+			SetFactValue( GetGameInstance(), 'AmmoRecipesRefreshed_UE', 1 );
+		}
 	}
 
 	public static function GetInstance( gameInstance : GameInstance ) : CraftingSystem
@@ -338,21 +350,13 @@ class CraftingSystem extends ScriptableSystem
 	{
 		var result : Bool;
 		var requiredIngredients : array< IngredientData >;
-		var quality : gamedataQuality;
 		var ammoCap, currentQuantity, resultQuantity : Int32;
 		var transactionSystem : TransactionSystem;
 		var itemRecord : Item_Record;
 		var itemTweakDBID : TweakDBID;
 		transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
 		requiredIngredients = GetItemCraftingCost( itemData );
-		if( itemData.GetItemType() == gamedataItemType.Prt_Program || itemData.HasTag( 'ChimeraMod' ) )
-		{
-			result = HasIngredients( requiredIngredients );
-		}
-		else
-		{
-			result = HasIngredients( requiredIngredients ) && CanCraftGivenQuality( itemData, quality );
-		}
+		result = HasIngredients( requiredIngredients );
 		if( result )
 		{
 			itemTweakDBID = ItemID.GetTDBID( itemData.GetID() );
@@ -702,7 +706,7 @@ class CraftingSystem extends ScriptableSystem
 		itemData = transactionSystem.GetItemData( target, craftedItemID );
 		SetItemLevel( itemData );
 		MarkItemAsCrafted( itemData );
-		SendItemCraftedDataTrackingRequest( craftedItemID );
+		SendItemCraftedDataTrackingRequest( craftedItemID, amount );
 		ProcessCraftSkill( ( ( Float )( recipeXP ) ) );
 		return itemData;
 	}
@@ -787,6 +791,42 @@ class CraftingSystem extends ScriptableSystem
 		else
 		{
 			TS.GiveItemByItemQuery( player, T"Query.RareWeaponModsQuery" );
+		}
+	}
+
+	private function ClearNonIconicSlotsWithoutDummyMods( itemData : weak< gameItemData > )
+	{
+		var i : Int32;
+		var slots : array< TweakDBID >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		var partData : InnerItemData;
+		var staticData : weak< Item_Record >;
+		TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+		player = GetMainPlayer( GetGameInstance() );
+		slots.Clear();
+		slots = RPGManager.GetModsSlotIDs( itemData.GetItemType() );
+		for( i = 0; i < slots.Size(); i += 1 )
+		{
+			itemData.GetItemPart( partData, slots[ i ] );
+			staticData = InnerItemData.GetStaticData( partData );
+			if( staticData && staticData.TagsContains( 'DummyPart' ) )
+			{
+				continue;
+			}
+			TS.RemovePart( player, itemData.GetID(), slots[ i ] );
+		}
+		slots.Clear();
+		slots = RPGManager.GetAttachmentSlotIDs();
+		for( i = 0; i < slots.Size(); i += 1 )
+		{
+			itemData.GetItemPart( partData, slots[ i ] );
+			staticData = InnerItemData.GetStaticData( partData );
+			if( staticData && staticData.TagsContains( 'DummyPart' ) )
+			{
+				continue;
+			}
+			TS.RemovePart( player, itemData.GetID(), slots[ i ] );
 		}
 	}
 
@@ -1393,12 +1433,13 @@ class CraftingSystem extends ScriptableSystem
 		}
 	}
 
-	private function SendItemCraftedDataTrackingRequest( targetItem : ItemID )
+	private function SendItemCraftedDataTrackingRequest( targetItem : ItemID, amount : Int32 )
 	{
 		var request : ItemCraftedDataTrackingRequest;
 		var dataTrackingSystem : DataTrackingSystem;
 		request = new ItemCraftedDataTrackingRequest;
 		request.targetItem = targetItem;
+		request.amount = amount;
 		dataTrackingSystem = ( ( DataTrackingSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'DataTrackingSystem' ) ) );
 		dataTrackingSystem.QueueRequest( request );
 	}
@@ -1463,6 +1504,27 @@ class CraftingSystem extends ScriptableSystem
 			if( itemList[ i ].HasTag( 'DeprecatedWeaponMod' ) && !( itemList[ i ].HasTag( 'DummyWeaponMod' ) ) )
 			{
 				CompensateForDeprecatedWeaponMods( itemList[ i ] );
+			}
+		}
+	}
+
+	private function ProcessGritModsPurge()
+	{
+		var i : Int32;
+		var itemList : array< weak< gameItemData > >;
+		var TS : TransactionSystem;
+		var player : weak< PlayerPuppet >;
+		player = GetPlayer( GetGameInstance() );
+		if( player )
+		{
+			TS = GameInstance.GetTransactionSystem( GetGameInstance() );
+			TS.GetItemList( player, itemList );
+		}
+		for( i = 0; i < itemList.Size(); i += 1 )
+		{
+			if( itemList[ i ].HasTag( 'Grit' ) )
+			{
+				ClearNonIconicSlotsWithoutDummyMods( itemList[ i ] );
 			}
 		}
 	}
@@ -2488,6 +2550,28 @@ class CraftBook
 		return false;
 	}
 
+	public function HideRecipesForOwnedItems()
+	{
+		var i : Int32;
+		var j : Int32;
+		var transactionSystem : TransactionSystem;
+		transactionSystem = GameInstance.GetTransactionSystem( m_owner.GetGame() );
+		for( i = 0; i < m_knownRecipes.Size(); i += 1 )
+		{
+			if( !( m_knownRecipes[ i ].isHidden ) && ( m_knownRecipes[ i ].hideOnItemsAdded.Size() > 0 ) )
+			{
+				for( j = 0; j < m_knownRecipes[ i ].hideOnItemsAdded.Size(); j += 1 )
+				{
+					if( transactionSystem.HasItem( m_owner, m_knownRecipes[ i ].hideOnItemsAdded[ j ] ) )
+					{
+						m_knownRecipes[ i ].isHidden = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+
 	public function AddRecipe( targetItem : TweakDBID, optional hideOnItemsAdded : array< weak< Item_Record > >, optional amount : Int32 )
 	{
 		var itemRecipe : ItemRecipe;
@@ -2513,10 +2597,10 @@ class CraftBook
 			for( i = 0; i < hideOnItemsAdded.Size(); i += 1 )
 			{
 				itemID = ItemID.CreateQuery( hideOnItemsAdded[ i ].GetID() );
+				itemRecipe.hideOnItemsAdded.PushBack( itemID );
 				if( transactionSystem.HasItem( m_owner, itemID ) )
 				{
 					itemRecipe.isHidden = true;
-					break;
 				}
 			}
 		}
@@ -2621,10 +2705,8 @@ class CraftingSystemInventoryCallback extends InventoryScriptCallback
 		var craftingSystem : CraftingSystem;
 		var recipeRecord : weak< ItemRecipe_Record >;
 		var itemToAdd : weak< CraftingResult_Record >;
-		var transactionSystem : TransactionSystem;
 		if( itemData.HasTag( 'Recipe' ) )
 		{
-			transactionSystem = GameInstance.GetTransactionSystem( player.GetGame() );
 			craftingSystem = ( ( CraftingSystem )( GameInstance.GetScriptableSystemsContainer( player.GetGame() ).Get( 'CraftingSystem' ) ) );
 			recipeRecord = TweakDBInterface.GetItemRecipeRecord( ItemID.GetTDBID( item ) );
 			itemToAdd = recipeRecord.CraftingResult();
@@ -2636,7 +2718,6 @@ class CraftingSystemInventoryCallback extends InventoryScriptCallback
 				recipeRecord.HideOnItemsAdded( addRecipeRequest.hideOnItemsAdded );
 			}
 			craftingSystem.QueueRequest( addRecipeRequest );
-			transactionSystem.RemoveItem( player, item, transactionSystem.GetItemQuantity( player, item ) );
 		}
 	}
 
@@ -2645,6 +2726,7 @@ class CraftingSystemInventoryCallback extends InventoryScriptCallback
 struct ItemRecipe
 {
 	persistent var targetItem : TweakDBID;
+	persistent var hideOnItemsAdded : array< ItemID >;
 	persistent var isHidden : Bool;
 	persistent var amount : Int32;
 }

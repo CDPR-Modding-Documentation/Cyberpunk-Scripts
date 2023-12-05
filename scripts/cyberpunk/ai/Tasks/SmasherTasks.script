@@ -1,0 +1,287 @@
+class SmasherFindTeleportPositionAroundTarget extends AIbehaviortaskScript
+{
+	editable inlined var m_target : AIArgumentMapping;
+	editable inlined var m_minDistance : Float;
+	editable inlined var m_maxDistance : Float;
+	editable inlined var m_minDistanceFromLastTeleport : Float;
+	editable inlined var m_rotateToTarget : Bool;
+	editable inlined var m_checkZLevel : Bool;
+	editable inlined var m_maintainLineOfSight : Bool;
+	editable inlined var m_teleportInPlayersFOV : Bool;
+	editable inlined var m_doPathCheck : Bool;
+	editable inlined var m_doWallCheck : Bool;
+	editable inlined var m_outPosition : AIArgumentMapping;
+	editable inlined var m_outRotation : AIArgumentMapping;
+	editable inlined var m_outDirection : AIArgumentMapping;
+	private var c_zLevelTolerance : Float;
+	default c_zLevelTolerance = 0.3f;
+	private var m_referenceTarget : weak< GameObject >;
+	private var m_fallbackPosition : Vector4;
+	private var m_fallbackPositionQuality : Int32;
+	private var m_blackboard : weak< IBlackboard >;
+
+	protected export override function Activate( context : ScriptExecutionContext )
+	{
+		m_referenceTarget = ( ( weak< weak< GameObject > > )( ScriptExecutionContext.GetMappingValue( context, m_target ) ) );
+		m_fallbackPositionQuality = -1;
+		m_blackboard = ( ( ScriptedPuppet )( ScriptExecutionContext.GetOwner( context ) ) ).GetAIControllerComponent().GetActionBlackboard();
+	}
+
+	protected export override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var navigationSystem : AINavigationSystem;
+		var navigationPath : NavigationPath;
+		var pointResult : NavigationFindPointResult;
+		var wallResult : NavigationFindWallResult;
+		var wallCheckOffset : Vector4;
+		var targetPosition : Vector4;
+		var testedPosition : Vector4;
+		var navmeshPosition : Vector4;
+		var minAngle : Float;
+		var maxAngle : Float;
+		var angle : Float;
+		var testSphereRadius : Float;
+		var middleDistance : Float;
+		var angleStep : Float;
+		wallCheckOffset = Vector4( 0.0, 0.0, c_zLevelTolerance, 0.0 );
+		angleStep = 10.0;
+		if( !( m_referenceTarget ) || !( m_referenceTarget.IsAttached() ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		navigationSystem = GameInstance.GetAINavigationSystem( ScriptExecutionContext.GetOwner( context ).GetGame() );
+		if( !( navigationSystem ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( m_maxDistance <= m_minDistance )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		targetPosition = m_referenceTarget.GetWorldPosition();
+		middleDistance = ( m_minDistance + m_maxDistance ) / 2.0;
+		testSphereRadius = ( m_maxDistance - m_minDistance ) / 2.0;
+		minAngle = ( ( Float )( RandRange( 0, 360 ) ) );
+		maxAngle = minAngle + 360.0;
+		for( angle = minAngle; angle < maxAngle; angle += angleStep )
+		{
+			testedPosition = targetPosition;
+			testedPosition.X += ( CosF( Deg2Rad( angle ) ) * middleDistance );
+			testedPosition.Y += ( SinF( Deg2Rad( angle ) ) * middleDistance );
+			pointResult = navigationSystem.FindPointInSphereForCharacter( testedPosition, testSphereRadius, ScriptExecutionContext.GetOwner( context ) );
+			if( pointResult.status != worldNavigationRequestStatus.OK )
+			{
+				continue;
+			}
+			navmeshPosition = pointResult.point;
+			if( m_doWallCheck )
+			{
+				wallResult = navigationSystem.FindWallInLineForCharacter( ScriptExecutionContext.GetOwner( context ).GetWorldPosition() + wallCheckOffset, navmeshPosition + wallCheckOffset, 0.2, ScriptExecutionContext.GetOwner( context ) );
+				if( wallResult.status != worldNavigationRequestStatus.OK || wallResult.isHit )
+				{
+					continue;
+				}
+			}
+			if( m_doPathCheck )
+			{
+				navigationPath = navigationSystem.CalculatePathForCharacter( targetPosition, navmeshPosition, 0.5, ScriptExecutionContext.GetOwner( context ) );
+				if( navigationPath.path.Size() <= 0 )
+				{
+					continue;
+				}
+			}
+			if( VerifyPosition( context, navmeshPosition ) )
+			{
+				ProcessSelectedPosition( context, navmeshPosition );
+				return AIbehaviorUpdateOutcome.SUCCESS;
+			}
+		}
+		if( m_fallbackPositionQuality >= 0 )
+		{
+			ProcessSelectedPosition( context, m_fallbackPosition );
+			return AIbehaviorUpdateOutcome.SUCCESS;
+		}
+		return AIbehaviorUpdateOutcome.FAILURE;
+	}
+
+	private function IsInPlayersFOV( context : ScriptExecutionContext, position : Vector4 ) : Bool
+	{
+		var cameraSystem : CameraSystem;
+		var cameraTransform : Transform;
+		var cameraPos : Vector4;
+		var cameraFwd : Vector4;
+		var direction : Vector4;
+		var angleToTarget : Float;
+		cameraSystem = GameInstance.GetCameraSystem( ScriptExecutionContext.GetOwner( context ).GetGame() );
+		if( !( cameraSystem.GetActiveCameraWorldTransform( cameraTransform ) ) )
+		{
+			return false;
+		}
+		cameraPos = Transform.GetPosition( cameraTransform );
+		cameraFwd = Transform.GetForward( cameraTransform );
+		direction = position - cameraPos;
+		angleToTarget = Vector4.GetAngleDegAroundAxis( direction, cameraFwd, ScriptExecutionContext.GetOwner( context ).GetWorldUp() );
+		return AbsF( angleToTarget ) < 30.0;
+	}
+
+	private function IsTooCloseToLastTeleport( context : ScriptExecutionContext, position : Vector4 ) : Bool
+	{
+		var lastTeleportPosition : Vector4;
+		if( !( m_blackboard ) )
+		{
+			return false;
+		}
+		lastTeleportPosition = m_blackboard.GetVector4( GetAllBlackboardDefs().AIActionBossData.excludedTeleportPosition );
+		return Vector4.Distance( lastTeleportPosition, position ) < m_minDistanceFromLastTeleport;
+	}
+
+	private function VerifyPosition( context : ScriptExecutionContext, position : Vector4 ) : Bool
+	{
+		var losOffset : Vector4;
+		var targetPosition : Vector4;
+		var ownerSenseManager : SenseManager;
+		losOffset = Vector4( 0.0, 0.0, 1.79999995, 0.0 );
+		TryUpdateFallbackPosition( position, 0 );
+		if( m_teleportInPlayersFOV && !( IsInPlayersFOV( context, position ) ) )
+		{
+			return false;
+		}
+		TryUpdateFallbackPosition( position, 1 );
+		targetPosition = m_referenceTarget.GetWorldPosition();
+		ownerSenseManager = GameInstance.GetSenseManager( ScriptExecutionContext.GetOwner( context ).GetGame() );
+		if( m_maintainLineOfSight && !( ownerSenseManager.IsPositionVisible( position + losOffset, targetPosition + losOffset ) ) )
+		{
+			return false;
+		}
+		TryUpdateFallbackPosition( position, 2 );
+		if( ( m_minDistanceFromLastTeleport > 0.0 ) && IsTooCloseToLastTeleport( context, position ) )
+		{
+			return false;
+		}
+		TryUpdateFallbackPosition( position, 3 );
+		targetPosition = m_referenceTarget.GetWorldPosition();
+		if( m_checkZLevel && ( AbsF( targetPosition.Z - position.Z ) > c_zLevelTolerance ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private function TryUpdateFallbackPosition( position : Vector4, quality : Int32 )
+	{
+		if( quality <= m_fallbackPositionQuality )
+		{
+			return;
+		}
+		m_fallbackPositionQuality = quality;
+		m_fallbackPosition = position;
+	}
+
+	private function ProcessSelectedPosition( context : ScriptExecutionContext, position : Vector4 )
+	{
+		var ownerPosition : Vector4;
+		var ownerToTargetVector : Vector4;
+		var orientation : EulerAngles;
+		ownerPosition = ScriptExecutionContext.GetOwner( context ).GetWorldPosition();
+		if( m_rotateToTarget )
+		{
+			ownerToTargetVector = position - ownerPosition;
+			orientation = Quaternion.ToEulerAngles( Quaternion.BuildFromDirectionVector( ownerToTargetVector ) );
+		}
+		ScriptExecutionContext.SetMappingValue( context, m_outPosition, position );
+		ScriptExecutionContext.SetMappingValue( context, m_outRotation, orientation.Yaw );
+		ScriptExecutionContext.SetMappingValue( context, m_outDirection, position - ownerPosition );
+		if( m_blackboard )
+		{
+			m_blackboard.SetVector4( GetAllBlackboardDefs().AIActionBossData.excludedTeleportPosition, position );
+		}
+	}
+
+}
+
+class SmasherPlayVFX extends AIbehaviortaskScript
+{
+	private editable inlined var m_vfxOffset : Vector3;
+	private editable inlined var m_vfxResource : FxResource;
+	private editable inlined var m_fxDirection : AIArgumentMapping;
+	private editable inlined var m_attachmentSlotName : CName;
+	private editable inlined var m_delay : Float;
+	private editable inlined var m_KillFx : Bool;
+	private editable inlined var m_effectToKill : CName;
+	private var m_owner : weak< GameObject >;
+	private var m_vfxInstance : FxInstance;
+	private var m_startTime : Float;
+
+	protected override function Activate( context : ScriptExecutionContext )
+	{
+		m_owner = ( ( NPCPuppet )( ScriptExecutionContext.GetOwner( context ) ) );
+		m_startTime = EngineTime.ToFloat( GameInstance.GetTimeSystem( m_owner.GetGame() ).GetSimTime() );
+	}
+
+	protected override function Update( context : ScriptExecutionContext ) : AIbehaviorUpdateOutcome
+	{
+		var currentTime : Float;
+		var fxPosition : Vector4;
+		var fxDirection : Vector4;
+		if( m_delay > 0.0 )
+		{
+			currentTime = EngineTime.ToFloat( GameInstance.GetTimeSystem( m_owner.GetGame() ).GetSimTime() );
+			if( currentTime < ( m_startTime + m_delay ) )
+			{
+				return AIbehaviorUpdateOutcome.IN_PROGRESS;
+			}
+		}
+		if( !( FxResource.IsValid( m_vfxResource ) ) )
+		{
+			return AIbehaviorUpdateOutcome.FAILURE;
+		}
+		if( IsNameValid( m_attachmentSlotName ) )
+		{
+			AIActionHelper.GetTargetSlotPosition( m_owner, m_attachmentSlotName, fxPosition );
+		}
+		else
+		{
+			fxPosition = m_owner.GetWorldPosition();
+		}
+		fxPosition += Vector4.Vector3To4( m_vfxOffset );
+		fxDirection = ( ( Vector4 )( ScriptExecutionContext.GetMappingValue( context, m_fxDirection ) ) );
+		if( m_KillFx )
+		{
+			GameObject.BreakReplicatedEffectLoopEvent( ( ( GameObject )( m_owner ) ), m_effectToKill );
+		}
+		else
+		{
+			SpawnVFX( context, m_vfxResource, fxPosition, fxDirection );
+		}
+		return AIbehaviorUpdateOutcome.SUCCESS;
+	}
+
+	private function SpawnVFX( context : ScriptExecutionContext, fx : FxResource, fxPosition : Vector4, fxDirection : Vector4 )
+	{
+		var transform : WorldTransform;
+		var position : WorldPosition;
+		if( FxResource.IsValid( fx ) )
+		{
+			WorldPosition.SetVector4( position, fxPosition );
+			WorldTransform.SetWorldPosition( transform, position );
+			WorldTransform.SetOrientationFromDir( transform, fxDirection );
+			m_vfxInstance = CreateFxInstance( context, fx, transform );
+		}
+	}
+
+	private function CreateFxInstance( context : ScriptExecutionContext, resource : FxResource, transform : WorldTransform ) : FxInstance
+	{
+		var fx : FxInstance;
+		var fxSystem : FxSystem;
+		fxSystem = GameInstance.GetFxSystem( GetGame( context ) );
+		fx = fxSystem.SpawnEffect( resource, transform );
+		return fx;
+	}
+
+	protected override function Deactivate( context : ScriptExecutionContext )
+	{
+		m_vfxInstance.BreakLoop();
+	}
+
+}
+

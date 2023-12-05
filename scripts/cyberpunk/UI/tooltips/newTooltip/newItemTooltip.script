@@ -15,6 +15,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 	protected editable var m_root : inkWidgetRef;
 	protected editable var m_iconicBG : inkWidgetRef;
 	protected editable var m_recipeBG : inkWidgetRef;
+	protected editable var m_illegalBG : inkWidgetRef;
 	protected editable var m_descriptionWrapper : inkWidgetRef;
 	protected editable var m_descriptionText : inkTextRef;
 	protected editable var DEBUG_iconErrorWrapper : inkWidgetRef;
@@ -37,9 +38,18 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 	protected var m_comparisonData : UIInventoryItemComparisonManager;
 	protected var m_player : weak< PlayerPuppet >;
 	protected var m_requestedModules : array< CName >;
+	protected var m_pendingModules : array< CName >;
+	protected var m_displayContext : ItemDisplayContextData;
 	protected var m_tooltipDisplayContext : InventoryTooltipDisplayContext;
 	protected var m_itemDisplayContext : ItemDisplayContext;
 	protected var m_priceOverride : Int32;
+	protected var m_settings : UserSettings;
+	protected var m_settingsListener : NewItemTooltipSettingsListener;
+	protected var m_groupPath : CName;
+	default m_groupPath = '/accessibility/interface';
+	protected editable var m_minWidth : inkWidgetRef;
+	protected var m_bigFontEnabled : Bool;
+	protected var m_inCrafting : Bool;
 
 	public function SetData( const data : ref< ItemViewData > )
 	{
@@ -59,16 +69,24 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			tooltipWrapper = ( ( UIInventoryItemTooltipWrapper )( tooltipData ) );
 			m_itemData = tooltipWrapper.m_data;
 			m_comparisonData = tooltipWrapper.m_comparisonData;
+			m_displayContext = tooltipWrapper.m_displayContext;
 			m_player = tooltipWrapper.m_displayContext.GetPlayerAsPuppet();
 			m_itemDisplayContext = tooltipWrapper.m_displayContext.GetDisplayContext();
 			m_tooltipDisplayContext = tooltipWrapper.m_displayContext.GetTooltipDisplayContext();
+			m_inCrafting = m_tooltipDisplayContext == InventoryTooltipDisplayContext.Crafting || m_tooltipDisplayContext == InventoryTooltipDisplayContext.Upgrading;
 			m_priceOverride = tooltipWrapper.m_overridePrice;
 			InvalidateSpawnedModules();
+			RegisterUserSettingsListener();
+			NewUpdateTooltipSize();
 			NEW_UpdateLayout();
 		}
 		else
 		{
 			m_data = ( ( MinimalItemTooltipData )( tooltipData ) );
+			m_displayContext = m_data.displayContextData;
+			m_inCrafting = m_data.displayContext == InventoryTooltipDisplayContext.Crafting || m_data.displayContext == InventoryTooltipDisplayContext.Upgrading;
+			RegisterUserSettingsListener();
+			NewUpdateTooltipSize();
 			UpdateLayout();
 		}
 		DEBUG_UpdateDebugInfo();
@@ -77,28 +95,56 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 	public function UpdateData( tooltipData : InventoryTooltipData )
 	{
 		m_data = MinimalItemTooltipData.FromInventoryTooltipData( tooltipData );
+		m_inCrafting = m_data.displayContext == InventoryTooltipDisplayContext.Crafting || m_data.displayContext == InventoryTooltipDisplayContext.Upgrading;
+		RegisterUserSettingsListener();
+		NewUpdateTooltipSize();
 		UpdateLayout();
 	}
 
-	protected function RequestModule( container : inkWidgetRef, moduleName : CName, callback : CName, optional data : ItemTooltipModuleSpawnedCallbackData ) : Bool
+	public override function PrespawnLazyModules()
 	{
+		RequestModule( m_itemEquippedContainer, 'itemEquipped', 'OnNEW_EquippedModuleSpawned' );
+		RequestModule( m_itemRecipeContainer, 'itemRecipe', 'OnNEW_RecipeModuleSpawned' );
+		RequestModule( m_itemHeaderContainer, 'itemHeader', 'OnNEW_HeaderModuleSpawned' );
+		RequestModule( m_itemWeaponBarsContainer, 'itemWeaponBars', 'OnNEW_WeaponBarsModuleSpawned' );
+		RequestModule( m_itemDetailsStatsContainer, 'itemDetailsStats', 'OnNEW_DetailsStatsModuleSpawned' );
+		RequestModule( m_itemDescriptionContainer, 'itemDescription', 'OnNEW_DescriptionModuleSpawned' );
+		RequestModule( m_itemRequirementsContainer, 'itemRequirements', 'OnNEW_RequirementsModuleSpawned' );
+		RequestModule( m_itemDetailsContainer, 'itemDetails', 'OnNEW_DetailsModuleSpawned' );
+		RequestModule( m_itemBottomContainer, 'itemBottom', 'OnNEW_BottomModuleSpawned' );
+		RequestModule( m_itemBrokenContainer, 'itemBroken', 'OnNEW_BrokenModuleSpawned' );
+	}
+
+	protected function RequestModule( container : inkWidgetRef, moduleName : CName, callback : CName, optional data : NewItemTooltipModuleSpawnedCallbackData ) : Bool
+	{
+		var spawnedCallbackData : NewItemTooltipModuleSpawnedCallbackData;
 		if( m_requestedModules.Contains( moduleName ) )
 		{
 			return false;
 		}
+		if( data )
+		{
+			spawnedCallbackData = data;
+		}
+		else
+		{
+			spawnedCallbackData = new NewItemTooltipModuleSpawnedCallbackData;
+			spawnedCallbackData.moduleName = moduleName;
+		}
 		m_requestedModules.PushBack( moduleName );
-		AsyncSpawnFromLocal( inkWidgetRef.Get( container ), moduleName, this, callback, data );
+		m_pendingModules.PushBack( moduleName );
+		AsyncSpawnFromLocal( inkWidgetRef.Get( container ), moduleName, this, callback, spawnedCallbackData );
 		return true;
 	}
 
 	protected function HandleModuleSpawned( widget : weak< inkWidget >, data : NewItemTooltipModuleSpawnedCallbackData )
 	{
 		var controller : weak< NewItemTooltipModuleController >;
-		m_requestedModules.Remove( data.moduleName );
+		m_pendingModules.Remove( data.moduleName );
 		widget.SetVAlign( inkEVerticalAlign.Top );
 		controller = ( ( weak< weak< NewItemTooltipModuleController > > )( widget.GetController() ) );
 		m_spawnedModules.PushBack( controller );
-		controller.SetDisplayContext( m_itemDisplayContext, m_tooltipDisplayContext );
+		controller.SetDisplayContext( m_itemDisplayContext, m_tooltipDisplayContext, m_displayContext );
 	}
 
 	protected function InvalidateSpawnedModules()
@@ -106,7 +152,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		var i, limit : Int32;
 		for( i = 0, limit = m_spawnedModules.Size(); i < limit; i += 1 )
 		{
-			m_spawnedModules[ i ].SetDisplayContext( m_itemDisplayContext, m_tooltipDisplayContext );
+			m_spawnedModules[ i ].SetDisplayContext( m_itemDisplayContext, m_tooltipDisplayContext, m_displayContext );
 		}
 	}
 
@@ -124,6 +170,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		UpdateFramesVisibility();
 		UpdateIconicBG();
 		UpdateRecipeBG();
+		UpdateIllegalBG();
 		UpdateBrokenModule();
 	}
 
@@ -152,6 +199,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		if( m_itemBrokenController && isBroken )
 		{
 			m_itemBrokenController.Update( m_data );
+			m_itemBrokenController.NEW_UpdateWrapping( m_bigFontEnabled );
 			inkWidgetRef.SetVisible( m_itemEquippedContainer, false );
 			inkWidgetRef.SetVisible( m_itemWeaponBarsContainer, false );
 			inkWidgetRef.SetVisible( m_itemDetailsStatsContainer, false );
@@ -193,6 +241,18 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		else
 		{
 			inkWidgetRef.SetVisible( m_recipeBG, false );
+		}
+	}
+
+	protected virtual function UpdateIllegalBG()
+	{
+		if( m_data.itemData.HasTag( 'IllegalItem' ) == true )
+		{
+			inkWidgetRef.SetVisible( m_illegalBG, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_illegalBG, false );
 		}
 	}
 
@@ -258,6 +318,10 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			return;
 		}
 		m_itemHeaderController.Update( m_data );
+		if( !( m_inCrafting ) )
+		{
+			m_itemHeaderController.NEW_UpdateWrapping( m_bigFontEnabled );
+		}
 	}
 
 	protected event OnHeaderModuleSpawned( widget : inkWidget, userData : IScriptable )
@@ -278,6 +342,10 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			}
 			inkWidgetRef.SetVisible( m_itemWeaponBarsContainer, true );
 			m_itemWeaponBarsController.Update( m_data );
+			if( !( m_inCrafting ) )
+			{
+				m_itemWeaponBarsController.UpdateWrapping( m_bigFontEnabled, m_data );
+			}
 		}
 		else
 		{
@@ -302,6 +370,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 				return;
 			}
 			inkWidgetRef.SetVisible( m_itemDetailsStatsContainer, true );
+			m_itemDetailsStatsController.GetContext( m_inCrafting );
 			m_itemDetailsStatsController.Update( m_data );
 		}
 		else
@@ -328,6 +397,10 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			}
 			inkWidgetRef.SetVisible( m_itemDescriptionContainer, true );
 			m_itemDescriptionController.Update( m_data );
+			if( !( m_inCrafting ) )
+			{
+				m_itemDescriptionController.UpdateWrapping( m_bigFontEnabled );
+			}
 		}
 		else
 		{
@@ -387,6 +460,11 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			}
 			inkWidgetRef.SetVisible( m_itemDetailsContainer, true );
 			m_itemDetailsController.Update( m_data, hasDedicatedMods, hasMods );
+			if( !( m_inCrafting ) )
+			{
+				m_itemDetailsController.GetContext( m_inCrafting );
+				m_itemDetailsController.NEW_UpdateWrapping( m_bigFontEnabled );
+			}
 		}
 		else
 		{
@@ -403,7 +481,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 
 	protected virtual function UpdateBottomModule()
 	{
-		if( m_data.displayContext == InventoryTooltipDisplayContext.Crafting )
+		if( ( m_data.displayContext == InventoryTooltipDisplayContext.Crafting || m_data.itemType == gamedataItemType.Wea_Fists ) || m_inCrafting )
 		{
 			inkWidgetRef.SetVisible( m_itemBottomContainer, false );
 			return;
@@ -438,6 +516,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		NEW_UpdateBrokenModule();
 		NEW_UpdateIconicBG();
 		NEW_UpdateRecipeBG();
+		NEW_UpdateIllegalBG();
 	}
 
 	protected virtual function NEW_UpdateEquippedModule()
@@ -518,6 +597,18 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		}
 	}
 
+	protected virtual function NEW_UpdateIllegalBG()
+	{
+		if( m_itemData.IsIllegal() )
+		{
+			inkWidgetRef.SetVisible( m_illegalBG, true );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_illegalBG, false );
+		}
+	}
+
 	protected virtual function NEW_UpdateHeaderModule()
 	{
 		if( !( m_itemHeaderController ) )
@@ -526,6 +617,10 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			return;
 		}
 		m_itemHeaderController.NEW_Update( m_itemData, m_comparisonData );
+		if( !( m_inCrafting ) )
+		{
+			m_itemHeaderController.NEW_UpdateWrapping( m_bigFontEnabled );
+		}
 	}
 
 	protected event OnNEW_HeaderModuleSpawned( widget : inkWidget, userData : IScriptable )
@@ -546,6 +641,10 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			}
 			inkWidgetRef.SetVisible( m_itemWeaponBarsContainer, true );
 			m_itemWeaponBarsController.NEW_Update( m_itemData, m_comparisonData );
+			if( !( m_inCrafting ) )
+			{
+				m_itemWeaponBarsController.NEW_UpdateWrapping( m_bigFontEnabled );
+			}
 		}
 		else
 		{
@@ -570,6 +669,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 				return;
 			}
 			inkWidgetRef.SetVisible( m_itemDetailsStatsContainer, true );
+			m_itemDetailsStatsController.GetContext( m_inCrafting );
 			m_itemDetailsStatsController.NEW_Update( m_itemData );
 		}
 		else
@@ -598,6 +698,10 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			}
 			inkWidgetRef.SetVisible( m_itemDescriptionContainer, true );
 			m_itemDescriptionController.NEW_Update( m_itemData );
+			if( !( m_inCrafting ) )
+			{
+				m_itemDescriptionController.UpdateWrapping( m_bigFontEnabled );
+			}
 		}
 		else
 		{
@@ -664,6 +768,11 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 			}
 			inkWidgetRef.SetVisible( m_itemDetailsContainer, true );
 			m_itemDetailsController.NEW_Update( m_itemData, m_comparisonData, hasDedicatedMods, hasMods );
+			if( !( m_inCrafting ) )
+			{
+				m_itemDetailsController.GetContext( m_inCrafting );
+				m_itemDetailsController.NEW_UpdateWrapping( m_bigFontEnabled );
+			}
 			return;
 		}
 		inkWidgetRef.SetVisible( m_itemDetailsContainer, false );
@@ -679,7 +788,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 	protected virtual function NEW_UpdateBottomModule()
 	{
 		var shouldHideBottom : Bool;
-		if( ( m_itemData.IsBroken() || m_itemData.GetItemType() == gamedataItemType.Wea_HeavyMachineGun ) || !( m_itemData.IsWeapon() ) )
+		if( ( ( ( m_itemData.IsBroken() || m_itemData.GetItemType() == gamedataItemType.Wea_HeavyMachineGun ) || !( m_itemData.IsWeapon() ) ) || m_itemData.GetItemType() == gamedataItemType.Wea_Fists ) || m_inCrafting )
 		{
 			shouldHideBottom = true;
 		}
@@ -716,6 +825,7 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 				return;
 			}
 			inkWidgetRef.SetVisible( m_itemBrokenContainer, true );
+			m_itemBrokenController.NEW_UpdateWrapping( m_bigFontEnabled );
 		}
 		else
 		{
@@ -861,11 +971,53 @@ class NewItemTooltipCommonController extends AGenericTooltipControllerWithDebug
 		}
 	}
 
+	public function OnVarModified( groupPath : CName, varName : CName, varType : ConfigVarType, reason : ConfigChangeReason )
+	{
+		switch( varName )
+		{
+			case 'BigFont':
+				NewUpdateTooltipSize();
+			break;
+			default:
+				break;
+		}
+	}
+
+	private function NewUpdateTooltipSize()
+	{
+		var configVar : ConfigVarBool;
+		configVar = ( ( ConfigVarBool )( m_settings.GetVar( m_groupPath, 'BigFont' ) ) );
+		NewSetTooltipSize( configVar.GetValue() );
+	}
+
+	protected virtual function NewSetTooltipSize( value : Bool )
+	{
+		if( value == true && !( m_inCrafting ) )
+		{
+			inkWidgetRef.SetSize( m_minWidth, 810.0, 0.0 );
+			m_bigFontEnabled = true;
+		}
+		else
+		{
+			inkWidgetRef.SetSize( m_minWidth, 710.0, 0.0 );
+			m_bigFontEnabled = false;
+		}
+	}
+
+	private function RegisterUserSettingsListener()
+	{
+		m_settings = new UserSettings;
+		m_settingsListener = new NewItemTooltipSettingsListener;
+		m_settingsListener.RegisterController( this );
+		m_settingsListener.Register( m_groupPath );
+	}
+
 }
 
 class NewItemTooltipModuleController extends inkLogicController
 {
 	protected editable var m_lineWidget : inkWidgetRef;
+	protected var m_displayContext : ItemDisplayContextData;
 	protected var m_tooltipDisplayContext : InventoryTooltipDisplayContext;
 	protected var m_itemDisplayContext : ItemDisplayContext;
 
@@ -873,8 +1025,9 @@ class NewItemTooltipModuleController extends inkLogicController
 
 	public virtual function NEW_Update( data : weak< UIInventoryItem > ) {}
 
-	public function SetDisplayContext( itemDisplayContext : ItemDisplayContext, tooltipDisplayContext : InventoryTooltipDisplayContext )
+	public function SetDisplayContext( itemDisplayContext : ItemDisplayContext, tooltipDisplayContext : InventoryTooltipDisplayContext, displayContext : ItemDisplayContextData )
 	{
+		m_displayContext = displayContext;
 		m_itemDisplayContext = itemDisplayContext;
 		m_tooltipDisplayContext = tooltipDisplayContext;
 	}
@@ -915,6 +1068,54 @@ class NewItemTooltipEquippedModule extends NewItemTooltipModuleController
 
 class NewItemTooltipRepiceModule extends NewItemTooltipModuleController
 {
+	private editable var m_itemNameText : inkTextRef;
+
+	public override function Update( data : MinimalItemTooltipData )
+	{
+		if( IsContext( InventoryTooltipDisplayContext.Crafting ) )
+		{
+			inkTextRef.SetVisible( m_itemNameText, false );
+		}
+		else
+		{
+			UpdateName( data );
+		}
+	}
+
+	private function UpdateName( data : MinimalItemTooltipData )
+	{
+		var finalItemName : String;
+		inkTextRef.SetVisible( m_itemNameText, true );
+		finalItemName = UIItemsHelper.GetTooltipItemName( data.itemTweakID, data.itemData, data.itemName );
+		if( data.quantity > 1 )
+		{
+			finalItemName += ( ( " [" + IntToString( data.quantity ) ) + "]" );
+		}
+		inkTextRef.SetText( m_itemNameText, finalItemName );
+	}
+
+	public override function NEW_Update( data : weak< UIInventoryItem > )
+	{
+		if( IsContext( InventoryTooltipDisplayContext.Crafting ) )
+		{
+			inkTextRef.SetVisible( m_itemNameText, false );
+		}
+		else
+		{
+			NEW_UpdateName( data.GetName(), data.GetQuantity() );
+		}
+	}
+
+	private function NEW_UpdateName( itemName : String, quantity : Int32 )
+	{
+		inkTextRef.SetVisible( m_itemNameText, true );
+		if( quantity > 1 )
+		{
+			itemName += ( ( " [" + IntToString( quantity ) ) + "]" );
+		}
+		inkTextRef.SetText( m_itemNameText, itemName );
+	}
+
 }
 
 class NewItemTooltipHeaderController extends NewItemTooltipModuleController
@@ -934,6 +1135,22 @@ class NewItemTooltipHeaderController extends NewItemTooltipModuleController
 		m_localizedIconicText = GetLocalizedText( UIItemsHelper.QualityToDefaultString( gamedataQuality.Iconic ) );
 	}
 
+	public function NEW_UpdateWrapping( bigFontEnabled : Bool )
+	{
+		if( bigFontEnabled == true )
+		{
+			inkTextRef.SetWrappingAtPosition( m_itemNameText, 750.0 );
+			inkTextRef.SetWrappingAtPosition( m_itemRarityText, 750.0 );
+			inkTextRef.SetWrappingAtPosition( m_itemTypeText, 685.0 );
+		}
+		else
+		{
+			inkTextRef.SetWrappingAtPosition( m_itemNameText, 650.0 );
+			inkTextRef.SetWrappingAtPosition( m_itemRarityText, 650.0 );
+			inkTextRef.SetWrappingAtPosition( m_itemTypeText, 585.0 );
+		}
+	}
+
 	public override function Update( data : MinimalItemTooltipData )
 	{
 		var itemData : weak< gameItemData >;
@@ -942,15 +1159,33 @@ class NewItemTooltipHeaderController extends NewItemTooltipModuleController
 		var itemType : gamedataItemType;
 		var itemEvolution : gamedataWeaponEvolution;
 		var itemTypeText : String;
+		var newItemTypeText : String;
 		itemData = data.itemData;
 		equipmentArea = data.equipmentArea;
 		itemTweakID = data.itemTweakID;
 		itemType = data.itemType;
 		itemEvolution = data.itemEvolution;
 		itemTypeText = UIItemsHelper.GetItemTypeKey( itemData, equipmentArea, itemTweakID, itemType, itemEvolution );
-		inkTextRef.SetVisible( m_itemTypeText, true );
-		inkTextRef.SetText( m_itemTypeText, itemTypeText );
-		if( IsContext( data, InventoryTooltipDisplayContext.Upgrading ) )
+		if( data.itemType == gamedataItemType.Wea_Fists )
+		{
+			newItemTypeText = ( GetLocalizedText( itemTypeText ) + " - " ) + GetLocalizedText( "LocKey#77968" );
+			inkTextRef.SetText( m_itemTypeText, newItemTypeText );
+			inkTextRef.SetVisible( m_itemTypeText, true );
+		}
+		else
+		{
+			inkTextRef.SetText( m_itemTypeText, itemTypeText );
+			inkTextRef.SetVisible( m_itemTypeText, true );
+		}
+		if( data.itemData.HasTag( 'Recipe' ) == true && ( m_tooltipDisplayContext != InventoryTooltipDisplayContext.Crafting && m_tooltipDisplayContext != InventoryTooltipDisplayContext.Upgrading ) )
+		{
+			inkTextRef.SetVisible( m_itemNameText, false );
+			UpdateRarity( data );
+			UpdateWeaponEvolution( data );
+			UpdatePerkGroup( data );
+			UpdateWeaponType( data );
+		}
+		else if( IsContext( data, InventoryTooltipDisplayContext.Upgrading ) )
 		{
 			UpdateContentForUpgrading( data );
 		}
@@ -1040,6 +1275,11 @@ class NewItemTooltipHeaderController extends NewItemTooltipModuleController
 		if( data.itemEvolution != gamedataWeaponEvolution.Invalid )
 		{
 			inkImageRef.SetTexturePart( m_itemEvolutionIcon, UIItemsHelper.GetWeaponEvolutionTexturePart( data.itemEvolution ) );
+			inkImageRef.SetVisible( m_itemEvolutionIcon, true );
+		}
+		else if( data.itemType == gamedataItemType.Wea_Fists )
+		{
+			inkImageRef.SetTexturePart( m_itemEvolutionIcon, 'ico_blunt' );
 			inkImageRef.SetVisible( m_itemEvolutionIcon, true );
 		}
 		else
@@ -1153,6 +1393,19 @@ class NewItemTooltipHeaderController extends NewItemTooltipModuleController
 			inkImageRef.SetVisible( m_itemPerkIcon, true );
 			inkImageRef.SetVisible( m_itemWeaponIcon, true );
 		}
+		else if( data.IsRecipe() && ( m_tooltipDisplayContext != InventoryTooltipDisplayContext.Crafting && m_tooltipDisplayContext != InventoryTooltipDisplayContext.Upgrading ) )
+		{
+			inkTextRef.SetVisible( m_itemNameText, false );
+			NEW_UpdateRarity( data );
+			inkTextRef.SetVisible( m_itemRarityText, true );
+			inkWidgetRef.SetVisible( m_comparisionArrow, false );
+			inkImageRef.SetTexturePart( m_itemEvolutionIcon, UIItemsHelper.GetWeaponEvolutionTexturePart( data.GetWeaponEvolution() ) );
+			inkImageRef.SetVisible( m_itemEvolutionIcon, true );
+			inkImageRef.SetTexturePart( m_itemPerkIcon, UIItemsHelper.GetBasicPerkRelevance( data.GetPerkGroup() ) );
+			inkImageRef.SetVisible( m_itemPerkIcon, true );
+			inkImageRef.SetTexturePart( m_itemWeaponIcon, UIItemsHelper.GetWeaponTooltipIcon( data.GetItemType() ) );
+			inkImageRef.SetVisible( m_itemWeaponIcon, true );
+		}
 		else
 		{
 			NEW_UpdateName( data.GetName(), data.GetQuantity() );
@@ -1220,6 +1473,7 @@ class NewItemTooltipHeaderController extends NewItemTooltipModuleController
 
 class NewItemTooltipWeaponBarsModule extends NewItemTooltipModuleController
 {
+	editable var m_wrapper : inkWidgetRef;
 	const editable var m_bars : array< inkWidgetRef >;
 	const editable var m_diffBars : array< inkWidgetRef >;
 	editable var m_betterColorDummyHolder : inkWidgetRef;
@@ -1236,6 +1490,30 @@ class NewItemTooltipWeaponBarsModule extends NewItemTooltipModuleController
 		for( i = 0, limit = m_bars.Size(); i < limit; i += 1 )
 		{
 			( ( weak< weak< NewItemTooltipStatBarController > > )( inkWidgetRef.GetController( m_bars[ i ] ) ) ).SetupColors( betterColor, worseColor );
+		}
+	}
+
+	public function UpdateWrapping( bigFontEnabled : Bool, data : MinimalItemTooltipData )
+	{
+		if( bigFontEnabled )
+		{
+			inkWidgetRef.SetMargin( m_wrapper, 60.0, 0.0, 0.0, 0.0 );
+		}
+		else
+		{
+			inkWidgetRef.SetMargin( m_wrapper, 0.0, 0.0, 0.0, 0.0 );
+		}
+	}
+
+	public function NEW_UpdateWrapping( bigFontEnabled : Bool )
+	{
+		if( bigFontEnabled )
+		{
+			inkWidgetRef.SetMargin( m_wrapper, 60.0, 0.0, 0.0, 0.0 );
+		}
+		else
+		{
+			inkWidgetRef.SetMargin( m_wrapper, 0.0, 0.0, 0.0, 0.0 );
 		}
 	}
 
@@ -1343,8 +1621,23 @@ class NewItemTooltipStatBarController extends inkLogicController
 	{
 		var percentage, comparedPercentage, diff : Float;
 		var overflow, isBetter : Bool;
+		var numericValue : Float;
+		var numericValueString : String;
+		numericValue = GetNumericValue( itemType, bar.Type, bar.Value, bar.MaxValue );
+		if( numericValue < 10.0 )
+		{
+			numericValueString = FloatToStringPrec( numericValue, 1 );
+			if( StrLen( numericValueString ) == 1 )
+			{
+				numericValueString += ".0";
+			}
+		}
+		else
+		{
+			numericValueString = IntToString( RoundFEx( numericValue ) );
+		}
 		inkTextRef.SetText( m_statName, BarTypeToName( bar.Type ) );
-		inkTextRef.SetText( m_statValue, FloatToStringPrec( GetNumericValue( itemType, bar.Type, bar.Value, bar.MaxValue ), 2 ) );
+		inkTextRef.SetText( m_statValue, numericValueString );
 		if( ( comparedBar != NULL ) && comparedBar.IsValueSet() )
 		{
 			diff = bar.Percentage - comparedBar.Percentage;
@@ -1537,6 +1830,7 @@ class NewItemTooltipRequirementsModule extends NewItemTooltipModuleController
 class NewItemTooltipDetailsStatsModule extends NewItemTooltipModuleController
 {
 	private editable var m_statsContainer : inkCompoundRef;
+	private editable var m_isCrafting : Bool;
 
 	public override function Update( data : MinimalItemTooltipData )
 	{
@@ -1550,6 +1844,7 @@ class NewItemTooltipDetailsStatsModule extends NewItemTooltipModuleController
 		{
 			widget = SpawnFromLocal( inkCompoundRef.Get( m_statsContainer ), 'itemDetailsStat' );
 			controller = ( ( ItemTooltipStatController )( widget.GetController() ) );
+			controller.GetContext( m_isCrafting );
 			controller.SetData( statsManager.GetTooltipStat( i ) );
 		}
 	}
@@ -1566,8 +1861,14 @@ class NewItemTooltipDetailsStatsModule extends NewItemTooltipModuleController
 		{
 			widget = SpawnFromLocal( inkCompoundRef.Get( m_statsContainer ), 'itemDetailsStat' );
 			controller = ( ( ItemTooltipStatController )( widget.GetController() ) );
+			controller.GetContext( m_isCrafting );
 			controller.SetData( statsManager.GetTooltipStat( i ) );
 		}
+	}
+
+	public function GetContext( isCrafting : Bool )
+	{
+		m_isCrafting = isCrafting;
 	}
 
 }
@@ -1586,6 +1887,7 @@ class NewItemTooltipDetailsModule extends NewItemTooltipModuleController
 	private editable var m_modifierPowerLine : inkWidgetRef;
 	private editable var m_modifierPowerLabel : inkTextRef;
 	private editable var m_modifierPowerWrapper : inkCompoundRef;
+	private editable var m_isCrafting : Bool;
 
 	public function Update( data : MinimalItemTooltipData, hasDedicatedMods : Bool, hasMods : Bool )
 	{
@@ -1625,6 +1927,18 @@ class NewItemTooltipDetailsModule extends NewItemTooltipModuleController
 		}
 	}
 
+	public function NEW_UpdateWrapping( bigFontEnabled : Bool )
+	{
+		if( bigFontEnabled == true )
+		{
+			inkTextRef.SetWrappingAtPosition( m_dedicatedModsText, 750.0 );
+		}
+		else
+		{
+			inkTextRef.SetWrappingAtPosition( m_dedicatedModsText, 650.0 );
+		}
+	}
+
 	private function UpdateMods( data : MinimalItemTooltipData )
 	{
 		var i, modsSize : Int32;
@@ -1641,6 +1955,7 @@ class NewItemTooltipDetailsModule extends NewItemTooltipModuleController
 		for( i = 0; i < modsSize; i += 1 )
 		{
 			controller = ( ( NewItemTooltipAttachmentGroupController )( inkCompoundRef.GetWidgetByIndex( m_modsContainer, i ).GetController() ) );
+			controller.GetContext( m_isCrafting );
 			controller.SetData( data.mods[ i ] );
 		}
 	}
@@ -1701,8 +2016,14 @@ class NewItemTooltipDetailsModule extends NewItemTooltipModuleController
 		for( i = 0; i < modsSize; i += 1 )
 		{
 			controller = ( ( NewItemTooltipAttachmentGroupController )( inkCompoundRef.GetWidgetByIndex( m_modsContainer, i ).GetController() ) );
+			controller.GetContext( m_isCrafting );
 			controller.SetData( modsManager.GetMod( i ) );
 		}
+	}
+
+	public function GetContext( isCrafting : Bool )
+	{
+		m_isCrafting = isCrafting;
 	}
 
 }
@@ -1813,6 +2134,18 @@ class NewItemTooltipDescriptionModule extends NewItemTooltipModuleController
 		m_defaultMargin = inkTextRef.GetMargin( m_descriptionText );
 	}
 
+	public function UpdateWrapping( bigFontEnabled : Bool )
+	{
+		if( bigFontEnabled == true )
+		{
+			inkTextRef.SetWrappingAtPosition( m_descriptionText, 750.0 );
+		}
+		else
+		{
+			inkTextRef.SetWrappingAtPosition( m_descriptionText, 650.0 );
+		}
+	}
+
 	public override function Update( data : MinimalItemTooltipData )
 	{
 		inkTextRef.SetText( m_descriptionText, data.gameplayDescription );
@@ -1842,7 +2175,35 @@ class NewItemTooltipBrokenModule extends NewItemTooltipModuleController
 
 	protected event OnInitialize()
 	{
-		inkTextRef.SetLocalizedTextScript( m_descriptionText, "LocKey#1327" );
+		inkTextRef.SetLocalizedTextScript( m_descriptionText, "LocKey#95195" );
+	}
+
+	public function NEW_UpdateWrapping( bigFontEnabled : Bool )
+	{
+		if( bigFontEnabled == true )
+		{
+			inkTextRef.SetWrappingAtPosition( m_descriptionText, 750.0 );
+		}
+		else
+		{
+			inkTextRef.SetWrappingAtPosition( m_descriptionText, 650.0 );
+		}
+	}
+
+}
+
+class NewItemTooltipSettingsListener extends ConfigVarListener
+{
+	private var m_ctrl : weak< NewItemTooltipCommonController >;
+
+	public function RegisterController( ctrl : NewItemTooltipCommonController )
+	{
+		m_ctrl = ctrl;
+	}
+
+	public export override function OnVarModified( groupPath : CName, varName : CName, varType : ConfigVarType, reason : ConfigChangeReason )
+	{
+		m_ctrl.OnVarModified( groupPath, varName, varType, reason );
 	}
 
 }

@@ -18,6 +18,7 @@ import class VehicleObject extends GameObject
 	private var m_fearInside : Bool;
 	private var m_vehicleUpsideDown : Bool;
 	private var m_isQhackUploadInProgress : Bool;
+	private var m_hitByPlayer : Bool;
 	private var m_currentlyUploadingAction : weak< ScriptableDeviceAction >;
 	private var m_bumpedRecently : Int32;
 	private var m_bumpTimestamp : Float;
@@ -66,6 +67,7 @@ import class VehicleObject extends GameObject
 	public import const final function IsAirControlEnabled() : Bool;
 	public import final function EnableAirControl( toggle : Bool );
 	public import const final function IsInAir() : Bool;
+	public import const final function IsLeaningOnOneWheel() : Bool;
 	public import const final function IsFlippedOver() : Bool;
 	public import const final function IsSkidding( wheelSlipThreshold : Float ) : Bool;
 	public import final function GetCameraManager() : VehicleCameraManager;
@@ -78,6 +80,8 @@ import class VehicleObject extends GameObject
 	public import final function SetIsHackable( enable : Bool );
 	public import final function ActivateNetrunnerQuickhack( chooseHack : VehicleNetrunnerQuickhackType );
 	public import final function IsRadioReceiverActive() : Bool;
+	public import final function WasRadioReceiverPlaying() : Bool;
+	public import final function GetCurrentRadioIndex() : Uint32;
 	public import final function GetRadioReceiverStationName() : CName;
 	public import final function GetRadioReceiverTrackName() : CName;
 	public import final function GetAnimsetOverrideForPassenger( slotName : CName ) : CName;
@@ -199,6 +203,7 @@ import class VehicleObject extends GameObject
 	{
 		super.OnGameAttached();
 		SetInteriorUIEnabled( false );
+		m_hitByPlayer = false;
 	}
 
 	protected event OnDeviceLinkRequest( evt : DeviceLinkRequest )
@@ -480,18 +485,16 @@ import class VehicleObject extends GameObject
 
 	protected event OnUploadProgressStateChanged( evt : UploadProgramProgressEvent )
 	{
-		if( evt.progressBarContext == EProgressBarContext.QuickHack )
+		if( evt.progressBarContext == EProgressBarContext.QuickHack && evt.progressBarType == EProgressBarType.UPLOAD )
 		{
-			if( evt.progressBarType == EProgressBarType.UPLOAD )
+			switch( evt.state )
 			{
-				if( evt.state == EUploadProgramState.STARTED )
-				{
+				case EUploadProgramState.STARTED:
 					m_isQhackUploadInProgress = true;
-				}
-				else if( evt.state == EUploadProgramState.COMPLETED )
-				{
+				break;
+				case EUploadProgramState.COMPLETED:
 					m_isQhackUploadInProgress = false;
-				}
+				break;
 			}
 		}
 	}
@@ -912,7 +915,7 @@ import class VehicleObject extends GameObject
 		}
 		if( ( passengersCanLeaveCar.Size() > 0 ) && !( IsA( 'vehicleAVBaseObject' ) ) )
 		{
-			if( ( ( ( IsPerformingPanicDriving() || IsCrowdVehicle() ) && !( IsQuest() ) ) && !( ( ( ScriptedPuppet )( passengersCanLeaveCar[ 0 ] ) ).IsPrevention() ) ) && !( ( ( ScriptedPuppet )( passengersCanLeaveCar[ 0 ] ) ).IsAggressive() ) )
+			if( ( ( ( IsPerformingPanicDriving() || ( ( ScriptedPuppet )( passengersCanLeaveCar[ 0 ] ) ).IsCrowd() ) && !( ( ( ScriptedPuppet )( passengersCanLeaveCar[ 0 ] ) ).IsPrevention() ) ) && !( ( ( ScriptedPuppet )( passengersCanLeaveCar[ 0 ] ) ).IsAggressive() ) ) && !( IsQuest() ) )
 			{
 				exitEvent = new AIEvent;
 				exitEvent.name = 'ExitVehicleInPanic';
@@ -1015,6 +1018,11 @@ import class VehicleObject extends GameObject
 		super.OnHit( evt );
 	}
 
+	public function ShouldPreventionReactToExplosion() : Bool
+	{
+		return m_hitByPlayer && ( ( GetBlackboard() && GetBlackboard().GetBool( GetAllBlackboardDefs().Vehicle.IsCrowd ) ) || IsVehicleParked() );
+	}
+
 	public override function ReactToHitProcess( hitEvent : gameHitEvent )
 	{
 		var isFromPrevention : Bool;
@@ -1023,6 +1031,10 @@ import class VehicleObject extends GameObject
 		if( hitEvent.attackData.GetInstigator() )
 		{
 			isFromPrevention = hitEvent.attackData.GetInstigator().IsPrevention();
+			if( !( m_hitByPlayer ) )
+			{
+				m_hitByPlayer = hitEvent.attackData.GetInstigator().IsPlayer();
+			}
 		}
 		if( ( IsPrevention() && IsCrowdVehicle() ) && !( isFromPrevention ) )
 		{
@@ -1252,6 +1264,7 @@ importonly class BikeObject extends WheeledObject
 	public import final function EnableTiltControl( enable : Bool );
 	public import final function GetCustomTargetTilt() : Float;
 	public import final function SetCustomTargetTilt( targetTilt : Float );
+	public import final function IsPerformingAWheelieOrEndo( minCOMOffset : Float, minPitchAngle : Float ) : Bool;
 }
 
 importonly class TankObject extends VehicleObject
@@ -1263,7 +1276,7 @@ import class AVObject extends VehicleObject
 
 	public function TurnOffThrusters()
 	{
-		GameObjectEffectHelper.StopEffectEvent( this, 'thrusters' );
+		GameObjectEffectHelper.BreakEffectLoopEvent( this, 'thrusters' );
 	}
 
 	public function TurnOnThrusters()
@@ -1275,6 +1288,158 @@ import class AVObject extends VehicleObject
 
 import class PreventionAVObject extends AVObject
 {
+}
+
+class MetroPitchAdjustmentEvent extends Event
+{
+}
+
+class ncartMetroObject extends AVObject
+{
+	private var m_pitchAdjustmentDelayID : DelayID;
+	private var m_Z : Float;
+	private var m_checkForLeveling : Bool;
+	private var m_pitchingValue : Int32;
+	editable var m_pitchAngleCheckInterval : Float;
+	default m_pitchAngleCheckInterval = 0.4f;
+	editable var m_pitchAngleReturnInterval : Float;
+	default m_pitchAngleReturnInterval = 0.75f;
+	editable var m_trainReverseDirectionFactName : CName;
+	default m_trainReverseDirectionFactName = 'ue_metro_track_reverse';
+	editable var m_pitchAngleAdjustmentTreshold : Float;
+	default m_pitchAngleAdjustmentTreshold = 0.9f;
+	editable var m_pitchAngleLevelOutTreshold : Float;
+	default m_pitchAngleLevelOutTreshold = 0.5f;
+
+	protected event OnGameAttached()
+	{
+		super.OnGameAttached();
+		m_Z = WorldPosition.GetZ( WorldTransform.GetWorldPosition( GetWorldTransform() ) );
+		TogglePitchAdjustment( true );
+	}
+
+	protected event OnDetach()
+	{
+		super.OnDetach();
+		TogglePitchAdjustment( false );
+	}
+
+	private function PerformYawAjustment()
+	{
+		var orientation : Quaternion;
+		var angles : EulerAngles;
+		orientation = WorldTransform.GetOrientation( GetWorldTransform() );
+		angles = Quaternion.ToEulerAngles( orientation );
+		angles.Yaw = AngleNormalize180( angles.Yaw + 180.0 );
+		GameInstance.GetTeleportationFacility( this.GetGame() ).Teleport( this, GetWorldPosition(), angles );
+	}
+
+	private function TogglePitchAdjustment( on : Bool )
+	{
+		var delaySystem : DelaySystem;
+		delaySystem = GameInstance.GetDelaySystem( GetGame() );
+		if( on )
+		{
+			m_pitchAdjustmentDelayID = delaySystem.DelayEvent( this, new MetroPitchAdjustmentEvent, m_pitchAngleCheckInterval );
+		}
+		else
+		{
+			delaySystem.CancelDelay( m_pitchAdjustmentDelayID );
+		}
+	}
+
+	private function PerformPitchAdjustment( z : Float )
+	{
+		var animPlay : gameTransformAnimationPlayEvent;
+		if( m_Z > z )
+		{
+			animPlay = new gameTransformAnimationPlayEvent;
+			animPlay.animationName = 'PitchDown';
+			animPlay.timeScale = 1.0;
+			animPlay.timesPlayed = 1;
+			m_pitchingValue = -1;
+			this.QueueEvent( animPlay );
+		}
+		else
+		{
+			animPlay = new gameTransformAnimationPlayEvent;
+			animPlay.timeScale = 1.0;
+			animPlay.animationName = 'PitchUp';
+			animPlay.timesPlayed = 1;
+			m_pitchingValue = 1;
+			this.QueueEvent( animPlay );
+		}
+	}
+
+	private function LevelOutPitch()
+	{
+		var animPlay : gameTransformAnimationPlayEvent;
+		switch( m_pitchingValue )
+		{
+			case 1:
+			{
+				animPlay = new gameTransformAnimationPlayEvent;
+				animPlay.animationName = 'PitchUp';
+				animPlay.timeScale = -1.0;
+				animPlay.timesPlayed = 1;
+				m_pitchingValue = 0;
+				this.QueueEvent( animPlay );
+			}
+			break;
+			case -1:
+			{
+				animPlay = new gameTransformAnimationPlayEvent;
+				animPlay.animationName = 'PitchDown';
+				animPlay.timeScale = -1.0;
+				animPlay.timesPlayed = 1;
+				m_pitchingValue = 0;
+				this.QueueEvent( animPlay );
+			}
+			break;
+		}
+	}
+
+	protected event OnMetroPitchAdjustmentEvent( evt : MetroPitchAdjustmentEvent )
+	{
+		var z : Float;
+		var disablingFact : Int32;
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( this.GetGame() );
+		z = WorldPosition.GetZ( WorldTransform.GetWorldPosition( GetWorldTransform() ) );
+		disablingFact = questSystem.GetFact( 'ue_metro_disable_pitch_adjustment' );
+		if( disablingFact >= 1 )
+		{
+			if( m_checkForLeveling )
+			{
+				LevelOutPitch();
+				m_checkForLeveling = false;
+			}
+			GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new MetroPitchAdjustmentEvent, m_pitchAngleCheckInterval );
+		}
+		else
+		{
+			if( !( m_checkForLeveling ) )
+			{
+				if( AbsF( m_Z - z ) > m_pitchAngleAdjustmentTreshold )
+				{
+					PerformPitchAdjustment( z );
+					m_checkForLeveling = true;
+				}
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new MetroPitchAdjustmentEvent, m_pitchAngleCheckInterval );
+			}
+			else
+			{
+				if( AbsF( m_Z - z ) <= m_pitchAngleLevelOutTreshold )
+				{
+					LevelOutPitch();
+					m_checkForLeveling = false;
+				}
+				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new MetroPitchAdjustmentEvent, m_pitchAngleReturnInterval );
+				m_Z = z;
+			}
+		}
+	}
+
 }
 
 function GetMountedVehicle( object : GameObject ) : weak< VehicleObject >

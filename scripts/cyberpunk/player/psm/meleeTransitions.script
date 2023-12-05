@@ -64,9 +64,9 @@ class DriverCombatListener
 		return m_isMounted;
 	}
 
-	public const function IsInTPP() : Bool
+	public const function IsMountedInTPP() : Bool
 	{
-		return m_isInTPP;
+		return m_isMounted && m_isInTPP;
 	}
 
 }
@@ -74,11 +74,20 @@ class DriverCombatListener
 abstract class MeleeTransition extends DefaultTransition
 {
 	var m_stateNameString : String;
+	protected var m_driverCombatListener : DriverCombatListener;
 
 	protected export virtual function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
 	{
 		m_stateNameString = NameToString( GetStateName() );
 		UppercaseFirstChar( m_stateNameString );
+		m_driverCombatListener = new DriverCombatListener;
+		m_driverCombatListener.Init( scriptInterface );
+	}
+
+	protected export virtual function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
+	{
+		m_driverCombatListener.UnInit( scriptInterface );
+		m_driverCombatListener = NULL;
 	}
 
 	public constexpr static function GetMeleeAttackCooldownName() : CName
@@ -1107,7 +1116,14 @@ abstract class MeleeTransition extends DefaultTransition
 		projectileTemplateName = weaponObj.GetNamePropertyFromWeaponDefinition( T".projectileTemplateName" );
 		if( itemObj && IsNameValid( projectileTemplateName ) )
 		{
-			ProjectileLaunchHelper.SpawnProjectileFromScreenCenter( scriptInterface.executionOwner, projectileTemplateName, appearanceName, itemObj );
+			if( m_driverCombatListener.IsMountedInTPP() )
+			{
+				ProjectileLaunchHelper.SpawnProjectileFromRightHand( scriptInterface.executionOwner, projectileTemplateName, appearanceName, itemObj );
+			}
+			else
+			{
+				ProjectileLaunchHelper.SpawnProjectileFromScreenCenter( scriptInterface.executionOwner, projectileTemplateName, appearanceName, itemObj );
+			}
 		}
 	}
 
@@ -1850,9 +1866,39 @@ class MeleePublicSafeEvents extends MeleeRumblingEvents
 class MeleeSafeDecisions extends MeleeTransition
 {
 
+	protected const function IsFriendlyTargetInMeleeRange( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface, const attackRangeSquared : Float ) : Bool
+	{
+		var player : PlayerPuppet;
+		var isTargeting : StateResultBool;
+		player = ( ( PlayerPuppet )( scriptInterface.executionOwner ) );
+		if( !( player ) )
+		{
+			return false;
+		}
+		if( !( player.IsAimingAtFriendly() ) )
+		{
+			return false;
+		}
+		isTargeting = stateContext.GetPermanentBoolParameter( 'isTargeting' );
+		if( !( isTargeting.value ) && ( player.DistanceFromTargetSquared() > attackRangeSquared ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
 	protected export const function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( ( ( PlayerPuppet )( scriptInterface.executionOwner ) ).IsAimingAtFriendly() || ShouldEnterSafe( stateContext, scriptInterface ) )
+		var isTargeting : StateResultBool;
+		var attackRangeSquared : Float;
+		isTargeting = stateContext.GetPermanentBoolParameter( 'isTargeting' );
+		attackRangeSquared = scriptInterface.GetStatsSystem().GetStatValue( ( ( EntityID )( scriptInterface.ownerEntityID ) ), gamedataStatType.Range );
+		attackRangeSquared = attackRangeSquared * attackRangeSquared;
+		if( IsFriendlyTargetInMeleeRange( stateContext, scriptInterface, attackRangeSquared ) )
+		{
+			return true;
+		}
+		if( ShouldEnterSafe( stateContext, scriptInterface, ( ( isTargeting.value ) ? ( 0.0 ) : ( attackRangeSquared ) ) ) )
 		{
 			return true;
 		}
@@ -1880,25 +1926,7 @@ class MeleeSafeEvents extends MeleePublicSafeEvents
 
 }
 
-abstract class MeleeHoldGenericDecisions extends MeleeTransition
-{
-	protected var m_driverCombatListener : DriverCombatListener;
-
-	protected export override function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener = new DriverCombatListener;
-		m_driverCombatListener.Init( scriptInterface );
-	}
-
-	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener.UnInit( scriptInterface );
-		m_driverCombatListener = NULL;
-	}
-
-}
-
-class MeleeHoldDecisions extends MeleeHoldGenericDecisions
+class MeleeHoldDecisions extends MeleeTransition
 {
 
 	protected export const function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
@@ -1936,16 +1964,16 @@ class MeleeHoldDecisions extends MeleeHoldGenericDecisions
 
 	protected export const function ToMeleeFinalAttack( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		if( GameInstance.GetPhotoModeSystem( scriptInterface.executionOwner.GetGame() ).IsPhotoModeActive() )
+		{
+			return false;
+		}
 		return CheckIfFinalAttack( scriptInterface, stateContext ) && WantsToLightAttack( stateContext, scriptInterface );
 	}
 
 	protected export const function ToMeleeMountedFinalAttack( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( !( m_driverCombatListener.IsMounted() ) )
-		{
-			return false;
-		}
-		if( !( m_driverCombatListener.IsInTPP() ) )
+		if( !( m_driverCombatListener.IsMountedInTPP() ) )
 		{
 			return false;
 		}
@@ -1976,7 +2004,7 @@ class MeleeHoldEvents extends MeleeEventsTransition
 
 }
 
-class MeleeChargedHoldDecisions extends MeleeHoldGenericDecisions
+class MeleeChargedHoldDecisions extends MeleeTransition
 {
 
 	protected export const virtual function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
@@ -2012,6 +2040,10 @@ class MeleeChargedHoldDecisions extends MeleeHoldGenericDecisions
 	protected const function ToMeleeStrongAttack( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
 		var timeoutDuration : Float;
+		if( GameInstance.GetPhotoModeSystem( scriptInterface.executionOwner.GetGame() ).IsPhotoModeActive() )
+		{
+			return false;
+		}
 		if( NoStrongAttackPressed( scriptInterface ) )
 		{
 			return true;
@@ -2026,11 +2058,7 @@ class MeleeChargedHoldDecisions extends MeleeHoldGenericDecisions
 
 	protected const function ToMeleeMountedStrongAttack( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( !( m_driverCombatListener.IsMounted() ) )
-		{
-			return false;
-		}
-		if( !( m_driverCombatListener.IsInTPP() ) )
+		if( !( m_driverCombatListener.IsMountedInTPP() ) )
 		{
 			return false;
 		}
@@ -2393,7 +2421,6 @@ abstract class MeleeAttackGenericEvents extends MeleeEventsTransition
 		stateContext.SetPermanentBoolParameter( 'VisionToggled', false, true );
 		ForceDisableVisionMode( stateContext );
 		stateContext.SetTemporaryBoolParameter( 'InterruptSprint', true, true );
-		stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
 		canPerformLeap = !( m_enteredFromMeleeLeap );
 		if( canPerformLeap )
 		{
@@ -2632,6 +2659,10 @@ abstract class MeleeAttackGenericEvents extends MeleeEventsTransition
 		{
 			return true;
 		}
+		if( scriptInterface.localBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsPlayerInsideMovingElevator ) )
+		{
+			return true;
+		}
 		return false;
 	}
 
@@ -2711,6 +2742,7 @@ abstract class MeleeAttackGenericEvents extends MeleeEventsTransition
 		mountedBike = ( ( BikeObject )( playerPuppet.GetMountedVehicle() ) );
 		if( mountedBike )
 		{
+			attackRange = MaxF( GetStaticFloatParameterDefault( "mountedMinBaseAttackRange", 2.0 ), attackRange );
 			bikeVelMag = Vector4.Length( mountedBike.GetLinearVelocity() );
 			attackRange *= ProportionalClampF( 0.0, 20.0, bikeVelMag, 1.0, 1.5 );
 			colliderBox.Y = attackRange;
@@ -2917,7 +2949,14 @@ abstract class MeleeAttackGenericEvents extends MeleeEventsTransition
 			{
 				pitchConstraint = 20.0;
 			}
-			cameraEulerAngles.Pitch = ClampF( ( cameraEulerAngles.Pitch + bikeEulerAngles.Pitch ) / 2.0, -( pitchConstraint ), pitchConstraint ) - bikeEulerAngles.Pitch;
+			if( mountedBike.IsLeaningOnOneWheel() )
+			{
+				cameraEulerAngles.Pitch = ( cameraEulerAngles.Pitch + 3.0 ) / 2.0;
+			}
+			else
+			{
+				cameraEulerAngles.Pitch = ClampF( ( cameraEulerAngles.Pitch + bikeEulerAngles.Pitch ) / 2.0, -( pitchConstraint ), pitchConstraint ) - bikeEulerAngles.Pitch;
+			}
 			if( mountedBike )
 			{
 				cameraWorldTransform.position.Z -= ( ProportionalClampF( 5.0, 20.0, bikeVelMag, 0.0, 0.25 ) * ProportionalClampF( -( pitchConstraint ), -( pitchConstraint ) / 2.0, cameraEulerAngles.Pitch, 1.0, 0.0 ) );
@@ -3049,6 +3088,10 @@ class MeleeComboAttackDecisions extends MeleeAttackGenericDecisions
 		{
 			return false;
 		}
+		if( m_driverCombatListener.IsMountedInTPP() && GameInstance.GetPhotoModeSystem( scriptInterface.executionOwner.GetGame() ).IsPhotoModeActive() )
+		{
+			return false;
+		}
 		return true;
 	}
 
@@ -3073,28 +3116,10 @@ class MeleeComboAttackEvents extends MeleeAttackGenericEvents
 
 class MeleeMountedComboAttackDecisions extends MeleeComboAttackDecisions
 {
-	var m_driverCombatListener : DriverCombatListener;
-
-	protected export override function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener = new DriverCombatListener;
-		m_driverCombatListener.Init( scriptInterface );
-		super.OnAttach( stateContext, scriptInterface );
-	}
-
-	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener.UnInit( scriptInterface );
-		m_driverCombatListener = NULL;
-	}
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( !( m_driverCombatListener.IsMounted() ) )
-		{
-			return false;
-		}
-		if( !( m_driverCombatListener.IsInTPP() ) )
+		if( !( m_driverCombatListener.IsMountedInTPP() ) )
 		{
 			return false;
 		}
@@ -3174,28 +3199,10 @@ class MeleeFinalAttackEvents extends MeleeAttackGenericEvents
 
 class MeleeMountedFinalAttackDecisions extends MeleeFinalAttackDecisions
 {
-	var m_driverCombatListener : DriverCombatListener;
-
-	protected export override function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener = new DriverCombatListener;
-		m_driverCombatListener.Init( scriptInterface );
-		super.OnAttach( stateContext, scriptInterface );
-	}
-
-	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener.UnInit( scriptInterface );
-		m_driverCombatListener = NULL;
-	}
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( !( m_driverCombatListener.IsMounted() ) )
-		{
-			return false;
-		}
-		if( !( m_driverCombatListener.IsInTPP() ) )
+		if( !( m_driverCombatListener.IsMountedInTPP() ) )
 		{
 			return false;
 		}
@@ -3538,28 +3545,10 @@ class MeleeStrongAttackEvents extends MeleeAttackGenericEvents
 
 class MeleeMountedStrongAttackDecisions extends MeleeStrongAttackDecisions
 {
-	var m_driverCombatListener : DriverCombatListener;
-
-	protected export override function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener = new DriverCombatListener;
-		m_driverCombatListener.Init( scriptInterface );
-		super.OnAttach( stateContext, scriptInterface );
-	}
-
-	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener.UnInit( scriptInterface );
-		m_driverCombatListener = NULL;
-	}
 
 	protected export const override function EnterCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		if( !( m_driverCombatListener.IsMounted() ) )
-		{
-			return false;
-		}
-		if( !( m_driverCombatListener.IsInTPP() ) )
+		if( !( m_driverCombatListener.IsMountedInTPP() ) )
 		{
 			return false;
 		}
@@ -3899,6 +3888,10 @@ class MeleeTargetingDecisions extends MeleeTransition
 
 	protected const function ExitCondition( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
+		if( GameInstance.GetPhotoModeSystem( scriptInterface.executionOwner.GetGame() ).IsPhotoModeActive() )
+		{
+			return false;
+		}
 		if( ShouldInterruptHoldStates( stateContext, scriptInterface ) )
 		{
 			return true;
@@ -3918,6 +3911,7 @@ class MeleeTargetingDecisions extends MeleeTransition
 
 class MeleeTargetingEvents extends MeleeEventsTransition
 {
+	private var m_aimInTimeRemaining : Float;
 
 	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
@@ -3929,6 +3923,9 @@ class MeleeTargetingEvents extends MeleeEventsTransition
 		ResetAttackNumber( stateContext );
 		GetAttackDataFromState( stateContext, scriptInterface, "MeleeThrowAttack", stateContext.GetIntParameter( 'meleeAttackNumber', true ), attackData );
 		stateContext.SetTemporaryBoolParameter( 'InterruptSprint', true, true );
+		m_aimInTimeRemaining = 0.25;
+		SetBlackboardFloatVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.AimInTimeRemaining, m_aimInTimeRemaining );
+		SetBlackboardFloatVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.AimInTime, m_aimInTimeRemaining );
 		if( aimAssistRecord && aimAssistRecord.AimSnapOnAim() )
 		{
 			scriptInterface.GetTargetingSystem().AimSnap( scriptInterface.executionOwner );
@@ -3946,11 +3943,33 @@ class MeleeTargetingEvents extends MeleeEventsTransition
 		super.OnUpdate( timeDelta, stateContext, scriptInterface );
 		ShowAttackPreview( true, weaponObject, scriptInterface, stateContext );
 		HandleDamagePreview( weaponObject, scriptInterface, stateContext );
+		if( m_aimInTimeRemaining > 0.0 )
+		{
+			m_aimInTimeRemaining -= timeDelta;
+			SetBlackboardFloatVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.AimInTimeRemaining, m_aimInTimeRemaining );
+		}
+	}
+
+	public function OnCommonExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		m_aimInTimeRemaining = 0.0;
+		SetBlackboardFloatVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.AimInTimeRemaining, m_aimInTimeRemaining );
+		ActivateDamageProjection( false, GetWeaponObject( scriptInterface ), scriptInterface, stateContext );
+		if( !( MeleeAttackPressed( scriptInterface ) ) )
+		{
+			stateContext.SetTemporaryBoolParameter( 'requestKerenzikovDeactivation', true, true );
+		}
+		stateContext.SetTemporaryBoolParameter( 'requestKerenzikovDeactivationWithEaseOut', true, true );
 	}
 
 	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		ActivateDamageProjection( false, GetWeaponObject( scriptInterface ), scriptInterface, stateContext );
+		OnCommonExit( stateContext, scriptInterface );
+	}
+
+	public override function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		OnCommonExit( stateContext, scriptInterface );
 	}
 
 }
@@ -4002,14 +4021,15 @@ class MeleeThrowAttackEvents extends MeleeAttackGenericEvents
 	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		var aimAssistRecord : AimAssistMelee_Record;
+		var locomotionState : CName;
 		aimAssistRecord = GetAimAssistMeleeRecord( scriptInterface );
+		locomotionState = stateContext.GetStateMachineCurrentState( 'Locomotion' );
 		m_projectileThrown = false;
 		if( CheckItemType( scriptInterface, gamedataItemType.Cyb_NanoWires ) )
 		{
 			m_targetObject = GetNanoWireTargetObject( scriptInterface );
 		}
 		SetBlackboardIntVariable( scriptInterface, GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, ( ( Int32 )( gamePSMMeleeWeapon.ThrowAttack ) ) );
-		EnableLockOnTarget( stateContext, scriptInterface );
 		if( aimAssistRecord && aimAssistRecord.AimSnapOnThrow() )
 		{
 			scriptInterface.GetTargetingSystem().AimSnap( scriptInterface.executionOwner );
@@ -4017,11 +4037,13 @@ class MeleeThrowAttackEvents extends MeleeAttackGenericEvents
 		super.OnEnter( stateContext, scriptInterface );
 		if( PlayerDevelopmentSystem.GetInstance( scriptInterface.executionOwner ).IsNewPerkBought( scriptInterface.executionOwner, gamedataNewPerkType.Cool_Master_Perk_4 ) )
 		{
-			if( ( ( IsInSlidingState( stateContext ) || 'crouchSprint' == stateContext.GetStateMachineCurrentState( 'Locomotion' ) ) || stateContext.IsStateActive( 'Locomotion', 'sprint' ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'JustDodged' ) )
+			if( ( ( ( ( IsInSlidingState( stateContext ) || locomotionState == 'crouchSprint' ) || locomotionState == 'coolExitJump' ) || stateContext.IsStateActive( 'Locomotion', 'sprint' ) ) || StatusEffectSystem.ObjectHasStatusEffectWithTag( scriptInterface.executionOwner, 'JustDodged' ) ) || StatusEffectSystem.ObjectHasStatusEffect( scriptInterface.executionOwner, T"BaseStatusEffect.DriverCombatVehicleManeuvers" ) )
 			{
 				StatusEffectHelper.ApplyStatusEffect( scriptInterface.executionOwner, T"BaseStatusEffect.ForceCritOnNextThrowSE" );
 			}
 		}
+		stateContext.SetTemporaryBoolParameter( 'requestKerenzikovDeactivationWithEaseOut', true, true );
+		scriptInterface.GetTargetingSystem().SetPlayerAimWeaponPositionProvider( scriptInterface.executionOwner, IPositionProvider.CreateSlotPositionProvider( scriptInterface.executionOwner, 'RightHand' ) );
 	}
 
 	public override function OnUpdate( timeDelta : Float, stateContext : StateContext, scriptInterface : StateGameScriptInterface )
@@ -4044,6 +4066,7 @@ class MeleeThrowAttackEvents extends MeleeAttackGenericEvents
 				SendAnimFeatureData( stateContext, scriptInterface );
 				SpawnMeleeWeaponProjectile( scriptInterface );
 				ApplyThrowableCooldown( stateContext, scriptInterface );
+				GetWeaponObject( scriptInterface ).SetVisible( false );
 			}
 		}
 	}
@@ -4082,6 +4105,13 @@ class MeleeThrowAttackEvents extends MeleeAttackGenericEvents
 	{
 		DisableNanoWireIK( scriptInterface );
 		super.OnExit( stateContext, scriptInterface );
+		scriptInterface.GetTargetingSystem().SetPlayerAimWeaponPositionProvider( scriptInterface.executionOwner, IPositionProvider.CreateEntityPositionProvider( GetWeaponObject( scriptInterface ) ) );
+	}
+
+	public override function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		scriptInterface.GetTargetingSystem().SetPlayerAimWeaponPositionProvider( scriptInterface.executionOwner, IPositionProvider.CreateEntityPositionProvider( GetWeaponObject( scriptInterface ) ) );
+		super.OnForcedExit( stateContext, scriptInterface );
 	}
 
 	protected function ApplyThrowableCooldown( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
@@ -4125,6 +4155,12 @@ class MeleeThrowReloadEvents extends MeleeEventsTransition
 {
 	var m_isSwitchingWeapon : Bool;
 
+	protected function OnEnterFromMeleeEquipping( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		GetWeaponObject( scriptInterface ).SetVisible( false );
+		OnEnter( stateContext, scriptInterface );
+	}
+
 	public override function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		SetIsThrowReloading( stateContext, true );
@@ -4146,6 +4182,12 @@ class MeleeThrowReloadEvents extends MeleeEventsTransition
 		}
 	}
 
+	public override function OnForcedExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
+	{
+		super.OnForcedExit( stateContext, scriptInterface );
+		GetWeaponObject( scriptInterface ).SetVisible( true );
+	}
+
 	public override function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		var weaponEquipAnimFeature : AnimFeature_EquipType;
@@ -4160,6 +4202,7 @@ class MeleeThrowReloadEvents extends MeleeEventsTransition
 		super.OnExit( stateContext, scriptInterface );
 		GameInstance.GetAudioSystem( scriptInterface.owner.GetGame() ).RemoveTriggerEffect( 'PSM_MeleeTargetingOnEnter_trigger' );
 		GameInstance.GetAudioSystem( scriptInterface.owner.GetGame() ).RemoveTriggerEffect( 'PSM_MeleeReloadOnEnter_feedback' );
+		GetWeaponObject( scriptInterface ).SetVisible( true );
 	}
 
 	private function EquipNextWeapon( owner : GameObject )
@@ -4177,20 +4220,6 @@ class MeleeThrowReloadEvents extends MeleeEventsTransition
 
 class MeleeLeapDecisions extends MeleeTransition
 {
-	var m_driverCombatListener : DriverCombatListener;
-
-	protected export override function OnAttach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener = new DriverCombatListener;
-		m_driverCombatListener.Init( scriptInterface );
-		super.OnAttach( stateContext, scriptInterface );
-	}
-
-	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
-	{
-		m_driverCombatListener.UnInit( scriptInterface );
-		m_driverCombatListener = NULL;
-	}
 
 	protected export const function EnterCondition( stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
@@ -4900,7 +4929,7 @@ class MeleeBodySlamAttackEvents extends MeleeEventsTransition
 	const var m_weakAttackIndex : Int32;
 	default m_weakAttackIndex = 1;
 
-	protected export function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
+	protected export override function OnDetach( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface )
 	{
 		RemoveStatModifiers( scriptInterface );
 	}
@@ -5448,6 +5477,7 @@ class MeleeGroundSlamAttackEvents extends MeleeAttackGenericEvents
 		ForceDisableVisionMode( stateContext );
 		stateContext.SetTemporaryBoolParameter( 'InterruptSprint', true, true );
 		stateContext.SetConditionBoolParameter( 'SprintToggled', false, true );
+		stateContext.SetConditionBoolParameter( 'SprintHoldCanStartWithoutNewInput', false, true );
 		ClearDebugText( scriptInterface, m_textLayer );
 		stateContext.SetPermanentIntParameter( 'attackType', ( ( Int32 )( GetAttackType() ) ), true );
 		stateContext.SetConditionBoolParameter( 'CrouchToggled', false, true );

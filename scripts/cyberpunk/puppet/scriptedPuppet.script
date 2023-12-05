@@ -120,15 +120,23 @@ class QuickHackEvent extends Event
 {
 }
 
-class HackPlayerEvent extends Event
+class HackTargetEvent extends Event
 {
 	var netrunnerID : EntityID;
 	var targetID : EntityID;
 	var objectRecord : weak< ObjectAction_Record >;
+	var settings : HackTargetSettings;
+}
+
+struct HackTargetSettings
+{
 	var showDirectionalIndicator : Bool;
 	default showDirectionalIndicator = true;
-	var revealPositionAction : Bool;
+	var isRevealPositionAction : Bool;
+	default isRevealPositionAction = false;
 	var skipBeingHackedSetUp : Bool;
+	default skipBeingHackedSetUp = false;
+	var HUDData : HUDProgressBarData;
 }
 
 class NetworkLinkQuickhackEvent extends Event
@@ -1050,10 +1058,6 @@ class ScriptedPuppet extends gamePuppet
 		{
 			return;
 		}
-		if( !( m_currentlyUploadingAction ) || m_currentlyUploadingAction.m_isInactive )
-		{
-			GameInstance.GetStatPoolsSystem( GetGame() ).RequestRemovingStatPool( netrunnerID, gamedataStatPoolType.QuickHackUpload );
-		}
 		targetID = ( ( EntityID )( bb.GetVariant( GetAllBlackboardDefs().AIAction.netrunnerTarget ) ) );
 		if( !( EntityID.IsDefined( targetID ) ) )
 		{
@@ -1151,12 +1155,18 @@ class ScriptedPuppet extends gamePuppet
 		}
 		else if( IsBoss() )
 		{
-			if( !( IsCharacterCyberpsycho() ) && !( NPCManager.HasTag( GetRecordID(), 'MiniBoss' ) ) )
+			if( NPCManager.HasTag( GetRecordID(), 'ImmuneToTakedown' ) )
 			{
-				EnableInteraction( 'BossTakedownLayer', true );
 				EnableInteraction( 'Grapple', false );
 				EnableInteraction( 'TakedownLayer', false );
 				EnableInteraction( 'AerialTakedown', false );
+			}
+			else
+			{
+				if( !( NPCManager.HasTag( GetRecordID(), 'MiniBoss' ) ) )
+				{
+					EnableInteraction( 'BossTakedownLayer', true );
+				}
 			}
 		}
 		else if( IsMassive() )
@@ -2696,11 +2706,12 @@ class ScriptedPuppet extends gamePuppet
 		var healing : Float;
 		var setQuickHackAttempt : SetQuickHackAttemptEvent;
 		var memoryReturnFactor : Float;
+		var wasDefeatedWithHack : Bool;
 		setQuickHackAttempt = new SetQuickHackAttemptEvent;
 		setQuickHackAttempt.wasQuickHackAttempt = false;
 		GameInstance.GetPersistencySystem( GetGame() ).QueuePSEvent( m_currentlyUploadingAction.GetPersistentID(), m_currentlyUploadingAction.GetDeviceClassName(), setQuickHackAttempt );
 		player = GetPlayer( GetGameInstance() );
-		if( !( player ) )
+		if( !( player ) || !( m_currentlyUploadingAction ) )
 		{
 			return;
 		}
@@ -2708,18 +2719,27 @@ class ScriptedPuppet extends gamePuppet
 		{
 			GameInstance.GetStatusEffectSystem( GetGame() ).RemoveStatusEffect( player.GetEntityID(), T"BaseStatusEffect.BlackWallUploadActive" );
 		}
-		if( !( IsActionQueueEnabled() ) || !( m_currentlyUploadingAction.m_deviceActionQueue.HasActionInQueue() ) )
+		if( !( IsActionQueueEnabled() ) || m_currentlyUploadingAction.m_isInactive )
 		{
 			return;
 		}
+		wasDefeatedWithHack = m_hitHistory && m_hitHistory.GetLastDamageType( player ) == gamedataAttackType.Hack;
 		if( PlayerDevelopmentSystem.GetData( player ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Inbetween_Left_3 ) && QuickHackableHelper.IsOverclockedStateActive( player ) )
 		{
-			queueSize = m_currentlyUploadingAction.m_deviceActionQueue.GetQueueSize();
+			queueSize = m_currentlyUploadingAction.m_deviceActionQueue.GetQueueSize() + ( ( wasDefeatedWithHack ) ? ( 1 ) : ( 0 ) );
 			healing = ( ( Float )( queueSize ) ) * GameInstance.GetStatsSystem( GetGame() ).GetStatValue( player.GetEntityID(), gamedataStatType.BloodQueueHealing );
 			GameInstance.GetStatPoolsSystem( GetGame() ).RequestChangingStatPoolValue( player.GetEntityID(), gamedataStatPoolType.Health, healing, player, false, false );
 		}
 		if( PlayerDevelopmentSystem.GetData( player ).IsNewPerkBought( gamedataNewPerkType.Intelligence_Left_Perk_2_2 ) )
 		{
+			if( wasDefeatedWithHack )
+			{
+				act = ( ( ScriptableDeviceAction )( m_currentlyUploadingAction ) );
+				if( act && ( act.GetExecutor() == player ) )
+				{
+					queueCost += act.paymentQuantity;
+				}
+			}
 			while( m_currentlyUploadingAction.m_deviceActionQueue.HasActionInQueue() )
 			{
 				act = ( ( ScriptableDeviceAction )( m_currentlyUploadingAction.m_deviceActionQueue.PopActionInQueue() ) );
@@ -3064,14 +3084,6 @@ class ScriptedPuppet extends gamePuppet
 			if( canLeftItemDrop || canRightItemDrop )
 			{
 				DropWeapons();
-				if( rightItem )
-				{
-					ScriptedPuppet.ScaleDroppedItem( rightItem.GetItemData(), this );
-				}
-				if( leftItem )
-				{
-					ScriptedPuppet.ScaleDroppedItem( leftItem.GetItemData(), this );
-				}
 				if( RPGManager.IsItemWeapon( rightItem.GetItemID() ) || RPGManager.IsItemWeapon( leftItem.GetItemID() ) )
 				{
 					m_droppedWeapons = true;
@@ -3167,7 +3179,7 @@ class ScriptedPuppet extends gamePuppet
 		puppet.RevokeAllTickets();
 	}
 
-	protected event OnHackPlayerEvent( evt : HackPlayerEvent )
+	protected event OnHackTargetEvent( evt : HackTargetEvent )
 	{
 		var action : AIQuickHackAction;
 		var attackAttemptEvent : AIAttackAttemptEvent;
@@ -3192,14 +3204,15 @@ class ScriptedPuppet extends gamePuppet
 			action.SetExecutor( netrunner );
 			action.SetObjectActionID( evt.objectRecord.GetID() );
 			action.m_target = target;
+			action.m_scaleUploadTime = !( evt.settings.isRevealPositionAction );
+			action.m_HUDData = evt.settings.HUDData;
 			action.SetUp( target.GetPS() );
-			action.m_scaleUploadTime = !( evt.revealPositionAction );
 			if( !( action.IsPossible( target ) ) )
 			{
 				return false;
 			}
 			action.ProcessRPGAction( GetGame(), m_gameplayRoleComponent );
-			if( evt.showDirectionalIndicator )
+			if( evt.settings.showDirectionalIndicator )
 			{
 				attackAttemptEvent = new AIAttackAttemptEvent;
 				attackAttemptEvent.instigator = netrunner;
@@ -3210,11 +3223,11 @@ class ScriptedPuppet extends gamePuppet
 				target.QueueEvent( attackAttemptEvent );
 				GetOwner().QueueEvent( attackAttemptEvent );
 			}
-			if( !( evt.skipBeingHackedSetUp ) )
+			if( !( evt.settings.skipBeingHackedSetUp ) )
 			{
 				StatusEffectHelper.ApplyStatusEffect( this, T"AIQuickHackStatusEffect.BeingHacked", evt.netrunnerID );
 			}
-			if( !( IsReplacer() ) && !( evt.revealPositionAction ) )
+			if( !( IsReplacer() ) && !( evt.settings.isRevealPositionAction ) )
 			{
 				ProcessEnemyNetrunnerTutorialFact();
 			}
@@ -3230,7 +3243,7 @@ class ScriptedPuppet extends gamePuppet
 		}
 		else
 		{
-			if( !( evt.revealPositionAction ) )
+			if( !( evt.settings.isRevealPositionAction ) )
 			{
 				GameInstance.GetDelaySystem( GetGame() ).DelayEvent( GameInstance.FindEntityByID( GetGame(), evt.targetID ), evt, 2.0 );
 			}
@@ -3448,7 +3461,7 @@ class ScriptedPuppet extends gamePuppet
 		var isFastFinisher : Bool;
 		var isInKnockdown : Bool;
 		isInKnockdown = this.GetHitReactionComponent().IsInKnockdown() || StatusEffectSystem.ObjectHasStatusEffect( this, T"BaseStatusEffect.HitReactionStagger" );
-		if( ( ( BlockWorkspotFinishers() || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.BlockWorkspotFinisherStatusEffect" ) ) || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.AdvancedBerserkPlayerBuff" ) ) || isInKnockdown )
+		if( ( ( ( BlockWorkspotFinishers() || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.BlockWorkspotFinisherStatusEffect" ) ) || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.AdvancedBerserkPlayerBuff" ) ) || !( playerPuppet.GetPuppetStateBlackboard().GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsOnGround ) ) ) || isInKnockdown )
 		{
 			isFastFinisher = true;
 		}
@@ -4083,6 +4096,9 @@ class ScriptedPuppet extends gamePuppet
 
 	public const override function ShouldShowScanner() : Bool
 	{
+		var playerPuppet : PlayerPuppet;
+		var distanceToTargetSquared : Float;
+		var maxDistanceToScanCivilianDriver : Float;
 		if( !( m_scanningComponent ) )
 		{
 			return false;
@@ -4090,6 +4106,19 @@ class ScriptedPuppet extends gamePuppet
 		if( m_scanningComponent.IsBraindanceBlocked() || m_scanningComponent.IsPhotoModeBlocked() )
 		{
 			return false;
+		}
+		if( ( IsCivilian() || ( IsCrowd() && !( IsPrevention() ) ) ) && VehicleComponent.IsMountedToVehicle( GetGame(), this ) )
+		{
+			playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+			if( playerPuppet )
+			{
+				distanceToTargetSquared = Vector4.DistanceSquared( GetWorldPosition(), playerPuppet.GetWorldPosition() );
+				maxDistanceToScanCivilianDriver = TDB.GetFloat( T"player.vehicleQuickHacks.distanceAllowedToScanCiviliansInCars", 25.0 );
+				if( distanceToTargetSquared > ( maxDistanceToScanCivilianDriver * maxDistanceToScanCivilianDriver ) )
+				{
+					return false;
+				}
+			}
 		}
 		return true;
 	}
@@ -4901,7 +4930,7 @@ class ScriptedPuppet extends gamePuppet
 		{
 			return true;
 		}
-		else if( IsAnyClueEnabled() || IsQuest() )
+		else if( ( IsAnyClueEnabled() || HasAnyStoredClues() ) || IsQuest() )
 		{
 			return true;
 		}
@@ -5224,8 +5253,8 @@ class ScriptedPuppet extends gamePuppet
 						newCommand.m_costRaw = puppetActions[ i1 ].GetBaseCost();
 						newCommand.m_cost = puppetActions[ i1 ].GetCost();
 						newCommand.m_awarenessCost = puppetActions[ i1 ].GetAwarenessCost( GetGame() );
-						newCommand.m_showRevealInfo = ( newCommand.m_awarenessCost > 0.0 ) && !( playerRef.IsInCombat() );
-						newCommand.m_willReveal = !( playerRef.IsBeingRevealed() );
+						newCommand.m_willReveal = QuickHackableHelper.WillHackRevealPlayer( playerRef, GetRecordID(), puppetActions[ i1 ], newCommand.m_itemID );
+						newCommand.m_showRevealInfo = QuickHackableHelper.ShouldShowRevealInfoWithTarget( playerRef, this, newCommand.m_awarenessCost );
 						if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.PreventQuickhacking ) > 0.0 )
 						{
 							if( NPCManager.HasTag( GetRecordID(), 'q305_maxtac' ) )
@@ -5238,6 +5267,11 @@ class ScriptedPuppet extends gamePuppet
 								puppetActions[ i1 ].SetInactiveWithReason( false, "LocKey#27694" );
 								break;
 							}
+						}
+						if( StatusEffectSystem.ObjectHasStatusEffect( playerRef, T"BaseStatusEffect.SmasherICE_DisableCyberdeck" ) )
+						{
+							puppetActions[ i1 ].SetInactiveWithReason( false, "LocKey#95870" );
+							break;
 						}
 						if( !( puppetActions[ i1 ].IsPossible( this ) ) || !( puppetActions[ i1 ].IsVisible( playerRef ) ) )
 						{
@@ -5576,25 +5610,33 @@ class ScriptedPuppet extends gamePuppet
 	protected event OnUploadProgressStateChanged( evt : UploadProgramProgressEvent )
 	{
 		var quickSlotCommandUsed : QuickSlotCommandUsed;
-		if( evt.progressBarContext == EProgressBarContext.QuickHack )
+		if( evt.progressBarContext == EProgressBarContext.QuickHack && evt.progressBarType == EProgressBarType.UPLOAD )
 		{
-			if( evt.progressBarType == EProgressBarType.UPLOAD )
+			switch( evt.state )
 			{
-				if( evt.state == EUploadProgramState.COMPLETED )
+				case EUploadProgramState.STARTED:
+					if( !( QuickHackableHelper.WillHackRevealPlayer( GetPlayer( GetGame() ), GetRecordID(), evt.action ) ) )
+					{
+						StatusEffectHelper.ApplyStatusEffect( this, T"AIQuickHackStatusEffect.BeingHackedWithUntraceableHack" );
+					}
+				StatusEffectHelper.ApplyStatusEffect( this, T"AIQuickHackStatusEffect.BeingHacked" );
+				break;
+				case EUploadProgramState.COMPLETED:
+					StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.BeingHacked" );
+				StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.BeingHackedWithUntraceableHack" );
+				quickSlotCommandUsed = QuickHackableQueueHelper.PopFromQuickHackQueue( evt, m_gameplayRoleComponent );
+				m_completedQuickhackHistory.PushBack( evt.action );
+				if( quickSlotCommandUsed && IsActive( this ) )
 				{
-					quickSlotCommandUsed = QuickHackableQueueHelper.PopFromQuickHackQueue( evt, m_gameplayRoleComponent );
-					m_completedQuickhackHistory.PushBack( evt.action );
-					if( quickSlotCommandUsed && IsActive( this ) )
-					{
-						m_activeQuickhackActionHistory.PushBack( evt.action );
-						OnQuickSlotCommandUsed( quickSlotCommandUsed );
-					}
-					else if( m_currentlyUploadingAction )
-					{
-						m_currentlyUploadingAction.m_isInactive = true;
-						ActivateIntelligencePerks( evt.action );
-					}
+					m_activeQuickhackActionHistory.PushBack( evt.action );
+					OnQuickSlotCommandUsed( quickSlotCommandUsed );
 				}
+				else if( m_currentlyUploadingAction )
+				{
+					m_currentlyUploadingAction.m_isInactive = true;
+					ActivateIntelligencePerks( evt.action );
+				}
+				break;
 			}
 		}
 	}

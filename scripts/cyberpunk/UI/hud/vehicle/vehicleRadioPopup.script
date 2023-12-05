@@ -21,30 +21,94 @@ class RadioStationChangedEvent extends Event
 class VehicleRadioPopupGameController extends BaseModalListPopupGameController
 {
 	private editable var m_icon : inkImageRef;
+	private editable var m_trackName : inkTextRef;
 	private editable var m_scrollArea : inkScrollAreaRef;
 	private editable var m_scrollControllerWidget : inkWidgetRef;
-	private editable var m_trackName : inkTextRef;
+	[ category = "Volume" ]
+	private editable var m_radioVolumeSettings : inkWidgetRef;
+	[ category = "Volume" ]
+	private editable var m_volumeSettingGroupName : CName;
+	default m_volumeSettingGroupName = '/audio/volume';
+	[ category = "Volume" ]
+	private editable var m_volumeSettingVarName : CName;
+	default m_volumeSettingVarName = 'CarRadioVolume';
 	private var m_dataView : RadioStationsDataView;
 	private var m_dataSource : ScriptableDataSource;
 	private var m_quickSlotsManager : weak< QuickSlotsManager >;
+	private var m_player : weak< PlayerPuppet >;
 	private var m_playerVehicle : weak< VehicleObject >;
 	private var m_startupIndex : Uint32;
 	private var m_currentRadioId : Int32;
 	private var m_selectedItem : weak< RadioStationListItemController >;
 	private var m_scrollController : weak< inkScrollController >;
+	private var m_canVolumeDown : Bool;
+	private var m_canVolumeUp : Bool;
+	private var m_radioVolumeSettingsController : weak< RadioVolumeSettingsController >;
+
+	private function GetRadioReceiverTrackName() : CName
+	{
+		if( m_playerVehicle )
+		{
+			return m_playerVehicle.GetRadioReceiverTrackName();
+		}
+		else
+		{
+			return m_player.GetPocketRadio().GetTrackName();
+		}
+	}
+
+	private function GetRadioReceiverStationName() : CName
+	{
+		if( m_playerVehicle )
+		{
+			return m_playerVehicle.GetRadioReceiverStationName();
+		}
+		else
+		{
+			return m_player.GetPocketRadio().GetStationName();
+		}
+	}
+
+	private function IsRadioReceiverActive() : Bool
+	{
+		if( m_playerVehicle )
+		{
+			return m_playerVehicle.IsRadioReceiverActive();
+		}
+		else
+		{
+			return m_player.GetPocketRadio().IsActive();
+		}
+	}
+
+	private function GetRadioReceiverEntityID() : EntityID
+	{
+		if( m_playerVehicle )
+		{
+			return m_playerVehicle.GetEntityID();
+		}
+		else
+		{
+			return m_player.GetEntityID();
+		}
+	}
 
 	protected event OnPlayerAttach( playerPuppet : GameObject )
 	{
-		var player : weak< PlayerPuppet >;
+		var playerControlledObject : GameObject;
 		var trackName : CName;
-		player = ( ( PlayerPuppet )( playerPuppet ) );
-		VehicleComponent.GetVehicle( player.GetGame(), player, m_playerVehicle );
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		VehicleComponent.GetVehicle( m_player.GetGame(), m_player, m_playerVehicle );
 		super.OnPlayerAttach( playerPuppet );
-		m_quickSlotsManager = player.GetQuickSlotsManager();
+		m_quickSlotsManager = m_player.GetQuickSlotsManager();
 		m_scrollController = ( ( inkScrollController )( inkWidgetRef.GetControllerByType( m_scrollControllerWidget, 'inkScrollController' ) ) );
 		inkScrollAreaRef.RegisterToCallback( m_scrollArea, 'OnScrollChanged', this, 'OnScrollChanged' );
-		trackName = m_playerVehicle.GetRadioReceiverTrackName();
+		trackName = GetRadioReceiverTrackName();
 		SetTrackName( trackName );
+		playerControlledObject = GetPlayerControlledObject();
+		playerControlledObject.RegisterInputListener( this, 'radio_volume_down' );
+		playerControlledObject.RegisterInputListener( this, 'radio_volume_up' );
+		SetupVolumeContorls();
 		PlaySound( 'VehicleRadioPopup', 'OnOpen' );
 	}
 
@@ -100,33 +164,28 @@ class VehicleRadioPopupGameController extends BaseModalListPopupGameController
 
 	protected override function SetupData()
 	{
-		var radioOn : Bool;
 		var radioName : CName;
 		var stationRecord : RadioStation_Record;
 		var i, radioArraySize : Int32;
 		m_dataSource.Reset( VehiclesManagerDataHelper.GetRadioStations( m_playerPuppet ) );
 		m_startupIndex = 0;
 		m_currentRadioId = -1;
-		if( m_playerVehicle )
+		if( IsRadioReceiverActive() )
 		{
-			radioOn = m_playerVehicle.IsRadioReceiverActive();
-			if( radioOn )
+			radioName = GetRadioReceiverStationName();
+			if( IsNameValid( radioName ) )
 			{
-				radioName = m_playerVehicle.GetRadioReceiverStationName();
-				if( IsNameValid( radioName ) )
+				radioArraySize = ( ( Int32 )( m_dataSource.GetArraySize() ) );
+				for( i = 0; i < radioArraySize; i += 1 )
 				{
-					radioArraySize = ( ( Int32 )( m_dataSource.GetArraySize() ) );
-					for( i = 0; i < radioArraySize; i += 1 )
+					stationRecord = ( ( RadioListItemData )( m_dataSource.GetItem( ( ( Uint32 )( i ) ) ) ) ).m_record;
+					if( stationRecord )
 					{
-						stationRecord = ( ( RadioListItemData )( m_dataSource.GetItem( ( ( Uint32 )( i ) ) ) ) ).m_record;
-						if( stationRecord )
+						if( GetLocalizedText( stationRecord.DisplayName() ) == GetLocalizedTextByKey( radioName ) )
 						{
-							if( GetLocalizedText( stationRecord.DisplayName() ) == GetLocalizedTextByKey( radioName ) )
-							{
-								m_startupIndex = ( ( Uint32 )( i ) );
-								m_currentRadioId = stationRecord.Index();
-								break;
-							}
+							m_startupIndex = ( ( Uint32 )( i ) );
+							m_currentRadioId = stationRecord.Index();
+							break;
 						}
 					}
 				}
@@ -134,12 +193,59 @@ class VehicleRadioPopupGameController extends BaseModalListPopupGameController
 		}
 	}
 
+	private function SetupVolumeContorls()
+	{
+		var settings : UserSettings;
+		var settingsGroup : ConfigGroup;
+		settings = GetSystemRequestsHandler().GetUserSettings();
+		m_radioVolumeSettingsController = ( ( RadioVolumeSettingsController )( inkWidgetRef.GetController( m_radioVolumeSettings ) ) );
+		settings = GetSystemRequestsHandler().GetUserSettings();
+		if( settings.HasGroup( m_volumeSettingGroupName ) )
+		{
+			settingsGroup = settings.GetGroup( m_volumeSettingGroupName );
+			if( settingsGroup.HasVar( m_volumeSettingVarName ) )
+			{
+				m_radioVolumeSettingsController.Setup( settingsGroup.GetVar( m_volumeSettingVarName ), false );
+			}
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : CName;
+		var actionType : gameinputActionType;
+		actionName = ListenerAction.GetName( action );
+		actionType = ListenerAction.GetType( action );
+		super.OnAction( action, consumer );
+		if( actionName == 'radio_volume_down' && actionType == gameinputActionType.BUTTON_PRESSED )
+		{
+			m_canVolumeDown = true;
+		}
+		if( actionName == 'radio_volume_up' && actionType == gameinputActionType.BUTTON_PRESSED )
+		{
+			m_canVolumeUp = true;
+		}
+		AdjustRadioVolumeWithAction( actionName, actionType );
+	}
+
+	private function AdjustRadioVolumeWithAction( actionName : CName, actionType : gameinputActionType )
+	{
+		if( actionType == gameinputActionType.BUTTON_PRESSED || actionType == gameinputActionType.REPEAT )
+		{
+			if( actionName == 'radio_volume_down' && m_canVolumeDown )
+			{
+				m_radioVolumeSettingsController.VolumeDown();
+			}
+			if( actionName == 'radio_volume_up' && m_canVolumeUp )
+			{
+				m_radioVolumeSettingsController.VolumeUp();
+			}
+		}
+	}
+
 	protected event OnVehicleRadioSongChanged( evt : VehicleRadioSongChanged )
 	{
-		if( m_playerVehicle )
-		{
-			SetTrackName( evt.radioSongName );
-		}
+		SetTrackName( evt.radioSongName );
 	}
 
 	protected event OnVehicleRadioEvent( evt : UIVehicleRadioEvent )
@@ -147,7 +253,7 @@ class VehicleRadioPopupGameController extends BaseModalListPopupGameController
 		var data : RadioListItemData;
 		var track : CName;
 		var radioIndexEvent : RadioStationChangedEvent;
-		track = m_playerVehicle.GetRadioReceiverTrackName();
+		track = GetRadioReceiverTrackName();
 		SetTrackName( track );
 		data = m_selectedItem.GetStationData();
 		radioIndexEvent = new RadioStationChangedEvent;
@@ -209,8 +315,6 @@ class RadioStationListItemController extends inkVirtualCompoundItemController
 	private editable var m_typeIcon : inkImageRef;
 	private editable var m_equilizerIcon : inkHorizontalPanelRef;
 	private editable var m_codeTLicon : inkImageRef;
-	private editable var m_trackName : inkTextRef;
-	private var m_playerVehicle : weak< VehicleObject >;
 	private var m_stationData : RadioListItemData;
 	private var m_currentRadioStationId : Int32;
 	default m_currentRadioStationId = -1;
@@ -276,6 +380,46 @@ class VehicleRadioLogicController extends inkLogicController
 			m_isSoundStopped = true;
 			PlaySound( 'VehicleRadioPopup', 'OnClose' );
 		}
+	}
+
+}
+
+class RadioVolumeSettingsController extends SettingsSelectorController
+{
+	private editable var m_value : inkTextRef;
+
+	public override function Setup( entry : ConfigVar, isPreGame : Bool )
+	{
+		var value : ConfigVarInt;
+		super.Setup( entry, isPreGame );
+		value = ( ( ConfigVarInt )( m_SettingsEntry ) );
+		inkTextRef.SetText( m_value, IntToString( value.GetValue() ) + "%" );
+	}
+
+	public function VolumeUp()
+	{
+		PlaySound( 'Button', 'OnPress' );
+		ChangeValue( true );
+	}
+
+	public function VolumeDown()
+	{
+		PlaySound( 'Button', 'OnPress' );
+		ChangeValue( false );
+	}
+
+	private override function ChangeValue( forward : Bool )
+	{
+		var step : Int32;
+		var newValue : Int32;
+		var congiVar : ConfigVarInt;
+		congiVar = ( ( ConfigVarInt )( m_SettingsEntry ) );
+		step = ( ( forward ) ? ( congiVar.GetStepValue() ) : ( -( congiVar.GetStepValue() ) ) );
+		newValue = congiVar.GetValue();
+		newValue = Clamp( newValue + step, congiVar.GetMinValue(), congiVar.GetMaxValue() );
+		congiVar.SetValue( newValue );
+		inkTextRef.SetText( m_value, IntToString( newValue ) + "%" );
+		Refresh();
 	}
 
 }
