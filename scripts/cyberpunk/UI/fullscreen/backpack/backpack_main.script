@@ -20,6 +20,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private var m_itemDropQueueItems : array< ItemID >;
 	private var m_itemDropQueue : array< ItemModParams >;
 	private var m_junkItems : array< UIInventoryItem >;
+	private var m_isRefreshUIScheduled : Bool;
 	private var m_craftingMaterialsListItems : array< weak< CrafringMaterialItemController > >;
 	private var m_DisassembleCallback : UI_CraftingDef;
 	private var m_DisassembleBlackboard : weak< IBlackboard >;
@@ -29,7 +30,9 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private var m_EquippedBBID : CallbackHandle;
 	private var m_InventoryCallback : UI_InventoryDef;
 	private var m_InventoryBlackboard : weak< IBlackboard >;
-	private var m_InventoryBBID : CallbackHandle;
+	private var m_InventoryItemAddedBBID : CallbackHandle;
+	private var m_InventoryItemRemvoedBBID : CallbackHandle;
+	private var m_InventoryItemQuantityChangedBBID : CallbackHandle;
 	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
 	private var m_activeFilter : weak< BackpackFilterButtonController >;
 	private var m_filterSpawnRequests : array< weak< inkAsyncSpawnRequest > >;
@@ -55,6 +58,13 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	private var m_isComparisonDisabled : Bool;
 	private var m_immediateNotificationListener : BakcpackImmediateNotificationListener;
 	private var m_lastDisassembledWidget : weak< InventoryItemDisplayController >;
+	private var m_cursorData : MenuCursorUserData;
+	private var m_pressedItemDisplay : weak< InventoryItemDisplayController >;
+	private var m_delayedOutfitCooldownResetCallbackId : DelayID;
+	private var m_outfitInCooldown : Bool;
+	default m_outfitInCooldown = false;
+	private var m_outfitCooldownPeroid : Float;
+	default m_outfitCooldownPeroid = 0.4f;
 
 	protected event OnInitialize()
 	{
@@ -80,6 +90,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 
 	protected event OnUninitialize()
 	{
+		GameInstance.GetDelaySystem( m_player.GetGame() ).CancelCallback( m_delayedOutfitCooldownResetCallbackId );
 		m_menuEventDispatcher.UnregisterFromEvent( 'OnBack', this, 'OnBack' );
 		m_menuEventDispatcher.UnregisterFromEvent( 'OnCloseMenu', this, 'OnCloseMenu' );
 		m_InventoryManager.UnInitialize();
@@ -186,7 +197,9 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		}
 		if( m_InventoryBlackboard )
 		{
-			m_InventoryBBID = m_InventoryBlackboard.RegisterDelayedListenerVariant( m_InventoryCallback.itemRemoved, this, 'OnInventoryItemRemoved', false );
+			m_InventoryItemAddedBBID = m_InventoryBlackboard.RegisterDelayedListenerVariant( m_InventoryCallback.itemRemoved, this, 'OnInventoryItemRemoved', false );
+			m_InventoryItemRemvoedBBID = m_InventoryBlackboard.RegisterDelayedListenerVariant( m_InventoryCallback.itemAdded, this, 'OnInventoryItemAdded', false );
+			m_InventoryItemQuantityChangedBBID = m_InventoryBlackboard.RegisterDelayedListenerVariant( m_InventoryCallback.itemQuantityChanged, this, 'OnInventoryItemQuantityChanged', false );
 		}
 	}
 
@@ -199,6 +212,12 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		if( m_EquippedBlackboard )
 		{
 			m_EquippedBlackboard.UnregisterDelayedListener( m_EquippedCallback.itemEquipped, m_EquippedBBID );
+		}
+		if( m_InventoryBlackboard )
+		{
+			m_InventoryBlackboard.UnregisterDelayedListener( m_InventoryCallback.itemRemoved, m_InventoryItemAddedBBID );
+			m_InventoryBlackboard.UnregisterDelayedListener( m_InventoryCallback.itemAdded, m_InventoryItemRemvoedBBID );
+			m_InventoryBlackboard.UnregisterDelayedListener( m_InventoryCallback.itemQuantityChanged, m_InventoryItemQuantityChangedBBID );
 		}
 	}
 
@@ -286,35 +305,13 @@ import class BackpackMainGameController extends gameuiMenuGameController
 
 	protected event OnDisassembleComplete( value : Variant )
 	{
-		var i, limit, quantity : Int32;
-		var itemID : ItemID;
+		var i, limit : Int32;
 		var action : CraftingCommands;
 		var updatedIngredients : array< IngredientData >;
 		var ingredientID : ItemID;
-		var inventoryItem : weak< UIInventoryItem >;
-		var dropItem : ItemModParams;
 		action = ( ( CraftingCommands )( m_DisassembleBlackboard.GetVariant( m_DisassembleCallback.lastCommand ) ) );
 		if( action == CraftingCommands.DisassemblingFinished )
 		{
-			itemID = ( ( ItemID )( m_DisassembleBlackboard.GetVariant( m_DisassembleCallback.lastItem ) ) );
-			inventoryItem = m_uiInventorySystem.GetPlayerItem( itemID );
-			quantity = inventoryItem.GetQuantity( true );
-			if( m_itemDropQueueItems.Contains( itemID ) )
-			{
-				dropItem = GetDropQueueItem( itemID );
-				if( dropItem.quantity >= quantity )
-				{
-					RefreshUI();
-				}
-				else
-				{
-					inventoryItem.SetQuantity( quantity - dropItem.quantity );
-				}
-			}
-			if( ( m_lastDisassembledWidget.GetUIInventoryItem() != NULL ) && ( m_lastDisassembledWidget.GetUIInventoryItem().ID == itemID ) )
-			{
-				m_lastDisassembledWidget.InvalidateQuantity();
-			}
 			updatedIngredients = ( ( array< IngredientData > )value );
 			for( i = 0, limit = updatedIngredients.Size(); i < limit; i += 1 )
 			{
@@ -328,7 +325,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	{
 		if( m_equipRequested )
 		{
-			RefreshUI();
+			RefreshUINextFrame();
 			m_equipRequested = false;
 			m_comparisonResolver.FlushCache();
 		}
@@ -336,17 +333,55 @@ import class BackpackMainGameController extends gameuiMenuGameController
 
 	protected event OnInventoryItemRemoved( value : Variant )
 	{
-		RefreshUI();
+		var itemAddedData : ItemAddedData;
+		itemAddedData = ( ( ItemAddedData )value );
+		HandleItemQuantityModified( itemAddedData.itemID, itemAddedData.isBackpackItem );
 	}
 
-	public function UpdateQuantites()
+	protected event OnInventoryItemAdded( value : Variant )
 	{
-		RefreshUI();
+		var itemRemovedData : ItemRemovedData;
+		itemRemovedData = ( ( ItemRemovedData )value );
+		HandleItemQuantityModified( itemRemovedData.itemID, itemRemovedData.isBackpackItem );
+	}
+
+	protected event OnInventoryItemQuantityChanged( value : Variant )
+	{
+		var itemQuantityChangedData : ItemQuantityChangedData;
+		itemQuantityChangedData = ( ( ItemQuantityChangedData )value );
+		HandleItemQuantityModified( itemQuantityChangedData.itemID, itemQuantityChangedData.isBackpackItem );
+	}
+
+	private function HandleItemQuantityModified( itemID : ItemID, backpackItem : Bool )
+	{
+		if( backpackItem )
+		{
+			if( !( m_uiInventorySystem.GetPlayerItem( itemID ).GetItemData().HasTag( 'CraftingPart' ) ) )
+			{
+				RefreshUINextFrame();
+			}
+		}
 	}
 
 	private function RefreshUI()
 	{
 		PopulateInventory();
+	}
+
+	private function RefreshUINextFrame()
+	{
+		if( m_isRefreshUIScheduled )
+		{
+			return;
+		}
+		m_isRefreshUIScheduled = true;
+		QueueEvent( new BackpackUpdateNextFrameEvent );
+	}
+
+	protected event OnRefreshUINextFrame( e : BackpackUpdateNextFrameEvent )
+	{
+		m_isRefreshUIScheduled = false;
+		RefreshUI();
 	}
 
 	protected function AddToDropQueue( item : ItemModParams )
@@ -575,6 +610,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		var controller : DropdownListController;
 		controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
 		m_lastItemHoverOverEvent = evt;
+		m_pressedItemDisplay = NULL;
 		if( !( controller.IsOpened() ) )
 		{
 			if( evt.uiInventoryItem )
@@ -602,6 +638,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		SetInventoryItemButtonHintsHoverOut();
 		HideDisassemblyHighlight();
 		m_lastItemHoverOverEvent = NULL;
+		m_pressedItemDisplay = NULL;
 	}
 
 	private function HighlightDisassemblyResults( inventoryItem : weak< UIInventoryItem > )
@@ -687,7 +724,6 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		var isUsable : Bool;
 		var isWeapon : Bool;
 		var isGarment : Bool;
-		var setPlayerFavouriteRequest : UIScriptableSystemSetItemPlayerFavourite;
 		if( evt.actionName.IsAction( 'drop_item' ) )
 		{
 			if( ( playerState == gamePSMVehicle.Default && RPGManager.CanItemBeDropped( m_player, evt.uiInventoryItem.GetItemData() ) ) && InventoryGPRestrictionHelper.CanDrop( evt.uiInventoryItem, m_player ) )
@@ -708,7 +744,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 					item.itemID = evt.uiInventoryItem.ID;
 					item.quantity = 1;
 					AddToDropQueue( item );
-					RefreshUI();
+					RefreshUINextFrame();
 				}
 			}
 			else
@@ -722,25 +758,29 @@ import class BackpackMainGameController extends gameuiMenuGameController
 			{
 				return false;
 			}
+			else if( evt.uiInventoryItem.GetItemType() == gamedataItemType.Clo_Outfit )
+			{
+				if( m_outfitInCooldown )
+				{
+					return false;
+				}
+				else if( ScheduleOutfitCooldownReset() )
+				{
+					SetOutfitCooldown( true );
+				}
+			}
 			EquipItem( evt.uiInventoryItem );
 		}
-		else if( evt.actionName.IsAction( 'preview_item' ) )
+		else if( evt.actionName.IsAction( 'preview_item' ) && ( m_pressedItemDisplay != NULL ) )
 		{
+			PlaySound( 'MapPin', 'OnCreate' );
 			isWeapon = evt.uiInventoryItem.IsWeapon();
 			isGarment = evt.uiInventoryItem.IsClothing();
 			if( isWeapon || isGarment )
 			{
 				m_itemPreviewPopupToken = ItemPreviewHelper.ShowPreviewItem( this, evt.uiInventoryItem, isGarment, 'OnItemPreviewPopup' );
 			}
-		}
-		else if( evt.actionName.IsAction( 'favourite_item' ) && evt.uiInventoryItem.IsWeapon() )
-		{
-			setPlayerFavouriteRequest = new UIScriptableSystemSetItemPlayerFavourite;
-			setPlayerFavouriteRequest.itemID = evt.uiInventoryItem.ID;
-			setPlayerFavouriteRequest.favourite = !( evt.display.GetIsPlayerFavourite() );
-			m_uiScriptableSystem.QueueRequest( setPlayerFavouriteRequest );
-			evt.display.SetIsPlayerFavourite( setPlayerFavouriteRequest.favourite );
-			UpdateFavouriteHint( setPlayerFavouriteRequest.favourite );
+			m_pressedItemDisplay = NULL;
 		}
 		else if( evt.actionName.IsAction( 'use_item' ) )
 		{
@@ -756,7 +796,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 					ShowNotification( m_player.GetGame(), DetermineUIMenuNotificationType() );
 					return false;
 				}
-				PlaySound( 'ItemConsumableFood', 'OnUse' );
+				GameInstance.GetAudioSystem( m_player.GetGame() ).Play( 'ui_loot_eat_ui' );
 				PlayRumble( RumbleStrength.Light, RumbleType.Pulse, RumblePosition.Right );
 				if( evt.uiInventoryItem.GetItemType() == gamedataItemType.Con_Skillbook )
 				{
@@ -764,7 +804,6 @@ import class BackpackMainGameController extends gameuiMenuGameController
 				}
 				ItemActionsHelper.PerformItemAction( m_player, evt.uiInventoryItem.GetID() );
 				m_InventoryManager.MarkToRebuild();
-				RefreshUI();
 			}
 		}
 	}
@@ -773,6 +812,12 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	{
 		if( e.IsAction( 'click' ) )
 		{
+			if( m_junkItems.Size() == 0 )
+			{
+				ShowNotification( m_player.GetGame(), UIMenuNotificationType.NoJunkToDisassemble );
+				PlaySound( 'Attributes', 'OnFail' );
+				return false;
+			}
 			OpenDisassembleJunkConfirmation();
 		}
 	}
@@ -781,23 +826,20 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	{
 		var data : VendorSellJunkPopupData;
 		var i, limit, numberOfItems : Int32;
-		if( m_junkItems.Size() )
+		for( i = 0, limit = m_junkItems.Size(); i < limit; i += 1 )
 		{
-			for( i = 0, limit = m_junkItems.Size(); i < limit; i += 1 )
-			{
-				numberOfItems += m_junkItems[ i ].GetQuantity( true );
-			}
-			data = new VendorSellJunkPopupData;
-			data.notificationName = 'base\gameplay\gui\widgets\notifications\vendor_sell_junk_confirmation.inkwidget';
-			data.isBlocking = true;
-			data.useCursor = true;
-			data.queueName = 'modal_popup';
-			data.itemsQuantity = numberOfItems;
-			data.actionType = VendorSellJunkActionType.Disassemble;
-			m_disassembleJunkPopupToken = ShowGameNotification( data );
-			m_disassembleJunkPopupToken.RegisterListener( this, 'OnDisassembleJunkPopupClosed' );
-			m_buttonHintsController.Hide();
+			numberOfItems += m_junkItems[ i ].GetQuantity( true );
 		}
+		data = new VendorSellJunkPopupData;
+		data.notificationName = 'base\gameplay\gui\widgets\notifications\vendor_sell_junk_confirmation.inkwidget';
+		data.isBlocking = true;
+		data.useCursor = true;
+		data.queueName = 'modal_popup';
+		data.itemsQuantity = numberOfItems;
+		data.actionType = VendorSellJunkActionType.Disassemble;
+		m_disassembleJunkPopupToken = ShowGameNotification( data );
+		m_disassembleJunkPopupToken.RegisterListener( this, 'OnDisassembleJunkPopupClosed' );
+		m_buttonHintsController.Hide();
 	}
 
 	protected event OnDisassembleJunkPopupClosed( data : inkGameNotificationData )
@@ -935,7 +977,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		}
 		item.quantity = data.choosenQuantity;
 		AddToDropQueue( item );
-		RefreshUI();
+		RefreshUINextFrame();
 	}
 
 	public function OnQuantityPickerDisassembly( data : QuantityPickerPopupCloseData )
@@ -951,6 +993,27 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	public function IsEquippable( itemData : gameItemData ) : Bool
 	{
 		return EquipmentSystem.GetInstance( m_player ).GetPlayerData( m_player ).IsEquippable( itemData );
+	}
+
+	private function ScheduleOutfitCooldownReset() : Bool
+	{
+		var delaySystem : DelaySystem;
+		var callback : BackpackOutfitCooldownResetCallback;
+		delaySystem = GameInstance.GetDelaySystem( m_player.GetGame() );
+		callback = new BackpackOutfitCooldownResetCallback;
+		callback.m_controller = this;
+		if( delaySystem && !( m_outfitInCooldown ) )
+		{
+			delaySystem.CancelCallback( m_delayedOutfitCooldownResetCallbackId );
+			m_delayedOutfitCooldownResetCallbackId = delaySystem.DelayCallback( callback, m_outfitCooldownPeroid, false );
+			return GetInvalidDelayID() != m_delayedOutfitCooldownResetCallbackId;
+		}
+		return false;
+	}
+
+	public function SetOutfitCooldown( inCooldown : Bool )
+	{
+		m_outfitInCooldown = inCooldown;
 	}
 
 	public function EquipItem( itemData : weak< UIInventoryItem > )
@@ -1088,8 +1151,14 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		m_TooltipsManager.HideTooltips();
 	}
 
+	protected event OnItemDisplayPress( evt : ItemDisplayPressEvent )
+	{
+		m_pressedItemDisplay = evt.display;
+	}
+
 	protected event OnItemDisplayHold( evt : ItemDisplayHoldEvent )
 	{
+		var setPlayerFavouriteRequest : UIScriptableSystemSetItemPlayerFavourite;
 		if( evt.actionName.IsAction( 'disassemble_item' ) )
 		{
 			if( RPGManager.CanItemBeDisassembled( m_player.GetGame(), evt.uiInventoryItem.GetItemData() ) )
@@ -1116,6 +1185,18 @@ import class BackpackMainGameController extends gameuiMenuGameController
 					m_TooltipsManager.HideTooltips();
 				}
 			}
+		}
+		else if( ( evt.actionName.IsAction( 'favourite_item' ) && evt.uiInventoryItem.IsWeapon() ) && ( m_pressedItemDisplay != NULL ) )
+		{
+			setPlayerFavouriteRequest = new UIScriptableSystemSetItemPlayerFavourite;
+			setPlayerFavouriteRequest.itemID = evt.uiInventoryItem.ID;
+			setPlayerFavouriteRequest.favourite = !( evt.display.GetIsPlayerFavourite() );
+			m_uiScriptableSystem.QueueRequest( setPlayerFavouriteRequest );
+			evt.display.SetIsPlayerFavourite( setPlayerFavouriteRequest.favourite );
+			UpdateFavouriteHint( setPlayerFavouriteRequest.favourite );
+			m_pressedItemDisplay = NULL;
+			PlaySound( 'MapPin', 'OnEnable' );
+			PlayRumble( RumbleStrength.Heavy, RumbleType.Pulse, RumblePosition.Right );
 		}
 	}
 
@@ -1163,10 +1244,9 @@ import class BackpackMainGameController extends gameuiMenuGameController
 
 	private function NewShowItemHints( itemData : weak< UIInventoryItem > )
 	{
-		var cursorData : MenuCursorUserData;
 		var unequipBlocked : Bool;
-		cursorData = new MenuCursorUserData;
-		cursorData.SetAnimationOverride( 'hoverOnHoldToComplete' );
+		m_cursorData = new MenuCursorUserData;
+		m_cursorData.SetAnimationOverride( 'hoverOnHoldToComplete' );
 		if( !( itemData ) )
 		{
 			SetCursorContext( 'Default' );
@@ -1176,7 +1256,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		if( ( !( unequipBlocked ) && !( itemData.IsEquipped() ) ) && RPGManager.CanItemBeDisassembled( m_player.GetGame(), itemData.ID ) )
 		{
 			m_buttonHintsController.AddButtonHint( 'disassemble_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "Gameplay-Devices-DisplayNames-DisassemblableItem" ) );
-			cursorData.AddAction( 'disassemble_item' );
+			m_cursorData.AddAction( 'disassemble_item' );
 		}
 		else
 		{
@@ -1221,9 +1301,9 @@ import class BackpackMainGameController extends gameuiMenuGameController
 		{
 			UpdateFavouriteHint( m_uiScriptableSystem.IsItemPlayerFavourite( itemData.GetID() ) );
 		}
-		if( cursorData.GetActionsListSize() >= 0 )
+		if( m_cursorData.GetActionsListSize() >= 0 )
 		{
-			SetCursorContext( 'Hover', cursorData );
+			SetCursorContext( 'Hover', m_cursorData );
 		}
 		else
 		{
@@ -1233,11 +1313,10 @@ import class BackpackMainGameController extends gameuiMenuGameController
 
 	private function SetInventoryItemButtonHintsHoverOver( const displayingData : ref< InventoryItemData > )
 	{
-		var cursorData : MenuCursorUserData;
 		var isUsable : Bool;
 		var isLearnble : Bool;
-		cursorData = new MenuCursorUserData;
-		cursorData.SetAnimationOverride( 'hoverOnHoldToComplete' );
+		m_cursorData = new MenuCursorUserData;
+		m_cursorData.SetAnimationOverride( 'hoverOnHoldToComplete' );
 		if( !( InventoryItemData.IsEmpty( displayingData ) ) )
 		{
 			isUsable = ( ItemActionsHelper.GetConsumeAction( InventoryItemData.GetGameItemData( displayingData ).GetID() ) || ItemActionsHelper.GetEatAction( InventoryItemData.GetGameItemData( displayingData ).GetID() ) ) || ItemActionsHelper.GetDrinkAction( InventoryItemData.GetGameItemData( displayingData ).GetID() );
@@ -1245,7 +1324,7 @@ import class BackpackMainGameController extends gameuiMenuGameController
 			if( ( RPGManager.CanItemBeDisassembled( m_player.GetGame(), InventoryItemData.GetID( displayingData ) ) && !( InventoryItemData.IsEquipped( displayingData ) ) ) && !( InventoryItemData.GetGameItemData( displayingData ).HasTag( 'UnequipBlocked' ) ) )
 			{
 				m_buttonHintsController.AddButtonHint( 'disassemble_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "Gameplay-Devices-DisplayNames-DisassemblableItem" ) );
-				cursorData.AddAction( 'disassemble_item' );
+				m_cursorData.AddAction( 'disassemble_item' );
 			}
 			else
 			{
@@ -1290,9 +1369,9 @@ import class BackpackMainGameController extends gameuiMenuGameController
 			{
 				UpdateFavouriteHint( m_uiScriptableSystem.IsItemPlayerFavourite( InventoryItemData.GetID( displayingData ) ) );
 			}
-			if( cursorData.GetActionsListSize() >= 0 )
+			if( m_cursorData.GetActionsListSize() >= 0 )
 			{
-				SetCursorContext( 'Hover', cursorData );
+				SetCursorContext( 'Hover', m_cursorData );
 			}
 			else
 			{
@@ -1309,11 +1388,21 @@ import class BackpackMainGameController extends gameuiMenuGameController
 	{
 		if( state )
 		{
-			m_buttonHintsController.AddButtonHint( 'favourite_item', "UI-UserActions-ItemRemoveFavourite" );
+			m_buttonHintsController.AddButtonHint( 'favourite_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "UI-UserActions-ItemRemoveFavourite" ) );
+			m_cursorData.AddUniqueAction( 'favourite_item' );
 		}
 		else
 		{
-			m_buttonHintsController.AddButtonHint( 'favourite_item', "UI-UserActions-ItemAddFavourite" );
+			m_buttonHintsController.AddButtonHint( 'favourite_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "UI-UserActions-ItemAddFavourite" ) );
+			m_cursorData.AddUniqueAction( 'favourite_item' );
+		}
+		if( m_cursorData.GetActionsListSize() >= 0 )
+		{
+			SetCursorContext( 'Hover', m_cursorData );
+		}
+		else
+		{
+			SetCursorContext( 'Hover' );
 		}
 	}
 
@@ -1845,6 +1934,17 @@ class BackpackCraftingMaterialItemCallbackData
 	var craftingMaterial : CachedCraftingMaterial;
 }
 
+class BackpackOutfitCooldownResetCallback extends DelayCallback
+{
+	var m_controller : weak< BackpackMainGameController >;
+
+	public override function Call()
+	{
+		m_controller.SetOutfitCooldown( false );
+	}
+
+}
+
 class CachedCraftingMaterial
 {
 	var m_itemID : ItemID;
@@ -1883,5 +1983,9 @@ class CachedCraftingMaterial
 		m_quantity = quantity;
 	}
 
+}
+
+class BackpackUpdateNextFrameEvent extends Event
+{
 }
 

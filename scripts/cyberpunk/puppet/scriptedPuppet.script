@@ -2003,6 +2003,7 @@ class ScriptedPuppet extends gamePuppet
 	public const function IsAggressive() : Bool
 	{
 		var reactionSystem : ReactionSystem;
+		var playerPuppet : PlayerPuppet;
 		if( StatusEffectSystem.ObjectHasStatusEffect( this, T"GameplayRestriction.FistFight" ) )
 		{
 			return true;
@@ -2020,6 +2021,11 @@ class ScriptedPuppet extends gamePuppet
 		}
 		reactionSystem = GameInstance.GetReactionSystem( GetGame() );
 		if( reactionSystem.IsRegisteredAsAggressive( GetEntityID() ) )
+		{
+			return true;
+		}
+		playerPuppet = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerMainGameObject() ) );
+		if( IsActive() && GetAttitudeTowards( this, playerPuppet ) == EAIAttitude.AIA_Hostile )
 		{
 			return true;
 		}
@@ -2249,7 +2255,14 @@ class ScriptedPuppet extends gamePuppet
 		telemetryDamageDealt.damage.distance = 0.0;
 		telemetryDamageDealt.damage.time = EngineTime.ToFloat( GameInstance.GetEngineTime( GetGame() ) );
 		GameInstance.GetTelemetrySystem( GetGame() ).LogDamageDealt( telemetryDamageDealt );
-		GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValueIgnoreChangeMode( GetEntityID(), gamedataStatPoolType.Health, 1.0, instigator );
+		if( GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.HasSecondHeart ) > 0.0 )
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValue( GetEntityID(), gamedataStatPoolType.Health, 1.0, instigator, false );
+		}
+		else
+		{
+			GameInstance.GetStatPoolsSystem( GetGame() ).RequestSettingStatPoolValue( GetEntityID(), gamedataStatPoolType.Health, 0.0, instigator, false );
+		}
 	}
 
 	public static function GetActiveWeapon( obj : GameObject ) : weak< WeaponObject >
@@ -2462,6 +2475,12 @@ class ScriptedPuppet extends gamePuppet
 			break;
 			case gamedataStatusEffectType.Cloaked:
 				ScriptedPuppet.SendNameplateVisibleEvent( this, false );
+			break;
+			case gamedataStatusEffectType.SystemCollapse:
+				if( EntityID.IsDefined( evt.instigatorEntityID ) )
+				{
+					Record1DamageInHistory( ( ( GameObject )( GameInstance.FindEntityByID( GetGame(), evt.instigatorEntityID ) ) ) );
+				}
 			break;
 			default:
 				break;
@@ -2747,6 +2766,7 @@ class ScriptedPuppet extends gamePuppet
 				{
 					queueCost += act.paymentQuantity;
 					RPGManager.DecrementQuickHackBlackboard( GetGameInstance(), act.GetObjectActionID() );
+					QuickHackableQueueHelper.DecreaseQuickHackQueueCount( ( ( PlayerPuppet )( act.GetExecutor() ) ) );
 				}
 			}
 			memoryReturnFactor = TDB.GetFloat( T"NewPerks.Intelligence_Left_Perk_2_2.memoryReturnFactor" );
@@ -3460,8 +3480,10 @@ class ScriptedPuppet extends gamePuppet
 	{
 		var isFastFinisher : Bool;
 		var isInKnockdown : Bool;
+		var psmBlackboard : IBlackboard;
+		psmBlackboard = GameInstance.GetBlackboardSystem( GetGame() ).GetLocalInstanced( evt.activator.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
 		isInKnockdown = this.GetHitReactionComponent().IsInKnockdown() || StatusEffectSystem.ObjectHasStatusEffect( this, T"BaseStatusEffect.HitReactionStagger" );
-		if( ( ( ( BlockWorkspotFinishers() || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.BlockWorkspotFinisherStatusEffect" ) ) || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.AdvancedBerserkPlayerBuff" ) ) || !( playerPuppet.GetPuppetStateBlackboard().GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsOnGround ) ) ) || isInKnockdown )
+		if( ( ( ( BlockWorkspotFinishers() || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.BlockWorkspotFinisherStatusEffect" ) ) || StatusEffectSystem.ObjectHasStatusEffect( playerPuppet, T"BaseStatusEffect.AdvancedBerserkPlayerBuff" ) ) || !( psmBlackboard.GetBool( GetAllBlackboardDefs().PlayerStateMachine.IsOnGround ) ) ) || isInKnockdown )
 		{
 			isFastFinisher = true;
 		}
@@ -4749,6 +4771,10 @@ class ScriptedPuppet extends gamePuppet
 		{
 			return NULL;
 		}
+		if( IsChimera() )
+		{
+			return GetChimeraHighlight();
+		}
 		highlight = new FocusForcedHighlightData;
 		highlight.outlineType = GetCurrentOutline();
 		switch( highlight.outlineType )
@@ -4773,6 +4799,30 @@ class ScriptedPuppet extends gamePuppet
 		}
 		highlight.sourceID = GetEntityID();
 		highlight.sourceName = GetClassName();
+		if( IsQuickHackAble() )
+		{
+			highlight.patternType = VisionModePatternType.Netrunner;
+		}
+		else
+		{
+			highlight.patternType = VisionModePatternType.Default;
+		}
+		return highlight;
+	}
+
+	private const function IsChimera() : Bool
+	{
+		return GetNPCType() == gamedataNPCType.Chimera;
+	}
+
+	private const function GetChimeraHighlight() : FocusForcedHighlightData
+	{
+		var highlight : FocusForcedHighlightData;
+		highlight = new FocusForcedHighlightData;
+		highlight.sourceID = GetEntityID();
+		highlight.sourceName = GetClassName();
+		highlight.highlightType = EFocusForcedHighlightType.HOSTILE;
+		highlight.outlineType = EFocusOutlineType.INVALID;
 		if( IsQuickHackAble() )
 		{
 			highlight.patternType = VisionModePatternType.Netrunner;
@@ -5615,15 +5665,15 @@ class ScriptedPuppet extends gamePuppet
 			switch( evt.state )
 			{
 				case EUploadProgramState.STARTED:
-					if( !( QuickHackableHelper.WillHackRevealPlayer( GetPlayer( GetGame() ), GetRecordID(), evt.action ) ) )
+					if( QuickHackableHelper.WillHackRevealPlayer( GetPlayer( GetGame() ), GetRecordID(), evt.action ) )
 					{
-						StatusEffectHelper.ApplyStatusEffect( this, T"AIQuickHackStatusEffect.BeingHackedWithUntraceableHack" );
+						StatusEffectHelper.ApplyStatusEffect( this, T"AIQuickHackStatusEffect.BeingHackedWithTraceableHack" );
 					}
 				StatusEffectHelper.ApplyStatusEffect( this, T"AIQuickHackStatusEffect.BeingHacked" );
 				break;
 				case EUploadProgramState.COMPLETED:
 					StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.BeingHacked" );
-				StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.BeingHackedWithUntraceableHack" );
+				StatusEffectHelper.RemoveStatusEffect( this, T"AIQuickHackStatusEffect.BeingHackedWithTraceableHack" );
 				quickSlotCommandUsed = QuickHackableQueueHelper.PopFromQuickHackQueue( evt, m_gameplayRoleComponent );
 				m_completedQuickhackHistory.PushBack( evt.action );
 				if( quickSlotCommandUsed && IsActive( this ) )

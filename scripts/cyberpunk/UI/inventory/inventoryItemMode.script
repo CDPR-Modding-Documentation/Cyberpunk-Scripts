@@ -13,6 +13,8 @@ class InventoryItemModeLogicController extends inkLogicController
 	private editable var m_emptyInventoryText : inkTextRef;
 	private editable var m_filterButtonsGrid : inkCompoundRef;
 	private editable var m_outfitsFilterInfoText : inkTextRef;
+	private editable var m_prevFilterHint : inkWidgetRef;
+	private editable var m_nextFilterHint : inkWidgetRef;
 	private editable var m_itemGridContainer : inkWidgetRef;
 	private editable var m_itemGridScrollControllerWidget : inkWidgetRef;
 	private editable var m_wardrobeSlotsContainer : inkWidgetRef;
@@ -43,8 +45,15 @@ class InventoryItemModeLogicController extends inkLogicController
 	var m_itemGridClassifier : ItemModeGridClassifier;
 	var m_itemGridDataView : ItemModeGridView;
 	var m_itemGridDataSource : ScriptableDataSource;
+	[ category = "FILTER" ]
 	private var m_activeFilter : weak< BackpackFilterButtonController >;
+	[ category = "FILTER" ]
+	private var m_filters : array< weak< BackpackFilterButtonController > >;
+	[ category = "FILTER" ]
 	private var m_filterManager : ItemCategoryFliterManager;
+	[ category = "FILTER" ]
+	private var m_currentFilterIndex : Int32;
+	[ category = "FILTER" ]
 	private var m_savedFilter : ItemFilterCategory;
 	private var m_lastSelectedDisplay : weak< InventoryItemDisplayController >;
 	private var m_itemModeInventoryListenerCallback : ItemModeInventoryListenerCallback;
@@ -68,14 +77,21 @@ class InventoryItemModeLogicController extends inkLogicController
 	default m_delayedItemEquippedRequested = false;
 	private var m_delaySystem : weak< DelaySystem >;
 	private var m_delayedTimeoutCallbackId : DelayID;
+	private var m_delayedOutfitCooldownResetCallbackId : DelayID;
 	private var m_timeoutPeroid : Float;
 	default m_timeoutPeroid = 0.5f;
+	private var m_outfitInCooldown : Bool;
+	default m_outfitInCooldown = false;
+	private var m_outfitCooldownPeroid : Float;
+	default m_outfitCooldownPeroid = 0.4f;
 	private var m_tokenPopup : inkGameNotificationToken;
 	private var m_refreshRequested : Bool;
 	private var m_currentFilter : ItemFilterCategory;
 	private var m_viewMode : ItemViewModes;
 	private var m_currentItems : array< weak< WrappedInventoryItemData > >;
-	private var m_previousSelectedItem : ItemID;
+	private var m_previousSelectedItem : weak< InventoryItemDisplayController >;
+	private var m_cursorData : MenuCursorUserData;
+	private var m_pressedItemDisplay : weak< InventoryItemDisplayController >;
 
 	protected event OnInitialize()
 	{
@@ -91,6 +107,7 @@ class InventoryItemModeLogicController extends inkLogicController
 	protected event OnUninitialize()
 	{
 		m_delaySystem.CancelCallback( m_delayedTimeoutCallbackId );
+		m_delaySystem.CancelCallback( m_delayedOutfitCooldownResetCallbackId );
 		UnregisterBlackboard();
 		CleanupVirtualGrid();
 		GameInstance.GetTransactionSystem( m_player.GetGame() ).UnregisterInventoryListener( m_player, m_itemModeInventoryListener );
@@ -291,6 +308,8 @@ class InventoryItemModeLogicController extends inkLogicController
 	{
 		var itemViewMode : ItemViewModes;
 		var itemsToSkip : array< ItemID >;
+		var isEquipped : Bool;
+		var isPreviousDifferentFromCurrent : Bool;
 		itemViewMode = ItemViewModes.Mod;
 		if( !( TDBID.IsValid( e.slotID ) ) || ( e.slotID == TDBID.None() ) )
 		{
@@ -328,11 +347,13 @@ class InventoryItemModeLogicController extends inkLogicController
 			}
 			RefreshAvailableItems();
 		}
-		if( m_previousSelectedItem != itemChooser.GetSelectedItem().GetItemID() )
+		isPreviousDifferentFromCurrent = m_previousSelectedItem.GetItemID() != itemChooser.GetSelectedItem().GetItemID();
+		isEquipped = InventoryItemData.IsEquipped( m_previousSelectedItem.GetItemData() );
+		if( isPreviousDifferentFromCurrent && !( isEquipped ) )
 		{
-			( ( inkScrollController )( inkWidgetRef.GetController( m_itemGridScrollControllerWidget ) ) ).SetScrollPosition( 0.0 );
+			ResetScrollPosition();
 		}
-		m_previousSelectedItem = itemChooser.GetSelectedItem().GetItemID();
+		m_previousSelectedItem = itemChooser.GetSelectedItem();
 	}
 
 	protected event OnDisassembleComplete( value : Variant )
@@ -341,6 +362,11 @@ class InventoryItemModeLogicController extends inkLogicController
 		{
 			itemChooser.RefreshItems();
 		}
+	}
+
+	private function ResetScrollPosition()
+	{
+		( ( inkScrollController )( inkWidgetRef.GetController( m_itemGridScrollControllerWidget ) ) ).SetScrollPosition( 0.0 );
 	}
 
 	private function UpdateOutfitWardrobe( active : Bool )
@@ -568,7 +594,7 @@ class InventoryItemModeLogicController extends inkLogicController
 			m_activeFilter = NULL;
 		}
 		m_itemGridDataView.SetFilterType( ItemFilterCategory.AllItems );
-		( ( inkScrollController )( inkWidgetRef.GetController( m_itemGridScrollControllerWidget ) ) ).SetScrollPosition( 0.0 );
+		ResetScrollPosition();
 	}
 
 	public function RequestClose() : Bool
@@ -679,6 +705,9 @@ class InventoryItemModeLogicController extends inkLogicController
 					filterButton.SetActive( true );
 					m_activeFilter = filterButton;
 				}
+				m_filters.PushBack( filterButton );
+				inkWidgetRef.SetVisible( m_prevFilterHint, i > 0 );
+				inkWidgetRef.SetVisible( m_nextFilterHint, i > 0 );
 			}
 		}
 	}
@@ -719,7 +748,41 @@ class InventoryItemModeLogicController extends inkLogicController
 		{
 			controller = ( ( BackpackFilterButtonController )( inkCompoundRef.GetWidgetByIndex( m_filterButtonsGrid, index ).GetController() ) );
 			SetActiveFilterController( controller );
+			m_currentFilterIndex = index;
 		}
+	}
+
+	protected event OnFilterHotkeyPressed( evt : inkPointerEvent )
+	{
+		if( ( m_itemPreviewPopupToken == NULL ) && inkWidgetRef.IsVisible( m_prevFilterHint ) )
+		{
+			if( evt.IsAction( 'option_switch_next_settings' ) )
+			{
+				NavigateFilters( ECustomFilterDPadNavigationOption.SelectNext );
+				PlaySound( 'Button', 'OnPress' );
+			}
+			else if( evt.IsAction( 'option_switch_prev_settings' ) )
+			{
+				PlaySound( 'Button', 'OnPress' );
+				NavigateFilters( ECustomFilterDPadNavigationOption.SelectPrev );
+			}
+		}
+	}
+
+	private function NavigateFilters( option : ECustomFilterDPadNavigationOption )
+	{
+		var filtersAmount : Int32;
+		filtersAmount = inkCompoundRef.GetNumChildren( m_filterButtonsGrid );
+		switch( option )
+		{
+			case ECustomFilterDPadNavigationOption.SelectNext:
+				m_currentFilterIndex = ( ( m_currentFilterIndex < ( filtersAmount - 1 ) ) ? ( m_currentFilterIndex + 1 ) : ( 0 ) );
+			break;
+			case ECustomFilterDPadNavigationOption.SelectPrev:
+				m_currentFilterIndex = ( ( m_currentFilterIndex > 0 ) ? ( m_currentFilterIndex - 1 ) : ( filtersAmount - 1 ) );
+			break;
+		}
+		SelectFilterButtonByIndex( m_currentFilterIndex );
 	}
 
 	protected event OnItemFilterClick( evt : inkPointerEvent )
@@ -912,6 +975,7 @@ class InventoryItemModeLogicController extends inkLogicController
 				{
 					continue;
 				}
+				InventoryItemData.SetIsEquipped( freshItems[ k ], false );
 				totalItems.PushBack( freshItems[ k ] );
 			}
 		}
@@ -1516,6 +1580,12 @@ class InventoryItemModeLogicController extends inkLogicController
 	{
 		HandleItemHoverOut();
 		m_lastItemHoverOverEvent = NULL;
+		m_pressedItemDisplay = NULL;
+	}
+
+	protected event OnItemDisplayPress( evt : ItemDisplayPressEvent )
+	{
+		m_pressedItemDisplay = evt.display;
 	}
 
 	private function RequestItemInspected( itemID : ItemID )
@@ -1542,7 +1612,6 @@ class InventoryItemModeLogicController extends inkLogicController
 
 	protected event OnItemDisplayClick( evt : ItemDisplayClickEvent )
 	{
-		var setPlayerFavouriteRequest : UIScriptableSystemSetItemPlayerFavourite;
 		if( HACK_lastItemDisplayEvent == evt )
 		{
 			return false;
@@ -1562,21 +1631,7 @@ class InventoryItemModeLogicController extends inkLogicController
 		}
 		else if( m_isShown )
 		{
-			if( ( ( evt.actionName.IsAction( 'favourite_item' ) && !( InventoryItemData.IsEmpty( evt.itemData ) ) ) && InventoryItemData.IsWeapon( evt.itemData ) ) && !( IsItemCyberware( InventoryItemData.GetItemType( evt.itemData ) ) ) )
-			{
-				setPlayerFavouriteRequest = new UIScriptableSystemSetItemPlayerFavourite;
-				setPlayerFavouriteRequest.itemID = InventoryItemData.GetID( evt.itemData );
-				setPlayerFavouriteRequest.favourite = !( evt.display.GetIsPlayerFavourite() );
-				m_uiScriptableSystem.QueueRequest( setPlayerFavouriteRequest );
-				evt.display.SetIsPlayerFavourite( setPlayerFavouriteRequest.favourite );
-				InventoryItemData.UpdateSortData( evt.itemData, m_uiScriptableSystem, setPlayerFavouriteRequest.favourite );
-				UpdateGridItemFavourite( setPlayerFavouriteRequest.itemID, setPlayerFavouriteRequest.favourite );
-				UpdateFavouriteHint( setPlayerFavouriteRequest.favourite );
-			}
-			else
-			{
-				HandleItemClick( evt.itemData, evt.actionName, evt.displayContext, evt.display.GetIsPlayerFavourite() );
-			}
+			HandleItemClick( evt.itemData, evt.actionName, evt.displayContext, evt.display.GetIsPlayerFavourite() );
 		}
 		HACK_lastItemDisplayEvent = evt;
 	}
@@ -1645,8 +1700,10 @@ class InventoryItemModeLogicController extends inkLogicController
 				}
 			}
 		}
-		else if( ( ( actionName.IsAction( 'preview_item' ) && ( InventoryItemData.IsWeapon( itemData ) || InventoryItemData.IsGarment( itemData ) ) ) && !( InventoryItemData.IsEmpty( itemData ) ) ) && displayContext == ItemDisplayContext.Backpack )
+		else if( ( ( ( actionName.IsAction( 'preview_item' ) && ( InventoryItemData.IsWeapon( itemData ) || InventoryItemData.IsGarment( itemData ) ) ) && !( InventoryItemData.IsEmpty( itemData ) ) ) && displayContext == ItemDisplayContext.Backpack ) && ( m_pressedItemDisplay != NULL ) )
 		{
+			PlaySound( 'MapPin', 'OnCreate' );
+			m_pressedItemDisplay = NULL;
 			isClothing = IsEquipmentAreaClothing( InventoryItemData.GetEquipmentArea( itemData ) ) || InventoryItemData.GetEquipmentArea( itemData ) == gamedataEquipmentArea.Outfit;
 			m_itemPreviewPopupToken = ItemPreviewHelper.ShowPreviewItem( this, itemData, isClothing, 'OnItemPreviewPopup' );
 		}
@@ -1664,6 +1721,17 @@ class InventoryItemModeLogicController extends inkLogicController
 			{
 				ShowNotification( m_player.GetGame(), DetermineUIMenuNotificationType() );
 				return;
+			}
+			if( InventoryItemData.GetItemType( itemData ) == gamedataItemType.Clo_Outfit )
+			{
+				if( m_outfitInCooldown )
+				{
+					return;
+				}
+				else if( ScheduleOutfitCooldownReset() )
+				{
+					SetOutfitCooldown( true );
+				}
 			}
 			EquipItem( itemData, itemChooser.GetSlotIndex() );
 			PlayRumble( RumbleStrength.Heavy, RumbleType.Pulse, RumblePosition.Right );
@@ -1683,6 +1751,25 @@ class InventoryItemModeLogicController extends inkLogicController
 			}
 			NotifyItemUpdate();
 		}
+	}
+
+	private function ScheduleOutfitCooldownReset() : Bool
+	{
+		var callback : InventoryOutfitCooldownResetCallback;
+		callback = new InventoryOutfitCooldownResetCallback;
+		callback.m_controller = this;
+		if( m_delaySystem && !( m_outfitInCooldown ) )
+		{
+			m_delaySystem.CancelCallback( m_delayedOutfitCooldownResetCallbackId );
+			m_delayedOutfitCooldownResetCallbackId = m_delaySystem.DelayCallback( callback, m_outfitCooldownPeroid, false );
+			return GetInvalidDelayID() != m_delayedOutfitCooldownResetCallbackId;
+		}
+		return false;
+	}
+
+	public function SetOutfitCooldown( inCooldown : Bool )
+	{
+		m_outfitInCooldown = inCooldown;
 	}
 
 	public function OpenQuantityPicker( const itemData : ref< InventoryItemData >, action : QuantityPickerActionType )
@@ -1759,7 +1846,7 @@ class InventoryItemModeLogicController extends inkLogicController
 
 	protected event OnItemDisplayHold( evt : ItemDisplayHoldEvent )
 	{
-		HandleItemHold( evt.itemData, evt.actionName, evt.display.GetIsPlayerFavourite() );
+		HandleItemHold( evt.itemData, evt.actionName, evt.display.GetIsPlayerFavourite(), evt.display );
 	}
 
 	protected event OnItemInventoryHold( evt : inkPointerEvent )
@@ -1770,7 +1857,7 @@ class InventoryItemModeLogicController extends inkLogicController
 		progress = evt.GetHoldProgress();
 		if( progress >= 1.0 )
 		{
-			HandleItemHold( controller.GetItemData(), evt.GetActionName(), controller.GetIsPlayerFavourite() );
+			HandleItemHold( controller.GetItemData(), evt.GetActionName(), controller.GetIsPlayerFavourite(), controller );
 		}
 	}
 
@@ -1813,9 +1900,10 @@ class InventoryItemModeLogicController extends inkLogicController
 		m_itemPreviewPopupToken = NULL;
 	}
 
-	private function HandleItemHold( const itemData : ref< InventoryItemData >, actionName : inkActionName, isPlayerLocked : Bool )
+	private function HandleItemHold( const itemData : ref< InventoryItemData >, actionName : inkActionName, isPlayerLocked : Bool, controller : weak< InventoryItemDisplayController > )
 	{
 		var IsInUse : Bool;
+		var setPlayerFavouriteRequest : UIScriptableSystemSetItemPlayerFavourite;
 		IsInUse = InventoryItemData.GetSlotIndex( itemData ) > -1;
 		if( ( actionName.IsAction( 'disassemble_item' ) && !( m_isE3Demo ) ) && RPGManager.CanItemBeDisassembled( m_player.GetGame(), InventoryItemData.GetGameItemData( itemData ) ) )
 		{
@@ -1856,6 +1944,20 @@ class InventoryItemModeLogicController extends inkLogicController
 			}
 			ItemActionsHelper.PerformItemAction( m_player, InventoryItemData.GetID( itemData ) );
 			m_InventoryManager.MarkToRebuild();
+		}
+		else if( ( ( ( actionName.IsAction( 'favourite_item' ) && !( InventoryItemData.IsEmpty( itemData ) ) ) && InventoryItemData.IsWeapon( itemData ) ) && !( IsItemCyberware( InventoryItemData.GetItemType( itemData ) ) ) ) && ( m_pressedItemDisplay != NULL ) )
+		{
+			setPlayerFavouriteRequest = new UIScriptableSystemSetItemPlayerFavourite;
+			setPlayerFavouriteRequest.itemID = InventoryItemData.GetID( itemData );
+			setPlayerFavouriteRequest.favourite = !( controller.GetIsPlayerFavourite() );
+			m_uiScriptableSystem.QueueRequest( setPlayerFavouriteRequest );
+			controller.SetIsPlayerFavourite( setPlayerFavouriteRequest.favourite );
+			InventoryItemData.UpdateSortData( itemData, m_uiScriptableSystem, setPlayerFavouriteRequest.favourite );
+			UpdateGridItemFavourite( setPlayerFavouriteRequest.itemID, setPlayerFavouriteRequest.favourite );
+			UpdateFavouriteHint( setPlayerFavouriteRequest.favourite );
+			m_pressedItemDisplay = NULL;
+			PlaySound( 'MapPin', 'OnEnable' );
+			PlayRumble( RumbleStrength.Heavy, RumbleType.Pulse, RumblePosition.Right );
 		}
 	}
 
@@ -2027,11 +2129,10 @@ class InventoryItemModeLogicController extends inkLogicController
 
 	private function SetInventoryItemButtonHintsHoverOver( const displayingData : ref< InventoryItemData >, optional display : InventoryItemDisplayController )
 	{
-		var cursorData : MenuCursorUserData;
 		var isEquippedOrAttachment : Bool;
 		var equipmentArea : gamedataEquipmentArea;
 		var equippedItem : InventoryItemData;
-		cursorData = new MenuCursorUserData;
+		m_cursorData = new MenuCursorUserData;
 		isEquippedOrAttachment = InventoryItemData.IsEquipped( displayingData ) || this.itemChooser.IsAttachmentItem( displayingData );
 		if( display )
 		{
@@ -2109,7 +2210,7 @@ class InventoryItemModeLogicController extends inkLogicController
 					if( RPGManager.CanItemBeDisassembled( m_player.GetGame(), InventoryItemData.GetID( displayingData ) ) && !( isEquippedOrAttachment ) )
 					{
 						m_buttonHintsController.AddButtonHint( 'disassemble_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "UI-ScriptExports-Disassemble0" ) );
-						cursorData.AddAction( 'disassemble_item' );
+						m_cursorData.AddAction( 'disassemble_item' );
 					}
 				}
 				if( InventoryItemData.GetEquipmentArea( displayingData ) == gamedataEquipmentArea.Consumable )
@@ -2117,7 +2218,7 @@ class InventoryItemModeLogicController extends inkLogicController
 					if( InventoryItemData.GetItemType( displayingData ) != gamedataItemType.Con_Inhaler && InventoryItemData.GetItemType( displayingData ) != gamedataItemType.Con_Injector )
 					{
 						m_buttonHintsController.AddButtonHint( 'use_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "UI-UserActions-Use" ) );
-						cursorData.AddAction( 'use_item' );
+						m_cursorData.AddAction( 'use_item' );
 					}
 				}
 			}
@@ -2125,9 +2226,9 @@ class InventoryItemModeLogicController extends inkLogicController
 			{
 				m_buttonHintsController.AddButtonHint( 'unequip_item', GetLocalizedText( "UI-UserActions-Unequip" ) );
 			}
-			if( cursorData.GetActionsListSize() >= 0 )
+			if( m_cursorData.GetActionsListSize() >= 0 )
 			{
-				SetCursorContext( 'HoldToComplete', cursorData );
+				SetCursorContext( 'HoldToComplete', m_cursorData );
 			}
 			else
 			{
@@ -2149,11 +2250,21 @@ class InventoryItemModeLogicController extends inkLogicController
 	{
 		if( state )
 		{
-			m_buttonHintsController.AddButtonHint( 'favourite_item', "UI-UserActions-ItemRemoveFavourite" );
+			m_buttonHintsController.AddButtonHint( 'favourite_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "UI-UserActions-ItemRemoveFavourite" ) );
+			m_cursorData.AddUniqueAction( 'favourite_item' );
 		}
 		else
 		{
-			m_buttonHintsController.AddButtonHint( 'favourite_item', "UI-UserActions-ItemAddFavourite" );
+			m_buttonHintsController.AddButtonHint( 'favourite_item', ( ( "[" + GetLocalizedText( "Gameplay-Devices-Interactions-Helpers-Hold" ) ) + "] " ) + GetLocalizedText( "UI-UserActions-ItemAddFavourite" ) );
+			m_cursorData.AddUniqueAction( 'favourite_item' );
+		}
+		if( m_cursorData.GetActionsListSize() >= 0 )
+		{
+			SetCursorContext( 'HoldToComplete', m_cursorData );
+		}
+		else
+		{
+			SetCursorContext( 'Hover' );
 		}
 	}
 
@@ -2474,5 +2585,16 @@ class DelayedItemEquipped extends Event
 
 class DelayedRefreshItems extends Event
 {
+}
+
+class InventoryOutfitCooldownResetCallback extends DelayCallback
+{
+	var m_controller : weak< InventoryItemModeLogicController >;
+
+	public override function Call()
+	{
+		m_controller.SetOutfitCooldown( false );
+	}
+
 }
 

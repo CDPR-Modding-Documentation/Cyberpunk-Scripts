@@ -15,8 +15,14 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 	private var m_statsDependantItems : inkWeakHashMap;
 	private var m_InventoryBlackboard : weak< IBlackboard >;
 	private var m_CraftingBlackboardDefinition : UI_CraftingDef;
+	private var m_LevelUpDef : UI_LevelUpDef;
+	private var m_AttributeBoughtDef : UI_AttributeBoughtDef;
 	private var m_Blackboard : weak< IBlackboard >;
+	private var m_BlackboardAttributeBought : weak< IBlackboard >;
+	private var m_BlackboardLevelUp : weak< IBlackboard >;
 	private var m_UpgradeBlackboardCallback : CallbackHandle;
+	private var m_CharacterLevelBlackboardCallback : CallbackHandle;
+	private var m_OnAttributesChangeCallback : CallbackHandle;
 	private var m_TEMP_questSystem : QuestsSystem;
 	private var m_TEMP_cuverBarsListener : Uint32;
 	private var m_TEMP_separatorBarsListener : Uint32;
@@ -31,6 +37,14 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 		if( m_Blackboard )
 		{
 			m_Blackboard.UnregisterListenerVariant( m_CraftingBlackboardDefinition.lastCommand, m_UpgradeBlackboardCallback );
+		}
+		if( m_BlackboardLevelUp )
+		{
+			m_BlackboardLevelUp.UnregisterDelayedListener( m_LevelUpDef.level, m_CharacterLevelBlackboardCallback );
+		}
+		if( m_BlackboardAttributeBought )
+		{
+			m_BlackboardAttributeBought.UnregisterDelayedListener( m_AttributeBoughtDef.attribute, m_OnAttributesChangeCallback );
 		}
 		m_TEMP_questSystem.UnregisterListener( 'disable_curve_bars', m_TEMP_cuverBarsListener );
 		m_TEMP_questSystem.UnregisterListener( 'enable_separator_bars', m_TEMP_separatorBarsListener );
@@ -68,10 +82,32 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 		{
 			m_UpgradeBlackboardCallback = m_Blackboard.RegisterListenerVariant( m_CraftingBlackboardDefinition.lastCommand, this, 'OnUpgradeItem', true );
 		}
+		m_LevelUpDef = GetAllBlackboardDefs().UI_LevelUp;
+		m_AttributeBoughtDef = GetAllBlackboardDefs().UI_AttributeBought;
+		m_BlackboardLevelUp = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( m_LevelUpDef );
+		m_BlackboardAttributeBought = GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( m_AttributeBoughtDef );
+		if( m_BlackboardLevelUp )
+		{
+			m_CharacterLevelBlackboardCallback = m_BlackboardLevelUp.RegisterListenerVariant( m_LevelUpDef.level, this, 'OnCharacterLevelUpdated', true );
+		}
+		if( m_BlackboardAttributeBought )
+		{
+			m_OnAttributesChangeCallback = m_BlackboardAttributeBought.RegisterListenerVariant( m_AttributeBoughtDef.attribute, this, 'OnCharacterAttributeUpdated', true );
+		}
 		m_TEMP_cuverBarsListener = m_TEMP_questSystem.RegisterListener( 'disable_curve_bars', this, 'DisableCurveBarsChanged' );
 		m_inventoryItemsManager.SetCuverBarsEnabled( m_TEMP_questSystem.GetFact( 'disable_curve_bars' ) <= 0 );
 		m_TEMP_separatorBarsListener = m_TEMP_questSystem.RegisterListener( 'enable_separator_bars', this, 'DisableSeparatorBarsChanged' );
 		m_inventoryItemsManager.SetSeparatorBarsEnabled( m_TEMP_questSystem.GetFact( 'enable_separator_bars' ) > 0 );
+	}
+
+	protected event OnCharacterLevelUpdated( value : Variant )
+	{
+		FlushCyberwareStats();
+	}
+
+	protected event OnCharacterAttributeUpdated( value : Variant )
+	{
+		FlushCyberwareStats();
 	}
 
 	private function DisableCurveBarsChanged( value : Int32 )
@@ -98,14 +134,15 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 
 	private function RefreshItem( itemID : ItemID )
 	{
-		var inventoryItem : UIInventoryItem;
+		var itemData : weak< gameItemData >;
+		var inventoryItemRefreshed : UIInventoryItem;
 		if( IsPreview( itemID ) )
 		{
 			return;
 		}
-		inventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_playerItems.Get( ItemID.GetCombinedHash( itemID ) ) ) );
-		inventoryItem.Internal_MarkStatsDirty();
-		inventoryItem.Internal_MarkModsDirty();
+		itemData = m_transactionSystem.GetItemData( m_attachedPlayer, itemID );
+		inventoryItemRefreshed = UIInventoryItem.Make( m_attachedPlayer, itemData, m_inventoryItemsManager );
+		m_playerItems.Set( ItemID.GetCombinedHash( itemID ), inventoryItemRefreshed );
 	}
 
 	private const function IsPreview( itemID : ItemID ) : Bool
@@ -193,14 +230,72 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 		}
 	}
 
-	private const function RemovePlayerItem( hash : Uint64, itemID : ItemID )
+	private const function GetQueryIDs( query : ItemID ) : array< ItemID >
 	{
-		m_playerItems.Remove( hash );
+		var ids : array< ItemID >;
+		var i, limit : Int32;
+		var values : array< weak< IScriptable > >;
+		var uiInventoryItem : UIInventoryItem;
+		m_playerItems.GetValues( values );
+		for( i = 0, limit = values.Size(); i < limit; i += 1 )
+		{
+			uiInventoryItem = ( ( UIInventoryItem )( values[ i ] ) );
+			if( uiInventoryItem.GetID() == query )
+			{
+				ids.PushBack( uiInventoryItem.GetID() );
+			}
+		}
+		return ids;
+	}
+
+	private const function GetNonInventoryQueryIDs( query : ItemID ) : array< ItemID >
+	{
+		var ids : array< ItemID >;
+		var i, limit : Int32;
+		var values : array< weak< IScriptable > >;
+		var uiInventoryItem : UIInventoryItem;
+		m_cachedNonInventoryItems.GetValues( values );
+		for( i = 0, limit = values.Size(); i < limit; i += 1 )
+		{
+			uiInventoryItem = ( ( UIInventoryItem )( values[ i ] ) );
+			if( uiInventoryItem.GetID() == query )
+			{
+				ids.PushBack( uiInventoryItem.GetID() );
+			}
+		}
+		return ids;
+	}
+
+	private const function InternalRemovePlayerItems( hash : Uint64, itemID : ItemID ) : Bool
+	{
+		var result : Bool;
+		result = m_playerItems.Remove( hash );
 		m_statsDependantItems.Remove( hash );
 		if( m_itemsRestored )
 		{
 			NotifyItemRemoved( itemID, hash );
 		}
+		return result;
+	}
+
+	private const function RemovePlayerItem( hash : Uint64, itemID : ItemID ) : Bool
+	{
+		var i, limit : Int32;
+		var ids : array< ItemID >;
+		var result : Bool;
+		if( ItemID.IsQuery( itemID ) )
+		{
+			ids = GetQueryIDs( itemID );
+			for( i = 0, limit = ids.Size(); i < limit; i += 1 )
+			{
+				result = result || InternalRemovePlayerItems( ItemID.GetCombinedHash( ids[ i ] ), ids[ i ] );
+			}
+		}
+		else
+		{
+			result = InternalRemovePlayerItems( hash, itemID );
+		}
+		return result;
 	}
 
 	private const function NotifyItemAdded( itemID : ItemID, hash : Uint64 )
@@ -294,6 +389,25 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 		return ( ( weak< weak< UIInventoryItem > > )( m_playerItems.Get( ItemID.GetCombinedHash( ids[ slotIndex ] ) ) ) );
 	}
 
+	public const function GetPlayerHealingItems() : array< weak< UIInventoryItem > >
+	{
+		var result : array< weak< UIInventoryItem > >;
+		var items : array< weak< gameItemData > >;
+		var i, limit : Int32;
+		var tags : array< CName >;
+		tags.PushBack( 'Injector' );
+		tags.PushBack( 'Inhaler' );
+		m_transactionSystem.GetItemListByTags( m_attachedPlayer, tags, items );
+		for( i = 0, limit = items.Size(); i < limit; i += 1 )
+		{
+			if( items[ i ] != NULL )
+			{
+				result.PushBack( ( ( weak< weak< UIInventoryItem > > )( m_playerItems.Get( ItemID.GetCombinedHash( items[ i ].GetID() ) ) ) ) );
+			}
+		}
+		return result;
+	}
+
 	public const function FlushFullscreenCache()
 	{
 		FlushTempData();
@@ -353,6 +467,7 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 		var isBackpackItem : Bool;
 		var isUnique : Bool;
 		var combinedHash : Uint64;
+		var itemAddedData : ItemRemovedData;
 		if( ItemID.HasFlag( request.itemID, gameEItemIDFlag.Preview ) )
 		{
 			return;
@@ -392,21 +507,31 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 			}
 			m_cachedNonInventoryItems.Insert( combinedHash, data );
 		}
-		m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemAdded, request.itemID, true );
+		itemAddedData.itemID = request.itemID;
+		itemAddedData.isBackpackItem = isBackpackItem;
+		m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemAdded, itemAddedData, true );
 	}
 
 	private function OnInventoryItemRemoved( request : UIInventoryScriptableSystemInventoryRemoveItem )
 	{
 		var hash : Uint64;
 		var favouriteRequest : UIScriptableSystemSetItemPlayerFavourite;
+		var itemRemovedData : ItemRemovedData;
+		var isBackpackItem, itemRemoved : Bool;
 		if( ItemID.HasFlag( request.itemID, gameEItemIDFlag.Preview ) )
 		{
 			return;
 		}
 		hash = ItemID.GetCombinedHash( request.itemID );
-		RemovePlayerItem( hash, request.itemID );
-		m_cachedNonInventoryItems.Remove( hash );
-		m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemRemoved, request.itemID, true );
+		isBackpackItem = RemovePlayerItem( hash, request.itemID );
+		itemRemoved = isBackpackItem;
+		itemRemoved = itemRemoved || m_cachedNonInventoryItems.Remove( hash );
+		if( itemRemoved )
+		{
+			itemRemovedData.itemID = request.itemID;
+			itemRemovedData.isBackpackItem = isBackpackItem;
+			m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemRemoved, itemRemovedData, true );
+		}
 		favouriteRequest = new UIScriptableSystemSetItemPlayerFavourite;
 		favouriteRequest.itemID = request.itemID;
 		m_uiScriptableSystem.QueueRequest( favouriteRequest );
@@ -416,13 +541,50 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 	{
 		var uiInventoryItem : weak< UIInventoryItem >;
 		var hash : Uint64;
-		hash = ItemID.GetCombinedHash( request.itemID );
-		uiInventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_playerItems.Get( hash ) ) );
-		if( uiInventoryItem == NULL )
+		var i, limit : Int32;
+		var ids : array< ItemID >;
+		var itemQuantityChangedData : ItemQuantityChangedData;
+		if( !( ItemID.IsQuery( request.itemID ) ) )
 		{
-			uiInventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_cachedNonInventoryItems.Get( hash ) ) );
+			hash = ItemID.GetCombinedHash( request.itemID );
+			uiInventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_playerItems.Get( hash ) ) );
+			if( uiInventoryItem == NULL )
+			{
+				uiInventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_cachedNonInventoryItems.Get( hash ) ) );
+			}
+			if( uiInventoryItem )
+			{
+				uiInventoryItem.MarkQuantityDirty();
+				itemQuantityChangedData.itemID = request.itemID;
+				itemQuantityChangedData.isBackpackItem = true;
+				m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemQuantityChanged, itemQuantityChangedData, true );
+			}
+			return;
 		}
-		uiInventoryItem.MarkQuantityDirty();
+		ids = GetQueryIDs( request.itemID );
+		for( i = 0, limit = ids.Size(); i < limit; i += 1 )
+		{
+			uiInventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_playerItems.Get( ItemID.GetCombinedHash( ids[ i ] ) ) ) );
+			if( uiInventoryItem )
+			{
+				uiInventoryItem.MarkQuantityDirty();
+				itemQuantityChangedData.itemID = ids[ i ];
+				itemQuantityChangedData.isBackpackItem = true;
+				m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemQuantityChanged, itemQuantityChangedData, true );
+			}
+		}
+		ids = GetNonInventoryQueryIDs( request.itemID );
+		for( i = 0, limit = ids.Size(); i < limit; i += 1 )
+		{
+			uiInventoryItem = ( ( weak< weak< UIInventoryItem > > )( m_cachedNonInventoryItems.Get( ItemID.GetCombinedHash( ids[ i ] ) ) ) );
+			if( uiInventoryItem )
+			{
+				uiInventoryItem.MarkQuantityDirty();
+				itemQuantityChangedData.itemID = ids[ i ];
+				itemQuantityChangedData.isBackpackItem = true;
+				m_InventoryBlackboard.SetVariant( GetAllBlackboardDefs().UI_Inventory.itemQuantityChanged, itemQuantityChangedData, true );
+			}
+		}
 	}
 
 	private function OnPartInstallRequest( request : PartInstallRequest )
@@ -493,6 +655,7 @@ class UIInventoryScriptableSystem extends ScriptableSystem
 			if( ( ( weak< weak< UIInventoryItem > > )( values[ i ] ) ).IsAnyCyberware() )
 			{
 				( ( weak< weak< UIInventoryItem > > )( values[ i ] ) ).Internal_MarkStatsDirty();
+				( ( weak< weak< UIInventoryItem > > )( values[ i ] ) ).Internal_MarkModsDirty();
 			}
 		}
 	}
@@ -634,5 +797,23 @@ class UIInventoryItemRemoved extends Event
 {
 	var itemID : ItemID;
 	var hash : Uint64;
+}
+
+struct ItemAddedData
+{
+	var itemID : ItemID;
+	var isBackpackItem : Bool;
+}
+
+struct ItemRemovedData
+{
+	var itemID : ItemID;
+	var isBackpackItem : Bool;
+}
+
+struct ItemQuantityChangedData
+{
+	var itemID : ItemID;
+	var isBackpackItem : Bool;
 }
 

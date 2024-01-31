@@ -734,6 +734,11 @@ class RadioHotkeyController extends GenericHotkeyController
 		UpdateEqualizer();
 	}
 
+	protected event OnVehicleRadioCycleEvent( evt : UIVehicleRadioCycleEvent )
+	{
+		PlayLibraryAnimation( 'OnRadioSongChanged' );
+	}
+
 	private function IsRadioEnabled() : Bool
 	{
 		return GetUIBlackboard().GetBool( GetAllBlackboardDefs().UIGameData.Popup_Radio_Enabled );
@@ -875,6 +880,7 @@ class HotkeyItemController extends GenericHotkeyController
 	protected var m_currentItem : InventoryItemData;
 	private var m_hotkeyBlackboard : weak< IBlackboard >;
 	private var m_hotkeyCallbackID : CallbackHandle;
+	private var m_holocallCallback : CallbackHandle;
 	private var m_equipmentSystem : weak< EquipmentSystem >;
 	protected var m_inventoryManager : InventoryDataManagerV2;
 	protected var m_dpadAnim : inkAnimProxy;
@@ -904,7 +910,38 @@ class HotkeyItemController extends GenericHotkeyController
 			m_hotkeyCallbackID = m_hotkeyBlackboard.RegisterDelayedListenerVariant( GetAllBlackboardDefs().UI_Hotkeys.ModifiedHotkey, this, 'OnHotkeyRefreshed' );
 		}
 		InitializeHotkeyItem();
+		RegisterHolocallListener();
 		return true;
+	}
+
+	private function RegisterHolocallListener()
+	{
+		var comDeviceBB : weak< IBlackboard >;
+		comDeviceBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ComDevice );
+		m_holocallCallback = comDeviceBB.RegisterListenerVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation, this, 'OnPhoneCallInfoChanged', true );
+	}
+
+	protected event OnPhoneCallInfoChanged( value : Variant )
+	{
+		ResolveState();
+	}
+
+	protected override function IsInDefaultState() : Bool
+	{
+		return ( IsActivatedByQuest() && IsAllowedByGameplay() ) && !( IsHoloCallActive() );
+	}
+
+	private function IsHoloCallActive() : Bool
+	{
+		var lastPhoneCallInformation : PhoneCallInformation;
+		var infoVariant : Variant;
+		infoVariant = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ComDevice ).GetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation );
+		if( infoVariant.IsValid() )
+		{
+			lastPhoneCallInformation = ( ( PhoneCallInformation )infoVariant );
+			return lastPhoneCallInformation.callPhase == questPhoneCallPhase.StartCall && lastPhoneCallInformation.callMode == questPhoneCallMode.Video;
+		}
+		return false;
 	}
 
 	protected event OnPlayerAttach( playerPuppet : GameObject )
@@ -926,6 +963,17 @@ class HotkeyItemController extends GenericHotkeyController
 		{
 			m_hotkeyBlackboard.UnregisterDelayedListener( GetAllBlackboardDefs().UI_Hotkeys.ModifiedHotkey, m_hotkeyCallbackID );
 			m_hotkeyBlackboard = NULL;
+		}
+		UnregisterHolocallListener();
+	}
+
+	private function UnregisterHolocallListener()
+	{
+		var comDeviceBB : weak< IBlackboard >;
+		if( m_holocallCallback )
+		{
+			comDeviceBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().UI_ComDevice );
+			comDeviceBB.UnregisterListenerVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneCallInformation, m_holocallCallback );
 		}
 	}
 
@@ -1227,6 +1275,11 @@ class ChargedHotkeyItemConsumableController extends ChargedHotkeyItemBaseControl
 		GameInstance.GetStatPoolsSystem( gi ).RequestUnregisteringListener( player.GetEntityID(), gamedataStatPoolType.HealingItemsCharges, m_statListener );
 	}
 
+	protected override function IsInDefaultState() : Bool
+	{
+		return IsActivatedByQuest() && IsAllowedByGameplay();
+	}
+
 	protected override function GetRechargeDuration() : Float
 	{
 		var statsSystem : StatsSystem;
@@ -1367,6 +1420,11 @@ class ChargedHotkeyItemGadgetController extends ChargedHotkeyItemBaseController
 		psmBlackboard = GameInstance.GetBlackboardSystem( player.GetGame() ).GetLocalInstanced( player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
 		combatState = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat );
 		return ( ( gamePSMCombat )( combatState ) );
+	}
+
+	protected override function IsInDefaultState() : Bool
+	{
+		return IsActivatedByQuest() && IsAllowedByGameplay();
 	}
 
 	protected override function GetRechargeDuration() : Float
@@ -1973,7 +2031,7 @@ class ChargeIndicatorGameController extends ChargedHotkeyItemBaseController
 		RegisterBlackboardListener();
 		m_chargeThreshold = 1.0;
 		InkImageUtils.RequestSetImage( this, m_itemIcon, "UIIcon." + m_iconName );
-		if( IsItemEquipped() )
+		if( IsItemEquipped() && !( IsControllingDevice() ) )
 		{
 			GetRootWidget().SetVisible( true );
 			GetRootWidget().SetOpacity( c_fullChargeOpacity );
@@ -2064,8 +2122,6 @@ class ChargeIndicatorGameController extends ChargedHotkeyItemBaseController
 		{
 			if( GetItemType( items[ i ], '' ) == m_itemType )
 			{
-				GetRootWidget().SetVisible( true );
-				GetRootWidget().SetOpacity( c_fullChargeOpacity );
 				return true;
 			}
 		}
@@ -2089,7 +2145,7 @@ class ChargeIndicatorGameController extends ChargedHotkeyItemBaseController
 		{
 			return 0;
 		}
-		if( IsItemEquipped() )
+		if( IsItemEquipped() && !( IsControllingDevice() ) )
 		{
 			GetRootWidget().SetVisible( true );
 			GetRootWidget().SetOpacity( c_fullChargeOpacity );
@@ -2114,6 +2170,229 @@ class ChargedHotkeyItemStatListener extends ScriptStatPoolsListener
 	public override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
 	{
 		m_hotkeyController.UpdateChargeValue( newValue, percToPoints, oldValue != newValue );
+	}
+
+}
+
+class vehicleVisualCustomizationHotkeyController extends GenericHotkeyController
+{
+	private var m_vehicleBB : weak< IBlackboard >;
+	private var m_vehicleEnterListener : CallbackHandle;
+	private var m_factListener : Uint32;
+	private var m_animationProxy : inkAnimProxy;
+	private var m_carColorSelectorToken : inkGameNotificationToken;
+	private var m_isInDefaultState : Bool;
+	private var m_phoneMenuActive : Bool;
+	private var m_currentCombatState : gamePSMCombat;
+	private var m_combatStateCallback : CallbackHandle;
+	private var m_phoneStateCallback : CallbackHandle;
+
+	protected event OnPlayerAttach( player : GameObject )
+	{
+		super.OnPlayerAttach( player );
+		InitializeStatusListener();
+		InitializeQuestListener();
+		InitializeCombatStateListener( true );
+		InitializePhoneSystemListener( true );
+		player.RegisterInputListener( this, 'VehicleVisualCustomization' );
+		m_vehicleEnterListener = GetPSMBlackboard( player ).RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, this, 'OnPlayerEnteredVehicle', true );
+		ResolveState();
+	}
+
+	protected override function Initialize() : Bool
+	{
+		SetHintController();
+		ResolveState();
+		return true;
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		if( ListenerAction.GetName( action ) == 'VehicleVisualCustomization' )
+		{
+			if( VehicleSystem.IsPlayerInVehicle( GetPlayer().GetGame() ) )
+			{
+				return true;
+			}
+			if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_HOLD_COMPLETE )
+			{
+				if( m_animationProxy && m_animationProxy.IsPlaying() )
+				{
+					m_animationProxy.GotoEndAndStop( true );
+					m_animationProxy = NULL;
+				}
+				m_animationProxy = PlayLibraryAnimation( 'onFailUse_carMod' );
+			}
+		}
+	}
+
+	private function InitializeQuestListener()
+	{
+		m_factListener = GameInstance.GetQuestsSystem( m_player.GetGame() ).RegisterListener( 'unlock_car_hud_dpad', this, 'OnFactChanged' );
+	}
+
+	private function SetHintController()
+	{
+		m_buttonHintController = ( ( inkInputDisplayController )( inkWidgetRef.Get( m_buttonHint ).GetController() ) );
+		m_buttonHintController.SetInputAction( 'VehicleVisualCustomization' );
+		m_buttonHintController.SetHoldIndicatorType( inkInputHintHoldIndicationType.Hold );
+	}
+
+	protected override function Uninitialize()
+	{
+		GameInstance.GetQuestsSystem( m_player.GetGame() ).UnregisterListener( 'unlock_car_hud_dpad', m_factListener );
+		m_statusEffectsListener = NULL;
+		InitializeCombatStateListener( false );
+		InitializePhoneSystemListener( false );
+		if( m_vehicleEnterListener )
+		{
+			GetPSMBlackboard( m_player ).UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, m_vehicleEnterListener );
+		}
+	}
+
+	private function InitializeCombatStateListener( val : Bool )
+	{
+		var player : PlayerPuppet;
+		var psmBlackboard : IBlackboard;
+		player = GetPlayer();
+		psmBlackboard = GameInstance.GetBlackboardSystem( player.GetGame() ).GetLocalInstanced( player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		if( val )
+		{
+			m_combatStateCallback = psmBlackboard.RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, this, 'OnCombatStateChanged' );
+		}
+		else
+		{
+			if( m_combatStateCallback )
+			{
+				psmBlackboard.UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, m_combatStateCallback );
+			}
+		}
+	}
+
+	private function InitializePhoneSystemListener( val : Bool )
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : weak< IBlackboard >;
+		blackboardSystem = GameInstance.GetBlackboardSystem( m_player.GetGame() );
+		blackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ComDevice );
+		if( val )
+		{
+			m_phoneStateCallback = blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, this, 'OnPhoneMenuStateChange' );
+		}
+		else
+		{
+			blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, m_phoneStateCallback );
+		}
+	}
+
+	private function InitializeDialogueSystemListener( val : Bool )
+	{
+		var blackboardSystem : BlackboardSystem;
+		var blackboard : weak< IBlackboard >;
+		blackboardSystem = GameInstance.GetBlackboardSystem( m_player.GetGame() );
+		blackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ComDevice );
+		if( val )
+		{
+			m_phoneStateCallback = blackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, this, 'OnPhoneMenuStateChange' );
+		}
+		else
+		{
+			blackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, m_phoneStateCallback );
+		}
+	}
+
+	private function GetPSMCombatState() : gamePSMCombat
+	{
+		var player : PlayerPuppet;
+		var psmBlackboard : IBlackboard;
+		var combatState : Int32;
+		player = GetPlayer();
+		psmBlackboard = GameInstance.GetBlackboardSystem( player.GetGame() ).GetLocalInstanced( player.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine );
+		combatState = psmBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat );
+		return ( ( gamePSMCombat )( combatState ) );
+	}
+
+	public function OnFactChanged( value : Int32 )
+	{
+		ResolveState();
+	}
+
+	protected event OnCombatStateChanged( newState : Int32 )
+	{
+		m_currentCombatState = ( ( gamePSMCombat )( newState ) );
+		ResolveState();
+	}
+
+	protected event OnPhoneMenuStateChange( newState : Bool )
+	{
+		m_phoneMenuActive = newState;
+		ResolveState();
+	}
+
+	protected event OnPlayerEnteredVehicle( value : Int32 )
+	{
+		ResolveState();
+	}
+
+	protected override function IsInDefaultState() : Bool
+	{
+		var isPlayerInVehicle : Bool;
+		var isNotInDriverCombat : Bool;
+		var isNotInVehicleScene : Bool;
+		var isNotQuestBlocked : Bool;
+		var isNotModInCooldown : Bool;
+		var isNotInPhoneCall : Bool;
+		var isNotModBlockedByDamage : Bool;
+		var isNotInCombat : Bool;
+		var isNotVisualCustomizationTeaser : Bool;
+		var isNotFastForwardAvailable : Bool;
+		var isNotFastForward : Bool;
+		isPlayerInVehicle = VehicleSystem.IsPlayerInVehicle( GetPlayer().GetGame() );
+		isNotInDriverCombat = !( StatusEffectSystem.ObjectHasStatusEffect( GetPlayer(), T"BaseStatusEffect.DriverCombat" ) );
+		isNotInVehicleScene = !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayer(), 'VehicleScene' ) );
+		isNotQuestBlocked = GameInstance.GetQuestsSystem( m_player.GetGame() ).GetFact( 'unlock_car_hud_dpad' ) != 0;
+		isNotModInCooldown = !( StatusEffectSystem.ObjectHasStatusEffect( GetPlayer(), T"BaseStatusEffect.VehicleVisualModCooldown" ) );
+		isNotInPhoneCall = ( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayer(), 'PhoneCall' ) ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayer(), 'PhoneNoTexting' ) ) ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayer(), 'PhoneNoCalling' ) );
+		isNotModBlockedByDamage = !( m_player.GetMountedVehicle().GetVehiclePS().GetIsVehicleVisualCustomizationBlockedByDamage() );
+		isNotInCombat = m_currentCombatState != gamePSMCombat.InCombat;
+		isNotVisualCustomizationTeaser = !( m_player.GetMountedVehicle().GetVehicleComponent().GetIsVehicleVisualCustomizationTeaser() );
+		isNotFastForwardAvailable = !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayer(), 'FastForwardHintActive' ) );
+		isNotFastForward = !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayer(), 'FastForward' ) );
+		if( isPlayerInVehicle )
+		{
+			if( ( ( ( ( ( ( ( ( ( isNotInVehicleScene && isNotQuestBlocked ) && isNotModInCooldown ) && isNotModBlockedByDamage ) && isNotFastForwardAvailable ) && isNotFastForward ) && isNotVisualCustomizationTeaser ) && isNotInDriverCombat ) && isNotInPhoneCall ) && !( m_isRemoteControllingVehicle ) ) && isNotInCombat )
+			{
+				m_isInDefaultState = true;
+				return true;
+			}
+			else
+			{
+				m_isInDefaultState = false;
+				return false;
+			}
+		}
+		else
+		{
+			m_isInDefaultState = false;
+			return false;
+		}
+	}
+
+	protected override function ResolveState()
+	{
+		var isVisible : Bool;
+		if( VehicleSystem.IsPlayerInVehicle( GetPlayer().GetGame() ) )
+		{
+			if( m_player.GetMountedVehicle().GetVehicleComponent().GetIsVehicleVisualCustomizationEnabled() )
+			{
+				isVisible = true;
+			}
+		}
+		GetRootWidget().SetVisible( isVisible );
+		if( isVisible )
+		{
+			super.ResolveState();
+		}
 	}
 
 }
