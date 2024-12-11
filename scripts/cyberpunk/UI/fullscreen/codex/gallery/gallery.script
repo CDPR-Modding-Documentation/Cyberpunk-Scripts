@@ -1,0 +1,942 @@
+import enum inkGameScreenshotSortMode : Uint32
+{
+	DateAscending,
+	DateDescending,
+	RatioAscending,
+	RatioDescending,
+	Favorite,
+}
+
+import struct GameScreenshotInfo
+{
+	import var path : String;
+	import var creationDate : Uint64;
+	import var aspectRatioType : Uint32;
+	import var pathHash : Uint32;
+	import var screenshotIndex : Int32;
+	import var canBeDeleted : Bool;
+}
+
+class GalleryMenuGameController extends gameuiMenuGameController
+{
+	protected editable var m_tooltipsManagerRef : inkWidgetRef;
+	protected editable var m_favoriteManagerRef : inkWidgetRef;
+	protected editable var m_buttonHintsManagerRef : inkWidgetRef;
+	protected editable var m_globalWrapper : inkWidgetRef;
+	protected editable var m_screenshotsGrid : inkCompoundRef;
+	protected editable var m_filtersGrid : inkWidgetRef;
+	protected editable var m_paginationWidget : inkCompoundRef;
+	protected editable var m_globalPreloaderContainer : inkWidgetRef;
+	protected editable var screenshotsPerPage : Int32;
+	private var m_globalPreloader : weak< inkWidget >;
+	private var m_paginationController : weak< PaginationController >;
+	protected var m_buttonHintsController : weak< ButtonHints >;
+	private var m_systemHandler : weak< inkISystemRequestsHandler >;
+	private var m_gameInstance : GameInstance;
+	private var m_screenshotInfos : array< GameScreenshotInfo >;
+	private var m_sortedScreenshotInfos : array< GameScreenshotInfo >;
+	private var m_screenshotFullPreviewPopupToken : inkGameNotificationToken;
+	private var m_filterTypes : array< inkGameScreenshotSortMode >;
+	private var m_activeSort : weak< GalleryFilterController >;
+	private var m_isFavoriteFiltering : Bool;
+	protected var m_screenshotItems : array< weak< GalleryScreenshotItem > >;
+	private var m_pageCount : Int32;
+	private var m_currentPage : Int32;
+	default m_currentPage = -1;
+	private var m_tooltipsManager : weak< gameuiTooltipsManager >;
+	private var m_favoriteManager : weak< GalleryFavoriteManager >;
+	private var m_onInputDeviceChangedCallbackID : CallbackHandle;
+	private var m_deleteConfirmationToken : inkGameNotificationToken;
+	private var m_deleteScreenshotId : Int32;
+	default m_deleteScreenshotId = -1;
+	protected var m_visualStateName : CName;
+	default m_visualStateName = 'inkGameGalleryMenuState';
+	protected var m_isSecondaryActionEnabled : Bool;
+	default m_isSecondaryActionEnabled = true;
+	private var m_filterButtons : array< weak< GalleryFilterController > >;
+	var m_canInteract : Bool;
+	default m_canInteract = true;
+	private var m_playerObj : weak< GameObject >;
+	private var m_pageToDisplayOnLoad : Int32;
+
+	protected event OnInitialize()
+	{
+		var playbackOptions : inkAnimOptions;
+		var i : Int32;
+		m_paginationController = ( ( PaginationController )( inkCompoundRef.GetController( m_paginationWidget ) ) );
+		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_buttonHintsController.AddButtonHint( 'back', GetLocalizedText( "Common-Access-Close" ) );
+		inkCompoundRef.SetVisible( m_paginationWidget, false );
+		m_systemHandler = GetSystemRequestsHandler();
+		m_systemHandler.RegisterToCallback( 'OnScreenshotsForLoadReady', this, 'OnScreenshotsForLoadReady' );
+		m_favoriteManager = ( ( GalleryFavoriteManager )( inkWidgetRef.GetControllerByType( m_favoriteManagerRef, 'GalleryFavoriteManager' ) ) );
+		m_favoriteManager.Setup( m_systemHandler );
+		m_systemHandler.RegisterToCallback( 'OnFavoritesLoadedReady', this, 'OnFavoritesLoadedReady' );
+		m_systemHandler.RequestLoadFavorites();
+		SetupFilters();
+		m_gameInstance = ( ( PlayerPuppet )( GetOwnerEntity() ) ).GetGame();
+		GameInstance.GetUISystem( m_gameInstance ).RequestNewVisualState( m_visualStateName );
+		for( i = 0; i < screenshotsPerPage; i += 1 )
+		{
+			CreateScreenshotItem();
+		}
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnShortcutPress' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelative', this, 'OnPostOnAxis' );
+		inkWidgetRef.RegisterToCallback( m_paginationController.m_previousArrow, 'OnRelease', this, 'OnArrowPrev' );
+		inkWidgetRef.RegisterToCallback( m_paginationController.m_nextArrow, 'OnRelease', this, 'OnArrowNext' );
+		m_globalPreloader = SpawnFromExternal( inkWidgetRef.Get( m_globalPreloaderContainer ), R"base\gameplay\gui\common\preloader\preloader.inkwidget", 'Root' );
+		m_globalPreloader.SetAnchor( inkEAnchor.Fill );
+		m_globalPreloader.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+		inkWidgetRef.SetVisible( m_globalWrapper, false );
+		m_globalPreloader.SetVisible( true );
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		m_globalPreloader.GetController().PlayLibraryAnimation( 'loop', playbackOptions );
+		m_playerObj = GetPlayerControlledObject();
+		PlayLibraryAnimation( 'galleryintro' );
+	}
+
+	protected event OnUninitialize()
+	{
+		var i : Int32;
+		m_systemHandler.CancelGameScreenshotRequests();
+		GameInstance.GetUISystem( m_gameInstance ).RestorePreviousVisualState( m_visualStateName );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnShortcutPress' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelative', this, 'OnPostOnAxis' );
+		m_systemHandler.UnregisterFromCallback( 'OnScreenshotsForLoadReady', this, 'OnScreenshotsForLoadReady' );
+		inkWidgetRef.UnregisterFromCallback( m_paginationController.m_previousArrow, 'OnRelease', this, 'OnArrowPrev' );
+		inkWidgetRef.UnregisterFromCallback( m_paginationController.m_nextArrow, 'OnRelease', this, 'OnArrowNext' );
+		for( i = 0; i < m_filterButtons.Size(); i += 1 )
+		{
+			m_filterButtons[ i ].UnregisterFromCallback( 'OnRelease', this, 'OnItemFilterClick' );
+		}
+		for( i = 0; i < m_screenshotItems.Size(); i += 1 )
+		{
+			m_screenshotItems[ i ].UnregisterFromCallback( 'OnRelease', this, 'OnReleaseOnScreenshotItem' );
+		}
+	}
+
+	private function RequestGameScreenshotsForLoad( pageToDisplayOnLoad : Int32 )
+	{
+		m_pageToDisplayOnLoad = pageToDisplayOnLoad;
+		m_systemHandler.RequestGameScreenshotsForLoad();
+	}
+
+	protected event OnArrowPrev( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) )
+		{
+			SwitchPage( -1 );
+			e.Handle();
+		}
+	}
+
+	protected event OnArrowNext( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) )
+		{
+			SwitchPage( 1 );
+			e.Handle();
+		}
+	}
+
+	protected event OnPostOnAxis( e : inkPointerEvent )
+	{
+		if( e.IsHandled() )
+		{
+			return true;
+		}
+		if( e.IsAction( 'mouse_wheel' ) )
+		{
+			SwitchPage( ( ( Int32 )( -( e.GetAxisData() ) ) ) );
+			e.Handle();
+		}
+	}
+
+	protected event OnShortcutPress( e : inkPointerEvent )
+	{
+		var screenshotItem : GalleryScreenshotItem;
+		var isFavorite : Bool;
+		if( !( e.IsHandled() ) && m_canInteract )
+		{
+			if( e.IsAction( 'option_switch_prev_settings' ) )
+			{
+				SwitchPage( -1 );
+				e.Handle();
+			}
+			else if( e.IsAction( 'option_switch_next_settings' ) )
+			{
+				SwitchPage( 1 );
+				e.Handle();
+			}
+			else if( m_isSecondaryActionEnabled && e.IsAction( 'secondaryAction' ) )
+			{
+				screenshotItem = ( ( GalleryScreenshotItem )( e.GetTarget().GetController() ) );
+				if( screenshotItem && screenshotItem.HasScreenshot() )
+				{
+					isFavorite = m_favoriteManager.IsFavorite( screenshotItem.GetHash() );
+					m_favoriteManager.SetFavorite( screenshotItem.GetHash(), !( isFavorite ) );
+					screenshotItem.SetFavoriteDisplay( !( isFavorite ) );
+					screenshotItem.RefreshButtonHints();
+				}
+				e.Handle();
+			}
+			if( m_isSecondaryActionEnabled && e.IsAction( 'delete_screenshot' ) )
+			{
+				screenshotItem = ( ( GalleryScreenshotItem )( e.GetTarget().GetController() ) );
+				if( screenshotItem && screenshotItem.HasScreenshot() )
+				{
+					DeleteScreenshot( screenshotItem.GetData().screenshotIndex, screenshotItem.GetData().canBeDeleted );
+				}
+				e.Handle();
+			}
+		}
+	}
+
+	public function DeleteScreenshot( screenshotIndex : Int32, canBeDeleted : Bool )
+	{
+		if( canBeDeleted )
+		{
+			m_deleteConfirmationToken = GenericMessageNotification.Show( this, "UI-Gallery-DeletePictureConfirmationTitle", "UI-Gallery-DeletePictureConfirmationDesc", GenericMessageNotificationType.ConfirmCancel );
+			m_deleteConfirmationToken.RegisterListener( this, 'OnDeleteConfirm' );
+			m_deleteScreenshotId = screenshotIndex;
+		}
+		else
+		{
+			m_deleteConfirmationToken = GenericMessageNotification.Show( this, "UI-Gallery-DeletePictureConfirmationTitle", "UI-Gallery-DeletePictureImpossibleDesc", GenericMessageNotificationType.OK );
+			m_deleteConfirmationToken.RegisterListener( this, 'OnDeleteConfirm' );
+		}
+		m_canInteract = false;
+	}
+
+	protected event OnDeleteConfirm( data : inkGameNotificationData )
+	{
+		var resultData : GenericMessageNotificationCloseData;
+		var delayedEvent : DelayedDeleteNotificationOKEvent;
+		resultData = ( ( GenericMessageNotificationCloseData )( data ) );
+		if( resultData && resultData.result == GenericMessageNotificationResult.Confirm )
+		{
+			m_systemHandler.DeleteGameScreenshotRequest( m_deleteScreenshotId, this, 'OnScreenshotDeleted' );
+		}
+		else if( resultData && resultData.result == GenericMessageNotificationResult.OK )
+		{
+			delayedEvent = new DelayedDeleteNotificationOKEvent;
+			GameInstance.GetDelaySystem( m_playerObj.GetGame() ).DelayEventNextFrame( m_playerObj, delayedEvent );
+		}
+		else
+		{
+			delayedEvent = new DelayedDeleteNotificationOKEvent;
+			GameInstance.GetDelaySystem( m_playerObj.GetGame() ).DelayEventNextFrame( m_playerObj, delayedEvent );
+		}
+		m_deleteConfirmationToken = NULL;
+		m_deleteScreenshotId = -1;
+	}
+
+	protected event OnDelayedDeleteNotificationOKEvent( evt : DelayedDeleteNotificationOKEvent )
+	{
+		m_canInteract = true;
+	}
+
+	protected event OnScreenshotDeleted( successful : Bool )
+	{
+		if( successful )
+		{
+			RequestGameScreenshotsForLoad( m_currentPage );
+		}
+		m_canInteract = true;
+	}
+
+	protected function SetSelectedItem( hash : Uint32 )
+	{
+		var i : Int32;
+		for( i = 0; i < m_screenshotItems.Size(); i += 1 )
+		{
+			m_screenshotItems[ i ].SetSelected( hash );
+		}
+	}
+
+	private function SetupFilters()
+	{
+		var i : Int32;
+		var textureNames : array< CName >;
+		var locKeys : array< CName >;
+		var filterButton : GalleryFilterController;
+		var platform : String;
+		platform = GetPlatformShortName();
+		textureNames.PushBack( 'filter_date' );
+		locKeys.PushBack( 'UI-Gallery-FilterDate' );
+		m_filterTypes.PushBack( inkGameScreenshotSortMode.DateAscending );
+		if( platform == "windows" )
+		{
+			textureNames.PushBack( 'filter_aspect_ratio' );
+			locKeys.PushBack( 'UI-Gallery-FilterAspectRatio' );
+			m_filterTypes.PushBack( inkGameScreenshotSortMode.RatioAscending );
+		}
+		textureNames.PushBack( 'filter_favorite' );
+		locKeys.PushBack( 'UI-Gallery-FilterFavorites' );
+		m_filterTypes.PushBack( inkGameScreenshotSortMode.Favorite );
+		m_tooltipsManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_tooltipsManagerRef, 'gameuiTooltipsManager' ) ) );
+		m_tooltipsManager.Setup( ETooltipsStyle.Menus );
+		for( i = 0; i < m_filterTypes.Size(); i += 1 )
+		{
+			filterButton = ( ( GalleryFilterController )( SpawnFromLocal( ( ( weak< weak< inkCompoundWidget > > )( inkWidgetRef.Get( m_filtersGrid ) ) ), 'filterButtonItem' ).GetController() ) );
+			filterButton.Setup( m_filterTypes[ i ], textureNames[ i ], locKeys[ i ], m_tooltipsManager );
+			filterButton.RegisterToCallback( 'OnRelease', this, 'OnItemFilterClick' );
+			m_filterButtons.PushBack( filterButton );
+			if( i == 0 )
+			{
+				m_activeSort = filterButton;
+				m_activeSort.SetActive( true );
+			}
+		}
+	}
+
+	protected event OnItemFilterClick( evt : inkPointerEvent )
+	{
+		var widget : inkWidget;
+		var controller : GalleryFilterController;
+		var filterType : inkGameScreenshotSortMode;
+		if( !( m_canInteract ) )
+		{
+			return 0;
+		}
+		if( evt.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			widget = evt.GetCurrentTarget();
+			controller = ( ( GalleryFilterController )( widget.GetController() ) );
+			filterType = controller.GetFilterType();
+			if( controller.IsActive() )
+			{
+				if( filterType == inkGameScreenshotSortMode.DateAscending )
+				{
+					controller.SetFilterType( inkGameScreenshotSortMode.DateDescending );
+				}
+				else if( filterType == inkGameScreenshotSortMode.DateDescending )
+				{
+					controller.SetFilterType( inkGameScreenshotSortMode.DateAscending );
+				}
+				else if( filterType == inkGameScreenshotSortMode.RatioAscending )
+				{
+					controller.SetFilterType( inkGameScreenshotSortMode.RatioDescending );
+				}
+				else if( filterType == inkGameScreenshotSortMode.RatioDescending )
+				{
+					controller.SetFilterType( inkGameScreenshotSortMode.RatioAscending );
+				}
+				filterType = controller.GetFilterType();
+			}
+			if( filterType != inkGameScreenshotSortMode.Favorite )
+			{
+				if( m_activeSort )
+				{
+					m_activeSort.SetActive( false );
+				}
+				m_activeSort = controller;
+				m_activeSort.SetActive( true );
+			}
+			else
+			{
+				m_isFavoriteFiltering = !( m_isFavoriteFiltering );
+				controller.SetActive( m_isFavoriteFiltering );
+				if( m_isFavoriteFiltering )
+				{
+					RefreshPageCount( m_favoriteManager.CountFavorites( m_screenshotInfos ) );
+				}
+				else
+				{
+					RefreshPageCount( m_screenshotInfos.Size() );
+				}
+			}
+			SortScreenshots();
+			SetPageNumber( 0, true );
+			evt.Handle();
+		}
+	}
+
+	protected event OnPageNumberReleased( e : inkPointerEvent )
+	{
+		var widget : inkWidget;
+		var controller : PaginationNumberController;
+		var pageNumber : Int32;
+		if( !( m_canInteract ) )
+		{
+			return 0;
+		}
+		if( e.IsAction( 'click' ) )
+		{
+			widget = e.GetCurrentTarget();
+			controller = ( ( PaginationNumberController )( widget.GetController() ) );
+			pageNumber = controller.GetPageNumber();
+			SetPageNumber( pageNumber, false );
+			e.Handle();
+		}
+	}
+
+	public virtual function SwitchPage( pageOffset : Int32 )
+	{
+		var nextPage : Int32;
+		nextPage = Clamp( m_currentPage + pageOffset, 0, m_pageCount );
+		SetPageNumber( nextPage, false );
+	}
+
+	public function SetPageNumber( nextPageIndex : Int32, forceUpdate : Bool )
+	{
+		var previousPage : Int32;
+		var animProxy : inkAnimProxy;
+		if( ( ( nextPageIndex >= 0 ) && ( nextPageIndex < m_pageCount ) ) && ( nextPageIndex != m_currentPage ) )
+		{
+			previousPage = m_currentPage;
+			m_currentPage = nextPageIndex;
+			m_paginationController.SetActivePageNumber( m_currentPage );
+			if( !( forceUpdate ) && ( previousPage >= 0 ) )
+			{
+				if( nextPageIndex < previousPage )
+				{
+					animProxy = PlayLibraryAnimation( 'animprev_part1' );
+					animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnFirstPartPrev' );
+				}
+				else if( nextPageIndex > previousPage )
+				{
+					animProxy = PlayLibraryAnimation( 'animnext_part1' );
+					animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnFirstPartNext' );
+				}
+				SetItemsHoverable( false );
+			}
+			else
+			{
+				UpdateGalleryView();
+			}
+			forceUpdate = false;
+		}
+		if( forceUpdate )
+		{
+			UpdateGalleryView();
+		}
+	}
+
+	private function SetItemsHoverable( enabled : Bool )
+	{
+		var i : Int32;
+		for( i = 0; i < screenshotsPerPage; i += 1 )
+		{
+			m_screenshotItems[ i ].SetCanBeHoveredOver( enabled );
+		}
+	}
+
+	protected event OnFirstPartNext( proxy : inkAnimProxy )
+	{
+		var animProxy : inkAnimProxy;
+		proxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		UpdateGalleryView();
+		animProxy = PlayLibraryAnimation( 'animnext_part2' );
+		animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnSwitchPageAnimFinish' );
+	}
+
+	protected event OnFirstPartPrev( proxy : inkAnimProxy )
+	{
+		var animProxy : inkAnimProxy;
+		proxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		UpdateGalleryView();
+		animProxy = PlayLibraryAnimation( 'animprev_part2' );
+		animProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnSwitchPageAnimFinish' );
+	}
+
+	protected event OnSwitchPageAnimFinish( proxy : inkAnimProxy )
+	{
+		proxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+		SetItemsHoverable( true );
+	}
+
+	private function RefreshPageCount( screenshotCount : Int32 )
+	{
+		UnregisterFromPaginationNumbers();
+		m_currentPage = -1;
+		if( ( screenshotCount % screenshotsPerPage ) == 0 )
+		{
+			m_pageCount = Max( 1, screenshotCount / screenshotsPerPage );
+		}
+		else
+		{
+			m_pageCount = ( screenshotCount / screenshotsPerPage ) + 1;
+		}
+		m_paginationController.SetData( m_pageCount );
+		RegisterToPaginationNumbers();
+	}
+
+	private function RegisterToPaginationNumbers()
+	{
+		var i : Int32;
+		var paginationNumbers : array< weak< PaginationNumberController > >;
+		paginationNumbers = m_paginationController.GetPaginationNumbers();
+		for( i = 0; i < paginationNumbers.Size(); i += 1 )
+		{
+			paginationNumbers[ i ].RegisterToCallback( 'OnRelease', this, 'OnPageNumberReleased' );
+		}
+	}
+
+	private function UnregisterFromPaginationNumbers()
+	{
+		var i : Int32;
+		var paginationNumbers : array< weak< PaginationNumberController > >;
+		paginationNumbers = m_paginationController.GetPaginationNumbers();
+		for( i = 0; i < paginationNumbers.Size(); i += 1 )
+		{
+			paginationNumbers[ i ].UnregisterFromCallback( 'OnRelease', this, 'OnPageNumberReleased' );
+		}
+	}
+
+	protected event OnScreenshotsForLoadReady( screenshotinfos : array< GameScreenshotInfo > )
+	{
+		var i : Int32;
+		m_screenshotInfos.Clear();
+		for( i = 0; i < screenshotinfos.Size(); i += 1 )
+		{
+			m_screenshotInfos.Resize( m_screenshotInfos.Size() + 1 );
+			m_screenshotInfos[ i ] = screenshotinfos[ i ];
+			m_screenshotInfos[ i ].screenshotIndex = i;
+		}
+		RefreshPageCount( m_screenshotInfos.Size() );
+		inkWidgetRef.SetVisible( m_globalWrapper, true );
+		m_globalPreloader.SetVisible( false );
+		SortScreenshots();
+		inkCompoundRef.SetVisible( m_paginationWidget, m_screenshotInfos.Size() > screenshotsPerPage );
+		m_pageToDisplayOnLoad = Clamp( m_pageToDisplayOnLoad, 0, m_pageCount - 1 );
+		SetPageNumber( m_pageToDisplayOnLoad, false );
+	}
+
+	protected event OnFavoritesLoadedReady( favorites : array< Uint32 > )
+	{
+		m_favoriteManager.InitValues( favorites );
+		RequestGameScreenshotsForLoad( 0 );
+	}
+
+	private function SortScreenshots()
+	{
+		var filterType : inkGameScreenshotSortMode;
+		var i : Int32;
+		var m_favoriteScreenshots : array< GameScreenshotInfo >;
+		filterType = m_activeSort.GetFilterType();
+		if( filterType == inkGameScreenshotSortMode.RatioAscending || filterType == inkGameScreenshotSortMode.RatioDescending )
+		{
+			m_sortedScreenshotInfos = m_systemHandler.SortGameScreenshot( m_screenshotInfos, inkGameScreenshotSortMode.DateAscending );
+			m_sortedScreenshotInfos = m_systemHandler.SortGameScreenshot( m_sortedScreenshotInfos, filterType );
+		}
+		else
+		{
+			m_sortedScreenshotInfos = m_systemHandler.SortGameScreenshot( m_screenshotInfos, filterType );
+		}
+		if( m_isFavoriteFiltering )
+		{
+			for( i = 0; i < m_sortedScreenshotInfos.Size(); i += 1 )
+			{
+				if( m_favoriteManager.IsFavorite( m_sortedScreenshotInfos[ i ].pathHash ) )
+				{
+					m_favoriteScreenshots.PushBack( m_sortedScreenshotInfos[ i ] );
+				}
+			}
+			m_sortedScreenshotInfos = m_favoriteScreenshots;
+		}
+	}
+
+	private function UpdateGalleryView()
+	{
+		var firstScreenshotIndex : Int32;
+		var localIndex : Int32;
+		var screenshotIndex : Int32;
+		localIndex = 0;
+		screenshotIndex = 0;
+		m_systemHandler.CancelGameScreenshotRequests();
+		firstScreenshotIndex = m_currentPage * screenshotsPerPage;
+		while( localIndex < screenshotsPerPage )
+		{
+			screenshotIndex = firstScreenshotIndex + localIndex;
+			if( screenshotIndex < m_sortedScreenshotInfos.Size() )
+			{
+				SetScreenshotItemData( m_screenshotItems[ localIndex ], m_sortedScreenshotInfos[ screenshotIndex ] );
+				localIndex += 1;
+			}
+			else
+			{
+				m_screenshotItems[ localIndex ].DisplayEmptyPreview();
+				localIndex += 1;
+			}
+		}
+	}
+
+	private function CreateScreenshotItem()
+	{
+		var itemButton : weak< inkCompoundWidget >;
+		var screenshotItem : weak< GalleryScreenshotItem >;
+		itemButton = ( ( inkCompoundWidget )( SpawnFromLocal( inkCompoundRef.Get( m_screenshotsGrid ), 'gallery_screenshot_item' ) ) );
+		screenshotItem = ( ( GalleryScreenshotItem )( itemButton.GetController() ) );
+		InitScreenshotItem( itemButton, screenshotItem );
+		m_screenshotItems.PushBack( screenshotItem );
+	}
+
+	protected virtual function InitScreenshotItem( itemButton : weak< inkCompoundWidget >, controller : weak< GalleryScreenshotItem > )
+	{
+		itemButton.RegisterToCallback( 'OnRelease', this, 'OnReleaseOnScreenshotItem' );
+		controller.SetInputHintController( m_buttonHintsController );
+	}
+
+	protected virtual function SetScreenshotItemData( item : GalleryScreenshotItem, screenshotInfo : GameScreenshotInfo )
+	{
+		var widget : inkImage;
+		widget = item.GetPreviewImageWidget();
+		if( !( widget ) )
+		{
+			return;
+		}
+		item.SetData( screenshotInfo.screenshotIndex, screenshotInfo, m_favoriteManager.IsFavorite( screenshotInfo.pathHash ) );
+		m_systemHandler.RequestGameScreenshot( screenshotInfo.screenshotIndex, widget, item, 'OnScreenshotLoaded' );
+	}
+
+	protected event OnReleaseOnScreenshotItem( e : inkPointerEvent )
+	{
+		var widget : inkWidget;
+		var controller : GalleryScreenshotItem;
+		var previewEvent : GalleryScreenshotPreviewPopupEvent;
+		var data : GalleryScreenshotPreviewData;
+		if( !( m_canInteract ) || e.IsHandled() )
+		{
+			return 0;
+		}
+		if( e.IsAction( 'click' ) )
+		{
+			PlaySound( 'Button', 'OnPress' );
+			widget = e.GetCurrentTarget();
+			controller = ( ( GalleryScreenshotItem )( widget.GetController() ) );
+			data = controller.GetData();
+			if( !( controller.HasScreenshot() ) )
+			{
+				return 0;
+			}
+			previewEvent = new GalleryScreenshotPreviewPopupEvent;
+			previewEvent.m_data = new GalleryScreenshotPreviewData;
+			previewEvent.m_data.screenshotIndex = data.screenshotIndex;
+			previewEvent.m_data.screenshotWidth = data.screenshotWidth;
+			previewEvent.m_data.screenshotHeight = data.screenshotHeight;
+			previewEvent.m_data.canBeDeleted = data.canBeDeleted;
+			previewEvent.m_data.queueName = 'modal_popup';
+			previewEvent.m_data.notificationName = 'base\gameplay\gui\fullscreen\codex\codex_gallery_fullpreview.inkwidget';
+			previewEvent.m_data.isBlocking = true;
+			previewEvent.m_data.useCursor = true;
+			previewEvent.m_data.Hash = controller.GetHash();
+			previewEvent.m_data.isFavorite = m_favoriteManager.IsFavorite( controller.GetData().Hash );
+			previewEvent.m_data.Path = controller.GetPath();
+			previewEvent.m_data.screenshotItem = controller;
+			previewEvent.m_data.favoriteManager = m_favoriteManager;
+			previewEvent.m_data.galleryController = this;
+			QueueBroadcastEvent( previewEvent );
+			e.Handle();
+		}
+	}
+
+	protected event OnScreenshotPreviewShowRequest( evt : GalleryScreenshotPreviewPopupEvent )
+	{
+		m_screenshotFullPreviewPopupToken = ShowGameNotification( evt.m_data );
+		m_screenshotFullPreviewPopupToken.RegisterListener( this, 'OnScreenshotFullPreviewPopup' );
+	}
+
+	protected event OnScreenshotFullPreviewPopup( data : inkGameNotificationData )
+	{
+		m_screenshotFullPreviewPopupToken = NULL;
+	}
+
+}
+
+class GalleryScreenshotItem extends inkLogicController
+{
+	private editable var m_screenshotPreview : inkWidgetRef;
+	private editable var m_container : inkWidgetRef;
+	private editable var m_hoverFrame : inkWidgetRef;
+	private editable var m_favoriteIcon : inkWidgetRef;
+	private editable var m_emptyBackground : inkWidgetRef;
+	private editable var m_errorText : inkWidgetRef;
+	private editable var m_selectedBoder : inkWidgetRef;
+	protected var m_preloader : weak< inkCompoundWidget >;
+	protected var m_basePreviewSize : Vector2;
+	protected var m_screenshotData : GalleryScreenshotPreviewData;
+	protected var m_buttonHintsController : weak< ButtonHints >;
+	protected var m_isHovered : Bool;
+	protected var m_canBeHoveredOver : Bool;
+	default m_canBeHoveredOver = true;
+
+	protected event OnInitialize()
+	{
+		m_basePreviewSize = inkWidgetRef.GetSize( m_screenshotPreview );
+		m_preloader = ( ( inkCompoundWidget )( SpawnFromExternal( inkWidgetRef.Get( m_container ), R"base\gameplay\gui\common\preloader\preloader.inkwidget", 'Root' ) ) );
+		m_preloader.SetAnchor( inkEAnchor.Fill );
+		m_preloader.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+		m_preloader.GetWidgetByPathName( 'border' ).SetVisible( false );
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	protected event OnUninitialize()
+	{
+		UnregisterFromCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		UnregisterFromCallback( 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	public function RefreshButtonHints()
+	{
+		if( m_buttonHintsController )
+		{
+			m_buttonHintsController.RemoveButtonHint( 'click' );
+			m_buttonHintsController.RemoveButtonHint( 'delete_screenshot' );
+			m_buttonHintsController.RemoveButtonHint( 'secondaryAction' );
+			if( HasScreenshot() && m_isHovered )
+			{
+				m_buttonHintsController.AddButtonHint( 'click', GetLocalizedText( "UI-Phone-Open" ) );
+				m_buttonHintsController.AddButtonHint( 'delete_screenshot', GetLocalizedText( "UI-Gallery-DeletePicture" ) );
+				m_buttonHintsController.AddButtonHint( 'secondaryAction', ( ( m_screenshotData.isFavorite ) ? ( GetLocalizedText( "UI-Gallery-RemoveFromFavorites" ) ) : ( GetLocalizedText( "UI-Gallery-AddToFavorites" ) ) ) );
+			}
+		}
+	}
+
+	private function HideButtonHints()
+	{
+		if( m_buttonHintsController )
+		{
+			m_buttonHintsController.RemoveButtonHint( 'click' );
+			m_buttonHintsController.RemoveButtonHint( 'delete_screenshot' );
+			m_buttonHintsController.RemoveButtonHint( 'secondaryAction' );
+		}
+	}
+
+	private function RefreshFavoriteButtonHint()
+	{
+		if( HasScreenshot() && m_buttonHintsController )
+		{
+			m_buttonHintsController.RemoveButtonHint( 'secondaryAction' );
+			m_buttonHintsController.AddButtonHint( 'secondaryAction', ( ( m_screenshotData.isFavorite ) ? ( GetLocalizedText( "UI-Gallery-RemoveFromFavorites" ) ) : ( GetLocalizedText( "UI-Gallery-AddToFavorites" ) ) ) );
+		}
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		if( m_canBeHoveredOver )
+		{
+			inkWidgetRef.SetVisible( m_hoverFrame, true );
+		}
+		m_isHovered = true;
+		RefreshButtonHints();
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		inkWidgetRef.SetVisible( m_hoverFrame, false );
+		m_isHovered = false;
+		HideButtonHints();
+	}
+
+	public function SetData( index : Int32, screenshotInfo : GameScreenshotInfo, isFavorite : Bool )
+	{
+		m_screenshotData = new GalleryScreenshotPreviewData;
+		m_screenshotData.screenshotIndex = index;
+		m_screenshotData.Path = screenshotInfo.path;
+		m_screenshotData.Hash = screenshotInfo.pathHash;
+		m_screenshotData.creationDate = screenshotInfo.creationDate;
+		m_screenshotData.isFavorite = isFavorite;
+		m_screenshotData.canBeDeleted = screenshotInfo.canBeDeleted;
+		m_screenshotData.screenshotItem = this;
+		DisplayPreload( true );
+		inkWidgetRef.SetVisible( m_emptyBackground, false );
+		inkWidgetRef.SetVisible( m_errorText, false );
+		inkWidgetRef.SetVisible( m_screenshotPreview, false );
+		inkWidgetRef.SetVisible( m_favoriteIcon, false );
+		if( m_isHovered )
+		{
+			RefreshButtonHints();
+		}
+	}
+
+	public function SetCanBeHoveredOver( canBeHoveredOver : Bool )
+	{
+		m_canBeHoveredOver = canBeHoveredOver;
+		if( !( m_canBeHoveredOver ) )
+		{
+			inkWidgetRef.SetVisible( m_hoverFrame, false );
+			m_isHovered = false;
+		}
+		else if( m_isHovered )
+		{
+			inkWidgetRef.SetVisible( m_hoverFrame, true );
+		}
+		GetRootWidget().SetInteractive( canBeHoveredOver );
+	}
+
+	public function GetData() : GalleryScreenshotPreviewData
+	{
+		return m_screenshotData;
+	}
+
+	public function GetPath() : String
+	{
+		return m_screenshotData.Path;
+	}
+
+	public function GetHash() : Uint32
+	{
+		return m_screenshotData.Hash;
+	}
+
+	public function HasScreenshot() : Bool
+	{
+		return m_screenshotData.Hash != 0;
+	}
+
+	public function GetPreviewImageWidget() : weak< inkImage >
+	{
+		return ( ( inkImage )( inkWidgetRef.Get( m_screenshotPreview ) ) );
+	}
+
+	public function OnScreenshotLoaded( screenshotSize : Vector2 )
+	{
+		if( HasScreenshot() )
+		{
+			inkWidgetRef.SetVisible( m_screenshotPreview, true );
+			SetFavoriteDisplay( m_screenshotData.isFavorite );
+			inkWidgetRef.SetSize( m_screenshotPreview, GalleryUtils.FitScreenshotInPreview( screenshotSize, m_basePreviewSize ) );
+			inkWidgetRef.SetTintColor( m_screenshotPreview, HDRColor( 0.73000002, 0.73000002, 0.73000002, 1.0 ) );
+			PlayLibraryAnimation( 'itemappear' );
+			DisplayPreload( false );
+			if( m_isHovered )
+			{
+				RefreshButtonHints();
+			}
+		}
+	}
+
+	public function SetSelected( hash : Uint32 )
+	{
+		if( inkWidgetRef.IsValid( m_selectedBoder ) )
+		{
+			inkWidgetRef.SetVisible( m_selectedBoder, IsSelected( hash ) );
+		}
+	}
+
+	public const function IsSelected( hash : Uint32 ) : Bool
+	{
+		return ( hash != 0 ) && ( m_screenshotData.Hash == hash );
+	}
+
+	private function DisplayPreload( display : Bool )
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		inkWidgetRef.SetVisible( m_screenshotPreview, !( display ) );
+		m_preloader.SetVisible( display );
+		if( display )
+		{
+			m_preloader.GetController().PlayLibraryAnimation( 'loop', playbackOptions );
+		}
+	}
+
+	public function SetFavoriteDisplay( isFavorite : Bool )
+	{
+		m_screenshotData.isFavorite = isFavorite;
+		inkWidgetRef.SetVisible( m_favoriteIcon, m_screenshotData.isFavorite );
+	}
+
+	public function DisplayEmptyPreview()
+	{
+		m_screenshotData = new GalleryScreenshotPreviewData;
+		inkWidgetRef.SetVisible( m_screenshotPreview, false );
+		m_preloader.SetVisible( false );
+		inkWidgetRef.SetVisible( m_favoriteIcon, false );
+		inkWidgetRef.SetVisible( m_errorText, false );
+		inkWidgetRef.SetVisible( m_emptyBackground, true );
+		if( inkWidgetRef.IsValid( m_selectedBoder ) )
+		{
+			inkWidgetRef.SetVisible( m_selectedBoder, false );
+		}
+		if( m_isHovered )
+		{
+			RefreshButtonHints();
+		}
+	}
+
+	public function DisplayErrorPreview()
+	{
+		inkWidgetRef.SetVisible( m_screenshotPreview, false );
+		m_preloader.SetVisible( false );
+		inkWidgetRef.SetVisible( m_favoriteIcon, false );
+		inkWidgetRef.SetVisible( m_emptyBackground, true );
+		inkWidgetRef.SetVisible( m_errorText, true );
+	}
+
+	public function SetInputHintController( buttonHintsController : ButtonHints )
+	{
+		m_buttonHintsController = buttonHintsController;
+	}
+
+}
+
+class GalleryUtils
+{
+
+	public static function FitScreenshotInPreview( screenshotSize : Vector2, previewSize : Vector2 ) : Vector2
+	{
+		var finalSize : Vector2;
+		finalSize = previewSize;
+		if( screenshotSize.Y >= screenshotSize.X )
+		{
+			finalSize.X = ( screenshotSize.X * finalSize.Y ) / screenshotSize.Y;
+		}
+		else
+		{
+			finalSize.Y = ( screenshotSize.Y * finalSize.X ) / screenshotSize.X;
+		}
+		return finalSize;
+	}
+
+	public static function FillScreenshotInPreview( screenshotSize : Vector2, previewSize : Vector2 ) : Vector2
+	{
+		var finalSize : Vector2;
+		finalSize = previewSize;
+		if( screenshotSize.Y >= finalSize.Y )
+		{
+			finalSize.X = ( screenshotSize.X * finalSize.Y ) / screenshotSize.Y;
+		}
+		else if( screenshotSize.X >= finalSize.X )
+		{
+			finalSize.X = ( finalSize.X * screenshotSize.Y ) / screenshotSize.X;
+		}
+		else
+		{
+			finalSize.X = screenshotSize.X;
+			finalSize.Y = screenshotSize.Y;
+		}
+		return finalSize;
+	}
+
+}
+
+class GalleryScreenshotPreviewData extends inkGameNotificationData
+{
+	var screenshotIndex : Int32;
+	var screenshotWidth : Int32;
+	var screenshotHeight : Int32;
+	var Path : String;
+	var Hash : Uint32;
+	var creationDate : Uint64;
+	var isFavorite : Bool;
+	var canBeDeleted : Bool;
+	var screenshotItem : weak< GalleryScreenshotItem >;
+	var favoriteManager : weak< GalleryFavoriteManager >;
+	var galleryController : weak< GalleryMenuGameController >;
+}
+
+class GalleryScreenshotPreviewPopupEvent extends Event
+{
+	var m_data : GalleryScreenshotPreviewData;
+}
+
+class DelayedDeleteNotificationOKEvent extends Event
+{
+}
+

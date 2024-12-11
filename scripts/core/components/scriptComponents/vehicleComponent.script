@@ -55,7 +55,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 	default m_timeSinceLastHit = 0;
 	var m_dragTime : Float;
 	default m_dragTime = 0;
-	var m_customizableApperanceApplied : Bool;
+	var effectBlackboard : worldEffectBlackboard;
 	private var m_vehicleController : vehicleController;
 
 	public constexpr static function GetImmobilizedName() : CName
@@ -4216,6 +4216,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 				biggestImpact = desiredChange;
 			}
 		}
+		PlayVehicleVisialCustomisationCollisionGlitch();
 		if( evt.damageMultiplier > 0.0 )
 		{
 			CreateHitEventOnSelf( evt.damageMultiplier, evt.impactPoint, evt.otherVehicle, evt.rammedOtherVehicle, evt.otherVehicleRammed );
@@ -4783,33 +4784,6 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
-	public function GetIsVehicleVisualCustomizationEnabled() : Bool
-	{
-		var recordID : TweakDBID;
-		var record : Vehicle_Record;
-		var globalEnablingFact : Int32;
-		recordID = GetVehicle().GetRecordID();
-		record = TweakDBInterface.GetVehicleRecord( recordID );
-		globalEnablingFact = GameInstance.GetQuestsSystem( GetVehicle().GetGame() ).GetFact( 'vvc_visual_customization_unlocked' );
-		if( record.HasVisualCustomization() == true && ( globalEnablingFact > 0 ) )
-		{
-			return true;
-		}
-		else
-		{
-			return false;
-		}
-	}
-
-	public function GetIsVehicleVisualCustomizationTeaser() : Bool
-	{
-		var recordID : TweakDBID;
-		var record : Vehicle_Record;
-		recordID = GetVehicle().GetRecordID();
-		record = TweakDBInterface.GetVehicleRecord( recordID );
-		return record.VisualCustomizationTeaser();
-	}
-
 	protected event OnVehicleOnPartDetached( evt : VehicleOnPartDetachedEvent )
 	{
 		var partName : CName;
@@ -4976,7 +4950,7 @@ class VehicleComponent extends ScriptableDeviceComponent
 	{
 		var vehController : vehicleController;
 		vehController = GetVehicleController();
-		vehController.SetLightColor( evt.lightType, evt.color );
+		vehController.SetLightColor( evt.lightType, evt.color, 0.0, evt.forceOverrideEmissiveColor );
 	}
 
 	protected event OnVehicleCycleHeadLightsEvent( evt : VehicleCycleLightsEvent )
@@ -5584,9 +5558,50 @@ class VehicleComponent extends ScriptableDeviceComponent
 		}
 	}
 
+	public function GetIsVehicleVisualCustomizationEnabled() : Bool
+	{
+		var recordID : TweakDBID;
+		var record : Vehicle_Record;
+		var globalEnablingFact : Int32;
+		recordID = GetVehicle().GetRecordID();
+		record = TweakDBInterface.GetVehicleRecord( recordID );
+		globalEnablingFact = GameInstance.GetQuestsSystem( GetVehicle().GetGame() ).GetFact( 'vvc_visual_customization_unlocked' );
+		if( GameInstance.GetQuestsSystem( GetVehicle().GetGame() ).GetFact( 'vvc_visual_customization_for_all_vehicles' ) > 0 )
+		{
+			return true;
+		}
+		if( record.HasVisualCustomization() == true && ( globalEnablingFact > 0 ) )
+		{
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	public function GetIsVehicleVisualCustomizationTeaser() : Bool
+	{
+		var recordID : TweakDBID;
+		var record : Vehicle_Record;
+		recordID = GetVehicle().GetRecordID();
+		record = TweakDBInterface.GetVehicleRecord( recordID );
+		return record.VisualCustomizationTeaser();
+	}
+
+	private function PlayVehicleVisialCustomisationCollisionGlitch()
+	{
+		var template : VehicleVisualCustomizationTemplate;
+		template = GetVehicle().GetVehiclePS().GetVehicleVisualCustomizationTemplate();
+		if( ( ( ( GetVehicle().GetVehicleComponent().GetIsVehicleVisualCustomizationEnabled() && !( GetPS().GetIsVehicleVisualCustomizationBlockedByDamage() ) ) && GetVehicle().GetVehiclePS().GetIsVehicleVisualCustomizationActive() ) && VehicleVisualCustomizationTemplate.IsValid( template ) ) && !( VehicleVisualCustomizationTemplate.IsLightsOnly( template ) ) )
+		{
+			GameObjectEffectHelper.StartEffectEvent( GetVehicle(), 'vvc_damage_glitch' );
+		}
+	}
+
 	private function SignalDamageToVehicleVisualCustomization()
 	{
-		m_vehicleBlackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehicleCustomizationBlockedByDamage, true, true );
+		DisableCurrentCustomization();
 		if( ( ( GetVehicle().GetVehicleComponent().GetIsVehicleVisualCustomizationEnabled() && GetVehicle().IsPlayerMounted() ) && !( GetVehicle().GetVehicleComponent().GetIsVehicleVisualCustomizationTeaser() ) ) && !( GetPS().GetIsVehicleVisualCustomizationBlockedByDamage() ) )
 		{
 			StatusEffectHelper.ApplyStatusEffect( m_mountedPlayer, T"BaseStatusEffect.VehicleVisualModCooldown" );
@@ -5635,63 +5650,190 @@ class VehicleComponent extends ScriptableDeviceComponent
 
 	protected event OnExecuteVehicleVisualCustomizationEvent( evt : ExecuteVehicleVisualCustomizationEvent )
 	{
+		if( evt.set && !( CanApplyTemplateOnVehicle( GetPS().GetVehicleVisualCustomizationTemplate(), true ) ) )
+		{
+			return false;
+		}
 		ExecuteVehicleVisualCustomization( evt.set, evt.reset, evt.instant );
 	}
 
 	private function ExecuteVehicleVisualCustomization( set : Bool, reset : Bool, instant : Bool )
 	{
-		var blackboard : IBlackboard;
-		blackboard = GetVehicle().GetBlackboard();
-		blackboard.SetFloat( GetAllBlackboardDefs().Vehicle.VehicleCustomizationWidgetDelay, 0.0 );
-		blackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehicleCustomizationInstant, instant );
+		var customizationEvent : NewVehicleVisualCustomizationTemplateEvent;
+		var newTemplate : VehicleVisualCustomizationTemplate;
+		var customizationDelay : Float;
 		if( reset )
 		{
 			GetPS().SetVehicleVisualCustomizationActive( false );
-			blackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehicleCustomizationActive, false );
+			DisableCurrentCustomization();
+			customizationDelay = 0.5;
 		}
 		else
 		{
 			GetPS().SetVehicleVisualCustomizationActive( set );
-			blackboard.SetBool( GetAllBlackboardDefs().Vehicle.VehicleCustomizationActive, set );
+			DisableCurrentCustomization();
+			customizationDelay = 0.5;
+			newTemplate = GetPS().GetVehicleVisualCustomizationTemplate();
+			if( ( set && VehicleVisualCustomizationTemplate.IsValid( newTemplate ) ) && !( VehicleVisualCustomizationTemplate.IsLightsOnly( newTemplate ) ) )
+			{
+				customizationEvent = new NewVehicleVisualCustomizationTemplateEvent;
+				customizationEvent.template = newTemplate;
+				customizationEvent.isInstant = instant;
+				GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), customizationEvent, 0.60000002 );
+				customizationDelay += 1.10000002;
+			}
 		}
-		blackboard.Signal( GetAllBlackboardDefs().Vehicle.VehicleCustomizationActive );
-		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), new VehicleVisualCustomizationPerformedEvent, 2.20000005 );
+		GameInstance.GetDelaySystem( GetVehicle().GetGame() ).DelayEvent( GetVehicle(), new VehicleCustomizationLightsEvent, customizationDelay );
 		StatusEffectHelper.ApplyStatusEffect( GetPlayer( GetVehicle().GetGame() ), T"BaseStatusEffect.VehicleVisualModCooldown" );
 	}
 
-	public function ProcessHeatLevelOnVisualCustomization( newApperanceDefinition : vehicleVisualModdingDefinition )
+	public function DisableCurrentCustomization()
+	{
+		var vehicleCustomizationComponent : VehicleCustomizationComponent;
+		vehicleCustomizationComponent = GetVehicle().GetCustomizationComponent();
+		vehicleCustomizationComponent.HideUniqueCustomizationDecalsWithDisolve();
+		vehicleCustomizationComponent.SetDefaultDecalsEnabled( true );
+		PlayVehicleVisualCustomizationShader( false );
+	}
+
+	protected function PlayVehicleVisualCustomizationShader( play : Bool, optional instant : Bool, optional blackboard : worldEffectBlackboard, optional affectRims : Bool )
+	{
+		var vehicle : VehicleObject;
+		vehicle = GetVehicle();
+		if( play )
+		{
+			if( instant )
+			{
+				GameObjectEffectHelper.StartEffectEvent( ( ( GameObject )( vehicle ) ), 'vvc_color_instant', true, blackboard, false );
+				if( affectRims )
+				{
+					GameObjectEffectHelper.StartEffectEvent( ( ( GameObject )( vehicle ) ), 'vvc_color_rims_instant', true, blackboard, false );
+				}
+			}
+			else
+			{
+				GameObjectEffectHelper.StartEffectEvent( ( ( GameObject )( vehicle ) ), 'vvc_color', true, blackboard, false );
+				if( affectRims )
+				{
+					GameObjectEffectHelper.StartEffectEvent( ( ( GameObject )( vehicle ) ), 'vvc_color_rims', true, blackboard, false );
+				}
+			}
+		}
+		else
+		{
+			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'vvc_color' );
+			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'vvc_color_instant' );
+			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'vvc_color_rims' );
+			GameObjectEffectHelper.BreakEffectLoopEvent( vehicle, 'vvc_color_rims_instant' );
+		}
+	}
+
+	protected event OnNewVehicleVisualCustomization( evt : NewVehicleVisualCustomizationTemplateEvent )
+	{
+		if( !( CanApplyTemplateOnVehicle( evt.template, true ) ) )
+		{
+			return false;
+		}
+		ApplyVehicleVisualCustomizationTemplate( evt.template, evt.isInstant );
+	}
+
+	protected function ApplyVehicleVisualCustomizationTemplate( template : VehicleVisualCustomizationTemplate, isInstant : Bool )
+	{
+		var vehicleCustomizationComponent : VehicleCustomizationComponent;
+		var packedColorA, packedColorB : Float;
+		var record : Vehicle_Record;
+		vehicleCustomizationComponent = GetVehicle().GetCustomizationComponent();
+		record = TweakDBInterface.GetVehicleRecord( GetVehicle().GetRecordID() );
+		vehicleCustomizationComponent.SetDefaultDecalsEnabled( false );
+		if( VehicleVisualCustomizationTemplate.GetType( template ) == VehicleVisualCustomizationType.Generic )
+		{
+			packedColorA = PackColorForEffect( GenericTemplatePersistentData.GetPrimaryColor( template.genericData ) );
+			packedColorB = PackColorForEffect( GenericTemplatePersistentData.GetSecondaryColor( template.genericData ) );
+			effectBlackboard = new worldEffectBlackboard;
+			effectBlackboard.SetValueUnclamped( 'colorA', packedColorA );
+			effectBlackboard.SetValueUnclamped( 'colorB', packedColorB );
+			vehicleCustomizationComponent.SetupGenericCustomization( record.ExcludedComponentsGeneric(), record.GenericCustomizationMask() );
+			PlayVehicleVisualCustomizationShader( true, isInstant, effectBlackboard, record.CustomizeCarRims() );
+		}
+		else
+		{
+			vehicleCustomizationComponent.SetupUniqueCustomization( template.uniqueData.customMultilayers, template.uniqueData.globalClearCoatOverrides, template.uniqueData.partsClearCoatOverrides );
+			vehicleCustomizationComponent.ShowUniqueCustomizationDecalsWithDisolve( template.uniqueData.customDecals );
+			PlayVehicleVisualCustomizationShader( true, isInstant, NULL, false );
+		}
+	}
+
+	public function PackColorForEffect( color : Color ) : Float
+	{
+		var packedValue : Float;
+		var rNormalized : Float;
+		var gNormalized : Float;
+		var bNormalized : Float;
+		rNormalized = 1.0 - RoundTo( color.Red / 255.0, 2 );
+		gNormalized = 1.0 - RoundTo( color.Green / 255.0, 2 );
+		bNormalized = 1.0 - RoundTo( color.Blue / 255.0, 2 );
+		rNormalized = ClampF( rNormalized, 0.01, 0.99000001 );
+		gNormalized = ClampF( gNormalized, 0.01, 0.99000001 );
+		bNormalized = ClampF( bNormalized, 0.01, 0.99000001 );
+		packedValue = ( rNormalized + ( gNormalized / 100.0 ) ) + ( bNormalized / 10000.0 );
+		return packedValue;
+	}
+
+	public function ProcessHeatLevelOnVisualCustomization( previousTemplate : VehicleVisualCustomizationTemplate, newTemplate : VehicleVisualCustomizationTemplate )
 	{
 		var preventionSystem : PreventionSystem;
-		var preventionForceDeescalateRequest : PreventionForceDeescalateRequest;
-		var PS : VehicleComponentPS;
-		var prevApperanceDefinition : vehicleVisualModdingDefinition;
-		var colorADelta, colorBDelta : Float;
+		var isNewProfileDifferentEnough : Bool;
+		var squaredDifference : Int32;
+		var colorA, colorB : Color;
 		preventionSystem = ( ( PreventionSystem )( GameInstance.GetScriptableSystemsContainer( GetVehicle().GetGame() ).Get( 'PreventionSystem' ) ) );
-		PS = GetPS();
-		prevApperanceDefinition = PS.GetVehicleVisualCustomizationDefinition();
-		colorADelta = AbsF( newApperanceDefinition.primaryColorH - prevApperanceDefinition.primaryColorH );
-		colorBDelta = AbsF( newApperanceDefinition.secondaryColorH - prevApperanceDefinition.secondaryColorH );
-		if( ( ( ( !( preventionSystem.IsChasingPlayer() ) || ( preventionSystem.GetHeatStageAsInt() > 2 ) ) || preventionSystem.GetStarState() == EStarState.Active ) || ( ( colorADelta < HalfPi() ) && ( colorBDelta < HalfPi() ) ) ) || StatusEffectHelper.HasStatusEffectWithTagConst( m_mountedPlayer, 'VehicleVisualModDeescalationCooldown' ) )
+		if( !( preventionSystem.IsChasingPlayer() ) )
 		{
 			return;
 		}
-		preventionForceDeescalateRequest = new PreventionForceDeescalateRequest;
-		preventionForceDeescalateRequest.fakeBlinkingDuration = TweakDBInterface.GetFloat( T"PreventionSystem.setup.forcedDeescalationUIStarsBlinkingDurationSeconds", 4.0 );
-		preventionForceDeescalateRequest.telemetryInfo = "VehicleVisualCustomization";
-		preventionSystem.QueueRequest( preventionForceDeescalateRequest );
-		StatusEffectHelper.ApplyStatusEffect( m_mountedPlayer, T"BaseStatusEffect.VehicleVisualModDeescalationCooldown" );
+		if( ( preventionSystem.GetHeatStageAsInt() > 4 ) || preventionSystem.GetStarState() == EStarState.Active )
+		{
+			return;
+		}
+		if( VehicleVisualCustomizationTemplate.Equals( previousTemplate, newTemplate ) || ( !( VehicleVisualCustomizationTemplate.IsValid( previousTemplate ) ) && !( VehicleVisualCustomizationTemplate.IsValid( newTemplate ) ) ) )
+		{
+			return;
+		}
+		if( VehicleVisualCustomizationTemplate.GetType( previousTemplate ) != VehicleVisualCustomizationTemplate.GetType( newTemplate ) )
+		{
+			isNewProfileDifferentEnough = true;
+		}
+		else if( !( VehicleVisualCustomizationTemplate.IsValid( previousTemplate ) ) ^ !( VehicleVisualCustomizationTemplate.IsValid( newTemplate ) ) )
+		{
+			isNewProfileDifferentEnough = true;
+		}
+		else if( VehicleVisualCustomizationTemplate.GetType( previousTemplate ) == VehicleVisualCustomizationType.Generic )
+		{
+			colorA = GenericTemplatePersistentData.GetPrimaryColor( previousTemplate.genericData );
+			colorB = GenericTemplatePersistentData.GetPrimaryColor( newTemplate.genericData );
+			squaredDifference = ( ( ( Int32 )( colorB.Red ) ) - ( ( Int32 )( colorA.Red ) ) ) * ( ( ( Int32 )( colorB.Red ) ) - ( ( Int32 )( colorA.Red ) ) );
+			squaredDifference += ( ( ( ( Int32 )( colorB.Green ) ) - ( ( Int32 )( colorA.Green ) ) ) * ( ( ( Int32 )( colorB.Green ) ) - ( ( Int32 )( colorA.Green ) ) ) );
+			squaredDifference += ( ( ( ( Int32 )( colorB.Blue ) ) - ( ( Int32 )( colorA.Blue ) ) ) * ( ( ( Int32 )( colorB.Blue ) ) - ( ( Int32 )( colorA.Blue ) ) ) );
+			isNewProfileDifferentEnough = squaredDifference >= ( ( ( ( ( Int32 )( 255 ) ) * ( ( Int32 )( 255 ) ) ) * ( ( Int32 )( 3 ) ) ) / ( ( Int32 )( 10 ) ) );
+		}
+		else if( VehicleVisualCustomizationTemplate.GetType( previousTemplate ) == VehicleVisualCustomizationType.Unique )
+		{
+			isNewProfileDifferentEnough = true;
+		}
+		if( !( isNewProfileDifferentEnough ) )
+		{
+			return;
+		}
+		preventionSystem.QueueRequest( new PreventionSearchingStatusRequest );
+		SendPoliceNotification();
 	}
 
-	private function CheckAboutToExplodeStateOnFlip()
+	private function SendPoliceNotification()
 	{
-		var speedTreshold : Float;
-		var probability : Float;
-		speedTreshold = TDB.GetFloat( T"vehicles.common.hostile_explode_on_flip_speed_treshold", 5.0 );
-		probability = TDB.GetFloat( T"vehicles.common.hostile_explode_on_flip_probability", 0.30000001 );
-		if( ( AbsF( GetVehicle().GetCurrentSpeed() ) > speedTreshold ) && ( RandF() < probability ) )
-		{
-			ForceAboutToExplodeState();
-		}
+		var warningMsg : SimpleScreenMessage;
+		warningMsg.isShown = true;
+		warningMsg.message = LocKeyToString( 'UI-Scanner-Twintone-PoliceSystemReduction' );
+		warningMsg.type = SimpleMessageType.Police;
+		GameInstance.GetBlackboardSystem( m_mountedPlayer.GetGame() ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, warningMsg, true );
 	}
 
 	public function VisualCustomizationBlockedNotification( message : String, optional messageType : SimpleMessageType )
@@ -5705,6 +5847,73 @@ class VehicleComponent extends ScriptableDeviceComponent
 			warningMsg.type = messageType;
 		}
 		GameInstance.GetBlackboardSystem( GetVehicle().GetGame() ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, warningMsg, true );
+	}
+
+	public function GetCurrentAppearanceColorTemplate() : VehicleVisualCustomizationTemplate
+	{
+		var colorTemplateRecords : weak< VehicleAppearancesToColorTemplate_Record >;
+		var templateRecord : weak< VehicleColorTemplate_Record >;
+		var vehicleColorTemplate : VehicleVisualCustomizationTemplate;
+		var currentAppearance, currentColorVariant : CName;
+		var appearanceMatch, colorVariantMatch : Bool;
+		var i : Int32;
+		colorTemplateRecords = GetVehicle().GetRecord().AppearancesToColorTemplate();
+		if( !( colorTemplateRecords ) )
+		{
+			return vehicleColorTemplate;
+		}
+		currentAppearance = GetVehicle().GetCurrentAppearanceName();
+		currentColorVariant = GetVehicle().GetCurrentColorVariantName();
+		for( i = 0; i < colorTemplateRecords.GetColorTemplatesCount(); i += 1 )
+		{
+			templateRecord = colorTemplateRecords.GetColorTemplatesItem( i );
+			if( !( templateRecord ) )
+			{
+				continue;
+			}
+			appearanceMatch = templateRecord.MatchingAppearancesContains( currentAppearance ) && currentColorVariant == '';
+			colorVariantMatch = templateRecord.MatchingColorVariantContains( currentColorVariant ) && currentColorVariant != '';
+			if( appearanceMatch || colorVariantMatch )
+			{
+				return VehicleVisualCustomizationTemplate.FromRecord( templateRecord, GetVehicle().GetRecord().TwintoneModelName() );
+			}
+		}
+		return vehicleColorTemplate;
+	}
+
+	public function CanApplyTemplateOnVehicle( template : VehicleVisualCustomizationTemplate, optional ignoreAlreadyApplied : Bool ) : Bool
+	{
+		var m_vehicle : VehicleObject;
+		m_vehicle = GetVehicle();
+		if( !( VehicleVisualCustomizationTemplate.IsValid( template ) ) || !( m_vehicle.GetVehicleComponent().GetIsVehicleVisualCustomizationEnabled() ) )
+		{
+			return false;
+		}
+		if( m_vehicle.GetVehiclePS().GetIsVehicleVisualCustomizationBlockedByDamage() || m_vehicle.GetVehicleComponent().GetIsVehicleVisualCustomizationTeaser() )
+		{
+			return false;
+		}
+		if( !( ignoreAlreadyApplied ) && VehicleVisualCustomizationTemplate.Equals( m_vehicle.GetVehiclePS().GetVehicleVisualCustomizationTemplate(), template ) )
+		{
+			return false;
+		}
+		if( VehicleVisualCustomizationTemplate.GetType( template ) == VehicleVisualCustomizationType.Generic )
+		{
+			return true;
+		}
+		return template.uniqueData.twintoneModelName == m_vehicle.GetRecord().TwintoneModelName();
+	}
+
+	private function CheckAboutToExplodeStateOnFlip()
+	{
+		var speedTreshold : Float;
+		var probability : Float;
+		speedTreshold = TDB.GetFloat( T"vehicles.common.hostile_explode_on_flip_speed_treshold", 5.0 );
+		probability = TDB.GetFloat( T"vehicles.common.hostile_explode_on_flip_probability", 0.30000001 );
+		if( ( AbsF( GetVehicle().GetCurrentSpeed() ) > speedTreshold ) && ( RandF() < probability ) )
+		{
+			ForceAboutToExplodeState();
+		}
 	}
 
 	protected event OnHasVehicleBeenFlippedOverForSomeTimeEvent( evt : HasVehicleBeenFlippedOverForSomeTimeEvent )
@@ -6048,10 +6257,6 @@ class VehicleCycleLightsEvent extends Event
 {
 }
 
-class VehicleVisualCustomizationPerformedEvent extends Event
-{
-}
-
 class MinutePassedEvent extends Event
 {
 }
@@ -6137,8 +6342,14 @@ class ExecuteVehicleVisualCustomizationEvent extends Event
 
 class NewVehicleVisualCustomizationEvent extends Event
 {
-	var modSet : vehicleVisualModdingDefinition;
+	var template : VehicleVisualCustomizationTemplate;
 	var reset : Bool;
+}
+
+class NewVehicleVisualCustomizationTemplateEvent extends Event
+{
+	var template : VehicleVisualCustomizationTemplate;
+	var isInstant : Bool;
 }
 
 class ShouldNPCReEquipWeaponOnDismount extends AIbehaviorconditionScript

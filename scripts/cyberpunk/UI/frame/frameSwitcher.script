@@ -1,0 +1,719 @@
+enum EFrameState
+{
+	NoScreenshot = 0,
+	Loading = 1,
+	HasScreenshot = 2,
+}
+
+class FrameSwitcherMenuGameController extends GalleryMenuGameController
+{
+	default m_isSecondaryActionEnabled = false;
+	private editable var m_frameDisplay : inkImageRef;
+	private editable var m_frameCanvas : inkWidgetRef;
+	private editable var m_frameWrapper : inkWidgetRef;
+	private editable var m_defaultImageRef : inkImageRef;
+	private editable var m_adjustButtonHintsManagerRef : inkWidgetRef;
+	private editable var m_movementGlobalScale : Float;
+	default m_movementGlobalScale = 0.001f;
+	private editable var m_zoomScale : Float;
+	default m_zoomScale = 0.9f;
+	private editable var m_maxZoom : Float;
+	default m_maxZoom = 0.1f;
+	private var m_data : inkFrameNotificationData;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_adjustButtonHintsController : weak< ButtonHints >;
+	private var m_frameState : EFrameState;
+	default m_frameState = EFrameState.NoScreenshot;
+	private var m_isPressing : Bool;
+	private var m_readyToZoom : Bool;
+	private var m_isHoveringScreenshot : Bool;
+	private var m_isHoveringFilter : Bool;
+	private var m_lastPressingPoint : Vector2;
+	private var m_movementScale : Vector2;
+	private var m_timeDilationProfile : String;
+	default m_timeDilationProfile = "smartFrameMenu";
+	private var m_lastMovementInput : Vector2;
+	private var m_transitionAnimproxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		var evt : inkGameNotificationLayer_SetCursorVisibility;
+		evt = new inkGameNotificationLayer_SetCursorVisibility;
+		evt.Init( true );
+		QueueEvent( evt );
+		super.OnInitialize();
+		PlaySound( 'GameMenu', 'OnOpen' );
+		PlayLibraryAnimation( 'smartframeintro' );
+		UpdateButtonHints();
+		m_data = ( ( inkFrameNotificationData )( GetRootWidget().GetUserData( 'inkFrameNotificationData' ) ) );
+		m_adjustButtonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_adjustButtonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
+		m_adjustButtonHintsController.SetInverted( true );
+		m_player = ( ( PlayerPuppet )( GetPlayerControlledObject() ) );
+		m_player.RegisterInputListener( this, '__DEVICE_CHANGED__' );
+		InitImageDisplay();
+		RegisterToGlobalInputCallback( 'OnPostOnPress', this, 'OnPostOnPress' );
+		RegisterToGlobalInputCallback( 'OnPostOnAxis', this, 'OnPostOnAxis' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelative', this, 'OnPostOnAxis' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+		inkImageRef.RegisterToCallback( m_frameDisplay, 'OnPress', this, 'OnFramePressed' );
+		inkImageRef.RegisterToCallback( m_frameDisplay, 'OnHoverOver', this, 'OnHoverOverFrame' );
+		inkImageRef.RegisterToCallback( m_frameDisplay, 'OnHoverOut', this, 'OnHoverOutFrame' );
+		TimeDilationHelper.SetTimeDilationWithProfile( m_player, m_timeDilationProfile, true, false );
+		PopupStateUtils.SetBackgroundBlur( this, true );
+		if( GetSystemRequestsHandler().IsGamePaused() )
+		{
+			Close();
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		m_player.UnregisterInputListener( this, '__DEVICE_CHANGED__' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnPress', this, 'OnPostOnPress' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnAxis', this, 'OnPostOnAxis' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelative', this, 'OnPostOnAxis' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnPostOnRelease' );
+		inkImageRef.UnregisterFromCallback( m_frameDisplay, 'OnPress', this, 'OnFramePressed' );
+		inkImageRef.UnregisterFromCallback( m_frameDisplay, 'OnHoverOver', this, 'OnHoverOverFrame' );
+		inkImageRef.UnregisterFromCallback( m_frameDisplay, 'OnHoverOut', this, 'OnHoverOutFrame' );
+		TimeDilationHelper.SetTimeDilationWithProfile( m_player, m_timeDilationProfile, false, false );
+		PopupStateUtils.SetBackgroundBlur( this, false );
+	}
+
+	private function InitImageDisplay()
+	{
+		var size : Vector2;
+		var wrapperSize : Vector2;
+		wrapperSize = inkWidgetRef.GetSize( m_frameWrapper );
+		size = GetDisplaySize( wrapperSize, m_data.frame.GetFrameSize() );
+		m_movementScale = Vector2( ( wrapperSize.X / size.X ) * m_movementGlobalScale, ( wrapperSize.Y / size.Y ) * m_movementGlobalScale );
+		inkWidgetRef.SetSize( m_frameCanvas, size );
+		SetSelectedItem( m_data.hash );
+		if( GetSystemRequestsHandler().RequestGameScreenshotByHash( m_data.hash, ( ( inkImage )( inkImageRef.Get( m_frameDisplay ) ) ), this, 'OnScreenshotInitialized' ) )
+		{
+			SetState( EFrameState.Loading );
+		}
+		else
+		{
+			SetState( EFrameState.NoScreenshot );
+		}
+	}
+
+	private function SetState( state : EFrameState )
+	{
+		m_frameState = state;
+		PlaySound( 'Scrolling', 'OnStop' );
+		switch( state )
+		{
+			case EFrameState.NoScreenshot:
+				inkImageRef.SetVisible( m_defaultImageRef, true );
+			DisplayPreload( false );
+			inkImageRef.SetVisible( m_frameDisplay, false );
+			break;
+			case EFrameState.Loading:
+				DisplayPreload( true );
+			break;
+			case EFrameState.HasScreenshot:
+				inkImageRef.SetVisible( m_defaultImageRef, false );
+			DisplayPreload( false );
+			inkImageRef.SetVisible( m_frameDisplay, true );
+			break;
+		}
+	}
+
+	private function DisplayPreload( display : Bool )
+	{
+		var options : inkAnimOptions;
+		if( display )
+		{
+			if( m_transitionAnimproxy.IsValid() && m_transitionAnimproxy.IsPlaying() )
+			{
+				m_transitionAnimproxy.GotoEndAndStop();
+			}
+			options.loopInfinite = true;
+			options.loopType = inkanimLoopType.Cycle;
+			options.dependsOnTimeDilation = false;
+			m_transitionAnimproxy = PlayLibraryAnimation( 'transition_glitch', options );
+			m_transitionAnimproxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnTransitionGlitchEndLoop' );
+		}
+	}
+
+	private function TriggerSingleLoadAnim()
+	{
+		var options : inkAnimOptions;
+		if( m_transitionAnimproxy.IsValid() && m_transitionAnimproxy.IsPlaying() )
+		{
+			m_transitionAnimproxy.GotoEndAndStop();
+		}
+		options.loopInfinite = false;
+		options.dependsOnTimeDilation = false;
+		m_transitionAnimproxy = PlayLibraryAnimation( 'transition_glitch', options );
+		m_transitionAnimproxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnTransitionGlitchEndLoop' );
+	}
+
+	protected event OnTransitionGlitchEndLoop( proxy : inkAnimProxy )
+	{
+		if( m_frameState != EFrameState.Loading )
+		{
+			proxy.Stop();
+		}
+	}
+
+	private const function IsLoading() : Bool
+	{
+		return m_frameState == EFrameState.Loading;
+	}
+
+	protected override function InitScreenshotItem( itemButton : weak< inkCompoundWidget >, controller : weak< GalleryScreenshotItem > )
+	{
+		itemButton.RegisterToCallback( 'OnRelease', this, 'OnReleaseOnScreenshotItem' );
+		itemButton.RegisterToCallback( 'OnHoverOver', this, 'OnHoverOverScreenshot' );
+		itemButton.RegisterToCallback( 'OnHoverOut', this, 'OnHoverOutScreenshot' );
+	}
+
+	protected override function SetScreenshotItemData( item : GalleryScreenshotItem, screenshotInfo : GameScreenshotInfo )
+	{
+		super.SetScreenshotItemData( item, screenshotInfo );
+		item.SetSelected( m_data.hash );
+	}
+
+	private function SetScreenshot( data : GalleryScreenshotPreviewData )
+	{
+		m_data.hash = GetSystemRequestsHandler().GetPathHash( data.Path );
+		m_data.index = data.screenshotIndex;
+		if( GetSystemRequestsHandler().RequestGameScreenshotByHash( m_data.hash, ( ( inkImage )( inkImageRef.Get( m_frameDisplay ) ) ), this, 'OnNewScreenshotLoaded' ) )
+		{
+			SetState( EFrameState.Loading );
+			SetSelectedItem( m_data.hash );
+		}
+	}
+
+	protected event OnPostOnAxis( e : inkPointerEvent )
+	{
+		var uv : RectF;
+		var result : Vector2;
+		var axis : Float;
+		uv = m_data.uv;
+		axis = e.GetAxisData();
+		if( IsLoading() )
+		{
+			return true;
+		}
+		if( m_data.hash == 0 )
+		{
+			return super.OnPostOnAxis( e );
+		}
+		if( e.IsAction( 'mouse_x' ) )
+		{
+			if( m_isPressing )
+			{
+				result = ProcessAxisMovement( uv.Left, uv.Right, -( axis ) * m_movementScale.X );
+				uv.Left = result.X;
+				uv.Right = result.Y;
+				inkImageRef.SetDynamicTextureUV( m_frameDisplay, uv );
+				m_data.uv = uv;
+				RefreshLastMovementInputX( axis );
+			}
+		}
+		else if( e.IsAction( 'right_stick_x' ) )
+		{
+			result = ProcessAxisMovement( uv.Left, uv.Right, axis * m_movementScale.X );
+			uv.Left = result.X;
+			uv.Right = result.Y;
+			inkImageRef.SetDynamicTextureUV( m_frameDisplay, uv );
+			m_data.uv = uv;
+			RefreshLastMovementInputX( axis );
+		}
+		else if( e.IsAction( 'mouse_y' ) )
+		{
+			if( m_isPressing )
+			{
+				result = ProcessAxisMovement( uv.Top, uv.Bottom, axis * m_movementScale.Y );
+				uv.Top = result.X;
+				uv.Bottom = result.Y;
+				inkImageRef.SetDynamicTextureUV( m_frameDisplay, uv );
+				m_data.uv = uv;
+				RefreshLastMovementInputY( axis );
+			}
+		}
+		else if( e.IsAction( 'right_stick_y' ) )
+		{
+			result = ProcessAxisMovement( uv.Top, uv.Bottom, -( axis ) * m_movementScale.Y );
+			uv.Top = result.X;
+			uv.Bottom = result.Y;
+			inkImageRef.SetDynamicTextureUV( m_frameDisplay, uv );
+			m_data.uv = uv;
+			RefreshLastMovementInputY( axis );
+		}
+		else if( e.IsAction( 'mouse_wheel' ) )
+		{
+			if( m_readyToZoom )
+			{
+				if( axis > 0.0 )
+				{
+					ZoomIn();
+					e.Handle();
+				}
+				else if( axis < 0.0 )
+				{
+					ZoomOut();
+					e.Handle();
+				}
+			}
+		}
+		super.OnPostOnAxis( e );
+	}
+
+	protected event OnReleaseOnScreenshotItem( e : inkPointerEvent )
+	{
+		var widget : inkWidget;
+		var controller : GalleryScreenshotItem;
+		if( ( ( ( !( IsLoading() ) && !( m_isPressing ) ) && !( e.IsHandled() ) ) && m_isHoveringScreenshot ) && e.IsAction( 'click' ) )
+		{
+			widget = e.GetCurrentTarget();
+			controller = ( ( GalleryScreenshotItem )( widget.GetController() ) );
+			PlaySound( 'Button', 'OnPress' );
+			if( controller.HasScreenshot() )
+			{
+				SetScreenshot( controller.GetData() );
+				UpdateButtonHints();
+			}
+			e.Handle();
+		}
+	}
+
+	protected event OnHoverOverScreenshot( e : inkPointerEvent )
+	{
+		m_isHoveringScreenshot = true;
+		UpdateButtonHints();
+	}
+
+	protected event OnHoverOutScreenshot( e : inkPointerEvent )
+	{
+		m_isHoveringScreenshot = false;
+		UpdateButtonHints();
+	}
+
+	protected event OnFramePressed( e : inkPointerEvent )
+	{
+		if( !( IsLoading() ) && e.IsAction( 'mouse_left' ) )
+		{
+			m_isPressing = true;
+			m_lastPressingPoint = WidgetUtils.GlobalToLocal( inkImageRef.Get( m_frameDisplay ), e.GetScreenSpacePosition() );
+		}
+	}
+
+	protected event OnHoverOverFrame( e : inkPointerEvent )
+	{
+		m_readyToZoom = true;
+	}
+
+	protected event OnHoverOutFrame( e : inkPointerEvent )
+	{
+		m_readyToZoom = false;
+	}
+
+	protected event OnPostOnPress( e : inkPointerEvent )
+	{
+		if( IsLoading() )
+		{
+			return true;
+		}
+		if( e.IsAction( 'UI_smart_frame_controller_zoom_in' ) )
+		{
+			ZoomIn();
+			e.Handle();
+		}
+		else if( e.IsAction( 'UI_smart_frame_controller_zoom_out' ) )
+		{
+			ZoomOut();
+			e.Handle();
+		}
+	}
+
+	protected event OnPostOnRelease( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) )
+		{
+			if( m_isPressing )
+			{
+				m_isPressing = false;
+				m_lastMovementInput = Vector2( 0.0, 0.0 );
+				PlaySound( 'Scrolling', 'OnStop' );
+				e.Handle();
+				return true;
+			}
+		}
+		if( e.IsHandled() )
+		{
+			return true;
+		}
+		if( e.IsAction( 'UI_smart_frame_remove' ) )
+		{
+			Remove();
+			e.Handle();
+		}
+		else if( e.IsAction( 'UI_smart_frame_confirm' ) )
+		{
+			Confirm();
+			e.Handle();
+		}
+		else if( e.IsAction( 'UI_smart_frame_close' ) )
+		{
+			Close();
+			e.Handle();
+		}
+		else
+		{
+			super.OnShortcutPress( e );
+		}
+	}
+
+	private function UpdateButtonHints()
+	{
+		m_buttonHintsController.ClearButtonHints();
+		m_adjustButtonHintsController.ClearButtonHints();
+		if( m_player.PlayerLastUsedKBM() )
+		{
+			UpdateButtonHints_KM();
+		}
+		else
+		{
+			UpdateButtonHints_Gamepad();
+		}
+	}
+
+	private function UpdateButtonHints_KM()
+	{
+		if( ( m_data.hash != 0 ) && !( IsLoading() ) )
+		{
+			m_adjustButtonHintsController.AddButtonHint( 'UI_smart_frame_remove', GetLocalizedText( "UI-SmartFrames-Clear" ) );
+			m_adjustButtonHintsController.AddButtonHint( 'ZoomIn', GetLocalizedText( "UI-Gallery-ZoomPicture" ) );
+			m_adjustButtonHintsController.AddButtonHint( 'mouse_left', GetLocalizedText( "UI-Gallery-MovePicture" ) );
+		}
+		m_buttonHintsController.AddButtonHint( 'UI_smart_frame_close', GetLocalizedText( "Common-Access-Close" ) );
+		m_buttonHintsController.AddButtonHint( 'UI_smart_frame_confirm', GetLocalizedText( "UI-Gallery-ConfirmPicture" ) );
+		if( m_isHoveringScreenshot )
+		{
+			m_buttonHintsController.AddButtonHint( 'click', GetLocalizedText( "UI-UserActions-Select" ) );
+		}
+	}
+
+	private function UpdateButtonHints_Gamepad()
+	{
+		if( ( m_data.hash != 0 ) && !( IsLoading() ) )
+		{
+			m_adjustButtonHintsController.AddButtonHint( 'UI_smart_frame_remove', GetLocalizedText( "UI-SmartFrames-Clear" ) );
+			m_adjustButtonHintsController.AddButtonHint( 'UI_smart_frame_controller_zoom_in', GetLocalizedText( "UI-Gallery-ZoomPicture" ) + "+" );
+			m_adjustButtonHintsController.AddButtonHint( 'UI_smart_frame_controller_zoom_out', GetLocalizedText( "UI-Gallery-ZoomPicture" ) + "-" );
+			m_adjustButtonHintsController.AddButtonHint( 'UI_smart_frame_move', GetLocalizedText( "UI-Gallery-MovePicture" ) );
+		}
+		m_buttonHintsController.AddButtonHint( 'UI_smart_frame_close', GetLocalizedText( "Common-Access-Close" ) );
+		m_buttonHintsController.AddButtonHint( 'UI_smart_frame_confirm', GetLocalizedText( "UI-Gallery-ConfirmPicture" ) );
+		if( m_isHoveringScreenshot )
+		{
+			m_buttonHintsController.AddButtonHint( 'click', GetLocalizedText( "UI-UserActions-Select" ) );
+		}
+	}
+
+	private function Remove()
+	{
+		if( IsLoading() )
+		{
+			return;
+		}
+		m_data.SetAsRemove();
+		TriggerSingleLoadAnim();
+		SetState( EFrameState.NoScreenshot );
+		UpdateButtonHints();
+		SetSelectedItem( 0 );
+	}
+
+	private function Confirm()
+	{
+		if( IsLoading() )
+		{
+			return;
+		}
+		PlaySound( 'GameMenu', 'OnClose' );
+		m_data.shouldApply = true;
+		m_data.token.TriggerCallback( m_data );
+	}
+
+	private function Close()
+	{
+		PlaySound( 'GameMenu', 'OnClose' );
+		m_data.shouldApply = false;
+		m_data.token.TriggerCallback( m_data );
+		if( ( m_lastMovementInput.X != 0.0 ) || ( m_lastMovementInput.Y != 0.0 ) )
+		{
+			PlaySound( 'Scrolling', 'OnStop' );
+		}
+	}
+
+	private function ProcessAxisMovement( min : Float, max : Float, offset : Float ) : Vector2
+	{
+		var uvMovement : Float;
+		if( offset < 0.0 )
+		{
+			if( min <= 0.000002 )
+			{
+				return Vector2( min, max );
+			}
+			else
+			{
+				uvMovement = -( offset );
+				if( min < uvMovement )
+				{
+					uvMovement = min;
+				}
+				return Vector2( min - uvMovement, max - uvMovement );
+			}
+		}
+		else
+		{
+			if( FloatIsEqual( max, 1.0 ) )
+			{
+				return Vector2( min, max );
+			}
+			else
+			{
+				uvMovement = offset;
+				if( ( max + uvMovement ) > 1.0 )
+				{
+					uvMovement = 1.0 - max;
+				}
+				return Vector2( min + uvMovement, max + uvMovement );
+			}
+		}
+	}
+
+	private function ZoomIn()
+	{
+		var uv : RectF;
+		var size, newSize, center : Vector2;
+		uv = m_data.uv;
+		if( IsLoading() )
+		{
+			return;
+		}
+		size = Vector2( uv.Right - uv.Left, uv.Bottom - uv.Top );
+		newSize = Vector2( size.X * m_zoomScale, size.Y * m_zoomScale );
+		if( newSize.X > newSize.Y )
+		{
+			if( newSize.X < m_maxZoom )
+			{
+				return;
+			}
+		}
+		else
+		{
+			if( newSize.Y < m_maxZoom )
+			{
+				return;
+			}
+		}
+		center = Vector2( ( uv.Left + uv.Right ) / 2.0, ( uv.Top + uv.Bottom ) / 2.0 );
+		uv.Left = center.X - ( newSize.X / 2.0 );
+		uv.Right = center.X + ( newSize.X / 2.0 );
+		uv.Top = center.Y - ( newSize.Y / 2.0 );
+		uv.Bottom = center.Y + ( newSize.Y / 2.0 );
+		inkImageRef.SetDynamicTextureUV( m_frameDisplay, uv );
+		m_data.uv = uv;
+		PlaySound( 'ButtonValueUp', 'OnPress' );
+	}
+
+	private function ZoomOut()
+	{
+		var uv : RectF;
+		var size, newSize, center : Vector2;
+		var tmp : Float;
+		uv = m_data.uv;
+		if( IsLoading() )
+		{
+			return;
+		}
+		if( FloatIsEqual( uv.Left, 0.0 ) && FloatIsEqual( uv.Right, 1.0 ) )
+		{
+			return;
+		}
+		if( FloatIsEqual( uv.Top, 0.0 ) && FloatIsEqual( uv.Bottom, 1.0 ) )
+		{
+			return;
+		}
+		size = Vector2( uv.Right - uv.Left, uv.Bottom - uv.Top );
+		newSize = Vector2( size.X / m_zoomScale, size.Y / m_zoomScale );
+		if( newSize.X > 1.0 )
+		{
+			tmp = newSize.Y / newSize.X;
+			newSize = Vector2( 1.0, tmp );
+		}
+		else if( newSize.Y > 1.0 )
+		{
+			tmp = newSize.X / newSize.Y;
+			newSize = Vector2( tmp, 1.0 );
+		}
+		center = Vector2( ( uv.Left + uv.Right ) / 2.0, ( uv.Top + uv.Bottom ) / 2.0 );
+		uv.Left = center.X - ( newSize.X / 2.0 );
+		uv.Right = center.X + ( newSize.X / 2.0 );
+		uv.Top = center.Y - ( newSize.Y / 2.0 );
+		uv.Bottom = center.Y + ( newSize.Y / 2.0 );
+		if( uv.Left < 0.0 )
+		{
+			uv.Right -= uv.Left;
+			uv.Left = 0.0;
+		}
+		else if( uv.Right > 1.0 )
+		{
+			uv.Left -= ( uv.Right - 1.0 );
+			uv.Right = 1.0;
+		}
+		if( uv.Top < 0.0 )
+		{
+			uv.Bottom -= uv.Top;
+			uv.Top = 0.0;
+		}
+		else if( uv.Bottom > 1.0 )
+		{
+			uv.Top -= ( uv.Bottom - 1.0 );
+			uv.Bottom = 1.0;
+		}
+		inkImageRef.SetDynamicTextureUV( m_frameDisplay, uv );
+		m_data.uv = uv;
+		PlaySound( 'ButtonValueDown', 'OnPress' );
+	}
+
+	private function RefreshLastMovementInputX( axis : Float )
+	{
+		if( axis != 0.0 )
+		{
+			if( ( m_lastMovementInput.X == 0.0 ) && ( m_lastMovementInput.Y == 0.0 ) )
+			{
+				PlaySound( 'Scrolling', 'OnStart' );
+			}
+		}
+		else
+		{
+			if( ( m_lastMovementInput.X != 0.0 ) && ( m_lastMovementInput.Y == 0.0 ) )
+			{
+				PlaySound( 'Scrolling', 'OnStop' );
+			}
+		}
+		m_lastMovementInput.X = axis;
+	}
+
+	private function RefreshLastMovementInputY( axis : Float )
+	{
+		if( axis != 0.0 )
+		{
+			if( ( m_lastMovementInput.X == 0.0 ) && ( m_lastMovementInput.Y == 0.0 ) )
+			{
+				PlaySound( 'Scrolling', 'OnStart' );
+			}
+		}
+		else
+		{
+			if( ( m_lastMovementInput.X == 0.0 ) && ( m_lastMovementInput.Y != 0.0 ) )
+			{
+				PlaySound( 'Scrolling', 'OnStop' );
+			}
+		}
+		m_lastMovementInput.Y = axis;
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		if( ListenerAction.IsAction( action, '__DEVICE_CHANGED__' ) )
+		{
+			UpdateButtonHints();
+		}
+	}
+
+	protected event OnScreenshotInitialized( screenshotSize : Vector2 )
+	{
+		if( ( screenshotSize.X == 0.0 ) || ( screenshotSize.Y == 0.0 ) )
+		{
+			m_data.SetAsRemove();
+			SetState( EFrameState.NoScreenshot );
+		}
+		else
+		{
+			inkImageRef.SetDynamicTextureUV( m_frameDisplay, m_data.uv );
+			SetState( EFrameState.HasScreenshot );
+		}
+		UpdateButtonHints();
+	}
+
+	protected event OnNewScreenshotLoaded( screenshotSize : Vector2 )
+	{
+		if( ( screenshotSize.X == 0.0 ) || ( screenshotSize.Y == 0.0 ) )
+		{
+			m_data.SetAsRemove();
+			SetState( EFrameState.NoScreenshot );
+		}
+		else
+		{
+			m_data.uv = GetFilledUV( inkWidgetRef.GetSize( m_frameCanvas ), screenshotSize );
+			inkImageRef.SetDynamicTextureUV( m_frameDisplay, m_data.uv );
+			SetState( EFrameState.HasScreenshot );
+		}
+		UpdateButtonHints();
+	}
+
+}
+
+function GetFilledUV( containerSize : Vector2, contentSize : Vector2 ) : RectF
+{
+	var containerRatio, contentRatio, scale : Float;
+	var rect : RectF;
+	containerRatio = containerSize.X / containerSize.Y;
+	contentRatio = contentSize.X / contentSize.Y;
+	if( FloatIsEqual( containerRatio, contentRatio ) )
+	{
+		rect.Left = 0.0;
+		rect.Right = 1.0;
+		rect.Top = 0.0;
+		rect.Bottom = 1.0;
+	}
+	else if( containerRatio > contentRatio )
+	{
+		scale = containerSize.X / contentSize.X;
+		rect.Left = 0.0;
+		rect.Right = 1.0;
+		rect.Top = ( 1.0 - ( containerSize.Y / ( contentSize.Y * scale ) ) ) / 2.0;
+		rect.Bottom = 1.0 - rect.Top;
+	}
+	else
+	{
+		scale = containerSize.Y / contentSize.Y;
+		rect.Left = ( 1.0 - ( containerSize.X / ( contentSize.X * scale ) ) ) / 2.0;
+		rect.Right = 1.0 - rect.Left;
+		rect.Top = 0.0;
+		rect.Bottom = 1.0;
+	}
+	return rect;
+}
+
+function GetDisplaySize( wrapperSize : Vector2, frameSize : Vector2 ) : Vector2
+{
+	var wrapperRatio, frameRatio : Float;
+	var size : Vector2;
+	wrapperRatio = wrapperSize.X / wrapperSize.Y;
+	frameRatio = frameSize.X / frameSize.Y;
+	if( FloatIsEqual( wrapperRatio, frameRatio ) )
+	{
+		return wrapperSize;
+	}
+	else if( wrapperRatio > frameRatio )
+	{
+		size.X = ( wrapperSize.Y / frameSize.Y ) * frameSize.X;
+		size.Y = wrapperSize.Y;
+	}
+	else
+	{
+		size.X = wrapperSize.X;
+		size.Y = ( wrapperSize.X / frameSize.X ) * frameSize.Y;
+	}
+	return size;
+}
+
