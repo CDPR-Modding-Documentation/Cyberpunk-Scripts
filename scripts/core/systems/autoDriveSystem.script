@@ -1,0 +1,591 @@
+class EnableAutoDriveRequest extends ScriptableSystemRequest
+{
+	var isDelamain : Bool;
+	default isDelamain = false;
+}
+
+class DisableAutoDriveRequest extends ScriptableSystemRequest
+{
+}
+
+class ToggleFreeRoamRequest extends ScriptableSystemRequest
+{
+}
+
+class UpdateAutoDriveAvailabilityRequest extends ScriptableSystemRequest
+{
+}
+
+importonly class StopAutoDriveOnDestinationReachedRequest extends ScriptableSystemRequest
+{
+}
+
+importonly class SendAutoDriveNotificationRequest extends ScriptableSystemRequest
+{
+	import var locKey : String;
+	import var isDelamain : Bool;
+}
+
+class UpdateAutodriveOnDestinationChangeRequest extends ScriptableSystemRequest
+{
+}
+
+class UpdateAutodriveStateAfterVehicleHealthChange extends ScriptableSystemRequest
+{
+}
+
+class UpdateAutodriveStateAfterQuestLockChange extends ScriptableSystemRequest
+{
+}
+
+class UpdateAutodriveStateOnVehicleQuickHackChange extends ScriptableSystemRequest
+{
+}
+
+class UpdateAutodriveStateOnVehicleForceBrakeEnd extends ScriptableSystemRequest
+{
+}
+
+class StopAutoDriveOnTeleportRequest extends ScriptableSystemRequest
+{
+}
+
+class AutodriveHealthChangeListener extends CustomValueStatPoolsListener
+{
+	var m_autodriveSystem : weak< AutoDriveSystem >;
+
+	public override function OnStatPoolValueChanged( oldValue : Float, newValue : Float, percToPoints : Float )
+	{
+		if( m_autodriveSystem )
+		{
+			m_autodriveSystem.QueueRequest( new UpdateAutodriveStateAfterVehicleHealthChange );
+		}
+	}
+
+}
+
+class AutodriveQuestContentLockListener extends ScriptQuestContentLockListener
+{
+	var m_autodriveSystem : weak< AutoDriveSystem >;
+
+	protected event OnBlocked( source : CName )
+	{
+		if( source == 'sq024_race_active' )
+		{
+			if( m_autodriveSystem )
+			{
+				m_autodriveSystem.QueueRequest( new UpdateAutodriveStateAfterQuestLockChange );
+			}
+		}
+	}
+
+	protected event OnUnblocked( source : CName )
+	{
+		if( source == 'sq024_race_active' )
+		{
+			if( m_autodriveSystem )
+			{
+				m_autodriveSystem.QueueRequest( new UpdateAutodriveStateAfterQuestLockChange );
+			}
+		}
+	}
+
+}
+
+class AutodriveForceBrakesCallbackListener extends vehicleForceBrakesCallbackListener
+{
+	var m_autodriveSystem : weak< AutoDriveSystem >;
+
+	protected event OnForceBrakeComplete( wasInterrupted : Bool )
+	{
+		m_autodriveSystem.QueueRequest( new UpdateAutodriveStateOnVehicleForceBrakeEnd );
+	}
+
+}
+
+import enum gameAutodriveDestinationType
+{
+	None,
+	PlayerTracked,
+	Quest,
+}
+
+import enum gameAutodriveLaneValidityResult
+{
+	OnValidLane,
+	NotOnValidLane,
+	NotOnRoad,
+}
+
+importonly class NativeAutodriveSystem extends ScriptableSystem
+{
+	public import const function GetAutodriveEnabled() : Bool;
+	public import const function GetAutodriveIsDelamain() : Bool;
+	public import function SetAutodriveEnabled( enabled : Bool, optional isDelamain : Bool ) : Bool;
+	public import const function GetFreeRoamEnabled() : Bool;
+	public import function SetFreeRoamEnabled( enabled : Bool );
+	public import const function GetAutodriveDestinationType() : gameAutodriveDestinationType;
+	public import const function GetAutodriveDestinationMappinID() : NewMappinID;
+	public import const function GetAutodriveDestination() : Vector3;
+	public import const function GetAutodriveVehicle() : VehicleObject;
+	public import const function CheckCurrentLaneValidity() : gameAutodriveLaneValidityResult;
+}
+
+class AutoDriveSystem extends NativeAutodriveSystem
+{
+	private var m_player : weak< PlayerPuppet >;
+	private var m_playerVehicleStateCallbackHandle : CallbackHandle;
+	private var m_playerCombatStateCallbackHandle : CallbackHandle;
+	private var m_playerWeaponStateCallbackHandle : CallbackHandle;
+	private var m_playerMeleeWeaponStateCallbackHandle : CallbackHandle;
+	private var m_playerAttachedCallbackID : Uint32;
+	private var m_playerDetachedCallbackID : Uint32;
+	private var m_vehicleHealthListener : AutodriveHealthChangeListener;
+	private var m_autodriveQuestContentLockListener : AutodriveQuestContentLockListener;
+
+	public export const function GetAutodriveAvailable() : Bool
+	{
+		var psmBB : IBlackboard;
+		var psmState : Int32;
+		var vehicleHealth : Float;
+		var healthThreshold : Float;
+		var mountedVehicle : VehicleObject;
+		if( !( m_player ) || !( m_player.GetMountedVehicle() ) )
+		{
+			return false;
+		}
+		mountedVehicle = m_player.GetMountedVehicle();
+		if( !( mountedVehicle.IsPlayerVehicle() ) )
+		{
+			return false;
+		}
+		if( mountedVehicle.IsVehicleAccelerateQuickhackActive() || mountedVehicle.IsVehicleForceBrakesQuickhackActive() )
+		{
+			return false;
+		}
+		psmBB = m_player.GetPlayerStateMachineBlackboard();
+		psmState = psmBB.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		if( ( ( psmState != ( ( Int32 )( gamePSMVehicle.Driving ) ) ) && ( psmState != ( ( Int32 )( gamePSMVehicle.Passenger ) ) ) ) && ( psmState != ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) ) )
+		{
+			return false;
+		}
+		psmState = psmBB.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat );
+		if( psmState == ( ( Int32 )( gamePSMCombat.InCombat ) ) )
+		{
+			return false;
+		}
+		psmState = psmBB.GetInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon );
+		if( psmState != ( ( Int32 )( gamePSMRangedWeaponStates.Default ) ) )
+		{
+			return false;
+		}
+		psmState = psmBB.GetInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon );
+		if( psmState != ( ( Int32 )( gamePSMMeleeWeapon.NotReady ) ) )
+		{
+			return false;
+		}
+		vehicleHealth = GameInstance.GetStatPoolsSystem( GetGameInstance() ).GetStatPoolValue( mountedVehicle.GetEntityID(), gamedataStatPoolType.Health, true );
+		healthThreshold = TDB.GetFloat( T"Vehicle.autodrive_settings.healthDeactivationThreshold" );
+		if( vehicleHealth <= healthThreshold )
+		{
+			return false;
+		}
+		if( GameInstance.GetQuestsContentSystem( GetGameInstance() ).IsTokensActivationBlockedBySource( 'sq024_race_active' ) )
+		{
+			return false;
+		}
+		if( CheckCurrentLaneValidity() != gameAutodriveLaneValidityResult.OnValidLane )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public const function GetDistanceToCurrentDestination() : Float
+	{
+		var playerVehicle : VehicleObject;
+		playerVehicle = GetAutodriveVehicle();
+		if( playerVehicle && GetAutodriveEnabled() )
+		{
+			return ( ( Float )( FloorF( playerVehicle.GetCurrentSlotLocalPathLength() - playerVehicle.GetCurrentSlotLocalPathProgression() ) ) );
+		}
+		return 0.0;
+	}
+
+	public const function GetEstimatedTimeToArrival() : Float
+	{
+		var playerVehicle : VehicleObject;
+		playerVehicle = GetAutodriveVehicle();
+		if( playerVehicle )
+		{
+			return playerVehicle.GetCurrentSlotEstimatedTimeToArrival();
+		}
+		return 0.0;
+	}
+
+	private export override function OnAttach()
+	{
+		if( m_playerAttachedCallbackID == ( ( Uint32 )( 0 ) ) )
+		{
+			m_playerAttachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetAttachedCallback( this, 'OnPlayerAttachedCallback' );
+		}
+		if( m_playerDetachedCallbackID == ( ( Uint32 )( 0 ) ) )
+		{
+			m_playerDetachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetDetachedCallback( this, 'OnPlayerDetachedCallback' );
+		}
+	}
+
+	private export override function OnDetach()
+	{
+		if( m_playerAttachedCallbackID > ( ( Uint32 )( 0 ) ) )
+		{
+			GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetAttachedCallback( m_playerAttachedCallbackID );
+			m_playerAttachedCallbackID = ( ( Uint32 )( 0 ) );
+		}
+		if( m_playerDetachedCallbackID > ( ( Uint32 )( 0 ) ) )
+		{
+			GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetDetachedCallback( m_playerDetachedCallbackID );
+			m_playerDetachedCallbackID = ( ( Uint32 )( 0 ) );
+		}
+	}
+
+	private export function OnPlayerAttachedCallback( playerPuppet : GameObject )
+	{
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		if( m_player )
+		{
+			m_autodriveQuestContentLockListener = new AutodriveQuestContentLockListener;
+			m_autodriveQuestContentLockListener.m_autodriveSystem = this;
+			GameInstance.GetQuestsContentSystem( GetGameInstance() ).RegisterLockListener( m_autodriveQuestContentLockListener );
+			m_playerVehicleStateCallbackHandle = GetActiveVehicleDataBB().RegisterListenerVariant( GetAllBlackboardDefs().UI_ActiveVehicleData.VehPlayerStateData, this, 'OnPlayerVehicleChange' );
+			m_playerCombatStateCallbackHandle = m_player.GetPlayerStateMachineBlackboard().RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, this, 'OnPlayerStateChange' );
+			m_playerWeaponStateCallbackHandle = m_player.GetPlayerStateMachineBlackboard().RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon, this, 'OnPlayerStateChange' );
+			m_playerMeleeWeaponStateCallbackHandle = m_player.GetPlayerStateMachineBlackboard().RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, this, 'OnPlayerStateChange' );
+			SignalAutodriveAvailable();
+		}
+	}
+
+	private export function OnPlayerDetachedCallback( playerPuppet : GameObject )
+	{
+		if( m_player )
+		{
+			GameInstance.GetQuestsContentSystem( GetGameInstance() ).UnregisterLockListener( m_autodriveQuestContentLockListener );
+			GetActiveVehicleDataBB().UnregisterListenerVariant( GetAllBlackboardDefs().UI_ActiveVehicleData.VehPlayerStateData, m_playerVehicleStateCallbackHandle );
+			m_player.GetPlayerStateMachineBlackboard().UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Combat, m_playerCombatStateCallbackHandle );
+			m_player.GetPlayerStateMachineBlackboard().UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Weapon, m_playerWeaponStateCallbackHandle );
+			m_player.GetPlayerStateMachineBlackboard().UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.MeleeWeapon, m_playerMeleeWeaponStateCallbackHandle );
+		}
+	}
+
+	private export function OnAutodriveToggled( enabled : Bool, isDelamain : Bool )
+	{
+		var delamainTaxiSystem : weak< DelamainTaxiSystem >;
+		if( enabled )
+		{
+			SetFreeRoamEnabled( GetAutodriveDestinationType() == gameAutodriveDestinationType.None );
+			SetFactValue( GetGameInstance(), 'disable_combat_events', 1 );
+			SetFactValue( GetGameInstance(), 'player_in_autodrive', 1 );
+			SaveLocksManager.RequestSaveLockAdd( m_player.GetGame(), 'Autodrive' );
+		}
+		else
+		{
+			m_player.QueueEvent( new vehicleRequestTPPCameraSoftResetEvent );
+			SetFactValue( GetGameInstance(), 'disable_combat_events', 0 );
+			SetFactValue( GetGameInstance(), 'player_in_autodrive', 0 );
+			SaveLocksManager.RequestSaveLockRemove( m_player.GetGame(), 'Autodrive' );
+			if( isDelamain )
+			{
+				delamainTaxiSystem = ( ( DelamainTaxiSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'DelamainTaxiSystem' ) ) );
+				delamainTaxiSystem.QueueRequest( new CancelDriveIfNecessaryRequest );
+			}
+		}
+	}
+
+	private function OnEnableAutoDriveRequest( request : EnableAutoDriveRequest )
+	{
+		var laneValidity : gameAutodriveLaneValidityResult;
+		laneValidity = CheckCurrentLaneValidity();
+		if( laneValidity == gameAutodriveLaneValidityResult.NotOnRoad )
+		{
+			HighlightValidRoadsOnMinimap();
+			SendNotification( "LocKey#96670", SimpleMessageType.Autodrive );
+			return;
+		}
+		else if( laneValidity == gameAutodriveLaneValidityResult.NotOnValidLane )
+		{
+			HighlightValidRoadsOnMinimap();
+			SendNotification( "LocKey#96671", SimpleMessageType.Autodrive );
+			return;
+		}
+		if( !( request.isDelamain ) && !( GetAutodriveAvailable() ) )
+		{
+			return;
+		}
+		SetAutodriveEnabled( true, request.isDelamain );
+	}
+
+	private function OnDisableAutoDriveRequest( request : DisableAutoDriveRequest )
+	{
+		SetAutodriveEnabled( false );
+	}
+
+	private function OnToggleFreeRoamRequest( request : ToggleFreeRoamRequest )
+	{
+		if( GetFreeRoamEnabled() && GetAutodriveDestinationType() == gameAutodriveDestinationType.None )
+		{
+			return;
+		}
+		SetFreeRoamEnabled( !( GetFreeRoamEnabled() ) );
+	}
+
+	private function OnUpdateAutoDriveAvailabilityRequest( request : UpdateAutoDriveAvailabilityRequest )
+	{
+		SignalAutodriveAvailable();
+	}
+
+	private function OnSendAutoDriveNotificationRequest( request : SendAutoDriveNotificationRequest )
+	{
+		SendNotification( request.locKey, ( ( request.isDelamain ) ? ( SimpleMessageType.DelamainTaxi ) : ( SimpleMessageType.Autodrive ) ) );
+	}
+
+	private function OnStopAutoDriveOnDestinationReachedRequest( request : StopAutoDriveOnDestinationReachedRequest )
+	{
+		var playerVehicle : VehicleObject;
+		var mappinSystem : weak< MappinSystem >;
+		var delamainTaxiSystem : weak< DelamainTaxiSystem >;
+		var messagelocKey : String;
+		var messageType : SimpleMessageType;
+		playerVehicle = GetAutodriveVehicle();
+		mappinSystem = GameInstance.GetMappinSystem( GetGameInstance() );
+		messagelocKey = "LocKey#96672";
+		messageType = SimpleMessageType.Autodrive;
+		if( ( playerVehicle && mappinSystem ) && GetAutodriveEnabled() )
+		{
+			StopPlayerVehicle();
+			if( mappinSystem.GetMappin( mappinSystem.GetDelamainTrackedMappinID() ) )
+			{
+				mappinSystem.UnregisterMappin( mappinSystem.GetDelamainTrackedMappinID() );
+				delamainTaxiSystem = ( ( DelamainTaxiSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'DelamainTaxiSystem' ) ) );
+				delamainTaxiSystem.QueueRequest( new DelamainTaxiArrivedRequest );
+				messagelocKey = "LocKey#97066";
+				messageType = SimpleMessageType.DelamainTaxi;
+			}
+			else if( mappinSystem.GetMappin( mappinSystem.GetManuallyTrackedMappinID() ).GetVariant() == gamedataMappinVariant.CustomPositionVariant )
+			{
+				mappinSystem.UnregisterMappin( mappinSystem.GetManuallyTrackedMappinID() );
+			}
+			else
+			{
+				mappinSystem.UntrackMappin();
+			}
+			SendNotification( messagelocKey, messageType );
+			SetAutodriveEnabled( false );
+		}
+	}
+
+	protected event OnReachedWorldBoundary()
+	{
+		QueueRequest( new StopAutoDriveOnDestinationReachedRequest );
+	}
+
+	private function OnStopAutoDriveOnTeleportRequest( request : StopAutoDriveOnTeleportRequest )
+	{
+		var playerVehicle : VehicleObject;
+		playerVehicle = GetAutodriveVehicle();
+		if( playerVehicle && GetAutodriveEnabled() )
+		{
+			StopPlayerVehicle();
+			SetAutodriveEnabled( false );
+		}
+	}
+
+	private function OnUpdateAutodriveOnDestinationChangeRequest( request : UpdateAutodriveOnDestinationChangeRequest )
+	{
+		if( GetAutodriveDestinationType() == gameAutodriveDestinationType.None )
+		{
+			SetAutodriveEnabled( false );
+		}
+	}
+
+	private function OnPlayerVehicleChange( data : Variant )
+	{
+		var newData : VehEntityPlayerStateData;
+		newData = ( ( VehEntityPlayerStateData )data );
+		if( ( newData.state == ( ( Int32 )( gamePSMVehicle.Driving ) ) ) || ( newData.state == ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) ) )
+		{
+			if( EntityID.IsDefined( newData.entID ) )
+			{
+				m_vehicleHealthListener = new AutodriveHealthChangeListener;
+				m_vehicleHealthListener.m_autodriveSystem = this;
+				GameInstance.GetStatPoolsSystem( GetGameInstance() ).RequestRegisteringListener( newData.entID, gamedataStatPoolType.Health, m_vehicleHealthListener );
+			}
+		}
+		else
+		{
+			if( m_vehicleHealthListener && EntityID.IsDefined( newData.entID ) )
+			{
+				GameInstance.GetStatPoolsSystem( GetGameInstance() ).RequestUnregisteringListener( newData.entID, gamedataStatPoolType.Health, m_vehicleHealthListener );
+				m_vehicleHealthListener = NULL;
+			}
+		}
+		SignalAutodriveAvailable();
+		StopAutodriveIfNecessary( true );
+	}
+
+	private function OnPlayerStateChange( value : Int32 )
+	{
+		if( !( GetAutodriveIsDelamain() ) )
+		{
+			SignalAutodriveAvailable();
+			StopAutodriveIfNecessary( false );
+		}
+	}
+
+	private function OnUpdateAutodriveStateAfterVehicleHealthChangeRequest( request : UpdateAutodriveStateAfterVehicleHealthChange )
+	{
+		SignalAutodriveAvailable();
+		StopAutodriveIfNecessary( false );
+	}
+
+	private function OnUpdateAutodriveStateAfterQuestLockChange( request : UpdateAutodriveStateAfterQuestLockChange )
+	{
+		SignalAutodriveAvailable();
+		StopAutodriveIfNecessary( true );
+	}
+
+	private function OnUpdateAutodriveStateOnVehicleQuickHackChange( request : UpdateAutodriveStateOnVehicleQuickHackChange )
+	{
+		SignalAutodriveAvailable();
+		StopAutodriveIfNecessary( false );
+	}
+
+	private function SignalAutodriveAvailable()
+	{
+		GetAutodriveDataBB().SetBool( GetAutodriveDataBBDef().AutoDriveAvailable, GetAutodriveAvailable() );
+	}
+
+	private function StopAutodriveIfNecessary( stopVehicleIfDeactivated : Bool )
+	{
+		var mappinSystem : weak< MappinSystem >;
+		var delamainTaxiSystem : weak< DelamainTaxiSystem >;
+		var request : CancelDelamainRideRequest;
+		if( GetAutodriveEnabled() && !( GetAutodriveAvailable() ) )
+		{
+			if( stopVehicleIfDeactivated )
+			{
+				StopPlayerVehicle();
+				if( GetAutodriveIsDelamain() )
+				{
+					mappinSystem = GameInstance.GetMappinSystem( GetGameInstance() );
+					mappinSystem.UnregisterMappin( mappinSystem.GetDelamainTrackedMappinID() );
+					delamainTaxiSystem = ( ( DelamainTaxiSystem )( GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).Get( 'DelamainTaxiSystem' ) ) );
+					request = new CancelDelamainRideRequest;
+					request.forceExit = false;
+					delamainTaxiSystem.QueueRequest( request );
+				}
+			}
+			SetAutodriveEnabled( false );
+		}
+	}
+
+	private function StopPlayerVehicle()
+	{
+		var playerVehicle : VehicleObject;
+		var callbackListener : AutodriveForceBrakesCallbackListener;
+		playerVehicle = GetAutodriveVehicle();
+		if( playerVehicle )
+		{
+			callbackListener = new AutodriveForceBrakesCallbackListener;
+			callbackListener.m_autodriveSystem = this;
+			StartListeningForPlayerMoveInputs();
+			playerVehicle.ForceBrakesUntilStoppedOrFor( 10.0, callbackListener );
+		}
+	}
+
+	private function StartListeningForPlayerMoveInputs()
+	{
+		m_player.RegisterInputListener( this, 'TurnX' );
+		m_player.RegisterInputListener( this, 'Accelerate' );
+		m_player.RegisterInputListener( this, 'Decelerate' );
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var playerVehicle : VehicleObject;
+		playerVehicle = GetMountedVehicle( m_player );
+		if( ( ListenerAction.IsAction( action, 'Accelerate' ) || ListenerAction.IsAction( action, 'Decelerate' ) ) || ListenerAction.IsAction( action, 'TurnX' ) )
+		{
+			if( playerVehicle )
+			{
+				StopListeningForPlayerMoveInputs();
+				playerVehicle.ForceBrakesUntilStoppedOrFor( 0.0 );
+			}
+		}
+	}
+
+	private function OnUpdateAutodriveStateOnVehicleForceBrakeEnd( request : UpdateAutodriveStateOnVehicleForceBrakeEnd )
+	{
+		StopListeningForPlayerMoveInputs();
+	}
+
+	private function StopListeningForPlayerMoveInputs()
+	{
+		m_player.UnregisterInputListener( this, 'TurnX' );
+		m_player.UnregisterInputListener( this, 'Accelerate' );
+		m_player.UnregisterInputListener( this, 'Decelerate' );
+	}
+
+	private export function SendNotification( const message : String, type : SimpleMessageType )
+	{
+		var warningMsg : SimpleScreenMessage;
+		warningMsg.isShown = true;
+		warningMsg.duration = 1.5;
+		warningMsg.message = message;
+		warningMsg.type = type;
+		GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAllBlackboardDefs().UI_Notifications ).SetVariant( GetAllBlackboardDefs().UI_Notifications.WarningMessage, warningMsg, true );
+	}
+
+	private function HighlightValidRoadsOnMinimap()
+	{
+		var requestData : LayerHighlightRequestData;
+		var request : MinimapLayerHighlightRequest;
+		requestData.highlightColor = HDRColor( 0.15800001, 1.30299997, 1.41400003, 1.0 );
+		requestData.highlightDuration = 1.5;
+		requestData.blinkCount = 3.0;
+		request.data = requestData;
+		request.layer = minimapuiELayerType.Road;
+		GetMapBB().SetVariant( GetMapBBDef().minimapLayerHighlightRequest, request, true );
+	}
+
+	private const function GetActiveVehicleDataBB() : IBlackboard
+	{
+		return GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetActiveVehicleDataBBDef() );
+	}
+
+	private const function GetActiveVehicleDataBBDef() : UI_ActiveVehicleDataDef
+	{
+		return GetAllBlackboardDefs().UI_ActiveVehicleData;
+	}
+
+	private const function GetAutodriveDataBB() : IBlackboard
+	{
+		return GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetAutodriveDataBBDef() );
+	}
+
+	private const function GetAutodriveDataBBDef() : UI_AutodriveDataDef
+	{
+		return GetAllBlackboardDefs().UI_AutodriveData;
+	}
+
+	private const function GetMapBB() : IBlackboard
+	{
+		return GameInstance.GetBlackboardSystem( GetGameInstance() ).Get( GetMapBBDef() );
+	}
+
+	private const function GetMapBBDef() : UI_MapDef
+	{
+		return GetAllBlackboardDefs().UI_Map;
+	}
+
+}
+

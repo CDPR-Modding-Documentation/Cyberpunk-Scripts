@@ -1,3 +1,29 @@
+import enum minimapuiELayerType
+{
+	Floor,
+	Cover,
+	WallInterior,
+	WallExterior,
+	Door,
+	Stairs,
+	Road,
+	RoadNoAutodrive,
+	Count,
+}
+
+import struct LayerHighlightRequestData
+{
+	import var highlightColor : HDRColor;
+	import var highlightDuration : Float;
+	import var blinkCount : Float;
+}
+
+struct MinimapLayerHighlightRequest
+{
+	var layer : minimapuiELayerType;
+	var data : LayerHighlightRequestData;
+}
+
 import class MinimapContainerController extends MappinsContainerController
 {
 	protected editable var m_rootZoneSafety : weak< inkWidget >;
@@ -8,15 +34,21 @@ import class MinimapContainerController extends MappinsContainerController
 	protected editable var m_combatModeHighlight : inkWidgetRef;
 	protected editable var m_courierTimerContainer : inkWidgetRef;
 	protected editable var m_courierTimerText : inkTextRef;
+	protected editable var m_alternativeIconContainer : inkWidgetRef;
+	protected editable var m_autoDriveModeHighlight : inkWidgetRef;
+	protected editable var m_autoDriveIconRef : inkWidgetLibraryReference;
 	private var m_rootWidget : weak< inkWidget >;
 	private var m_zoneVignetteAnimProxy : inkAnimProxy;
 	private var m_inPublicOrRestrictedZone : Bool;
 	private var m_fluffTextCount : Int32;
 	default m_fluffTextCount = 0;
+	private var m_alternativePlayerIconAnimProxy : inkAnimProxy;
+	private var m_hasOverridenPlayerIcon : Bool;
 	private var m_psmBlackboard : weak< IBlackboard >;
 	private var m_mapBlackboard : weak< IBlackboard >;
 	private var m_mapDefinition : UI_MapDef;
 	private var m_locationDataCallback : CallbackHandle;
+	private var m_highlightRequestCallback : CallbackHandle;
 	private var m_countdownTimerBlackboard : weak< IBlackboard >;
 	private var m_countdownTimerDefinition : UI_HUDCountdownTimerDef;
 	private var m_countdownTimerActiveCallback : CallbackHandle;
@@ -25,9 +57,16 @@ import class MinimapContainerController extends MappinsContainerController
 	private var m_remoteControlledVehicleDataCallback : CallbackHandle;
 	private var m_remoteControlledVehicleCameraChangedToTPPCallback : CallbackHandle;
 	private var m_combatAnimation : inkAnimProxy;
+	private var m_autodriveDataDefinition : UI_AutodriveDataDef;
+	private var m_autodriveDataBlackboard : weak< IBlackboard >;
+	private var m_autoDriveEnabledCallback : CallbackHandle;
+	private var m_autoDriveEnabled : Bool;
+	private var m_autoDriveAnimation : inkAnimProxy;
 	private var m_playerInCombat : Bool;
 	private var m_currentZoneType : ESecurityAreaType;
 	private var m_messageCounterController : weak< inkCompoundWidget >;
+
+	private import function RequestLayerHighlight( layer : minimapuiELayerType, highlightData : LayerHighlightRequestData );
 
 	protected event OnInitialize()
 	{
@@ -37,16 +76,22 @@ import class MinimapContainerController extends MappinsContainerController
 		m_mapBlackboard = GetBlackboardSystem().Get( m_mapDefinition );
 		m_locationDataCallback = m_mapBlackboard.RegisterListenerString( m_mapDefinition.currentLocation, this, 'OnLocationUpdated' );
 		OnLocationUpdated( m_mapBlackboard.GetString( m_mapDefinition.currentLocation ) );
+		m_highlightRequestCallback = m_mapBlackboard.RegisterListenerVariant( m_mapDefinition.minimapLayerHighlightRequest, this, 'OnHighlightRequestUpdate' );
 		m_countdownTimerDefinition = GetAllBlackboardDefs().UI_HUDCountdownTimer;
 		m_countdownTimerBlackboard = GetBlackboardSystem().Get( m_countdownTimerDefinition );
 		m_countdownTimerActiveCallback = m_countdownTimerBlackboard.RegisterListenerBool( m_countdownTimerDefinition.Active, this, 'OnCountdownTimerActiveUpdated' );
 		m_countdownTimerTimeCallback = m_countdownTimerBlackboard.RegisterListenerFloat( m_countdownTimerDefinition.Progress, this, 'OnCountdownTimerTimeUpdated' );
 		OnCountdownTimerActiveUpdated( m_countdownTimerBlackboard.GetBool( m_countdownTimerDefinition.Active ) );
+		m_autodriveDataDefinition = GetAllBlackboardDefs().UI_AutodriveData;
+		m_autodriveDataBlackboard = GetBlackboardSystem().Get( m_autodriveDataDefinition );
+		m_autoDriveEnabledCallback = m_autodriveDataBlackboard.RegisterListenerBool( m_autodriveDataDefinition.AutoDriveEnabled, this, 'OnAutoDriveStateChanged' );
 	}
 
 	protected event OnUnitialize()
 	{
 		m_mapBlackboard.UnregisterListenerString( m_mapDefinition.currentLocation, m_locationDataCallback );
+		m_mapBlackboard.UnregisterListenerVariant( m_mapDefinition.minimapLayerHighlightRequest, m_highlightRequestCallback );
+		m_autodriveDataBlackboard.UnregisterListenerBool( m_autodriveDataDefinition.AutoDriveEnabled, m_autoDriveEnabledCallback );
 	}
 
 	protected event OnPlayerAttach( player : GameObject )
@@ -127,6 +172,38 @@ import class MinimapContainerController extends MappinsContainerController
 	protected event OnLocationUpdated( value : String )
 	{
 		inkTextRef.SetText( m_locationTextWidget, ( ( StrLen( value ) == 0 ) ? ( "Story-base-journal-contacts-unknown-Unknown_name" ) : ( value ) ) );
+	}
+
+	protected event OnHighlightRequestUpdate( variant : Variant )
+	{
+		var request : MinimapLayerHighlightRequest;
+		request = ( ( MinimapLayerHighlightRequest )variant );
+		RequestLayerHighlight( request.layer, request.data );
+	}
+
+	protected event OnAutoDriveStateChanged( state : Bool )
+	{
+		var playbackOptions : inkAnimOptions;
+		if( m_autoDriveEnabled != state )
+		{
+			inkWidgetRef.SetVisible( m_autoDriveModeHighlight, state );
+			if( state && !( m_autodriveDataBlackboard.GetBool( m_autodriveDataDefinition.AutoDriveDelamain ) ) )
+			{
+				OverridePlayerIcon( m_autoDriveIconRef );
+				playbackOptions.loopInfinite = true;
+				playbackOptions.loopType = inkanimLoopType.Cycle;
+				m_autoDriveAnimation = PlayLibraryAnimation( 'AutoDriveMode', playbackOptions );
+			}
+			else
+			{
+				RemovePlayerIconOverride();
+				if( m_autoDriveAnimation.IsPlaying() )
+				{
+					m_autoDriveAnimation.Stop();
+				}
+			}
+			m_autoDriveEnabled = state;
+		}
 	}
 
 	protected event OnPSMCombatChanged( psmCombatArg : gamePSMCombat )
@@ -298,6 +375,41 @@ import class MinimapContainerController extends MappinsContainerController
 		}
 	}
 
+	private function OverridePlayerIcon( overrideIcon : inkWidgetLibraryReference )
+	{
+		var container : inkCompoundWidget;
+		container = ( ( inkCompoundWidget )( inkWidgetRef.Get( m_alternativeIconContainer ) ) );
+		if( m_hasOverridenPlayerIcon )
+		{
+			return;
+		}
+		if( container )
+		{
+			container.RemoveAllChildren();
+			SpawnFromExternal( inkWidgetRef.Get( m_alternativeIconContainer ), inkWidgetLibraryResource.GetPath( overrideIcon.widgetLibrary ), overrideIcon.widgetItem );
+			if( m_alternativePlayerIconAnimProxy.IsValid() && m_alternativePlayerIconAnimProxy.IsPlaying() )
+			{
+				m_alternativePlayerIconAnimProxy.Stop();
+			}
+			m_alternativePlayerIconAnimProxy = PlayLibraryAnimation( 'ShowAlternativeIcon' );
+			m_hasOverridenPlayerIcon = true;
+		}
+	}
+
+	private function RemovePlayerIconOverride()
+	{
+		if( !( m_hasOverridenPlayerIcon ) )
+		{
+			return;
+		}
+		if( m_alternativePlayerIconAnimProxy.IsValid() && m_alternativePlayerIconAnimProxy.IsPlaying() )
+		{
+			m_alternativePlayerIconAnimProxy.Stop();
+		}
+		m_alternativePlayerIconAnimProxy = PlayLibraryAnimation( 'ShowPlayerIcon' );
+		m_hasOverridenPlayerIcon = false;
+	}
+
 	private function TryStopZoneVignetteAnimation()
 	{
 		if( m_zoneVignetteAnimProxy && m_zoneVignetteAnimProxy.IsPlaying() )
@@ -355,6 +467,7 @@ import class MinimapContainerController extends MappinsContainerController
 				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.ShortRange", T"MinimapMappinUIProfile.DropPoint" );
 			case gamedataMappinVariant.VehicleVariant:
 			case gamedataMappinVariant.Zzz03_MotorcycleVariant:
+			case gamedataMappinVariant.Zzz19_DelamainTaxiVariant:
 				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.Vehicle" );
 			case gamedataMappinVariant.Zzz04_PreventionVehicleVariant:
 				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_prevention_vehicle.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.PreventionVehicle" );
@@ -362,6 +475,8 @@ import class MinimapContainerController extends MappinsContainerController
 				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_road_blockade.inkwidget", T"MappinUISpawnProfile.Always", T"MinimapMappinUIProfile.PreventionVehicle" );
 			case gamedataMappinVariant.CustomPositionVariant:
 				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.Always", defaultRuntimeProfile );
+			case gamedataMappinVariant.Zzz20_DelamainTaxiDestinationVariant:
+				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_delamain_mappin.inkwidget", T"MappinUISpawnProfile.Always", defaultRuntimeProfile );
 			case gamedataMappinVariant.Zzz16_RelicDeviceBasicVariant:
 				return MappinUIProfile.Create( R"base\gameplay\gui\widgets\minimap\minimap_poi_mappin.inkwidget", T"MappinUISpawnProfile.ShortRange", defaultRuntimeProfile );
 			case gamedataMappinVariant.ExclamationMarkVariant:

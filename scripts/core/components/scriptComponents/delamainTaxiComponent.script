@@ -1,0 +1,358 @@
+class DelamainTaxiArrivedEvent extends Event
+{
+}
+
+class ForceExitDelamainEvent extends Event
+{
+	var shouldExit : Bool;
+}
+
+enum DelamainTaxiState
+{
+	None = 0,
+	Spawned = 1,
+	Parked = 2,
+	Ready = 3,
+	Started = 4,
+	Arrived = 5,
+	Cancelled = 6,
+	Finished = 7,
+	Freeroam = 8,
+}
+
+class DelamainTaxiComponent extends ScriptableComponent
+{
+	private editable var m_taxiStateFact : CName;
+	default m_taxiStateFact = 'delamain_taxi_state';
+	private editable var m_taxiSeatFact : CName;
+	default m_taxiSeatFact = 'delamain_taxi_seat';
+	private var m_gameInstance : GameInstance;
+	private var m_delamainTaxiSystem : weak< DelamainTaxiSystem >;
+	private var m_autoDriveSystem : weak< AutoDriveSystem >;
+	private var m_currentState : DelamainTaxiState;
+	private var m_callbackID : Uint32;
+	var m_vehicleSpeedCallbackID : CallbackHandle;
+	private var m_isActiveCab : Bool;
+	default m_isActiveCab = true;
+
+	private export function OnGameAttach()
+	{
+		var controllerPS : weak< vehicleControllerPS >;
+		var request : RegisterDelamainTaxiRequest;
+		request = new RegisterDelamainTaxiRequest;
+		controllerPS = ( ( vehicleControllerPS )( ( ( VehicleObject )( GetEntity() ) ).GetAccessoryController().GetPS() ) );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.seat_front_left, VehicleDoorInteractionState.Disabled );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.seat_front_right, VehicleDoorInteractionState.Disabled );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.seat_back_left, VehicleDoorInteractionState.Available );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.seat_back_right, VehicleDoorInteractionState.Available );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.trunk, VehicleDoorInteractionState.Disabled );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.hood, VehicleDoorInteractionState.Disabled );
+		m_gameInstance = GetOwner().GetGame();
+		InitState();
+		m_autoDriveSystem = ( ( AutoDriveSystem )( GameInstance.GetScriptableSystemsContainer( m_gameInstance ).Get( 'AutoDriveSystem' ) ) );
+		m_delamainTaxiSystem = ( ( DelamainTaxiSystem )( GameInstance.GetScriptableSystemsContainer( m_gameInstance ).Get( 'DelamainTaxiSystem' ) ) );
+		request.delamainTaxi = this;
+		m_delamainTaxiSystem.QueueRequest( request );
+		m_callbackID = GameInstance.GetQuestsSystem( m_gameInstance ).RegisterEntity( m_taxiStateFact, GetEntity().GetEntityID() );
+		SetupVehicleSpeedBBListener();
+	}
+
+	protected const override function GetPS() : DelamainTaxiComponentPS
+	{
+		return ( ( DelamainTaxiComponentPS )( GetBasePS() ) );
+	}
+
+	private export function OnGameDetach()
+	{
+		if( m_isActiveCab )
+		{
+			UnregisterCab();
+		}
+	}
+
+	private function InitState()
+	{
+		m_currentState = GetPS().GetState();
+		switch( m_currentState )
+		{
+			case DelamainTaxiState.None:
+				SetState( DelamainTaxiState.Spawned );
+			break;
+			case DelamainTaxiState.Spawned:
+			case DelamainTaxiState.Parked:
+				SetDoorState( true );
+			break;
+			case DelamainTaxiState.Started:
+				StartAutoDrive();
+			break;
+			case DelamainTaxiState.Freeroam:
+				GoToFreeRoam();
+			m_isActiveCab = false;
+			break;
+		}
+	}
+
+	protected event OnFactChanged( evt : FactChangedEvent )
+	{
+		if( !( m_isActiveCab ) )
+		{
+			return false;
+		}
+		m_currentState = ( ( DelamainTaxiState )( GameInstance.GetQuestsSystem( m_gameInstance ).GetFact( evt.GetFactName() ) ) );
+		GetPS().SetState( m_currentState );
+		switch( m_currentState )
+		{
+			case DelamainTaxiState.Ready:
+			{
+				GameInstance.GetUISystem( m_gameInstance ).RequestDelamainTaxiMenu();
+				break;
+			}
+			case DelamainTaxiState.Cancelled:
+			{
+				m_delamainTaxiSystem.QueueRequest( new DelamainTaxiCancelledRequest );
+				SetHUDHidden( false );
+				break;
+			}
+			case DelamainTaxiState.Freeroam:
+			{
+				GoToFreeRoam();
+				UnregisterCab();
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	protected function OnVehicleSpeedChange( speed : Float )
+	{
+		if( speed < 2.0 )
+		{
+			if( ( m_currentState == DelamainTaxiState.Arrived || m_currentState == DelamainTaxiState.Parked ) || m_currentState == DelamainTaxiState.Cancelled )
+			{
+				SetDoorState( true );
+			}
+		}
+	}
+
+	protected const function GetVehicle() : weak< VehicleObject >
+	{
+		return ( ( VehicleObject )( GetEntity() ) );
+	}
+
+	protected function SetupVehicleSpeedBBListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( !( m_vehicleSpeedCallbackID ) )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			m_vehicleSpeedCallbackID = vehicleDefBlackboard.RegisterListenerFloat( GetAllBlackboardDefs().Vehicle.SpeedValue, this, 'OnVehicleSpeedChange' );
+		}
+	}
+
+	protected function UnregisterVehicleSpeedBBListener()
+	{
+		var vehicleDefBlackboard : weak< IBlackboard >;
+		if( m_vehicleSpeedCallbackID )
+		{
+			vehicleDefBlackboard = GetVehicle().GetBlackboard();
+			vehicleDefBlackboard.UnregisterListenerFloat( GetAllBlackboardDefs().Vehicle.SpeedValue, m_vehicleSpeedCallbackID );
+		}
+	}
+
+	protected event OnVehicleStartedMountingEvent( evt : VehicleStartedMountingEvent )
+	{
+		if( evt.character != ( ( GameObject )( GetPlayer( GetOwner().GetGame() ) ) ) )
+		{
+			return false;
+		}
+		if( !( m_isActiveCab ) )
+		{
+			QueueExitCabEvent();
+			return false;
+		}
+		if( evt.isMounting )
+		{
+			GetVehicle().PhysicsWakeUp();
+			switch( evt.slotID )
+			{
+				case 'seat_back_left':
+					GameInstance.GetQuestsSystem( m_gameInstance ).SetFact( m_taxiSeatFact, 1 );
+				break;
+				case 'seat_back_right':
+					GameInstance.GetQuestsSystem( m_gameInstance ).SetFact( m_taxiSeatFact, 2 );
+				break;
+				default:
+					GameInstance.GetQuestsSystem( m_gameInstance ).SetFact( m_taxiSeatFact, 0 );
+				break;
+			}
+		}
+		else
+		{
+			GameInstance.GetQuestsSystem( m_gameInstance ).SetFact( m_taxiSeatFact, 0 );
+			SetHUDHidden( false );
+			if( m_currentState == DelamainTaxiState.Started )
+			{
+				m_delamainTaxiSystem.QueueRequest( new PayTravelRequest );
+			}
+		}
+	}
+
+	protected event OnVehicleFinishedMountingEvent( evt : VehicleFinishedMountingEvent )
+	{
+		if( evt.character != ( ( GameObject )( GetPlayer( GetOwner().GetGame() ) ) ) )
+		{
+			return false;
+		}
+		if( evt.isMounting )
+		{
+			if( !( m_isActiveCab ) )
+			{
+				QueueExitCabEvent();
+				return false;
+			}
+			else
+			{
+				GetVehicleControllerPS().SetAllowPassengerCameraSwitch( evt.isMounting );
+				SetDoorState( false );
+			}
+		}
+		else if( m_currentState == DelamainTaxiState.Freeroam )
+		{
+			GoToFreeRoam();
+		}
+	}
+
+	private function GoToFreeRoam()
+	{
+		var command : AIVehicleJoinTrafficCommand;
+		command = new AIVehicleJoinTrafficCommand;
+		command.needDriver = false;
+		command.useKinematic = true;
+		GetVehicle().GetAIComponent().SendCommand( command );
+		GetVehicle().GetVehicleComponent().DestroyMappin();
+	}
+
+	protected event OnVehicleParkedEvent( evt : VehicleParkedEvent )
+	{
+		if( m_currentState == DelamainTaxiState.Spawned )
+		{
+			SetState( DelamainTaxiState.Parked );
+		}
+	}
+
+	private function SetDoorState( open : Bool )
+	{
+		if( open )
+		{
+			VehicleComponent.OpenDoor( ( ( VehicleObject )( GetOwner() ) ), VehicleComponent.GetBackLeftPassengerSlotID() );
+			VehicleComponent.OpenDoor( ( ( VehicleObject )( GetOwner() ) ), VehicleComponent.GetBackRightPassengerSlotID() );
+		}
+		else
+		{
+			VehicleComponent.CloseDoor( ( ( VehicleObject )( GetOwner() ) ), VehicleComponent.GetBackLeftPassengerSlotID() );
+			VehicleComponent.CloseDoor( ( ( VehicleObject )( GetOwner() ) ), VehicleComponent.GetBackRightPassengerSlotID() );
+		}
+	}
+
+	public function OnDelamainTaxiArrivedEvent()
+	{
+		SetState( DelamainTaxiState.Arrived );
+		SetHUDHidden( false );
+		m_delamainTaxiSystem.QueueRequest( new PayTravelRequest );
+	}
+
+	private function SetState( state : DelamainTaxiState, optional force : Bool )
+	{
+		if( !( force ) && m_currentState == state )
+		{
+			return;
+		}
+		m_currentState = state;
+		GameInstance.GetQuestsSystem( m_gameInstance ).SetFact( m_taxiStateFact, ( ( Int32 )( state ) ) );
+		GetPS().SetState( state );
+	}
+
+	private function SetHUDHidden( hidden : Bool )
+	{
+		var request : SetHUDHiddenRequest;
+		request = new SetHUDHiddenRequest;
+		request.hidden = hidden;
+		m_delamainTaxiSystem.QueueRequest( request );
+	}
+
+	public function StartAutoDrive()
+	{
+		var request : EnableAutoDriveRequest;
+		request = new EnableAutoDriveRequest;
+		request.isDelamain = true;
+		SetState( DelamainTaxiState.Started );
+		m_autoDriveSystem.QueueRequest( request );
+		GetVehicleControllerPS().SetAllowPassengerCameraSwitch( true );
+		SetHUDHidden( true );
+	}
+
+	public function CancelRide( forceExit : Bool )
+	{
+		if( forceExit )
+		{
+			QueueExitCabEvent();
+		}
+		SetState( DelamainTaxiState.Cancelled );
+	}
+
+	private function QueueExitCabEvent()
+	{
+		var persistentId : PersistentID;
+		var evt : ForceExitDelamainEvent;
+		evt = new ForceExitDelamainEvent;
+		persistentId = CreatePersistentID( GetOwner().GetEntityID(), 'controller' );
+		evt.shouldExit = true;
+		GameInstance.GetPersistencySystem( GetOwner().GetGame() ).QueuePSEvent( persistentId, 'VehicleComponentPS', evt );
+	}
+
+	private function GetVehicleControllerPS() : vehicleControllerPS
+	{
+		var persistentId : PersistentID;
+		var vehicleControllerPS : vehicleControllerPS;
+		persistentId = CreatePersistentID( GetEntity().GetEntityID(), 'VehicleController' );
+		vehicleControllerPS = ( ( vehicleControllerPS )( GameInstance.GetPersistencySystem( GetVehicle().GetGame() ).GetConstAccessToPSObject( persistentId, 'gamevehicleControllerPS' ) ) );
+		return vehicleControllerPS;
+	}
+
+	private function UnregisterCab()
+	{
+		var controllerPS : weak< vehicleControllerPS >;
+		if( !( m_isActiveCab ) )
+		{
+			return;
+		}
+		m_delamainTaxiSystem.QueueRequest( new UnregisterCurrentTaxiRequest );
+		GameInstance.GetQuestsSystem( m_gameInstance ).SetFact( m_taxiStateFact, 0 );
+		GameInstance.GetQuestsSystem( m_gameInstance ).UnregisterEntity( m_taxiStateFact, m_callbackID );
+		SetDoorState( false );
+		m_isActiveCab = false;
+		controllerPS = ( ( vehicleControllerPS )( GetVehicle().GetAccessoryController().GetPS() ) );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.seat_back_left, VehicleDoorInteractionState.Disabled );
+		controllerPS.SetDoorInteractionState( EVehicleDoor.seat_back_right, VehicleDoorInteractionState.Disabled );
+		UnregisterVehicleSpeedBBListener();
+	}
+
+}
+
+class DelamainTaxiComponentPS extends GameComponentPS
+{
+	protected persistent var m_state : Uint32;
+
+	public const function GetState() : DelamainTaxiState
+	{
+		return ( ( DelamainTaxiState )( m_state ) );
+	}
+
+	public function SetState( state : DelamainTaxiState )
+	{
+		m_state = ( ( Uint32 )( state ) );
+	}
+
+}
+

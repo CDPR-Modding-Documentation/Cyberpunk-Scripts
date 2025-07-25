@@ -571,6 +571,8 @@ class PlayerPuppet extends ScriptedPuppet
 	private var m_friendlyDevicesHostileToEnemiesLock : RWLock;
 	private var m_friendlyDevicesHostileToEnemies : array< EntityID >;
 	private var m_pocketRadio : PocketRadio;
+	private var m_noMovementModifierData : array< gameStatModifierData >;
+	private var m_registeredFactListeners : array< FactCallbackData >;
 
 	public const override function IsPlayer() : Bool
 	{
@@ -585,6 +587,16 @@ class PlayerPuppet extends ScriptedPuppet
 	public const override function IsVRReplacer() : Bool
 	{
 		return GetRecord().GetID() == T"Character.q000_vr_replacer";
+	}
+
+	public const function IsInGyroTutorial() : Bool
+	{
+		return IsVRReplacer() && ( GameInstance.GetQuestsSystem( GetGame() ).GetFact( 'q000_vr_tutorial_gyro_started' ) > 0 );
+	}
+
+	public const function IsInReplayTutorial() : Bool
+	{
+		return IsVRReplacer() && ( GameInstance.GetQuestsSystem( GetGame() ).GetFact( 'start_vr_tutorial_level' ) > 0 );
 	}
 
 	public const override function IsJohnnyReplacer() : Bool
@@ -635,6 +647,11 @@ class PlayerPuppet extends ScriptedPuppet
 	public const function GetCombatExitTimestamp() : Float
 	{
 		return GetPS().GetCombatExitTimestamp();
+	}
+
+	public export const override function IsPuppetInCombat() : Bool
+	{
+		return IsInCombat();
 	}
 
 	public const function SetPermanentFoodBonus( type : gamedataStatType, value : Float )
@@ -949,6 +966,20 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 	}
 
+	private function RemoveInteractionChoices()
+	{
+		var bboard : IBlackboard;
+		var interactionChoiceHubData : InteractionChoiceHubData;
+		var dialogChoiceHubs : DialogChoiceHubs;
+		bboard = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UIInteractions );
+		interactionChoiceHubData = ( ( InteractionChoiceHubData )( bboard.GetVariant( GetAllBlackboardDefs().UIInteractions.InteractionChoiceHub ) ) );
+		dialogChoiceHubs = ( ( DialogChoiceHubs )( bboard.GetVariant( GetAllBlackboardDefs().UIInteractions.DialogChoiceHubs ) ) );
+		interactionChoiceHubData.choices.Clear();
+		dialogChoiceHubs.choiceHubs.Clear();
+		bboard.SetVariant( GetAllBlackboardDefs().UIInteractions.InteractionChoiceHub, interactionChoiceHubData );
+		bboard.SetVariant( GetAllBlackboardDefs().UIInteractions.DialogChoiceHubs, dialogChoiceHubs );
+	}
+
 	private function EvaluateApplyingReplacerGameplayRestrictions()
 	{
 		var mainObj : weak< PlayerPuppet >;
@@ -1099,6 +1130,11 @@ class PlayerPuppet extends ScriptedPuppet
 				playerDevelopmentData = PlayerDevelopmentSystem.GetData( this );
 				playerDevelopmentData.OnRestored( GetGame() );
 			}
+			if( IsVRReplacer() )
+			{
+				RemoveInteractionChoices();
+			}
+			GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'q000_vr_tutorial_gyro_choice_enabled', 0 );
 			EvaluateApplyingReplacerGameplayRestrictions();
 			RestoreMinigamePrograms();
 			ResolveCachedGameplayRestrictions();
@@ -1225,6 +1261,7 @@ class PlayerPuppet extends ScriptedPuppet
 		playerDetach.ownerID = GetEntityID();
 		GameInstance.GetScriptableSystemsContainer( GetGameInstance() ).QueueRequest( playerDetach );
 		UnregisterStatListeners( this );
+		UnregisterToFacts();
 		EnableUIBlackboardListener( false );
 		if( IsClient() )
 		{
@@ -4907,6 +4944,27 @@ class PlayerPuppet extends ScriptedPuppet
 		GameInstance.GetTelemetrySystem( GetGame() ).LogNumberOfCombatants( m_numberOfCombatants );
 	}
 
+	public function ApplyNoMovementStatGroupModifiers()
+	{
+		var outList : array< weak< GameplayLogicPackage_Record > >;
+		var statsList : array< weak< StatModifier_Record > >;
+		var statRecord : ConstantStatModifier_Record;
+		var statModifierType : gameStatModifierType;
+		var i : Int32;
+		TweakDBInterface.GetStatusEffectRecord( T"GameplayRestriction.NoMovement" ).Packages( outList );
+		if( outList.Size() > 0 )
+		{
+			outList[ 0 ].Stats( statsList );
+		}
+		for( i = 0; i < statsList.Size(); i += 1 )
+		{
+			statRecord = ( ( ConstantStatModifier_Record )( statsList[ i ] ) );
+			statModifierType = ( ( gameStatModifierType )( ( ( Int32 )( EnumValueFromName( 'gameStatModifierType', statsList[ i ].ModifierType() ) ) ) ) );
+			m_noMovementModifierData.PushBack( RPGManager.CreateStatModifier( statRecord.StatType().StatType(), statModifierType, statRecord.Value() * 100.0 ) );
+		}
+		GameInstance.GetStatsSystem( GetGame() ).AddModifiers( GetMainPlayer( GetGame() ).GetEntityID(), m_noMovementModifierData );
+	}
+
 	protected event OnPlayerCoverStatusChangedEvent( evt : PlayerCoverStatusChangedEvent )
 	{
 		if( m_behindCover != evt.fullyBehindCover )
@@ -5916,14 +5974,41 @@ class PlayerPuppet extends ScriptedPuppet
 		return GetPS().IsActionReady( actionID );
 	}
 
+	private function CreateFactCallbackData( factName : CName ) : FactCallbackData
+	{
+		var factCallbackData : FactCallbackData;
+		factCallbackData.m_factName = factName;
+		factCallbackData.m_callbackID = GameInstance.GetQuestsSystem( GetGame() ).RegisterEntity( factName, GetEntityID() );
+		return factCallbackData;
+	}
+
 	private function RegisterToFacts()
 	{
-		GameInstance.GetQuestsSystem( GetGame() ).RegisterEntity( 'q001_took_vroom_jacket', GetEntityID() );
-		GameInstance.GetQuestsSystem( GetGame() ).RegisterEntity( 'player_allow_outerwear_clothing', GetEntityID() );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q001_took_vroom_jacket' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'player_allow_outerwear_clothing' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q000_vr_tutorial_gyro_started' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q000_vr_course_02_early_exit_mode' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q000_vr_course_04_early_exit_mode' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'disable_gyro_tutorials' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'start_vr_tutorial_level' ) );
+		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'vr_gyro_pattern_matching_tutorial_completed' ) );
+	}
+
+	private function UnregisterToFacts()
+	{
+		var factCallbackData : FactCallbackData;
+		var i : Int32;
+		for( i = 0; i < m_registeredFactListeners.Size(); i += 1 )
+		{
+			factCallbackData = m_registeredFactListeners[ i ];
+			GameInstance.GetQuestsSystem( GetGame() ).UnregisterEntity( factCallbackData.m_factName, factCallbackData.m_callbackID );
+		}
 	}
 
 	protected event OnFactChangedEvent( evt : FactChangedEvent )
 	{
+		var mainPlayerEntityID : EntityID;
+		var i : Int32;
 		switch( evt.GetFactName() )
 		{
 			case 'q001_took_vroom_jacket':
@@ -5938,6 +6023,50 @@ class PlayerPuppet extends ScriptedPuppet
 				}
 			;
 			break;
+			case 'q000_vr_tutorial_gyro_started':
+				break;
+			case 'q000_vr_course_02_early_exit_mode':
+			case 'q000_vr_course_04_early_exit_mode':
+				if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( evt.GetFactName() ) > 0 )
+				{
+					if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( 'q000_vr_tutorial_gyro_started' ) > 0 )
+					{
+						GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'q000_vr_tutorial_gyro_started', 0 );
+					}
+				}
+			;
+			break;
+			case 'disable_gyro_tutorials':
+				if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( evt.GetFactName() ) > 0 )
+				{
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_gyro_tutorials', 0 );
+				}
+			break;
+			case 'start_vr_tutorial_level':
+				if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( evt.GetFactName() ) > 0 )
+				{
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_gyro_tutorials', 1 );
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'q000_vr_tutorial_gyro_started', 0 );
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'tutorials_were_disabled', GameInstance.GetQuestsSystem( GetGame() ).GetFact( 'disable_tutorials' ) );
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_tutorials', 0 );
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'q000_vr_obligatory_courses_done', 1 );
+					SaveLocksManager.RequestSaveLockAdd( GetGame(), 'ReplayTutorial' );
+				}
+				else
+				{
+					mainPlayerEntityID = GetMainPlayer( GetGame() ).GetEntityID();
+					for( i = 0; i < m_noMovementModifierData.Size(); i += 1 )
+					{
+						GameInstance.GetStatsSystem( GetGame() ).RemoveModifier( mainPlayerEntityID, m_noMovementModifierData[ i ] );
+					}
+					m_noMovementModifierData.Clear();
+					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_tutorials', GameInstance.GetQuestsSystem( GetGame() ).GetFact( 'tutorials_were_disabled' ) );
+					GetHudManager().QueueRequest( new VisionModeResetRequest );
+					SaveLocksManager.RequestSaveLockRemove( GetGame(), 'ReplayTutorial' );
+				}
+			break;
+			case 'vr_gyro_pattern_matching_tutorial_completed':
+				break;
 			default:
 				break;
 		}
@@ -6266,7 +6395,7 @@ class PlayerPuppet extends ScriptedPuppet
 	protected event OnDeath( evt : gameDeathEvent )
 	{
 		ForceCloseRadialWheel();
-		StatusEffectHelper.ApplyStatusEffect( this, T"GameplayRestriction.BlockAllHubMenu" );
+		StatusEffectHelper.ApplyStatusEffect( this, T"GameplayRestriction.BlockAllMenu" );
 		super.OnDeath( evt );
 		GameInstance.GetTelemetrySystem( GetGame() ).LogPlayerDeathEvent( evt );
 		GameInstance.GetAutoSaveSystem( GetGame() ).InvalidateAutoSaveRequests();
@@ -7669,5 +7798,11 @@ struct DismembermentInstigatedInfo
 
 class GameLoadedFactReset extends Event
 {
+}
+
+struct FactCallbackData
+{
+	var m_factName : CName;
+	var m_callbackID : Uint32;
 }
 
