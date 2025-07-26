@@ -1,0 +1,973 @@
+struct CinematicCameraData
+{
+	var cameraComponent : vehicleCinematicCameraComponent;
+	var currentShot : vehicleCinematicCameraShot;
+	var shotInitialTransform : WorldTransform;
+	var vehicleInitialTransform : WorldTransform;
+	var referenceLocalBoundingBox : Box;
+	var currentLocalBoundingBox : Box;
+	var shotStartTime : Float;
+	var shotRootTransform : WorldTransform;
+	var shotSpaceTransform : WorldTransform;
+	var vehicleTransform : WorldTransform;
+	var vehicleSpeed : Float;
+	var currentTime : Float;
+	var deltaTime : Float;
+
+	public static function GetShotScaleRatios( data : CinematicCameraData ) : Vector4
+	{
+		if( data.currentShot.scaleForVehicle )
+		{
+			return Box.GetSize( data.currentLocalBoundingBox ) / Box.GetSize( data.referenceLocalBoundingBox );
+		}
+		return Vector4( 1.0, 1.0, 1.0, 1.0 );
+	}
+
+	public static function ScaleTransformForVehicle( data : CinematicCameraData, transform : Transform ) : Transform
+	{
+		if( data.currentShot.scaleForVehicle )
+		{
+			Transform.SetPosition( transform, Transform.GetPosition( transform ) * CinematicCameraData.GetShotScaleRatios( data ) );
+		}
+		return transform;
+	}
+
+}
+
+import class vehicleCinematicCameraShotEffect extends IScriptable
+{
+	public import function GetValueFromCurve( curve : CName, input : Float, optional min : Float, optional max : Float ) : Float;
+
+	public virtual function GetExecutionTime( data : CinematicCameraData ) : Float
+	{
+		return data.currentTime - data.shotStartTime;
+	}
+
+	public virtual function Reset();
+	public virtual function Start( data : CinematicCameraData );
+	public virtual function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > );
+}
+
+import class vehicleTimedCinematicCameraShotEffect extends vehicleCinematicCameraShotEffect
+{
+	import var startDelay : Float;
+	import var duration : Float;
+	private var hasStarted : Bool;
+	default hasStarted = false;
+
+	public const function HasStarted() : Bool
+	{
+		return hasStarted;
+	}
+
+	public override function GetExecutionTime( data : CinematicCameraData ) : Float
+	{
+		return MaxF( data.currentTime - ( data.shotStartTime + startDelay ), 0.0 );
+	}
+
+	public override function Reset()
+	{
+		hasStarted = false;
+	}
+
+	public override function Start( data : CinematicCameraData )
+	{
+		hasStarted = true;
+	}
+
+	public virtual function StartDelayed( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		hasStarted = true;
+	}
+
+}
+
+import struct vehicleCinematicCameraShotUpdateContext
+{
+	import var cameraComponent : vehicleCinematicCameraComponent;
+	import var vehicleType : gamedataVehicleType;
+	import var vehicleTransform : WorldTransform;
+	import var vehicleBoundingBox : Box;
+	import var vehicleSpeed : Float;
+	import var engineTime : Float;
+	import var deltaTime : Float;
+}
+
+enum ZoneRelativeToVehicle
+{
+	Right = 0,
+	Left = 1,
+	Middle = 2,
+}
+
+import class vehicleCinematicCameraShot extends IScriptable
+{
+	import var name : String;
+	import var enabled : Bool;
+	import var probability : Int32;
+	import var duration : Float;
+	import var scaleForVehicle : Bool;
+	import var root : vehicleCinematicCameraShotRoot;
+	import var effects : array< vehicleCinematicCameraShotEffect >;
+	import var stopConditions : array< vehicleCinematicCameraShotStopCondition >;
+	private var runtimeData : CinematicCameraData;
+
+	public const function IsStaticCameraShot() : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < effects.Size(); i += 1 )
+		{
+			if( ( ( cameraShotEffect_Translation )( effects[ i ] ) ) )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public const function GetCanBeSelectedFromContext( context : vehicleCinematicCameraShotUpdateContext ) : Bool
+	{
+		var cameraPosition : WorldPosition;
+		var shotStartPosition : WorldPosition;
+		var currentZone : ZoneRelativeToVehicle;
+		var shotZone : ZoneRelativeToVehicle;
+		cameraPosition = context.cameraComponent.GetWorldPosition();
+		shotStartPosition = WorldTransform.GetWorldPosition( GetRootTransformFromContext( context ) );
+		currentZone = GetZoneRelativeToVehicle( cameraPosition, context );
+		shotZone = GetZoneRelativeToVehicle( shotStartPosition, context );
+		return ( currentZone == shotZone || shotZone == ZoneRelativeToVehicle.Middle ) || currentZone == ZoneRelativeToVehicle.Middle;
+	}
+
+	private const function GetZoneRelativeToVehicle( worldPosition : WorldPosition, context : vehicleCinematicCameraShotUpdateContext ) : ZoneRelativeToVehicle
+	{
+		var localShotPosition : Vector4;
+		localShotPosition = WorldTransform.TransformInvPoint( context.vehicleTransform, WorldPosition.ToVector4( worldPosition ) );
+		if( AbsF( localShotPosition.X ) < ( context.cameraComponent.middleZoneSizeForShotSelection / 2.0 ) )
+		{
+			return ZoneRelativeToVehicle.Middle;
+		}
+		return ( ( Vector4.Dot2D( localShotPosition, Vector4.RIGHT() ) >= 0.0 ) ? ( ZoneRelativeToVehicle.Right ) : ( ZoneRelativeToVehicle.Left ) );
+	}
+
+	public const function GetShotProbabilityFromContext( context : vehicleCinematicCameraShotUpdateContext ) : Int32
+	{
+		var finalProbability : Int32;
+		var cc : vehicleCinematicCameraComponent;
+		var isShotStatic : Bool;
+		var wasLastShotStatic : Bool;
+		var shotStartPosition : WorldTransform;
+		var shotDistanceFromCamera : Float;
+		finalProbability = probability;
+		cc = context.cameraComponent;
+		isShotStatic = IsStaticCameraShot();
+		wasLastShotStatic = cc.GetLastShot().IsStaticCameraShot();
+		shotStartPosition = GetRootTransformFromContext( context );
+		if( isShotStatic && wasLastShotStatic )
+		{
+			finalProbability += cc.consecutiveStaticShotsProbabilityBonus;
+		}
+		else if( !( isShotStatic ) && !( wasLastShotStatic ) )
+		{
+			finalProbability += cc.consecutiveDynamicShotsProbabilityBonus;
+		}
+		shotDistanceFromCamera = Vector4.Distance( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( shotStartPosition ) ), WorldPosition.ToVector4( cc.GetWorldPosition() ) );
+		finalProbability += FloorF( ProportionalClampF( 0.0, cc.maxDistanceFromCameraToHaveProbabilityBonusForShot, shotDistanceFromCamera, cc.maxProbabilityBonusFromCameraProximityToShot, 0.0 ) );
+		return finalProbability;
+	}
+
+	public function Reset()
+	{
+		var i : Int32;
+		runtimeData = CinematicCameraData();
+		root.Reset();
+		for( i = 0; i < effects.Size(); i += 1 )
+		{
+			effects[ i ].Reset();
+		}
+		for( i = 0; i < stopConditions.Size(); i += 1 )
+		{
+			stopConditions[ i ].Reset();
+		}
+	}
+
+	public const function GetRootTransformFromContext( context : vehicleCinematicCameraShotUpdateContext ) : WorldTransform
+	{
+		return root.GetRootTransform( CreateCinematicCameraDataFromContext( context ) );
+	}
+
+	public function Start( context : vehicleCinematicCameraShotUpdateContext )
+	{
+		var effect : vehicleCinematicCameraShotEffect;
+		var timedEffect : vehicleTimedCinematicCameraShotEffect;
+		var i : Int32;
+		runtimeData = CreateCinematicCameraDataFromContext( context );
+		for( i = 0; i < effects.Size(); i += 1 )
+		{
+			effect = effects[ i ];
+			if( timedEffect = ( ( vehicleTimedCinematicCameraShotEffect )( effect ) ) )
+			{
+				if( timedEffect.startDelay <= 0.0 )
+				{
+					timedEffect.Start( runtimeData );
+				}
+			}
+			else
+			{
+				effect.Start( runtimeData );
+			}
+		}
+	}
+
+	public function Update( context : vehicleCinematicCameraShotUpdateContext ) : WorldTransform
+	{
+		var effect : vehicleCinematicCameraShotEffect;
+		var timedEffect : vehicleTimedCinematicCameraShotEffect;
+		var resultTransform : WorldTransform;
+		var i : Int32;
+		UpdateCinematicCameraData( runtimeData, context );
+		resultTransform = runtimeData.shotRootTransform;
+		for( i = 0; i < effects.Size(); i += 1 )
+		{
+			effect = effects[ i ];
+			if( timedEffect = ( ( vehicleTimedCinematicCameraShotEffect )( effect ) ) )
+			{
+				if( ( runtimeData.currentTime - runtimeData.shotStartTime ) >= timedEffect.startDelay )
+				{
+					if( !( timedEffect.HasStarted() ) )
+					{
+						timedEffect.StartDelayed( runtimeData, resultTransform );
+					}
+					timedEffect.Update( runtimeData, resultTransform );
+				}
+			}
+			else
+			{
+				effect.Update( runtimeData, resultTransform );
+			}
+		}
+		return resultTransform;
+	}
+
+	public function ShouldStop( const finalTransform : WorldTransform ) : Bool
+	{
+		var i : Int32;
+		for( i = 0; i < stopConditions.Size(); i += 1 )
+		{
+			if( stopConditions[ i ].Evaluate( runtimeData, finalTransform ) )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private const function CreateCinematicCameraDataFromContext( context : vehicleCinematicCameraShotUpdateContext ) : CinematicCameraData
+	{
+		var data : CinematicCameraData;
+		data.cameraComponent = context.cameraComponent;
+		data.currentShot = this;
+		data.vehicleTransform = context.vehicleTransform;
+		data.vehicleInitialTransform = data.vehicleTransform;
+		data.vehicleSpeed = context.vehicleSpeed;
+		data.referenceLocalBoundingBox = Box( Vector4( -1.16043401, -2.46429396, -0.30037099, 1.0 ), Vector4( 1.16043401, 2.54005003, 0.81962502, 1.0 ) );
+		data.currentLocalBoundingBox = context.vehicleBoundingBox;
+		data.shotStartTime = context.engineTime;
+		data.currentTime = context.engineTime;
+		data.deltaTime = context.deltaTime;
+		data.shotRootTransform = root.GetRootTransform( data );
+		data.shotSpaceTransform = root.GetShotSpaceTransform( data );
+		data.shotInitialTransform = data.shotRootTransform;
+		return data;
+	}
+
+	private const function UpdateCinematicCameraData( data : ref< CinematicCameraData >, context : vehicleCinematicCameraShotUpdateContext )
+	{
+		data.vehicleTransform = context.vehicleTransform;
+		data.vehicleSpeed = context.vehicleSpeed;
+		data.currentTime = context.engineTime;
+		data.deltaTime = context.deltaTime;
+		data.shotRootTransform = root.GetRootTransform( data );
+		data.shotSpaceTransform = root.GetShotSpaceTransform( data );
+	}
+
+}
+
+import class vehicleCinematicCameraShotGroup extends IScriptable
+{
+	editable var enabled : Bool;
+	import var name : String;
+
+	public import function GetShot( index : Int32 ) : vehicleCinematicCameraShot;
+	public import function GetShotCount() : Int32;
+	public import function GetCondition( index : Int32 ) : vehicleCinematicCameraShotStartCondition;
+	public import function GetConditionCount() : Int32;
+
+	public function CanBeSelected( context : vehicleCinematicCameraShotUpdateContext ) : Bool
+	{
+		var i : Int32;
+		if( !( enabled ) )
+		{
+			return false;
+		}
+		for( i = 0; i < GetConditionCount(); i += 1 )
+		{
+			if( !( GetCondition( i ).Evaluate( context ) ) )
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+}
+
+import class vehicleCinematicCameraShotStartCondition extends IScriptable
+{
+
+	public virtual function Evaluate( context : vehicleCinematicCameraShotUpdateContext ) : Bool
+	{
+		return true;
+	}
+
+}
+
+class vehicleCinematicCameraShotStartCondition_VehicleType extends vehicleCinematicCameraShotStartCondition
+{
+	editable var vehicleType : gamedataVehicleType;
+
+	public override function Evaluate( context : vehicleCinematicCameraShotUpdateContext ) : Bool
+	{
+		return vehicleType == context.vehicleType;
+	}
+
+}
+
+class vehicleCinematicCameraShotStartCondition_MinSpeed extends vehicleCinematicCameraShotStartCondition
+{
+	editable var minSpeed : Float;
+
+	public override function Evaluate( context : vehicleCinematicCameraShotUpdateContext ) : Bool
+	{
+		return context.vehicleSpeed >= ( minSpeed * ( 5.0 / 18.0 ) );
+	}
+
+}
+
+class vehicleCinematicCameraShotStartCondition_MaxSpeed extends vehicleCinematicCameraShotStartCondition
+{
+	editable var maxSpeed : Float;
+
+	public override function Evaluate( context : vehicleCinematicCameraShotUpdateContext ) : Bool
+	{
+		return context.vehicleSpeed < ( maxSpeed * ( 5.0 / 18.0 ) );
+	}
+
+}
+
+import class vehicleCinematicCameraShotStopCondition extends IScriptable
+{
+	public virtual function Reset();
+
+	public virtual function Evaluate( const data : CinematicCameraData, const finalTransform : WorldTransform ) : Bool
+	{
+		return false;
+	}
+
+}
+
+import class vehicleCinematicCameraShotStopCondition_VehicleNotVisible extends vehicleCinematicCameraShotStopCondition
+{
+	editable var timeOutOfSightBeforeStop : Float;
+	default timeOutOfSightBeforeStop = 0.75f;
+	private var counter : Float;
+
+	public override function Reset()
+	{
+		counter = 0.0;
+	}
+
+	public override function Evaluate( const data : CinematicCameraData, const finalTransform : WorldTransform ) : Bool
+	{
+		if( !( data.cameraComponent.CheckIfVehicleIsInFrustum() ) || !( data.cameraComponent.CheckIfHasLineOfSightWithVehicle( Vector4.Vector4To3( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( finalTransform ) ) ) ) ) )
+		{
+			counter += data.deltaTime;
+			if( counter >= timeOutOfSightBeforeStop )
+			{
+				return true;
+			}
+		}
+		else
+		{
+			counter = 0.0;
+		}
+		return false;
+	}
+
+}
+
+import class vehicleCinematicCameraShotStopCondition_VehicleDistanceFromCamera extends vehicleCinematicCameraShotStopCondition
+{
+	editable var maxDistanceFromCamera : Float;
+	default maxDistanceFromCamera = 30f;
+
+	public override function Evaluate( const data : CinematicCameraData, const finalTransform : WorldTransform ) : Bool
+	{
+		var distanceToCameraSquared : Float;
+		distanceToCameraSquared = Vector4.DistanceSquared( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( data.vehicleTransform ) ), WorldPosition.ToVector4( WorldTransform.GetWorldPosition( finalTransform ) ) );
+		return distanceToCameraSquared >= ( maxDistanceFromCamera * maxDistanceFromCamera );
+	}
+
+}
+
+import class vehicleCinematicCameraShotStopCondition_CollisionWithEnvironment extends vehicleCinematicCameraShotStopCondition
+{
+
+	public override function Evaluate( const data : CinematicCameraData, const finalTransform : WorldTransform ) : Bool
+	{
+		return data.cameraComponent.CheckCollisionsAtPosition( Vector4.Vector4To3( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( finalTransform ) ) ) );
+	}
+
+}
+
+import class vehicleCinematicCameraShotRoot extends IScriptable
+{
+	public virtual function Reset();
+
+	public virtual function GetRootTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		return WorldTransform();
+	}
+
+	public virtual function GetShotSpaceTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		return WorldTransform();
+	}
+
+}
+
+class cameraShotRoot_FixedOnVehicle extends vehicleCinematicCameraShotRoot
+{
+	editable var deccelerationAmount : Float;
+	editable var detachToVehicleTime : Float;
+	default detachToVehicleTime = -1.f;
+	private var detachedFromVehicle : Bool;
+	private var detachedDirection : Vector4;
+	private var detachedSpeed : Float;
+	private var detachedTransform : WorldTransform;
+
+	public override function Reset()
+	{
+		detachedFromVehicle = false;
+	}
+
+	public override final function GetRootTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		if( ( !( detachedFromVehicle ) && ( detachToVehicleTime >= 0.0 ) ) && ( data.currentTime > ( data.shotStartTime + detachToVehicleTime ) ) )
+		{
+			detachedFromVehicle = true;
+			detachedTransform = GetRootTransform_Internal( data );
+			detachedSpeed = data.vehicleSpeed;
+			detachedDirection = WorldTransform.GetForward( data.vehicleTransform );
+			return detachedTransform;
+		}
+		if( detachedFromVehicle )
+		{
+			WorldTransform.SetWorldPosition( detachedTransform, WorldTransform.GetWorldPosition( detachedTransform ) + ( detachedDirection * ( detachedSpeed * data.deltaTime ) ) );
+			detachedSpeed = MaxF( 0.0, detachedSpeed - ( deccelerationAmount * data.deltaTime ) );
+			return detachedTransform;
+		}
+		else
+		{
+			return GetRootTransform_Internal( data );
+		}
+	}
+
+	protected virtual function GetRootTransform_Internal( data : CinematicCameraData ) : WorldTransform
+	{
+		return WorldTransform();
+	}
+
+}
+
+class cameraShotRoot_FixedOnVehicleNonSuspensionTracking extends cameraShotRoot_FixedOnVehicle
+{
+	editable var offsetFromCar : Transform;
+
+	protected override function GetRootTransform_Internal( data : CinematicCameraData ) : WorldTransform
+	{
+		return WorldTransform.TransformXForm( GetShotSpaceTransform( data ), CinematicCameraData.ScaleTransformForVehicle( data, offsetFromCar ) );
+	}
+
+	public override function GetShotSpaceTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		var carStabilizedDirection : Vector4;
+		var shotSpaceTransform : WorldTransform;
+		carStabilizedDirection = Vector4.Cross( Vector4.UP(), Quaternion.GetRight( WorldTransform.GetOrientation( data.vehicleTransform ) ) );
+		shotSpaceTransform = data.vehicleTransform;
+		WorldTransform.SetOrientationFromDir( shotSpaceTransform, carStabilizedDirection );
+		return shotSpaceTransform;
+	}
+
+}
+
+class cameraShotRoot_FixedOnVehicleSuspensionTracking extends cameraShotRoot_FixedOnVehicle
+{
+	editable var offsetFromChassis : Transform;
+
+	protected override function GetRootTransform_Internal( data : CinematicCameraData ) : WorldTransform
+	{
+		return WorldTransform.TransformXForm( GetShotSpaceTransform( data ), CinematicCameraData.ScaleTransformForVehicle( data, offsetFromChassis ) );
+	}
+
+	public override function GetShotSpaceTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		return data.vehicleTransform;
+	}
+
+}
+
+class cameraShotRoot_FixedShot extends vehicleCinematicCameraShotRoot
+{
+	editable var offsetFromInitialPosition : Transform;
+
+	public override function GetRootTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		return WorldTransform.TransformXForm( GetShotSpaceTransform( data ), CinematicCameraData.ScaleTransformForVehicle( data, offsetFromInitialPosition ) );
+	}
+
+	public override function GetShotSpaceTransform( data : CinematicCameraData ) : WorldTransform
+	{
+		var fixedShotTransformWorldSpace : WorldTransform;
+		var vehicleRotationWorldSpace : EulerAngles;
+		fixedShotTransformWorldSpace = data.vehicleInitialTransform;
+		vehicleRotationWorldSpace = Quaternion.ToEulerAngles( WorldTransform.GetOrientation( data.vehicleInitialTransform ) );
+		vehicleRotationWorldSpace.Pitch = 0.0;
+		vehicleRotationWorldSpace.Roll = 0.0;
+		WorldTransform.SetOrientationEuler( fixedShotTransformWorldSpace, vehicleRotationWorldSpace );
+		return fixedShotTransformWorldSpace;
+	}
+
+}
+
+struct cameraShotEffect_TranslationAffectedAxis
+{
+	editable var X : Bool;
+	default X = true;
+	editable var Y : Bool;
+	default Y = true;
+	editable var Z : Bool;
+	default Z = true;
+}
+
+class cameraShotEffect_Translation extends vehicleTimedCinematicCameraShotEffect
+{
+	editable var movementCurve : CName;
+	editable var targetTransform : Transform;
+	editable var affectedAxisPosition : cameraShotEffect_TranslationAffectedAxis;
+	editable var ignoreRotation : Bool;
+	default ignoreRotation = false;
+	private var startTransformShotSpace : Transform;
+
+	public override function Reset()
+	{
+		super.Reset();
+		startTransformShotSpace = Transform();
+	}
+
+	public override function Start( data : CinematicCameraData )
+	{
+		super.Start( data );
+		startTransformShotSpace = WorldTransform.TransformInvWorldXForm( data.shotSpaceTransform, data.shotInitialTransform );
+	}
+
+	public override function StartDelayed( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		super.StartDelayed( data, resultTransform );
+		startTransformShotSpace = WorldTransform.TransformInvWorldXForm( data.shotSpaceTransform, resultTransform );
+	}
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var translationProgression : Float;
+		var currentTransformShotSpace : Transform;
+		var targetTransformShotSpace : Transform;
+		var positionAShotSpace, positionBShotSpace, currentPositionShotSpace : Vector4;
+		var lerpedPositionShotSpace : Vector4;
+		var lerpedRotationShotSpace : Quaternion;
+		translationProgression = GetValueFromCurve( movementCurve, GetExecutionTime( data ) / duration );
+		currentTransformShotSpace = WorldTransform.TransformInvWorldXForm( data.shotSpaceTransform, resultTransform );
+		targetTransformShotSpace = CinematicCameraData.ScaleTransformForVehicle( data, targetTransform );
+		positionAShotSpace = Transform.GetPosition( startTransformShotSpace );
+		positionBShotSpace = Transform.GetPosition( targetTransformShotSpace );
+		currentPositionShotSpace = Transform.GetPosition( currentTransformShotSpace );
+		lerpedPositionShotSpace.X = ( ( affectedAxisPosition.X ) ? ( LerpF( translationProgression, positionAShotSpace.X, positionBShotSpace.X ) ) : ( currentPositionShotSpace.X ) );
+		lerpedPositionShotSpace.Y = ( ( affectedAxisPosition.Y ) ? ( LerpF( translationProgression, positionAShotSpace.Y, positionBShotSpace.Y ) ) : ( currentPositionShotSpace.Y ) );
+		lerpedPositionShotSpace.Z = ( ( affectedAxisPosition.Z ) ? ( LerpF( translationProgression, positionAShotSpace.Z, positionBShotSpace.Z ) ) : ( currentPositionShotSpace.Z ) );
+		lerpedRotationShotSpace = ( ( !( ignoreRotation ) ) ? ( Quaternion.Lerp( Transform.GetOrientation( startTransformShotSpace ), Transform.GetOrientation( targetTransformShotSpace ), translationProgression ) ) : ( Transform.GetOrientation( currentTransformShotSpace ) ) );
+		resultTransform = WorldTransform.TransformXForm( data.shotSpaceTransform, Transform.Create( lerpedPositionShotSpace, lerpedRotationShotSpace ) );
+	}
+
+}
+
+class cameraShotEffect_FOV extends vehicleTimedCinematicCameraShotEffect
+{
+	editable var curve : CName;
+	editable var startFOV : Float;
+	editable var endFOV : Float;
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var lerpedFOV : Float;
+		lerpedFOV = GetValueFromCurve( curve, GetExecutionTime( data ) / duration, startFOV, endFOV );
+		data.cameraComponent.SetFOV( lerpedFOV );
+	}
+
+}
+
+class cameraShotEffect_LookAtVehicle extends vehicleTimedCinematicCameraShotEffect
+{
+	editable var aimOffset : Vector4;
+	editable var ignoreHorizontal : Bool;
+	editable var ignoreVertical : Bool;
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var cameraToVehicleDirection : Vector4;
+		var inputAngles : EulerAngles;
+		var lookAtAngles : EulerAngles;
+		cameraToVehicleDirection = ( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( data.vehicleTransform ) ) + ( aimOffset * CinematicCameraData.GetShotScaleRatios( data ) ) ) - WorldPosition.ToVector4( WorldTransform.GetWorldPosition( resultTransform ) );
+		inputAngles = Quaternion.ToEulerAngles( WorldTransform.GetOrientation( resultTransform ) );
+		WorldTransform.SetOrientationFromDir( resultTransform, cameraToVehicleDirection );
+		lookAtAngles = Quaternion.ToEulerAngles( WorldTransform.GetOrientation( resultTransform ) );
+		if( ignoreHorizontal )
+		{
+			lookAtAngles.Yaw = inputAngles.Yaw;
+		}
+		if( ignoreVertical )
+		{
+			lookAtAngles.Pitch = inputAngles.Pitch;
+		}
+		WorldTransform.SetOrientationEuler( resultTransform, lookAtAngles );
+	}
+
+}
+
+import class CameraShotEffect_VectorDamper extends vehicleTimedCinematicCameraShotEffect
+{
+	protected editable var dampingCurve : CName;
+	protected editable var damping : Float;
+
+	protected import function SetDampFactor( dampFactor : Float );
+	protected import function SetCurrValue( currValue : Vector4 );
+	protected import function UpdateDamp( dest : Vector4, dt : Float );
+	protected import function GetDampValue() : Vector4;
+}
+
+import class CameraShotEffect_EulerAnglesDamper extends vehicleTimedCinematicCameraShotEffect
+{
+	protected editable var dampingCurve : CName;
+	protected editable var damping : Float;
+
+	protected import function SetDampFactor( dampFactor : Float );
+	protected import function SetCurrValue( currValue : EulerAngles );
+	protected import function UpdateDamp( dest : EulerAngles, dt : Float );
+	protected import function GetDampValue() : EulerAngles;
+}
+
+class cameraShotEffect_Shake extends CameraShotEffect_EulerAnglesDamper
+{
+	editable var shakeStrength : Float;
+	default shakeStrength = .01f;
+	editable var frequency : Float;
+	default frequency = 1f;
+
+	public override function Start( data : CinematicCameraData )
+	{
+		super.Start( data );
+		SetDampFactor( damping );
+	}
+
+	public override function StartDelayed( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		super.StartDelayed( data, resultTransform );
+		SetDampFactor( damping );
+	}
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var cameraEulerAngles : EulerAngles;
+		var cameraOffset : EulerAngles;
+		var randomVertical : Float;
+		var randomHorizontal : Float;
+		var dampedOffset : EulerAngles;
+		randomVertical = RandPerlinNoiseF( ( ( Int32 )( data.shotStartTime ) ) + 1, data.currentTime * frequency ) * shakeStrength;
+		randomHorizontal = RandPerlinNoiseF( ( ( Int32 )( data.shotStartTime ) ) + 3, data.currentTime * frequency ) * shakeStrength;
+		cameraOffset = EulerAngles( randomHorizontal, randomVertical, 0.0 );
+		UpdateDamp( cameraOffset, data.deltaTime );
+		dampedOffset = GetDampValue();
+		cameraEulerAngles = Quaternion.ToEulerAngles( WorldTransform.GetOrientation( resultTransform ) );
+		cameraEulerAngles.Pitch = cameraEulerAngles.Pitch + dampedOffset.Pitch;
+		cameraEulerAngles.Yaw = cameraEulerAngles.Yaw + dampedOffset.Yaw;
+		WorldTransform.SetOrientationEuler( resultTransform, cameraEulerAngles );
+	}
+
+}
+
+class cameraShotEffect_PositionShake extends CameraShotEffect_VectorDamper
+{
+	editable var shakeStrength : Float;
+	default shakeStrength = .01f;
+	editable var frequency : Float;
+	default frequency = 1f;
+	editable var directionsCoef : Vector3;
+
+	public override function Start( data : CinematicCameraData )
+	{
+		super.Start( data );
+		SetDampFactor( damping );
+	}
+
+	public override function StartDelayed( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		super.StartDelayed( data, resultTransform );
+		SetDampFactor( damping );
+	}
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var cameraPosition : Vector4;
+		var cameraOffset : Vector4;
+		var randomVertical : Float;
+		var randomHorizontal : Float;
+		var randomForward : Float;
+		var dampedOffset : Vector4;
+		randomVertical = RandPerlinNoiseF( ( ( Int32 )( data.shotStartTime ) ) + 100, data.currentTime * frequency ) * shakeStrength;
+		randomHorizontal = RandPerlinNoiseF( ( ( Int32 )( data.shotStartTime ) ) + 200, data.currentTime * frequency ) * shakeStrength;
+		randomForward = RandPerlinNoiseF( ( ( Int32 )( data.shotStartTime ) ) + 300, data.currentTime * frequency ) * shakeStrength;
+		cameraOffset = Vector4( randomHorizontal * directionsCoef.X, randomForward * directionsCoef.Y, randomVertical * directionsCoef.Z, 0.0 );
+		UpdateDamp( cameraOffset, data.deltaTime );
+		dampedOffset = GetDampValue();
+		cameraPosition = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( resultTransform ) );
+		cameraPosition += ( WorldTransform.GetRight( resultTransform ) * dampedOffset.X );
+		cameraPosition += ( WorldTransform.GetForward( resultTransform ) * dampedOffset.Y );
+		cameraPosition += ( WorldTransform.GetUp( resultTransform ) * dampedOffset.Z );
+		WorldTransform.SetPosition( resultTransform, cameraPosition );
+	}
+
+}
+
+class CameraShotEffect_PositionDamper extends CameraShotEffect_VectorDamper
+{
+
+	public override function Start( data : CinematicCameraData )
+	{
+		super.Start( data );
+		SetDampFactor( damping );
+		SetCurrValue( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( data.shotInitialTransform ) ) );
+	}
+
+	public override function StartDelayed( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		super.StartDelayed( data, resultTransform );
+		SetDampFactor( damping );
+		SetCurrValue( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( resultTransform ) ) );
+	}
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var targetTransform : Vector4;
+		var curveDamping : Float;
+		targetTransform = WorldPosition.ToVector4( WorldTransform.GetWorldPosition( resultTransform ) );
+		curveDamping = GetValueFromCurve( dampingCurve, GetExecutionTime( data ) / duration );
+		SetDampFactor( curveDamping );
+		UpdateDamp( targetTransform, data.deltaTime );
+		WorldTransform.SetPosition( resultTransform, GetDampValue() );
+	}
+
+}
+
+class CameraShotEffect_RotationDamper extends CameraShotEffect_EulerAnglesDamper
+{
+
+	public override function Start( data : CinematicCameraData )
+	{
+		super.Start( data );
+		SetDampFactor( damping );
+		SetCurrValue( Quaternion.ToEulerAngles( WorldTransform.GetOrientation( data.shotInitialTransform ) ) );
+	}
+
+	public override function StartDelayed( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		super.StartDelayed( data, resultTransform );
+		SetDampFactor( damping );
+		SetCurrValue( Quaternion.ToEulerAngles( WorldTransform.GetOrientation( resultTransform ) ) );
+	}
+
+	public override function Update( data : CinematicCameraData, resultTransform : ref< WorldTransform > )
+	{
+		var targetTransform : EulerAngles;
+		var curveDamping : Float;
+		targetTransform = Quaternion.ToEulerAngles( WorldTransform.GetOrientation( resultTransform ) );
+		curveDamping = damping * GetValueFromCurve( dampingCurve, GetExecutionTime( data ) / duration );
+		SetDampFactor( curveDamping );
+		UpdateDamp( targetTransform, data.deltaTime );
+		WorldTransform.SetOrientationEuler( resultTransform, GetDampValue() );
+	}
+
+}
+
+import class vehicleCinematicCameraComponent extends CameraComponent
+{
+	import var teleportThisFrame : Bool;
+	import var targetTransform : WorldTransform;
+
+	public import function GetGroup( index : Int32 ) : vehicleCinematicCameraShotGroup;
+	public import function GetGroupCount() : Int32;
+	public import function GetEngineTime() : EngineTime;
+	public import function CheckCollisionsAtPosition( position : Vector3 ) : Bool;
+	public import function CheckIfShotIsObstructed( position : Vector3, direction : Vector3 ) : Bool;
+	public import function CheckIfHasLineOfSightWithVehicle( position : Vector3 ) : Bool;
+	public import function CheckIfVehicleIsInFrustum() : Bool;
+
+	editable var middleZoneSizeForShotSelection : Float;
+	default middleZoneSizeForShotSelection = .5f;
+	editable var consecutiveStaticShotsProbabilityBonus : Int32;
+	default consecutiveStaticShotsProbabilityBonus = 2;
+	editable var consecutiveDynamicShotsProbabilityBonus : Int32;
+	default consecutiveDynamicShotsProbabilityBonus = 1;
+	editable var maxProbabilityBonusFromCameraProximityToShot : Float;
+	default maxProbabilityBonusFromCameraProximityToShot = 3.f;
+	editable var maxDistanceFromCameraToHaveProbabilityBonusForShot : Float;
+	default maxDistanceFromCameraToHaveProbabilityBonusForShot = 5.f;
+	private var lastChangeTime : Float;
+	default lastChangeTime = 0f;
+	private var shotChangeRequested : Bool;
+	default shotChangeRequested = false;
+	private var currentShot : vehicleCinematicCameraShot;
+	private var lastShot : vehicleCinematicCameraShot;
+
+	public const function GetLastShot() : vehicleCinematicCameraShot
+	{
+		return lastShot;
+	}
+
+	public const function GetWorldPosition() : WorldPosition
+	{
+		return WorldTransform.GetWorldPosition( targetTransform );
+	}
+
+	public export function UpdateCameraState( context : vehicleCinematicCameraShotUpdateContext )
+	{
+		if( shotChangeRequested || ( context.engineTime > ( lastChangeTime + currentShot.duration ) ) )
+		{
+			lastChangeTime = context.engineTime;
+			currentShot.Reset();
+			lastShot = currentShot;
+			ChangeCameraShot( context );
+			currentShot.Start( context );
+			targetTransform = currentShot.Update( context );
+			teleportThisFrame = true;
+			shotChangeRequested = false;
+		}
+		else
+		{
+			targetTransform = currentShot.Update( context );
+			shotChangeRequested = currentShot.ShouldStop( targetTransform );
+		}
+	}
+
+	private function ChangeCameraShot( context : vehicleCinematicCameraShotUpdateContext )
+	{
+		var i : Int32;
+		var possibleGroups : array< Int32 >;
+		var possibleShots : array< vehicleCinematicCameraShot >;
+		var nextShot : vehicleCinematicCameraShot;
+		var nextShotTransform : WorldTransform;
+		var nextShotPosition : Vector3;
+		var nextShotDirection : Vector3;
+		var isNextShotSuitable : Bool;
+		for( i = 0; i < GetGroupCount(); i += 1 )
+		{
+			if( GetGroup( i ).CanBeSelected( context ) )
+			{
+				possibleGroups.PushBack( i );
+			}
+		}
+		if( possibleGroups.Size() == 0 )
+		{
+			return;
+		}
+		for( i = 0; i < possibleGroups.Size(); i += 1 )
+		{
+			ExtractShotsFromGroup( GetGroup( possibleGroups[ i ] ), context, possibleShots );
+		}
+		if( possibleShots.Size() == 0 )
+		{
+			return;
+		}
+		else if( possibleShots.Size() == 1 )
+		{
+			currentShot = possibleShots[ 0 ];
+			return;
+		}
+		do
+		{
+			isNextShotSuitable = true;
+			nextShot = SelectRandomShot( possibleShots, context );
+			if( !( nextShot ) )
+			{
+				return;
+			}
+			nextShotTransform = nextShot.GetRootTransformFromContext( context );
+			nextShotPosition = Vector4.Vector4To3( WorldPosition.ToVector4( WorldTransform.GetWorldPosition( nextShotTransform ) ) );
+			nextShotDirection = Vector4.Vector4To3( Quaternion.GetForward( WorldTransform.GetOrientation( nextShotTransform ) ) );
+			if( ( currentShot.name == nextShot.name || CheckIfShotIsObstructed( nextShotPosition, nextShotDirection ) ) || !( CheckIfHasLineOfSightWithVehicle( nextShotPosition ) ) )
+			{
+				possibleShots.Remove( nextShot );
+				isNextShotSuitable = false;
+			}
+		}
+		while( !( isNextShotSuitable ) );
+		currentShot = nextShot;
+	}
+
+	private function ExtractShotsFromGroup( group : vehicleCinematicCameraShotGroup, context : vehicleCinematicCameraShotUpdateContext, shots : ref< array< vehicleCinematicCameraShot > > )
+	{
+		var i : Int32;
+		var shot : vehicleCinematicCameraShot;
+		for( i = 0; i < group.GetShotCount(); i += 1 )
+		{
+			shot = group.GetShot( i );
+			if( shot.GetCanBeSelectedFromContext( context ) )
+			{
+				shots.PushBack( shot );
+			}
+		}
+	}
+
+	private function SelectRandomShot( possibleShots : array< vehicleCinematicCameraShot >, context : vehicleCinematicCameraShotUpdateContext ) : vehicleCinematicCameraShot
+	{
+		var i : Int32;
+		var random : Int32;
+		var totalWeights : Int32;
+		var shotsProbability : array< Int32 >;
+		for( i = 0; i < possibleShots.Size(); i += 1 )
+		{
+			shotsProbability.PushBack( possibleShots[ i ].GetShotProbabilityFromContext( context ) );
+			totalWeights += shotsProbability.Last();
+		}
+		random = RandRange( 0, totalWeights );
+		totalWeights = 0;
+		for( i = 0; i < possibleShots.Size(); i += 1 )
+		{
+			totalWeights += shotsProbability[ i ];
+			if( totalWeights > random )
+			{
+				return possibleShots[ i ];
+			}
+		}
+		return NULL;
+	}
+
+}
+

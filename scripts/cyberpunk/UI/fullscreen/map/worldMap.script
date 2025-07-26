@@ -75,7 +75,12 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	protected import function TrackMappin( mappinController : BaseMappinBaseController );
 	protected import function UntrackMappin();
 	protected import function TrackCustomPositionMappin();
+	protected import function TrackDelamainTaxiMappin();
 	protected import function UntrackCustomPositionMappin();
+	protected import function UntrackDelamainTaxiMappin();
+	protected import function ConfirmDelamainTaxiMappinPosition();
+	protected import function CancelDelamainTaxiMappinPosition();
+	protected import function GetTravelDistance() : Float;
 	protected import function SetMappinVisited( mappinController : BaseWorldMapMappinController );
 	protected import function MoveToPlayer();
 	protected import function ZoomToMappin( mappinController : BaseWorldMapMappinController );
@@ -96,6 +101,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private editable var m_preloaderWidget : inkWidgetRef;
 	private editable var m_gameTimeText : inkTextRef;
 	private editable var m_fastTravelInstructions : inkWidgetRef;
+	private editable var m_delamainTaxiInstructions : inkWidgetRef;
 	private editable var m_filterSelector : inkWidgetRef;
 	private editable var m_filterSelectorWarning : inkWidgetRef;
 	private editable var m_filterText : inkTextRef;
@@ -125,6 +131,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private import const var selectedDistrict : gamedataDistrict;
 	private import const var canChangeCustomFilter : Bool;
 	private import var selectedMappin : weak< BaseWorldMapMappinController >;
+	private import const var delamainTaxiMappinID : NewMappinID;
 	private var m_cameraMode : gameuiEWorldMapCameraMode;
 	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
 	private var m_tooltipController : weak< WorldMapTooltipContainer >;
@@ -173,6 +180,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		m_currentHoveredDistrict = gamedataDistrict.Invalid;
 		m_showedSubdistrictGangs = false;
 		inkWidgetRef.SetVisible( m_fastTravelInstructions, false );
+		inkWidgetRef.SetVisible( m_delamainTaxiInstructions, false );
 		inkWidgetRef.SetVisible( m_openInJournalButton, false );
 		HideAllTooltips();
 		m_cameraMode = gameuiEWorldMapCameraMode.TopDown;
@@ -218,6 +226,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		evt = new inkMenuLayer_SetCursorType;
 		evt.Init( 'default' );
 		QueueEvent( evt );
+		CancelDelamainTaxiMappinPosition();
 	}
 
 	private function InitializeQuickFiltersList()
@@ -406,7 +415,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		var isQuestType : Bool;
 		var questType : gameJournalQuestType;
 		m_mappinsPositions.Clear();
-		if( IsFastTravelEnabled() )
+		if( IsFastTravelEnabled() || IsDelamainTaxiEnabled() )
 		{
 			return;
 		}
@@ -464,6 +473,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	protected event OnEntityAttached()
 	{
 		var fastTravelEnabled : Bool;
+		var delamainTaxiEnabled : Bool;
 		var mappinSpawnContainer : weak< inkCompoundWidget >;
 		var delayEvent : MapNavigationDelay;
 		var preloaderController : weak< WorldMapPreloader >;
@@ -481,6 +491,8 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		{
 			SetQuickFilter( gamedataWorldMapFilter.FastTravel );
 		}
+		delamainTaxiEnabled = IsDelamainTaxiEnabled();
+		UpdateDelamainTaxiVisiblity( delamainTaxiEnabled );
 		if( m_initMappinFocus )
 		{
 			delayEvent = new MapNavigationDelay;
@@ -654,8 +666,17 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	protected event OnBack( userData : IScriptable )
 	{
 		var evt : BackActionCallback;
+		var request : CancelDelamainRideRequest;
+		request = new CancelDelamainRideRequest;
 		PlaySound( 'Button', 'OnPress' );
-		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) && !( m_pressedRMB ) )
+		if( IsDelamainTaxiEnabled() && !( m_pressedRMB ) )
+		{
+			m_menuEventDispatcher.SpawnEvent( 'OnCancel' );
+			request.forceExit = true;
+			GetDelamainTaxiSystem().QueueRequest( request );
+			UntrackDelamainTaxiMappin();
+		}
+		else if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) && !( m_pressedRMB ) )
 		{
 			evt = new BackActionCallback;
 			QueueEvent( evt );
@@ -680,6 +701,13 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		inkWidgetRef.SetVisible( m_fastTravelInstructions, fastTravelEnabled );
 		inkWidgetRef.SetVisible( m_topShadow, !( fastTravelEnabled ) );
 		inkWidgetRef.SetVisible( m_openInJournalButton, !( fastTravelEnabled ) );
+	}
+
+	private function UpdateDelamainTaxiVisiblity( delamainTaxiEnabled : Bool )
+	{
+		inkWidgetRef.SetVisible( m_delamainTaxiInstructions, delamainTaxiEnabled );
+		inkWidgetRef.SetVisible( m_topShadow, !( delamainTaxiEnabled ) );
+		inkWidgetRef.SetVisible( m_openInJournalButton, !( delamainTaxiEnabled ) );
 	}
 
 	private function NavigateCustomFilters( option : ECustomFilterDPadNavigationOption )
@@ -872,6 +900,15 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		}
 	}
 
+	private function TryConfirmDelamainTaxi() : Bool
+	{
+		if( HasSelectedDelamainTaxiMappin() )
+		{
+			return CanPay();
+		}
+		return false;
+	}
+
 	private function PrepFastTravel()
 	{
 		var player : GameObject;
@@ -901,8 +938,18 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		{
 			return;
 		}
-		if( selectedMappin != NULL )
+		if( IsDelamainTaxiEnabled() )
 		{
+			TrackDelamainTaxiMappin();
+			UpdateTravelDestination();
+			UpdateSelectedMappinTooltip();
+		}
+		else if( selectedMappin != NULL )
+		{
+			if( selectedMappin.IsDelamainTaxiTracked() )
+			{
+				return;
+			}
 			if( ( selectedMappin.IsInCollection() && selectedMappin.IsCollection() ) || !( selectedMappin.IsInCollection() ) )
 			{
 				if( CanQuestTrackMappin( selectedMappin ) )
@@ -924,7 +971,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 						PlaySound( 'MapPin', 'OnDisable' );
 						PlayRumble( RumbleStrength.SuperLight, RumbleType.Pulse, RumblePosition.Right );
 					}
-					else if( selectedMappin.IsPlayerTracked() )
+					else if( selectedMappin.IsPlayerTracked() && selectedMappin.IsDelamainTaxiTracked() )
 					{
 						UntrackMappin();
 						PlaySound( 'MapPin', 'OnDisable' );
@@ -961,6 +1008,20 @@ import class WorldMapMenuGameController extends MappinsContainerController
 			return;
 		}
 		m_journalManager.TrackEntry( journalEntry );
+	}
+
+	private function UpdateTravelDestination()
+	{
+		var request : SetTravelDestinationRequest;
+		request = new SetTravelDestinationRequest;
+		request.mappinID = delamainTaxiMappinID;
+		request.cost = GetTravelCost();
+		GetDelamainTaxiSystem().QueueRequest( request );
+	}
+
+	private function GetTravelCost() : Int32
+	{
+		return CeilF( GetTravelDistance() / 500.0 ) * 50;
 	}
 
 	private function FastTravel()
@@ -1202,6 +1263,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private function HandleHoldInput( e : inkPointerEvent )
 	{
 		var holdProgress : Float;
+		var request : StartDelamainTaxiRequest;
 		if( e.IsAction( 'world_map_menu_fast_travel' ) )
 		{
 			holdProgress = e.GetHoldProgress();
@@ -1210,6 +1272,27 @@ import class WorldMapMenuGameController extends MappinsContainerController
 				return;
 			}
 			TryFastTravel();
+		}
+		else if( e.IsAction( 'world_map_menu_confirm_delamain_taxi' ) )
+		{
+			holdProgress = e.GetHoldProgress();
+			if( holdProgress < 1.0 )
+			{
+				return;
+			}
+			if( IsDelamainTaxiEnabled() && TryConfirmDelamainTaxi() )
+			{
+				request = new StartDelamainTaxiRequest;
+				request.m_price = GetTravelCost();
+				GetDelamainTaxiSystem().QueueRequest( request );
+				m_menuEventDispatcher.SpawnEvent( 'OnConfirm' );
+				ConfirmDelamainTaxiMappinPosition();
+			}
+			else
+			{
+				m_tooltipController.PlayPaymentErrorAnimation();
+				PlaySound( 'Attributes', 'OnFail' );
+			}
 		}
 	}
 
@@ -1364,6 +1447,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private function UpdateTooltip( tooltipType : WorldMapTooltipType, controller : weak< BaseWorldMapMappinController > )
 	{
 		var toolTipData : WorldMapTooltipData;
+		var transactionSystem : TransactionSystem;
 		if( controller != NULL )
 		{
 			toolTipData.controller = controller;
@@ -1374,6 +1458,13 @@ import class WorldMapMenuGameController extends MappinsContainerController
 			toolTipData.isCollection = controller.IsCollection();
 		}
 		toolTipData.fastTravelEnabled = IsFastTravelEnabled();
+		if( IsDelamainTaxiEnabled() )
+		{
+			toolTipData.delamainTaxiEnabled = true;
+			toolTipData.travelCost = GetTravelCost();
+			transactionSystem = GameInstance.GetTransactionSystem( m_player.GetGame() );
+			toolTipData.playerMoney = transactionSystem.GetItemQuantity( m_player, MarketSystem.Money() );
+		}
 		m_tooltipController.SetData( tooltipType, toolTipData, this );
 	}
 
@@ -1488,6 +1579,16 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		return GetFastTravelSystem().IsFastTravelEnabledOnMap();
 	}
 
+	private function GetDelamainTaxiSystem() : DelamainTaxiSystem
+	{
+		return ( ( DelamainTaxiSystem )( GameInstance.GetScriptableSystemsContainer( GetOwner().GetGame() ).Get( 'DelamainTaxiSystem' ) ) );
+	}
+
+	public function IsDelamainTaxiEnabled() : Bool
+	{
+		return GetDelamainTaxiSystem().IsDelamainTaxiEnabledOnMap();
+	}
+
 	private function GetOwner() : GameObject
 	{
 		return ( ( GameObject )( GetOwnerEntity() ) );
@@ -1496,6 +1597,11 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private function HasSelectedMappin() : Bool
 	{
 		return selectedMappin != NULL;
+	}
+
+	private function HasSelectedDelamainTaxiMappin() : Bool
+	{
+		return delamainTaxiMappinID.value != 0;
 	}
 
 	private const function GetMappinJournalEntry( mappin : IMappin ) : JournalEntry
@@ -1596,6 +1702,29 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		return isZoomToMappinEnabled;
 	}
 
+	private function CanPay() : Bool
+	{
+		var gi : GameInstance;
+		var autoDriveSystem : AutoDriveSystem;
+		var transactionSystem : TransactionSystem;
+		var playerMoney : Int32;
+		var travelCost : Int32;
+		gi = m_player.GetGame();
+		autoDriveSystem = ( ( AutoDriveSystem )( GameInstance.GetScriptableSystemsContainer( gi ).Get( 'AutoDriveSystem' ) ) );
+		travelCost = GetTravelCost();
+		if( autoDriveSystem.CheckCurrentLaneValidity() != gameAutodriveLaneValidityResult.OnValidLane )
+		{
+			return false;
+		}
+		transactionSystem = GameInstance.GetTransactionSystem( gi );
+		playerMoney = transactionSystem.GetItemQuantity( m_player, MarketSystem.Money() );
+		if( travelCost > playerMoney )
+		{
+			return false;
+		}
+		return true;
+	}
+
 }
 
 import class BaseWorldMapMappinController extends BaseInteractionMappinController
@@ -1683,10 +1812,16 @@ import class BaseWorldMapMappinController extends BaseInteractionMappinControlle
 		var mappinVariant : gamedataMappinVariant;
 		var mappinPhase : gamedataMappinPhase;
 		var texturePart : CName;
+		var color : CName;
 		mappinVariant = m_mappin.GetVariant();
 		mappinPhase = m_mappin.GetPhase();
 		texturePart = MappinUIUtils.MappinToTexturePart( mappinVariant, mappinPhase );
 		inkImageRef.SetTexturePart( iconWidget, texturePart );
+		color = MappinUIUtils.MappinToColor( mappinVariant );
+		if( color != '' )
+		{
+			inkImageRef.Get( iconWidget ).BindProperty( 'tintColor', color );
+		}
 		if( inkWidgetRef.IsValid( playerTrackedWidget ) )
 		{
 			inkWidgetRef.SetVisible( playerTrackedWidget, IsTracked() );

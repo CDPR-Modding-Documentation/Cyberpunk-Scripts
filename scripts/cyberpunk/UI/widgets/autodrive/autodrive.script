@@ -1,0 +1,567 @@
+enum AutoDriveDriveType
+{
+	GoToDestination = 0,
+	FreeRoam = 1,
+}
+
+class AutoDriveController extends inkHUDGameController
+{
+	editable var m_inputHintContainer : inkWidgetRef;
+	editable var m_autoDriveContentContainer : inkWidgetRef;
+	editable var m_countersContainer : inkWidgetRef;
+	editable var m_freeRoamHeaderContainer : inkWidgetRef;
+	editable var m_remainingDistanceCounterContainer : inkWidgetRef;
+	editable var m_remainingDistanceCounterText : inkTextRef;
+	editable var m_remainingTimeCounterContainer : inkWidgetRef;
+	editable var m_remainingTimeCounterText : inkTextRef;
+	private var m_gameInstance : GameInstance;
+	private var m_autoDriveSystem : weak< AutoDriveSystem >;
+	private var m_player : weak< PlayerPuppet >;
+	private var m_autodriveBB : weak< IBlackboard >;
+	private var m_autodriveBBDef : UI_AutodriveDataDef;
+	private var m_quickslotBB : weak< IBlackboard >;
+	private var m_quickslotBBDef : UI_QuickSlotsDataDef;
+	private var m_fakeUpdateProxy : inkAnimProxy;
+	private var m_autoDriveEnabledCallbackHandle : CallbackHandle;
+	private var m_cinematicCameraCallbackHandle : CallbackHandle;
+	private var m_autoDriveAvailableCallbackHandle : CallbackHandle;
+	private var m_freeRoamEnabledCallbackHandle : CallbackHandle;
+	private var m_radialWheelCallbackHandle : CallbackHandle;
+	private var m_playerVehicleStateCallbackHandle : CallbackHandle;
+	private var m_q000StartedListenerId : Uint32;
+	private var m_dpadHintsVisibilityEnabledListenerId : Uint32;
+	private var m_remainingDistanceCounterTextParams : inkTextParams;
+	private var m_remainingTimeCounterTextParams : inkTextParams;
+	private var m_inputHintVisibilityAnimProxy : inkAnimProxy;
+	private var m_inputHintVisible : Bool;
+	private var m_wheelIconAnimProxy : inkAnimProxy;
+	private var m_wheelAnimationEnabled : Bool;
+	private var m_isHoldingDirectionInput : Bool;
+	private var m_slowCloseAnimProxy : inkAnimProxy;
+	private var m_slowCloseAnimIsReversed : Bool;
+	private var m_containerAnimProxy : inkAnimProxy;
+	private var m_containerVisible : Bool;
+	private var m_containerAnimationPlaying : Bool;
+	private var m_rootAnimProxy : inkAnimProxy;
+	private var m_rootVisible : Bool;
+	default m_rootVisible = true;
+	private var m_activeDriveType : AutoDriveDriveType;
+	private var m_headerAnimProxy : inkAnimProxy;
+	private var m_inputHintDriveTypeAnimProxy : inkAnimProxy;
+
+	protected event OnInitialize()
+	{
+		m_gameInstance = GetPlayerControlledObject().GetGame();
+		m_autoDriveSystem = ( ( AutoDriveSystem )( GameInstance.GetScriptableSystemsContainer( m_gameInstance ).Get( 'AutoDriveSystem' ) ) );
+		m_autodriveBBDef = GetAllBlackboardDefs().UI_AutodriveData;
+		m_autodriveBB = GameInstance.GetBlackboardSystem( m_gameInstance ).Get( m_autodriveBBDef );
+		m_quickslotBBDef = GetAllBlackboardDefs().UI_QuickSlotsData;
+		m_quickslotBB = GameInstance.GetBlackboardSystem( m_gameInstance ).Get( m_quickslotBBDef );
+		InitTextDisplays();
+		m_autoDriveEnabledCallbackHandle = m_autodriveBB.RegisterListenerBool( m_autodriveBBDef.AutoDriveEnabled, this, 'OnAutoDriveStateChanged' );
+		SetContainerVisibility( m_autodriveBB.GetBool( m_autodriveBBDef.AutoDriveEnabled ), true, true );
+		m_cinematicCameraCallbackHandle = m_autodriveBB.RegisterListenerBool( m_autodriveBBDef.CinematicCameraActive, this, 'OnCinematicCameraChanged' );
+		OnCinematicCameraChanged( m_autodriveBB.GetBool( m_autodriveBBDef.CinematicCameraActive ) );
+		m_radialWheelCallbackHandle = m_quickslotBB.RegisterListenerBool( m_quickslotBBDef.UIRadialContextRequest, this, 'OnRadialMenuShown' );
+		OnRadialMenuShown( m_quickslotBB.GetBool( m_quickslotBBDef.UIRadialContextRequest ) );
+		m_autoDriveAvailableCallbackHandle = m_autodriveBB.RegisterListenerBool( m_autodriveBBDef.AutoDriveAvailable, this, 'OnAutoDriveAvailabilityChanged' );
+		OnAutoDriveAvailabilityChanged( m_autodriveBB.GetBool( m_autodriveBBDef.AutoDriveAvailable ) );
+		m_freeRoamEnabledCallbackHandle = m_autodriveBB.RegisterListenerBool( m_autodriveBBDef.FreeRoamEnabled, this, 'OnFreeRoamStateChanged' );
+		UpdateActiveDriveType( false );
+		SetAvailabilityUpdateEnabled( true );
+		GetRootWidget().RegisterToCallback( 'OnSlowCloseAnimationThresholdCallback', this, 'OnSlowCloseAnimationThreshold' );
+	}
+
+	protected event OnPlayerAttach( playerPuppet : GameObject )
+	{
+		m_player = ( ( PlayerPuppet )( playerPuppet ) );
+		if( m_player )
+		{
+			m_q000StartedListenerId = GameInstance.GetQuestsSystem( m_player.GetGame() ).RegisterListener( 'q000_started', this, 'OnFactChange' );
+			m_dpadHintsVisibilityEnabledListenerId = GameInstance.GetQuestsSystem( m_player.GetGame() ).RegisterListener( 'dpad_hints_visibility_enabled', this, 'OnFactChange' );
+			m_playerVehicleStateCallbackHandle = m_player.GetPlayerStateMachineBlackboard().RegisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, this, 'OnPlayerVehicleStateChange' );
+			UpdateInputHintVisibility( true, true );
+			m_player.RegisterInputListener( this, 'HoldAutodrive' );
+			m_player.RegisterInputListener( this, 'ToggleAutodrive' );
+			m_player.RegisterInputListener( this, 'TurnX' );
+			m_player.RegisterInputListener( this, 'Accelerate' );
+			m_player.RegisterInputListener( this, 'Decelerate' );
+		}
+	}
+
+	protected event OnUninitialize()
+	{
+		m_autodriveBB.UnregisterListenerBool( m_autodriveBBDef.AutoDriveEnabled, m_autoDriveEnabledCallbackHandle );
+		m_autodriveBB.UnregisterListenerBool( m_autodriveBBDef.CinematicCameraActive, m_cinematicCameraCallbackHandle );
+		m_autodriveBB.UnregisterListenerBool( m_autodriveBBDef.AutoDriveAvailable, m_autoDriveAvailableCallbackHandle );
+		m_autodriveBB.UnregisterListenerBool( m_autodriveBBDef.FreeRoamEnabled, m_freeRoamEnabledCallbackHandle );
+		m_quickslotBB.UnregisterListenerBool( m_quickslotBBDef.UIRadialContextRequest, m_radialWheelCallbackHandle );
+		SetAvailabilityUpdateEnabled( false );
+		GetRootWidget().UnregisterFromCallback( 'OnSlowCloseAnimationThresholdCallback', this, 'OnSlowCloseAnimationThreshold' );
+	}
+
+	protected event OnPlayerDetach( playerPuppet : GameObject )
+	{
+		if( m_player )
+		{
+			GameInstance.GetQuestsSystem( m_player.GetGame() ).UnregisterListener( 'q000_started', m_q000StartedListenerId );
+			GameInstance.GetQuestsSystem( m_player.GetGame() ).UnregisterListener( 'dpad_hints_visibility_enabled', m_dpadHintsVisibilityEnabledListenerId );
+			m_player.GetPlayerStateMachineBlackboard().UnregisterListenerInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle, m_playerVehicleStateCallbackHandle );
+			m_player.UnregisterInputListener( this, 'HoldAutodrive' );
+			m_player.UnregisterInputListener( this, 'ToggleAutodrive' );
+			m_player.UnregisterInputListener( this, 'TurnX' );
+			m_player.UnregisterInputListener( this, 'Accelerate' );
+			m_player.UnregisterInputListener( this, 'Decelerate' );
+		}
+	}
+
+	private function InitTextDisplays()
+	{
+		m_remainingDistanceCounterTextParams = new inkTextParams;
+		m_remainingDistanceCounterTextParams.AddMeasurement( "DISTANCE", 0.0, EMeasurementUnit.Meter );
+		m_remainingDistanceCounterTextParams.AddString( "UNIT", GetLocalizedText( NameToString( MeasurementUtils.GetUnitLocalizationKey( UILocalizationHelper.GetSystemBaseUnit() ) ) ) );
+		inkTextRef.SetText( m_remainingDistanceCounterText, "{DISTANCE}{UNIT}", m_remainingDistanceCounterTextParams );
+		m_remainingTimeCounterTextParams = new inkTextParams;
+		m_remainingTimeCounterTextParams.AddTime( "TIME", 0 );
+		inkTextRef.SetText( m_remainingTimeCounterText, "{TIME,time,mm:ss}", m_remainingTimeCounterTextParams );
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		if( !( m_inputHintVisible ) )
+		{
+			return true;
+		}
+		if( ( ListenerAction.IsAction( action, 'HoldAutodrive' ) && ListenerAction.GetType( action ) == gameinputActionType.BUTTON_HOLD_COMPLETE ) && !( IsAnimationPlaying() ) )
+		{
+			PlayLibraryAnimation( 'onUse' );
+			if( m_autoDriveSystem.GetAutodriveEnabled() )
+			{
+				m_autoDriveSystem.QueueRequest( new DisableAutoDriveRequest );
+			}
+			else
+			{
+				m_autoDriveSystem.QueueRequest( new EnableAutoDriveRequest );
+			}
+		}
+		else if( ListenerAction.IsAction( action, 'ToggleAutodrive' ) && ListenerAction.IsButtonJustReleased( action ) )
+		{
+			if( m_autoDriveSystem.GetAutodriveEnabled() )
+			{
+				m_autoDriveSystem.QueueRequest( new ToggleFreeRoamRequest );
+			}
+		}
+		else if( ( ListenerAction.IsAction( action, 'Accelerate' ) || ListenerAction.IsAction( action, 'Decelerate' ) ) && !( IsAnimationPlaying() ) )
+		{
+			if( AbsF( ListenerAction.GetValue( action ) ) >= 0.1 )
+			{
+				if( m_autoDriveSystem.GetAutodriveEnabled() )
+				{
+					m_autoDriveSystem.QueueRequest( new DisableAutoDriveRequest );
+				}
+			}
+		}
+		if( !( m_containerVisible ) )
+		{
+			return true;
+		}
+		if( ListenerAction.IsAction( action, 'TurnX' ) )
+		{
+			m_isHoldingDirectionInput = AbsF( ListenerAction.GetValue( action ) ) >= 0.1;
+			UpdateSlowCloseAnimationState();
+		}
+	}
+
+	private function OnAutoDriveStateChanged( state : Bool )
+	{
+		if( state )
+		{
+			SetContainerVisibility( !( m_autoDriveSystem.GetAutodriveIsDelamain() ), false, false );
+			SetWheelAnimationEnabled( true );
+			SetDataUpdateEnabled( true );
+			UpdateActiveDriveType( true );
+			UpdateUIData();
+		}
+		else
+		{
+			SetContainerVisibility( false, false, false );
+			SetWheelAnimationEnabled( false );
+			SetDataUpdateEnabled( false );
+			UpdateUIData();
+		}
+		UpdateInputHintState();
+	}
+
+	private function OnCinematicCameraChanged( active : Bool )
+	{
+		GetRootWidget().SetVisible( !( active ) );
+	}
+
+	private function SetContainerVisibility( visible : Bool, instant : Bool, force : Bool )
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.dependsOnTimeDilation = false;
+		if( visible == m_containerVisible && !( force ) )
+		{
+			return;
+		}
+		m_containerVisible = visible;
+		if( m_containerAnimProxy.IsValid() && m_containerAnimProxy.IsPlaying() )
+		{
+			m_containerAnimProxy.Stop();
+		}
+		if( instant )
+		{
+			inkWidgetRef.SetVisible( m_autoDriveContentContainer, visible );
+			return;
+		}
+		inkWidgetRef.SetVisible( m_autoDriveContentContainer, true );
+		m_containerAnimProxy = PlayLibraryAnimation( ( ( visible ) ? ( 'autoDriveOpen' ) : ( 'autoDriveClose' ) ), playbackOptions );
+		m_containerAnimationPlaying = true;
+		m_containerAnimProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnContainerAnimationFinished' );
+	}
+
+	protected event OnContainerAnimationFinished( proxy : inkAnimProxy )
+	{
+		m_containerAnimationPlaying = false;
+		m_containerAnimProxy = NULL;
+	}
+
+	protected event OnRadialMenuShown( value : Bool )
+	{
+		SetRootVisibility( !( value ) );
+	}
+
+	private function SetRootVisibility( visible : Bool )
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.dependsOnTimeDilation = false;
+		if( visible == m_rootVisible )
+		{
+			return;
+		}
+		m_rootVisible = visible;
+		if( m_rootAnimProxy.IsValid() && m_rootAnimProxy.IsPlaying() )
+		{
+			m_rootAnimProxy.Stop();
+		}
+		m_rootAnimProxy = PlayLibraryAnimation( ( ( visible ) ? ( 'showRoot' ) : ( 'hideRoot' ) ), playbackOptions );
+	}
+
+	private function OnAutoDriveAvailabilityChanged( state : Bool )
+	{
+		UpdateInputHintState();
+	}
+
+	private function OnFreeRoamStateChanged( state : Bool )
+	{
+		SetActiveDriveType( ( ( state ) ? ( AutoDriveDriveType.FreeRoam ) : ( AutoDriveDriveType.GoToDestination ) ), false );
+	}
+
+	private function UpdateActiveDriveType( force : Bool )
+	{
+		SetActiveDriveType( ( ( m_autodriveBB.GetBool( m_autodriveBBDef.FreeRoamEnabled ) ) ? ( AutoDriveDriveType.FreeRoam ) : ( AutoDriveDriveType.GoToDestination ) ), force );
+	}
+
+	private function SetActiveDriveType( type : AutoDriveDriveType, force : Bool )
+	{
+		var playbackOptions : inkAnimOptions;
+		playbackOptions.dependsOnTimeDilation = false;
+		if( !( force ) && type == m_activeDriveType )
+		{
+			return;
+		}
+		m_activeDriveType = type;
+		if( m_headerAnimProxy.IsValid() && m_headerAnimProxy.IsPlaying() )
+		{
+			m_headerAnimProxy.Stop();
+		}
+		if( m_inputHintDriveTypeAnimProxy.IsValid() && m_inputHintDriveTypeAnimProxy.IsPlaying() )
+		{
+			m_inputHintDriveTypeAnimProxy.GotoEndAndStop();
+		}
+		if( type == AutoDriveDriveType.GoToDestination )
+		{
+			m_remainingDistanceCounterTextParams.UpdateMeasurement( "DISTANCE", 0.0, EMeasurementUnit.Meter );
+			m_remainingTimeCounterTextParams.UpdateTime( "TIME", 0 );
+		}
+		if( !( m_autodriveBB.GetBool( m_autodriveBBDef.AutoDriveDelamain ) ) )
+		{
+			m_headerAnimProxy = PlayLibraryAnimation( ( ( type == AutoDriveDriveType.GoToDestination ) ? ( 'showCounters' ) : ( 'showFreeRoamHeader' ) ), playbackOptions );
+			m_inputHintDriveTypeAnimProxy = PlayLibraryAnimation( ( ( type == AutoDriveDriveType.GoToDestination ) ? ( 'switchToGoToDestination' ) : ( 'switchToFreeroam' ) ), playbackOptions );
+		}
+	}
+
+	private function OnPlayerVehicleStateChange( value : Int32 )
+	{
+		UpdateInputHintVisibility( false, false );
+	}
+
+	private function OnFactChange( factValue : Int32 )
+	{
+		UpdateInputHintVisibility( false, false );
+	}
+
+	private function ShouldInputHintBeVisible() : Bool
+	{
+		var playerVehicleState : Int32;
+		if( !( m_player ) )
+		{
+			return false;
+		}
+		if( GameInstance.GetQuestsSystem( m_gameInstance ).GetFact( 'q000_started' ) && !( GameInstance.GetQuestsSystem( m_gameInstance ).GetFact( 'dpad_hints_visibility_enabled' ) ) )
+		{
+			return false;
+		}
+		playerVehicleState = m_player.GetPlayerStateMachineBlackboard().GetInt( GetAllBlackboardDefs().PlayerStateMachine.Vehicle );
+		if( ( playerVehicleState != ( ( Int32 )( gamePSMVehicle.Driving ) ) ) && ( playerVehicleState != ( ( Int32 )( gamePSMVehicle.DriverCombat ) ) ) )
+		{
+			return false;
+		}
+		if( m_autodriveBB.GetBool( m_autodriveBBDef.CinematicCameraActive ) )
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private function UpdateInputHintVisibility( instant : Bool, force : Bool )
+	{
+		var visible : Bool;
+		var previousProgression : Float;
+		var playbackOptions : inkAnimOptions;
+		previousProgression = -1.0;
+		playbackOptions.dependsOnTimeDilation = false;
+		visible = ShouldInputHintBeVisible();
+		if( visible == m_inputHintVisible && !( force ) )
+		{
+			inkWidgetRef.SetVisible( m_inputHintContainer, visible );
+			return;
+		}
+		m_inputHintVisible = visible;
+		if( m_inputHintVisibilityAnimProxy.IsValid() && m_inputHintVisibilityAnimProxy.IsPlaying() )
+		{
+			previousProgression = m_inputHintVisibilityAnimProxy.GetProgression();
+			m_inputHintVisibilityAnimProxy.Stop();
+		}
+		if( instant )
+		{
+			inkWidgetRef.SetVisible( m_inputHintContainer, visible );
+			return;
+		}
+		inkWidgetRef.SetVisible( m_inputHintContainer, true );
+		m_inputHintVisibilityAnimProxy = PlayLibraryAnimation( ( ( visible ) ? ( 'showInputHint' ) : ( 'hideInputHint' ) ), playbackOptions );
+		if( previousProgression >= 0.0 )
+		{
+			m_inputHintVisibilityAnimProxy.SetNormalizedPosition( 1.0 - previousProgression, true );
+		}
+	}
+
+	private function UpdateInputHintState()
+	{
+		var autodriveAvailable : Bool;
+		var autodriveEnabled : Bool;
+		autodriveAvailable = m_autodriveBB.GetBool( m_autodriveBBDef.AutoDriveAvailable );
+		autodriveEnabled = m_autodriveBB.GetBool( m_autodriveBBDef.AutoDriveEnabled );
+		inkWidgetRef.Get( m_inputHintContainer ).SetState( ( ( autodriveAvailable || autodriveEnabled ) ? ( 'Default' ) : ( 'Unavailable' ) ) );
+	}
+
+	private function SetWheelAnimationEnabled( enabled : Bool )
+	{
+		var animOptions : inkAnimOptions;
+		animOptions.dependsOnTimeDilation = true;
+		if( m_wheelAnimationEnabled == enabled )
+		{
+			return;
+		}
+		m_wheelAnimationEnabled = enabled;
+		if( m_wheelIconAnimProxy.IsValid() && m_wheelIconAnimProxy.IsPlaying() )
+		{
+			m_wheelIconAnimProxy.Stop();
+		}
+		if( enabled )
+		{
+			animOptions.loopType = inkanimLoopType.Cycle;
+			animOptions.loopInfinite = true;
+			m_wheelIconAnimProxy = PlayLibraryAnimation( 'wheelSwivel', animOptions );
+		}
+		else
+		{
+			m_wheelIconAnimProxy = PlayLibraryAnimation( 'wheelRest', animOptions );
+		}
+	}
+
+	protected event OnDataUpdate( proxy : inkAnimProxy )
+	{
+		UpdateUIData();
+	}
+
+	private function UpdateUIData()
+	{
+		if( !( m_autoDriveSystem ) )
+		{
+			return;
+		}
+		if( m_autoDriveSystem.GetAutodriveDestinationType() != gameAutodriveDestinationType.None )
+		{
+			inkWidgetRef.SetVisible( m_remainingDistanceCounterContainer, true );
+			m_remainingDistanceCounterTextParams.UpdateMeasurement( "DISTANCE", m_autoDriveSystem.GetDistanceToCurrentDestination(), EMeasurementUnit.Meter );
+			inkWidgetRef.SetVisible( m_remainingTimeCounterContainer, true );
+			m_remainingTimeCounterTextParams.UpdateTime( "TIME", FloorF( m_autoDriveSystem.GetEstimatedTimeToArrival() ) );
+		}
+		else
+		{
+			inkWidgetRef.SetVisible( m_remainingDistanceCounterContainer, false );
+			inkWidgetRef.SetVisible( m_remainingTimeCounterContainer, false );
+		}
+	}
+
+	protected event OnAvailabilityUpdate( proxy : inkAnimProxy )
+	{
+		m_autoDriveSystem.QueueRequest( new UpdateAutoDriveAvailabilityRequest );
+	}
+
+	private function UpdateSlowCloseAnimationState()
+	{
+		var animOptions : inkAnimOptions;
+		if( m_isHoldingDirectionInput )
+		{
+			if( !( m_slowCloseAnimProxy.IsPlaying() ) )
+			{
+				animOptions.dependsOnTimeDilation = false;
+				animOptions.playReversed = false;
+				StartSlowCloseAnimProxy( animOptions );
+			}
+			else if( m_slowCloseAnimIsReversed )
+			{
+				ChangeSlowCloseAnimationDirection();
+			}
+		}
+		else
+		{
+			if( m_slowCloseAnimProxy.IsPlaying() && !( m_slowCloseAnimIsReversed ) )
+			{
+				ChangeSlowCloseAnimationDirection();
+			}
+		}
+	}
+
+	private function ChangeSlowCloseAnimationDirection()
+	{
+		var animOptions : inkAnimOptions;
+		var progression : Float;
+		if( m_slowCloseAnimProxy.IsValid() && m_slowCloseAnimProxy.IsPlaying() )
+		{
+			progression = m_slowCloseAnimProxy.GetProgression();
+			animOptions.dependsOnTimeDilation = false;
+			animOptions.playReversed = !( m_slowCloseAnimIsReversed );
+			if( animOptions.playReversed )
+			{
+				animOptions.applyCustomTimeDilation = true;
+				animOptions.customTimeDilation = 3.0;
+			}
+			StartSlowCloseAnimProxy( animOptions );
+			m_slowCloseAnimProxy.SetNormalizedPosition( 1.0 - progression, true );
+		}
+	}
+
+	private function StartSlowCloseAnimProxy( animOptions : inkAnimOptions )
+	{
+		if( m_slowCloseAnimProxy.IsValid() && m_slowCloseAnimProxy.IsPlaying() )
+		{
+			m_slowCloseAnimProxy.Stop();
+		}
+		m_slowCloseAnimIsReversed = animOptions.playReversed;
+		m_slowCloseAnimProxy = PlayLibraryAnimation( 'autoDriveCloseSlowly', animOptions );
+	}
+
+	protected event OnSlowCloseAnimationThreshold( target : weak< inkWidget > )
+	{
+		if( m_autoDriveSystem.GetAutodriveEnabled() )
+		{
+			m_autoDriveSystem.QueueRequest( new DisableAutoDriveRequest );
+			m_containerVisible = false;
+		}
+	}
+
+	private function SetDataUpdateEnabled( on : Bool )
+	{
+		var anim : inkAnimDef;
+		var alphaInterpolator : inkAnimTransparency;
+		var animOptions : inkAnimOptions;
+		if( on )
+		{
+			anim = new inkAnimDef;
+			alphaInterpolator = new inkAnimTransparency;
+			alphaInterpolator.SetDuration( 1.0 );
+			alphaInterpolator.SetStartTransparency( 1.0 );
+			alphaInterpolator.SetEndTransparency( 1.0 );
+			alphaInterpolator.SetType( inkanimInterpolationType.Linear );
+			alphaInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+			anim.AddInterpolator( alphaInterpolator );
+			animOptions.playReversed = false;
+			animOptions.executionDelay = 0.0;
+			animOptions.loopType = inkanimLoopType.Cycle;
+			animOptions.loopInfinite = true;
+			m_fakeUpdateProxy = GetRootWidget().PlayAnimationWithOptions( anim, animOptions );
+			m_fakeUpdateProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnDataUpdate' );
+		}
+		else
+		{
+			if( m_fakeUpdateProxy.IsPlaying() )
+			{
+				m_fakeUpdateProxy.Stop();
+				m_fakeUpdateProxy.UnregisterFromCallback( inkanimEventType.OnEndLoop, this, 'OnDataUpdate' );
+			}
+		}
+	}
+
+	private function SetAvailabilityUpdateEnabled( on : Bool )
+	{
+		var anim : inkAnimDef;
+		var alphaInterpolator : inkAnimTransparency;
+		var animOptions : inkAnimOptions;
+		if( on )
+		{
+			anim = new inkAnimDef;
+			alphaInterpolator = new inkAnimTransparency;
+			alphaInterpolator.SetDuration( 0.2 );
+			alphaInterpolator.SetStartTransparency( 1.0 );
+			alphaInterpolator.SetEndTransparency( 1.0 );
+			alphaInterpolator.SetType( inkanimInterpolationType.Linear );
+			alphaInterpolator.SetMode( inkanimInterpolationMode.EasyIn );
+			anim.AddInterpolator( alphaInterpolator );
+			animOptions.playReversed = false;
+			animOptions.executionDelay = 0.0;
+			animOptions.loopType = inkanimLoopType.Cycle;
+			animOptions.loopInfinite = true;
+			m_fakeUpdateProxy = GetRootWidget().PlayAnimationWithOptions( anim, animOptions );
+			m_fakeUpdateProxy.RegisterToCallback( inkanimEventType.OnEndLoop, this, 'OnAvailabilityUpdate' );
+		}
+		else
+		{
+			if( m_fakeUpdateProxy.IsPlaying() )
+			{
+				m_fakeUpdateProxy.Stop();
+				m_fakeUpdateProxy.UnregisterFromCallback( inkanimEventType.OnEndLoop, this, 'OnAvailabilityUpdate' );
+			}
+		}
+	}
+
+	private const function IsAnimationPlaying() : Bool
+	{
+		return m_containerAnimationPlaying || ( m_inputHintVisibilityAnimProxy.IsValid() && m_inputHintVisibilityAnimProxy.IsPlaying() );
+	}
+
+}
+
+class AutoDriveAnimationEventListener extends inkLogicController
+{
+
+	protected event OnSlowCloseAnimationThresholdEvent()
+	{
+		GetRootWidget().CallCustomCallback( 'OnSlowCloseAnimationThresholdCallback' );
+	}
+
+}
+
