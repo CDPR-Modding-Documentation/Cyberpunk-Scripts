@@ -57,9 +57,6 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 	private var m_comparisonResolver : ItemPreferredComparisonResolver;
 	private var m_equipmentSystem : weak< EquipmentSystem >;
 	private var m_EquipAreas : array< gamedataEquipmentArea >;
-	private var m_CyberwareAreas : array< gamedataEquipmentArea >;
-	private var m_WeaponAreas : array< gamedataItemType >;
-	private var m_PocketAreas : array< gamedataEquipmentArea >;
 	private var m_ConsumablesAreas : array< gamedataEquipmentArea >;
 	protected var m_UIBBEquipment : UI_EquipmentDef;
 	protected var m_UIBBItemMod : UI_ItemModSystemDef;
@@ -110,9 +107,6 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		m_uiScriptableSystem = UIScriptableSystem.GetInstance( m_player.GetGame() );
 		m_equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( m_player.GetGame() ).Get( 'EquipmentSystem' ) ) );
 		m_EquipAreas = InventoryDataManagerV2.GetInventoryEquipmentAreas();
-		m_CyberwareAreas = InventoryDataManagerV2.GetInventoryCyberwareAreas();
-		m_WeaponAreas = InventoryDataManagerV2.GetInventoryWeaponTypes();
-		m_PocketAreas = InventoryDataManagerV2.GetInventoryPocketAreas();
 		m_TooltipsManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_TooltipsManagerRef, 'gameuiTooltipsManager' ) ) );
 		m_TooltipsManager.Setup( ETooltipsStyle.Menus );
 		m_buttonHintsController = ( ( ButtonHints )( SpawnFromExternal( inkWidgetRef.Get( m_buttonHintsManagerRef ), R"base\gameplay\gui\common\buttonhints.inkwidget", 'Root' ).GetController() ) );
@@ -355,7 +349,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 	protected event OnSortingButtonClicked( evt : inkPointerEvent )
 	{
 		var controller : DropdownListController;
-		if( evt.IsAction( 'click' ) )
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
 		{
 			PlaySound( 'Button', 'OnPress' );
 			controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
@@ -513,6 +507,9 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		var controller : DropdownListController;
 		SwapMode( InventoryModes.Default );
 		m_itemModeLogicController.m_isShown = false;
+		m_canToggleWeapon = true;
+		m_isInputLockedForSelect = false;
+		m_isInputLockedForClick = false;
 		StartModeTransitionAnimation();
 		controller = ( ( DropdownListController )( inkWidgetRef.GetController( m_sortingDropdown ) ) );
 		controller.Close();
@@ -768,10 +765,10 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 					currentEquipmentArea = equipmentAreas[ 0 ];
 					container.displayControllers[ i ].Bind( m_InventoryManager, currentEquipmentArea, i, ItemDisplayContext.GearPanel, clothingSetIndex > -1, clothingSetIndex );
 				}
+				container.displayControllers[ i ].SetItemCounterDisabled( true );
 				container.displayControllers[ i ].BindComparisonAndScriptableSystem( m_uiScriptableSystem, m_comparisonResolver );
 				container.displayControllers[ i ].SetLocked( isOutfitEquipped && IsAreaLockedByOutfit( currentEquipmentArea ), true );
 				container.displayControllers[ i ].SetTransmoged( m_wardrobeOutfitAreas.Contains( currentEquipmentArea ) );
-				container.displayControllers[ i ].SetItemCounterDisabled( true );
 			}
 		}
 	}
@@ -859,12 +856,18 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		m_equipmentSystem.QueueRequest( req );
 	}
 
+
+	private var m_isInputLockedForSelect : Bool;
+	private var m_isInputLockedForClick : Bool;
+	private var m_canToggleWeapon : Bool;
+
 	protected event OnEquipmentClick( evt : ItemDisplayClickEvent )
 	{
 		var controller : weak< InventoryItemDisplayController >;
 		var itemData : InventoryItemData;
 		var hotkey : EHotkey;
 		var pressedOpenModsExclusiveHotkey : Bool;
+		var weaponDisplayController : InventoryWeaponDisplayController;
 		controller = evt.display;
 		if( m_mode == InventoryModes.Item )
 		{
@@ -873,6 +876,16 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		if( evt.actionName.IsAction( 'install_quickhack' ) )
 		{
 			pressedOpenModsExclusiveHotkey = true;
+		}
+		if( ( ( evt.actionName.IsAction( 'switch_to_secondary' ) && !( InventoryItemData.IsEmpty( evt.itemData ) ) ) && InventoryItemData.IsWeapon( evt.itemData ) ) && InventoryItemData.CanDualWield( evt.itemData ) )
+		{
+			ToggleDualWieldWeapon( evt.display.GetSlotIndex(), false );
+			return false;
+		}
+		if( evt.actionName.IsAction( 'switch_to_primary' ) )
+		{
+			ToggleDualWieldWeapon( evt.display.GetSlotIndex(), true );
+			return false;
 		}
 		if( evt.actionName.IsAction( 'unequip_item' ) )
 		{
@@ -920,6 +933,19 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		}
 		else if( evt.actionName.IsAction( 'select' ) || evt.actionName.IsAction( 'click' ) )
 		{
+			if( m_canToggleWeapon )
+			{
+				if( m_isInputLockedForClick )
+				{
+					m_isInputLockedForClick = false;
+					return false;
+				}
+				if( m_isInputLockedForSelect )
+				{
+					m_isInputLockedForSelect = false;
+					return false;
+				}
+			}
 			PlaySound( 'Button', 'OnPress' );
 			if( controller.GetEquipmentArea() == gamedataEquipmentArea.Invalid )
 			{
@@ -949,8 +975,47 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 			}
 			else if( !( evt.toggleVisibilityRequest ) )
 			{
+				weaponDisplayController = ( ( InventoryWeaponDisplayController )( controller ) );
+				if( weaponDisplayController )
+				{
+					if( weaponDisplayController.GetToggleToPrimary() || weaponDisplayController.GetToggleToSecondary() )
+					{
+						ToggleDualWieldWeapon( evt.display.GetSlotIndex(), weaponDisplayController.GetToggleToPrimary() );
+						weaponDisplayController.ResetToggle();
+						evt.evt.Handle();
+						return false;
+					}
+				}
 				OpenItemMode( controller.GetItemDisplayData() );
 			}
+		}
+	}
+
+	private function ToggleDualWieldWeapon( slotIndex : Int32, isLeftWeapon : Bool )
+	{
+		var currentEquipmentArea : array< gamedataEquipmentArea >;
+		var equipmentAreaDisplays : EquipmentAreaDisplays;
+		var equipmentAreaCategory : EquipmentAreaCategory;
+		var weaponDisplayController : InventoryWeaponDisplayController;
+		var displayedSlotIndex : Int32;
+		var targetSlotIndex : Int32;
+		var dualWieldIndexOffset : Int32;
+		dualWieldIndexOffset = ( ( Int32 )( WeaponSlot.LeftSlot_1 ) );
+		if( !( m_InventoryManager.HasPlayerDualWield() ) )
+		{
+			return;
+		}
+		currentEquipmentArea.PushBack( gamedataEquipmentArea.Weapon );
+		equipmentAreaCategory = GetEquipmentCategoryByArea( currentEquipmentArea[ 0 ] );
+		equipmentAreaDisplays = GetEquipmentAreaDisplaysFromCategory( currentEquipmentArea, equipmentAreaCategory );
+		displayedSlotIndex = ( ( isLeftWeapon ) ? ( slotIndex - dualWieldIndexOffset ) : ( slotIndex ) );
+		targetSlotIndex = ( ( isLeftWeapon ) ? ( displayedSlotIndex ) : ( displayedSlotIndex + dualWieldIndexOffset ) );
+		weaponDisplayController = ( ( InventoryWeaponDisplayController )( equipmentAreaDisplays.displayControllers[ displayedSlotIndex ] ) );
+		if( weaponDisplayController )
+		{
+			weaponDisplayController.Bind( m_InventoryManager, currentEquipmentArea[ 0 ], targetSlotIndex, ItemDisplayContext.GearPanel, false, -1 );
+			m_itemModeLogicController.UpdateDualWieldHint( weaponDisplayController );
+			m_itemModeLogicController.UpdateItemDisplayHover( weaponDisplayController.GetItemData() );
 		}
 	}
 
@@ -1025,6 +1090,25 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		}
 	}
 
+	protected event OnItemDisplayHold( evt : ItemDisplayHoldEvent )
+	{
+		var isLeftWeapon : Bool;
+		isLeftWeapon = ( evt.display.GetSlotIndex() >= ( ( Int32 )( WeaponSlot.LeftSlot_1 ) ) ) && ( evt.display.GetSlotIndex() <= ( ( Int32 )( WeaponSlot.LeftSlot_3 ) ) );
+		if( evt.actionName.IsAction( 'switch_to_other_weapon' ) && ( ( !( InventoryItemData.IsEmpty( evt.itemData ) ) && InventoryItemData.CanDualWield( evt.itemData ) ) || ( InventoryItemData.IsEmpty( evt.itemData ) && isLeftWeapon ) ) )
+		{
+			m_isInputLockedForSelect = true;
+			m_isInputLockedForClick = true;
+			m_canToggleWeapon = false;
+			ToggleDualWieldWeapon( evt.display.GetSlotIndex(), isLeftWeapon );
+			QueueEvent( new DelayedItemDisplayHold );
+		}
+	}
+
+	protected event OnDelayedResetDualWieldItemToggled( evt : DelayedItemDisplayHold )
+	{
+		m_canToggleWeapon = true;
+	}
+
 	protected event OnOpenInventoryQuantityPickerRequest( request : OpenInventoryQuantityPickerRequest )
 	{
 		OpenQuantityPicker( request.itemData, request.actionType );
@@ -1086,8 +1170,17 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 	{
 		var paperdollTargetPosition : PaperdollPositionAnimation;
 		var isItemACyberdeck : Bool;
+		var pairedWeaponDisplayData : InventoryItemDisplayData;
 		SwapMode( InventoryModes.Item );
-		m_itemModeLogicController.SetupMode( displayData, m_InventoryManager, this );
+		pairedWeaponDisplayData = CreatePairedItemDisplayData( displayData );
+		if( displayData.m_equipmentArea == gamedataEquipmentArea.Weapon && EquipmentSystemPlayerData.IsLeftWeaponSlotIndex( displayData.m_slotIndex ) )
+		{
+			m_itemModeLogicController.SetupMode( pairedWeaponDisplayData, displayData, m_InventoryManager, this, true );
+		}
+		else
+		{
+			m_itemModeLogicController.SetupMode( displayData, pairedWeaponDisplayData, m_InventoryManager, this );
+		}
 		QueueEvent( new DelayedSetItemModeShown );
 		paperdollTargetPosition = GetEquipmentAreaPaperdollLocation( displayData.m_equipmentArea );
 		if( paperdollTargetPosition == PaperdollPositionAnimation.Right )
@@ -1123,6 +1216,23 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		StartModeTransitionAnimation( displayData );
 	}
 
+	private function CreatePairedItemDisplayData( displayData : InventoryItemDisplayData ) : InventoryItemDisplayData
+	{
+		var pairedDisplayData : InventoryItemDisplayData;
+		var pairedItemData : InventoryItemData;
+		var slotIndex : Int32;
+		if( displayData.m_equipmentArea != gamedataEquipmentArea.Weapon )
+		{
+			return pairedDisplayData;
+		}
+		slotIndex = EquipmentSystemPlayerData.GetOppositeWeaponSlotIndex( displayData.m_slotIndex );
+		pairedItemData = m_InventoryManager.GetWeaponEquippedInSlot( slotIndex );
+		pairedDisplayData.m_itemID = InventoryItemData.GetID( pairedItemData );
+		pairedDisplayData.m_equipmentArea = displayData.m_equipmentArea;
+		pairedDisplayData.m_slotIndex = slotIndex;
+		return pairedDisplayData;
+	}
+
 	protected event OnDelayedSetItemModeShown( evt : DelayedSetItemModeShown )
 	{
 		m_itemModeLogicController.m_isShown = true;
@@ -1137,6 +1247,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 	{
 		m_InventoryManager.UnequipItem( controller.GetEquipmentArea(), controller.GetSlotIndex() );
 		m_InventoryManager.RemoveInventoryItemFromCache( controller.GetItemID() );
+		m_itemModeLogicController.SetInventoryItemButtonHintsHoverOut();
 	}
 
 	private function EquipItem( const itemData : ref< InventoryItemData > )
@@ -1149,11 +1260,11 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 			}
 			if( InventoryItemData.GetEquipmentArea( itemData ) == gamedataEquipmentArea.Weapon )
 			{
-				m_InventoryManager.EquipItem( InventoryItemData.GetID( itemData ), GetFirstAvailableWeaponSlot() );
+				m_InventoryManager.EquipItem( InventoryItemData.GetID( itemData ), GetFirstAvailableWeaponSlot(), true );
 			}
 			else
 			{
-				m_InventoryManager.EquipItem( InventoryItemData.GetID( itemData ), 0 );
+				m_InventoryManager.EquipItem( InventoryItemData.GetID( itemData ), 0, true );
 			}
 		}
 	}
@@ -1759,7 +1870,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 				controllerLabel = "Gameplay-RPG-Items-Categories-Cyberware";
 			break;
 			case gamedataEquipmentArea.Weapon:
-				controllerLabel = "Gameplay-RPG-Items-Categories-Weapon";
+				controllerLabel = ( ( EquipmentSystemPlayerData.IsLeftWeaponSlotIndex( displayData.m_slotIndex ) ) ? ( "Gameplay-Weapons-DualWield-SecondaryWeapon" ) : ( "Gameplay-RPG-Items-Categories-Weapon" ) );
 			break;
 			case gamedataEquipmentArea.QuickSlot:
 			case gamedataEquipmentArea.Gadget:
@@ -2252,6 +2363,10 @@ class DelayedRefreshUI extends Event
 }
 
 class DelayedSetItemModeShown extends Event
+{
+}
+
+class DelayedItemDisplayHold extends Event
 {
 }
 

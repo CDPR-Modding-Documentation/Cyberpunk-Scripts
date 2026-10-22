@@ -124,6 +124,7 @@ import class WeaponObject extends ItemObject
 	public import function StopContinuousAttack();
 	public import function IsContinuousAttackStarted() : Bool;
 	public import function GetCurrentRangedAttack() : weak< RangedAttackPackage_Record >;
+	public import function GetAttachedSlotID() : TweakDBID;
 	public import function HasScope() : Bool;
 	public import function GetScopeOffset() : Vector4;
 	public import function GetIronSightOffset() : Vector4;
@@ -342,6 +343,16 @@ import class WeaponObject extends ItemObject
 		return m_triggerEffectName;
 	}
 
+	public function IsEquippedInLeftHand() : Bool
+	{
+		return GetAttachedSlotID() == T"AttachmentSlots.WeaponLeft";
+	}
+
+	public function GetStateMachineBlackboardID() : BlackboardID_Int
+	{
+		return ( ( IsEquippedInLeftHand() ) ? ( GetAllBlackboardDefs().PlayerStateMachine.LeftWeapon ) : ( GetAllBlackboardDefs().PlayerStateMachine.RightWeapon ) );
+	}
+
 	public constexpr static function GetBaseMaxChargeThreshold( self : WeaponObject ) : Float
 	{
 		return GameInstance.GetStatsSystem( self.GetGame() ).GetStatValue( self.GetEntityID(), gamedataStatType.BaseMaxChargeThreshold );
@@ -396,6 +407,11 @@ import class WeaponObject extends ItemObject
 		return 0;
 	}
 
+	public static function IsDiscardable( self : WeaponObject ) : Bool
+	{
+		return self && ( self.GetItemData().HasTag( 'DiscardOnEmpty' ) || self.GetWeaponRecord().EquipArea().Type() == gamedataEquipmentArea.WeaponHeavy );
+	}
+
 	public static function GetMagazineCapacity( self : WeaponObject ) : Uint32
 	{
 		if( self )
@@ -409,7 +425,7 @@ import class WeaponObject extends ItemObject
 	{
 		if( self )
 		{
-			return ( ( Float )( self.GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCount ) ) ) / ( ( Float )( self.GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCapacity ) ) );
+			return ( ( Float )( GetMagazineAmmoCount( self ) ) ) / ( ( Float )( GetMagazineCapacity( self ) ) );
 		}
 		return -1.0;
 	}
@@ -443,7 +459,7 @@ import class WeaponObject extends ItemObject
 
 	public function IsMagazineEmpty() : Bool
 	{
-		return GetSharedData().GetUint( GetAllBlackboardDefs().Weapon.MagazineAmmoCount ) <= ( ( Uint32 )( 0 ) );
+		return GetMagazineAmmoCount( this ) <= ( ( Uint32 )( 0 ) );
 	}
 
 	public static function IsMagazineEmpty( self : WeaponObject ) : Bool
@@ -526,7 +542,7 @@ import class WeaponObject extends ItemObject
 		animFeature = new AnimFeature_WeaponStats;
 		animFeature.cycleTime = statSystem.GetStatValue( weaponStatsID, gamedataStatType.CycleTime );
 		animFeature.magazineCapacity = ( ( Int32 )( statSystem.GetStatValue( weaponStatsID, gamedataStatType.MagazineCapacity ) ) );
-		AnimationControllerComponent.ApplyFeature( this, 'WeaponStats', animFeature );
+		AnimationControllerComponent.ApplyFeature( this, ( ( IsEquippedInLeftHand() ) ? ( 'LeftWeaponStats' ) : ( 'RightWeaponStats' ) ), animFeature );
 	}
 
 	private function OnUpdateWeaponStatsEvent( evt : UpdateWeaponStatsEvent )
@@ -710,6 +726,22 @@ import class WeaponObject extends ItemObject
 		return false;
 	}
 
+	public static function IsMonowire( weaponID : ItemID ) : Bool
+	{
+		var wpnRec : WeaponItem_Record;
+		var type : gamedataItemType;
+		wpnRec = TweakDBInterface.GetWeaponItemRecord( ItemID.GetTDBID( weaponID ) );
+		if( wpnRec )
+		{
+			type = wpnRec.ItemType().Type();
+			if( type == gamedataItemType.Cyb_NanoWires )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public static function IsOfType( weaponID : ItemID, type : gamedataItemType ) : Bool
 	{
 		var wpnRec : WeaponItem_Record;
@@ -732,6 +764,11 @@ import class WeaponObject extends ItemObject
 	public constexpr static function GetRangedWeaponTag() : CName
 	{
 		return 'RangedWeapon';
+	}
+
+	public constexpr static function GetDualWieldWeaponTag() : CName
+	{
+		return 'DualWield';
 	}
 
 	public constexpr static function GetShotgunWeaponTag() : CName
@@ -1307,7 +1344,7 @@ import class WeaponObject extends ItemObject
 					PlayPerfectChargeEvent( this, 'perfectChargeShot' );
 					PlayPerfectChargeUIEvent( 'perfectChargeShot' );
 				}
-				if( ( GetBlackboardIntVariable( GetAllBlackboardDefs().PlayerStateMachine.Weapon ) == ( ( Int32 )( gamePSMRangedWeaponStates.Ready ) ) ) && ( evt.newValue <= 0.0 ) )
+				if( ( GetBlackboardIntVariable( GetStateMachineBlackboardID() ) == ( ( Int32 )( gamePSMRangedWeaponStates.Ready ) ) ) && ( evt.newValue <= 0.0 ) )
 				{
 					m_perfectChargeStarted = false;
 					m_perfectChargeReached = false;
@@ -1500,6 +1537,24 @@ import class WeaponObject extends ItemObject
 			WeaponObject.TriggerWeaponEffects( this, gamedataFxAction.ExitLowAmmo );
 			m_lowAmmoEffectActive = false;
 		}
+	}
+
+	public static function ForceEnableReloading( self : WeaponObject ) : Bool
+	{
+		var weaponOwner : PlayerPuppet;
+		var questSystem : QuestsSystem;
+		var allowOnlyPatternInputs : Bool;
+		weaponOwner = ( ( PlayerPuppet )( self.GetOwner() ) );
+		if( weaponOwner && weaponOwner.IsVRReplacer() )
+		{
+			allowOnlyPatternInputs = StatusEffectSystem.ObjectHasStatusEffectWithTag( weaponOwner, 'AllowOnlyMotionPatternInputs' );
+			questSystem = GameInstance.GetQuestsSystem( weaponOwner.GetGame() );
+			if( ( allowOnlyPatternInputs && ( questSystem.GetFact( 'gyro_reload_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_reload_tutorial_seen' ) == 0 ) )
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 }
