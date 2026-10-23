@@ -87,6 +87,13 @@ function IsFriendlyTowardsPlayer( object : weak< GameObject > ) : Bool
 	return false;
 }
 
+function SetValue_GyroAimingIsShootingWithRangedWeapon( value : Bool, gameInstance : GameInstance )
+{
+	var gyroBlackboard : IBlackboard;
+	gyroBlackboard = GameInstance.GetBlackboardSystem( gameInstance ).Get( GetAllBlackboardDefs().GyroRestrictions );
+	gyroBlackboard.SetBool( GetAllBlackboardDefs().GyroRestrictions.IsShootingWithRangedWeapon, value );
+}
+
 struct KeyBindings
 {
 	persistent var DPAD_UP : TweakDBID;
@@ -468,6 +475,12 @@ class PlayerPuppet extends ScriptedPuppet
 	var m_contactsActiveListener : CallbackHandle;
 	var m_smsMessengerActiveListener : CallbackHandle;
 	var m_currentVisibleTargetListener : CallbackHandle;
+	var m_joyconDualStyleChangedListener : CallbackHandle;
+	var m_onInputStyleChangedListener : CallbackHandle;
+	var m_chargeAttackPatternListener : CallbackHandle;
+	var m_patternMatchingMeleeEnabledListener : CallbackHandle;
+	private var m_isInsideOfChargePattern : Bool;
+	private var m_isPatternMatchingMeleeEnabled : Bool;
 	var lastScanTarget : weak< GameObject >;
 	var meleeSelectInputProcessed : Bool;
 	private var m_waitingForDelayEvent : Bool;
@@ -494,6 +507,7 @@ class PlayerPuppet extends ScriptedPuppet
 	private var m_autoRevealListener : AutoRevealStatListener;
 	private var m_allStatsListener : PlayerPuppetAllStatListener;
 	private var m_rightHandAttachmentSlotListener : AttachmentSlotsScriptListener;
+	private var m_leftHandAttachmentSlotListener : AttachmentSlotsScriptListener;
 	private var m_HealingItemsChargeStatListener : HealingItemsChargeStatListener;
 	private var m_GrenadesChargeStatListener : GrenadesChargeStatListener;
 	private var m_ProjectileLauncherChargeStatListener : ProjectileLauncherChargeStatListener;
@@ -525,6 +539,7 @@ class PlayerPuppet extends ScriptedPuppet
 	private var m_focusModeActive : Bool;
 	private var m_customFastForwardPossible : Bool;
 	private var m_equippedRightHandWeapon : weak< WeaponObject >;
+	private var m_equippedLeftHandWeapon : weak< WeaponObject >;
 	private var m_aimAssistUpdateQueued : Bool;
 	private var m_locomotionState : Int32;
 	private var m_leftHandCyberwareState : Int32;
@@ -564,13 +579,16 @@ class PlayerPuppet extends ScriptedPuppet
 	private var m_interestingFactsListenersFunctions : InterestingFactsListenersFunctions;
 	private var m_visionModeController : PlayerVisionModeController;
 	private var m_combatController : PlayerCombatController;
-	private var m_handlingModifiers : PlayerWeaponHandlingModifiers;
+	private var m_weaponHandlingModifiers : PlayerWeaponHandlingModifiers;
 	private var m_cachedGameplayRestrictions : array< TweakDBID >;
 	private var m_delayEndGracePeriodAfterSpawnEventID : DelayID;
 	private var m_CWMaskInVehicleInputHeld : Bool;
 	private var m_friendlyDevicesHostileToEnemiesLock : RWLock;
 	private var m_friendlyDevicesHostileToEnemies : array< EntityID >;
 	private var m_pocketRadio : PocketRadio;
+	private var m_patternManager : PatternManager;
+	private var m_patternMatchingIsOn : Bool;
+	private var m_isJoyConStyleDual : Bool;
 	private var m_noMovementModifierData : array< gameStatModifierData >;
 	private var m_registeredFactListeners : array< FactCallbackData >;
 
@@ -825,12 +843,57 @@ class PlayerPuppet extends ScriptedPuppet
 	protected event OnLookAtObjectChangedEvent( evt : LookAtObjectChangedEvent )
 	{
 		UpdateLookAtObject( evt.lookatObject );
+		if( IsInGyroTutorial() )
+		{
+			EvaulateGyroAimingTutorial( ( ( GameEntity )( evt.lookatObject ) ) );
+		}
+	}
+
+	private function EvaulateGyroAimingTutorial( target : GameEntity )
+	{
+		var questsSystem : QuestsSystem;
+		var communityEntryNames : array< CName >;
+		var entityRef : EntityReference;
+		var shootingTargetGlobalRef1 : GlobalNodeRef;
+		var shootingTargetGlobalRef3 : GlobalNodeRef;
+		var targetComponent : TargetingComponent;
+		var isAimAssistEnabled : Bool;
+		var isGyroAimingTutorialDone : Bool;
+		questsSystem = GameInstance.GetQuestsSystem( GetGame() );
+		if( !( target ) )
+		{
+			questsSystem.SetFact( 'q000_vr_tutorial_shooting_target_001_aiming', 0 );
+			questsSystem.SetFact( 'q000_vr_tutorial_shooting_target_003_aiming', 0 );
+			return;
+		}
+		entityRef = CreateEntityReference( "#q000_vr_tutorial_shooting_target_001", communityEntryNames );
+		shootingTargetGlobalRef1 = ResolveNodeRef( entityRef.reference, GlobalNodeID.GetRoot() );
+		entityRef = CreateEntityReference( "#q000_vr_tutorial_shooting_target_003", communityEntryNames );
+		shootingTargetGlobalRef3 = ResolveNodeRef( entityRef.reference, GlobalNodeID.GetRoot() );
+		if( target.GetEntityID() == ( ( EntityID )( shootingTargetGlobalRef3 ) ) )
+		{
+			targetComponent = ( ( TargetingComponent )( target.FindComponentByName( 'Targeting' ) ) );
+			isAimAssistEnabled = targetComponent.IsAimAssistEnabled();
+			isGyroAimingTutorialDone = questsSystem.GetFact( 'gyro_aiming_tutorial_done' ) > 0;
+			if( isAimAssistEnabled && !( isGyroAimingTutorialDone ) )
+			{
+				target.QueueEvent( new DisableAimAssist );
+			}
+			else if( !( isAimAssistEnabled ) && isGyroAimingTutorialDone )
+			{
+				target.QueueEvent( new EnableAimAssist );
+			}
+		}
+		questsSystem.SetFact( 'q000_vr_tutorial_shooting_target_001_aiming', ( ( target.GetEntityID() == ( ( EntityID )( shootingTargetGlobalRef1 ) ) ) ? ( 1 ) : ( 0 ) ) );
+		questsSystem.SetFact( 'q000_vr_tutorial_shooting_target_003_aiming', ( ( target.GetEntityID() == ( ( EntityID )( shootingTargetGlobalRef3 ) ) ) ? ( 1 ) : ( 0 ) ) );
 	}
 
 	protected event OnWeaponEquipEvent( evt : WeaponEquipEvent )
 	{
-		AnimationControllerComponent.ApplyFeature( this, 'WeaponEquipType', evt.animFeature );
-		AnimationControllerComponent.ApplyFeature( evt.item, 'WeaponEquipType', evt.animFeature );
+		var featureName : CName;
+		featureName = ( ( evt.isLeftWeapon ) ? ( 'LeftWeaponEquipType' ) : ( 'WeaponEquipType' ) );
+		AnimationControllerComponent.ApplyFeature( this, featureName, evt.animFeature );
+		AnimationControllerComponent.ApplyFeature( evt.item, featureName, evt.animFeature );
 	}
 
 	protected event OnSetUpEquipmentOverlayEvent( evt : SetUpEquipmentOverlayEvent )
@@ -1080,6 +1143,7 @@ class PlayerPuppet extends ScriptedPuppet
 		var pmsBlackboard : IBlackboard;
 		var allBlackboardDef : AllBlackboardDefinitions;
 		var attachmentSlotCallback : PlayerPuppetAttachmentSlotsCallback;
+		var leftAttachmentSlotCallback : PlayerPuppetAttachmentSlotsCallback;
 		var playerDevelopmentData : PlayerDevelopmentData;
 		if( playerPuppet == this )
 		{
@@ -1095,7 +1159,7 @@ class PlayerPuppet extends ScriptedPuppet
 			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.MeleeWeapon, this, 'OnMeleeWeaponStateChange', true ) );
 			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.UpperBody, this, 'OnUpperBodyStateChange', true ) );
 			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.Vehicle, this, 'OnVehicleStateChange', true ) );
-			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.Weapon, this, 'OnWeaponStateChange', true ) );
+			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.RightWeapon, this, 'OnWeaponStateChange', true ) );
 			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerBool( allBlackboardDef.PlayerStateMachine.IsDriverCombatInTPP, this, 'OnDriverCombatCameraChange', true ) );
 			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerInt( allBlackboardDef.PlayerStateMachine.DriverCombatWeaponType, this, 'OnDriverCombatWeaponTypeChange', true ) );
 			m_callbackHandles.PushBack( pmsBlackboard.RegisterListenerBool( allBlackboardDef.PlayerStateMachine.IsInBodySlamState, this, 'OnBodySlamStateChange', true ) );
@@ -1120,7 +1184,12 @@ class PlayerPuppet extends ScriptedPuppet
 			attachmentSlotCallback.m_player = this;
 			attachmentSlotCallback.slotID = T"AttachmentSlots.WeaponRight";
 			m_rightHandAttachmentSlotListener = GameInstance.GetTransactionSystem( GetGame() ).RegisterAttachmentSlotListener( this, attachmentSlotCallback );
-			UpdateWeaponRightEquippedItemInfo();
+			UpdateWeaponRightEquippedItemInfo( T"AttachmentSlots.WeaponRight" );
+			leftAttachmentSlotCallback = new PlayerPuppetAttachmentSlotsCallback;
+			leftAttachmentSlotCallback.m_player = this;
+			leftAttachmentSlotCallback.slotID = T"AttachmentSlots.WeaponLeft";
+			m_leftHandAttachmentSlotListener = GameInstance.GetTransactionSystem( GetGame() ).RegisterAttachmentSlotListener( this, leftAttachmentSlotCallback );
+			UpdateWeaponRightEquippedItemInfo( T"AttachmentSlots.WeaponLeft" );
 			if( IsJohnnyReplacer() )
 			{
 				GameplaySettingsSystem.SetWasEverJohnny( this, true );
@@ -1134,7 +1203,7 @@ class PlayerPuppet extends ScriptedPuppet
 			{
 				RemoveInteractionChoices();
 			}
-			GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'q000_vr_tutorial_gyro_choice_enabled', 0 );
+			PatternManager.SetupMotionControlsSettings( GetGame() );
 			EvaluateApplyingReplacerGameplayRestrictions();
 			RestoreMinigamePrograms();
 			ResolveCachedGameplayRestrictions();
@@ -1155,6 +1224,7 @@ class PlayerPuppet extends ScriptedPuppet
 			m_callbackHandles.Clear();
 			GameInstance.GetStatsSystem( GetGame() ).UnregisterListener( GetEntityID(), m_allStatsListener );
 			GameInstance.GetTransactionSystem( GetGame() ).UnregisterAttachmentSlotListener( this, m_rightHandAttachmentSlotListener );
+			GameInstance.GetTransactionSystem( GetGame() ).UnregisterAttachmentSlotListener( this, m_leftHandAttachmentSlotListener );
 		}
 	}
 
@@ -1177,6 +1247,26 @@ class PlayerPuppet extends ScriptedPuppet
 			RegisterInputListener( this, 'ToggleWalk' );
 			RegisterInputListener( this, 'SceneFastForward' );
 			RegisterInputListener( this, 'PocketRadio' );
+			RegisterInputListener( this, 'Dodge' );
+			RegisterInputListener( this, 'MeleeAttack' );
+			RegisterInputListener( this, 'MeleeBlock' );
+			RegisterInputListener( this, 'PatternMatchingToggle' );
+			RegisterInputListener( this, 'GyroAimingToggle' );
+			RegisterInputListener( this, 'Reload' );
+			RegisterInputListener( this, 'UseConsumable' );
+			RegisterInputListener( this, 'RangedAttack' );
+			if( IsVRReplacer() )
+			{
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'CameraX' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'CameraY' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'CameraMouseX' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'CameraMouseY' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'CameraGyroX' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'CameraGyroY' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'Reload_Tutorial' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'UseConsumable_Tutorial' );
+				GetMainPlayer( GetGame() ).RegisterInputListener( this, 'MeleeAttack_Tutorial' );
+			}
 			m_Debug_DamageInputRec = new DEBUG_DamageInputReceiver;
 			m_Debug_DamageInputRec.m_player = this;
 			RegisterInputListener( m_Debug_DamageInputRec, 'Debug_KillAll' );
@@ -1236,10 +1326,13 @@ class PlayerPuppet extends ScriptedPuppet
 		statPoolsSystem.RequestMarkingStatPoolActive( GetEntityID(), gamedataStatPoolType.BerserkCharge );
 		statPoolsSystem.RequestMarkingStatPoolActive( GetEntityID(), gamedataStatPoolType.SandevistanCharge );
 		statPoolsSystem.RequestMarkingStatPoolActive( GetEntityID(), gamedataStatPoolType.CyberdeckOverclock );
-		m_handlingModifiers = PlayerWeaponHandlingModifiers.Create( this );
-		m_handlingModifiers.OnAttach();
+		m_weaponHandlingModifiers = PlayerWeaponHandlingModifiers.Create( this );
+		m_weaponHandlingModifiers.OnAttach();
 		m_pocketRadio = new PocketRadio;
 		m_pocketRadio.OnPlayerAttach( this );
+		m_patternManager = new PatternManager;
+		m_patternManager.OnPlayerAttach( this );
+		m_patternMatchingIsOn = false;
 		evt = new GameLoadedFactReset;
 		GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, evt, 1.0 );
 		questSystem = GameInstance.GetQuestsSystem( GetGame() );
@@ -1279,6 +1372,7 @@ class PlayerPuppet extends ScriptedPuppet
 			GameInstance.GetPlayerSystem( GetGame() ).UnregisterPlayerPuppetDetachedCallback( m_playerDetachedCallbackID );
 		}
 		m_pocketRadio.OnPlayerDetach( this );
+		m_patternManager.OnPlayerDetach( this );
 	}
 
 	protected const override function ShouldRegisterToHUD() : Bool
@@ -1315,6 +1409,7 @@ class PlayerPuppet extends ScriptedPuppet
 
 	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
 	{
+		var questsSystem : QuestsSystem;
 		if( ListenerAction.GetName( action ) == 'ToggleWalk' && ListenerAction.IsButtonJustReleased( action ) )
 		{
 			ProcessToggleWalkInput();
@@ -1379,6 +1474,49 @@ class PlayerPuppet extends ScriptedPuppet
 		{
 			m_pocketRadio.HandleInputAction( action );
 		}
+		if( ListenerAction.GetName( action ) == 'PatternMatchingToggleOn' )
+		{
+			m_patternMatchingIsOn = true;
+		}
+		else if( ListenerAction.GetName( action ) == 'PatternMatchingToggleOff' )
+		{
+			m_patternMatchingIsOn = false;
+		}
+		if( ListenerAction.IsPatternJustActivated( action ) )
+		{
+			m_patternMatchingIsOn = true;
+		}
+		if( ListenerAction.GetName( action ) == 'RangedAttack' )
+		{
+			if( ( m_equippedRightHandWeapon && m_equippedRightHandWeapon.IsRanged() ) && m_vehicleState == gamePSMVehicle.Default )
+			{
+				if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_PRESSED )
+				{
+					SetValue_GyroAimingIsShootingWithRangedWeapon( true, GetGame() );
+				}
+				else if( ListenerAction.GetType( action ) == gameinputActionType.BUTTON_RELEASED )
+				{
+					SetValue_GyroAimingIsShootingWithRangedWeapon( false, GetGame() );
+				}
+			}
+			else
+			{
+				SetValue_GyroAimingIsShootingWithRangedWeapon( false, GetGame() );
+			}
+		}
+		if( IsInGyroTutorial() )
+		{
+			questsSystem = GameInstance.GetQuestsSystem( GetGame() );
+			if( ListenerAction.GetName( action ) == 'CameraX' || ListenerAction.GetName( action ) == 'CameraY' )
+			{
+				questsSystem.SetFact( 'q000_vr_tutorial_aiming_with_stick', 1 );
+			}
+			if( ( ListenerAction.GetName( action ) == 'CameraGyroX' || ListenerAction.GetName( action ) == 'CameraGyroY' ) || GetPlatformShortName() != "emporium" )
+			{
+				questsSystem.SetFact( 'q000_vr_tutorial_aiming_with_gyro', 1 );
+			}
+		}
+		m_patternManager.HandleInputAction( action, consumer );
 	}
 
 	private function KeybaordAndMouseControlsActive() : Bool
@@ -1721,12 +1859,22 @@ class PlayerPuppet extends ScriptedPuppet
 
 	public function GetPlayerWeaponHandler() : PlayerWeaponHandlingModifiers
 	{
-		return m_handlingModifiers;
+		return m_weaponHandlingModifiers;
 	}
 
 	public function GetPocketRadio() : PocketRadio
 	{
 		return m_pocketRadio;
+	}
+
+	public function GetPatternManager() : PatternManager
+	{
+		return m_patternManager;
+	}
+
+	public function IsPatternMatchingOn() : Bool
+	{
+		return m_patternMatchingIsOn;
 	}
 
 	public static function IsTargetFriendlyNPC( player : PlayerPuppet, target : Entity ) : Bool
@@ -1837,11 +1985,15 @@ class PlayerPuppet extends ScriptedPuppet
 		var quickSlotsBlackboard : IBlackboard;
 		var phoneBlackboard : weak< IBlackboard >;
 		var targetingBlackBoard : weak< IBlackboard >;
+		var inputSchemesBlackBoard : weak< IBlackboard >;
+		var gyroBlackBoard : weak< IBlackboard >;
 		blackboardSystem = GameInstance.GetBlackboardSystem( GetGameInstance() );
 		uiBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().UIGameData );
 		quickSlotsBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_QuickSlotsData );
 		phoneBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ComDevice );
 		targetingBlackBoard = blackboardSystem.Get( GetAllBlackboardDefs().UI_TargetingInfo );
+		inputSchemesBlackBoard = blackboardSystem.Get( GetAllBlackboardDefs().InputSchemes );
+		gyroBlackBoard = blackboardSystem.Get( GetAllBlackboardDefs().GyroRestrictions );
 		if( enable )
 		{
 			m_itemLogBlackboard = blackboardSystem.Get( GetAllBlackboardDefs().UI_ItemLog );
@@ -1852,6 +2004,15 @@ class PlayerPuppet extends ScriptedPuppet
 			m_contactsActiveListener = phoneBlackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, this, 'OnUIContactListContextChanged' );
 			m_smsMessengerActiveListener = phoneBlackboard.RegisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.SmsMessengerActive, this, 'OnUISmsMessengerContextChanged' );
 			m_currentVisibleTargetListener = targetingBlackBoard.RegisterListenerEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget, this, 'OnCurrentVisibleTargetChanged' );
+			if( GetPlatformShortName() == "emporium" )
+			{
+				m_joyconDualStyleChangedListener = inputSchemesBlackBoard.RegisterListenerBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle, this, 'OnJoyconDualStyleChanged' );
+				m_isJoyConStyleDual = inputSchemesBlackBoard.GetBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle );
+				m_onInputStyleChangedListener = inputSchemesBlackBoard.RegisterListenerName( GetAllBlackboardDefs().InputSchemes.ActiveStyle, this, 'OnInputStyleChanged' );
+				m_chargeAttackPatternListener = gyroBlackBoard.RegisterListenerBool( GetAllBlackboardDefs().GyroRestrictions.IsInsideOfChargePattern, this, 'OnChargePatternChange' );
+				m_patternMatchingMeleeEnabledListener = gyroBlackBoard.RegisterListenerBool( GetAllBlackboardDefs().GyroRestrictions.SettingsPatternMatchingMeleeEnabled, this, 'OnPatternMatchingMeleeEnabled' );
+				m_isPatternMatchingMeleeEnabled = gyroBlackBoard.GetBool( GetAllBlackboardDefs().GyroRestrictions.SettingsPatternMatchingMeleeEnabled );
+			}
 		}
 		else
 		{
@@ -1862,6 +2023,13 @@ class PlayerPuppet extends ScriptedPuppet
 			phoneBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.ContactsActive, m_contactsActiveListener );
 			phoneBlackboard.UnregisterListenerBool( GetAllBlackboardDefs().UI_ComDevice.SmsMessengerActive, m_smsMessengerActiveListener );
 			targetingBlackBoard.UnregisterListenerEntityID( GetAllBlackboardDefs().UI_TargetingInfo.CurrentVisibleTarget, m_currentVisibleTargetListener );
+			if( GetPlatformShortName() == "emporium" )
+			{
+				inputSchemesBlackBoard.UnregisterListenerBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle, m_joyconDualStyleChangedListener );
+				inputSchemesBlackBoard.UnregisterListenerName( GetAllBlackboardDefs().InputSchemes.ActiveStyle, m_onInputStyleChangedListener );
+				gyroBlackBoard.UnregisterListenerBool( GetAllBlackboardDefs().GyroRestrictions.IsInsideOfChargePattern, m_chargeAttackPatternListener );
+				gyroBlackBoard.UnregisterListenerBool( GetAllBlackboardDefs().GyroRestrictions.SettingsPatternMatchingMeleeEnabled, m_patternMatchingMeleeEnabledListener );
+			}
 			m_itemLogBlackboard = NULL;
 			m_interactionDataListener = NULL;
 			m_popupIsModalListener = NULL;
@@ -2094,6 +2262,12 @@ class PlayerPuppet extends ScriptedPuppet
 	protected event OnUIRadialContextChange( value : Bool )
 	{
 		var psmEvent : PSMPostponedParameterBool;
+		var controlledPlayer : PlayerPuppet;
+		controlledPlayer = ( ( PlayerPuppet )( GameInstance.GetPlayerSystem( GetGame() ).GetLocalPlayerControlledGameObject() ) );
+		if( controlledPlayer.IsReplacer() && !( IsReplacer() ) )
+		{
+			return false;
+		}
 		if( value )
 		{
 			psmEvent = new PSMPostponedParameterBool;
@@ -2205,45 +2379,64 @@ class PlayerPuppet extends ScriptedPuppet
 		var paperdollEquipData : SPaperdollEquipData;
 		var equipmentData : EquipmentSystemPlayerData;
 		var equipmentBB : IBlackboard;
-		var equipSlot : SEquipSlot;
+		var equipment : SLoadout;
 		var itemType : gamedataItemCategory;
 		var itemRecord : Item_Record;
 		var itemID : ItemID;
 		var slotID : TweakDBID;
+		var itemCategory : gamedataEquipmentArea;
+		var equipSlot : SEquipSlot;
+		var request : SaveAndApplyCyberWareSwitcherIndexRequest;
+		var savedData : CyberwareCustomizationPersistentData;
+		var cyberwareCustomizationSystem : weak< CyberwareCustomizationSystem >;
+		var switcherIndex : Uint32;
+		var longsleeveSwitcherIndex : Int32;
 		itemID = evt.GetItemID();
 		itemTDBID = ItemID.GetTDBID( itemID );
 		itemRecord = TweakDBInterface.GetItemRecord( itemTDBID );
 		slotID = evt.GetSlotID();
-		if( itemRecord && itemRecord.ItemCategory() )
+		equipmentData = EquipmentSystem.GetData( GetPlayer( GetGame() ) );
+		if( equipmentData )
 		{
-			itemType = itemRecord.ItemCategory().Type();
-		}
-		if( itemType == gamedataItemCategory.Weapon )
-		{
-			newApp = TweakDBInterface.GetCName( itemTDBID + T".specific_player_appearance", '' );
-			if( newApp != '' )
+			if( itemRecord && itemRecord.ItemCategory() )
 			{
-				GameInstance.GetTransactionSystem( GetGame() ).ChangeItemAppearanceByName( this, itemID, newApp );
+				itemType = itemRecord.ItemCategory().Type();
 			}
-			if( slotID == T"AttachmentSlots.WeaponRight" )
+			if( itemType == gamedataItemCategory.Weapon )
 			{
-				equipmentBB = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_Equipment );
-				if( equipmentBB )
+				newApp = TweakDBInterface.GetCName( itemTDBID + T".specific_player_appearance", '' );
+				if( newApp != '' )
 				{
-					paperdollEquipData.equipArea.areaType = TweakDBInterface.GetItemRecord( itemTDBID ).EquipArea().Type();
-					paperdollEquipData.equipArea.activeIndex = 0;
-					equipSlot.itemID = itemID;
-					paperdollEquipData.equipArea.equipSlots.PushBack( equipSlot );
-					paperdollEquipData.equipped = true;
-					paperdollEquipData.placementSlot = EquipmentSystem.GetPlacementSlot( itemID );
-					equipmentBB.SetVariant( GetAllBlackboardDefs().UI_Equipment.lastModifiedArea, paperdollEquipData );
+					GameInstance.GetTransactionSystem( GetGame() ).ChangeItemAppearanceByName( this, itemID, newApp );
+				}
+				if( ( slotID == T"AttachmentSlots.WeaponRight" ) || ( slotID == T"AttachmentSlots.WeaponLeft" ) )
+				{
+					equipmentBB = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_Equipment );
+					if( equipmentBB )
+					{
+						itemCategory = TweakDBInterface.GetItemRecord( itemTDBID ).EquipArea().Type();
+						if( itemCategory == gamedataEquipmentArea.Weapon )
+						{
+							equipment = equipmentData.GetEquipment();
+							paperdollEquipData.equipArea = equipment.equipAreas[ equipmentData.GetEquipAreaIndex( gamedataEquipmentArea.Weapon ) ];
+							paperdollEquipData.slotIndex = ( ( slotID == T"AttachmentSlots.WeaponLeft" ) ? ( EquipmentSystemPlayerData.GetOppositeWeaponSlotIndex( paperdollEquipData.equipArea.activeIndex ) ) : ( paperdollEquipData.equipArea.activeIndex ) );
+							paperdollEquipData.placementSlot = slotID;
+						}
+						else
+						{
+							equipSlot.itemID = itemID;
+							paperdollEquipData.equipArea.areaType = itemCategory;
+							paperdollEquipData.equipArea.activeIndex = 0;
+							paperdollEquipData.equipArea.equipSlots.PushBack( equipSlot );
+							paperdollEquipData.placementSlot = EquipmentSystem.GetPlacementSlot( itemID );
+						}
+						paperdollEquipData.equipped = true;
+						equipmentBB.SetVariant( GetAllBlackboardDefs().UI_Equipment.lastModifiedArea, paperdollEquipData );
+						equipmentBB.FireCallbacks();
+					}
 				}
 			}
-		}
-		else if( itemType == gamedataItemCategory.Clothing )
-		{
-			equipmentData = EquipmentSystem.GetData( GetPlayer( GetGame() ) );
-			if( equipmentData && !( equipmentData.IsVisualSetActive() ) )
+			else if( itemType == gamedataItemCategory.Clothing && !( equipmentData.IsVisualSetActive() ) )
 			{
 				equipmentData.OnEquipProcessVisualTags( itemID );
 			}
@@ -2251,6 +2444,26 @@ class PlayerPuppet extends ScriptedPuppet
 		if( ( slotID == T"AttachmentSlots.WeaponRight" ) || ( slotID == T"AttachmentSlots.WeaponLeft" ) )
 		{
 			EquipmentSystemPlayerData.UpdateArmSlot( this, evt.GetItemID(), false );
+		}
+		if( ( ( evt.GetSlotID() == T"AttachmentSlots.Torso" ) || ( evt.GetSlotID() == T"AttachmentSlots.Chest" ) ) || ( evt.GetSlotID() == T"AttachmentSlots.Outfit" ) )
+		{
+			cyberwareCustomizationSystem = ( ( CyberwareCustomizationSystem )( GameInstance.GetScriptableSystemsContainer( GetGame() ).Get( 'CyberwareCustomizationSystem' ) ) );
+			savedData = cyberwareCustomizationSystem.GetSavedData();
+			if( savedData.enabled )
+			{
+				longsleeveSwitcherIndex = CyberwareCustomizationHelper.GetLongSleevesCustomizationIndexFromCustomizationItem( savedData.customizationItemID );
+				if( ( longsleeveSwitcherIndex != -1 ) && EquipmentSystemPlayerData.HasLongSleeves( this ) )
+				{
+					switcherIndex = ( ( Uint32 )( longsleeveSwitcherIndex ) );
+				}
+				else
+				{
+					switcherIndex = ( ( Uint32 )( CyberwareCustomizationHelper.GetCustomizationIndexFromCustomizationItem( savedData.customizationItemID ) ) );
+				}
+				request = new SaveAndApplyCyberWareSwitcherIndexRequest;
+				request.switcherIndex = switcherIndex;
+				cyberwareCustomizationSystem.QueueRequest( request );
+			}
 		}
 		super.OnItemAddedToSlot( evt );
 	}
@@ -2267,7 +2480,7 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 		for( i = 0; i < packages.Size(); i += 1 )
 		{
-			RPGManager.ApplyGLP( this, packages[ i ] );
+			RPGManager.ApplyGLP( this, evt.item, packages[ i ] );
 		}
 	}
 
@@ -2301,6 +2514,11 @@ class PlayerPuppet extends ScriptedPuppet
 		var itemRecord : Item_Record;
 		var equipSlot : SEquipSlot;
 		var itemID : ItemID;
+		var request : SaveAndApplyCyberWareSwitcherIndexRequest;
+		var savedData : CyberwareCustomizationPersistentData;
+		var cyberwareCustomizationSystem : weak< CyberwareCustomizationSystem >;
+		var switcherIndex : Uint32;
+		var longsleeveSwitcherIndex : Int32;
 		itemID = evt.GetItemID();
 		itemTDBID = ItemID.GetTDBID( itemID );
 		itemRecord = TweakDBInterface.GetItemRecord( itemTDBID );
@@ -2310,7 +2528,7 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 		if( itemType == gamedataItemCategory.Weapon )
 		{
-			if( evt.GetSlotID() == T"AttachmentSlots.WeaponRight" )
+			if( ( evt.GetSlotID() == T"AttachmentSlots.WeaponRight" ) || ( evt.GetSlotID() == T"AttachmentSlots.WeaponLeft" ) )
 			{
 				equipmentBB = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_Equipment );
 				if( equipmentBB )
@@ -2320,14 +2538,35 @@ class PlayerPuppet extends ScriptedPuppet
 					paperdollEquipData.equipArea.activeIndex = 0;
 					paperdollEquipData.equipArea.areaType = itemRecord.EquipArea().Type();
 					paperdollEquipData.equipped = false;
-					paperdollEquipData.placementSlot = EquipmentSystem.GetPlacementSlot( itemID );
+					paperdollEquipData.placementSlot = evt.GetSlotID();
 					equipmentBB.SetVariant( GetAllBlackboardDefs().UI_Equipment.lastModifiedArea, paperdollEquipData );
+					equipmentBB.FireCallbacks();
 				}
 			}
 		}
 		if( ( evt.GetSlotID() == T"AttachmentSlots.WeaponRight" ) || ( evt.GetSlotID() == T"AttachmentSlots.WeaponLeft" ) )
 		{
 			EquipmentSystemPlayerData.UpdateArmSlot( this, evt.GetItemID(), true );
+		}
+		if( ( ( evt.GetSlotID() == T"AttachmentSlots.Torso" ) || ( evt.GetSlotID() == T"AttachmentSlots.Chest" ) ) || ( evt.GetSlotID() == T"AttachmentSlots.Outfit" ) )
+		{
+			cyberwareCustomizationSystem = ( ( CyberwareCustomizationSystem )( GameInstance.GetScriptableSystemsContainer( GetGame() ).Get( 'CyberwareCustomizationSystem' ) ) );
+			savedData = cyberwareCustomizationSystem.GetSavedData();
+			if( savedData.enabled )
+			{
+				longsleeveSwitcherIndex = CyberwareCustomizationHelper.GetLongSleevesCustomizationIndexFromCustomizationItem( savedData.customizationItemID );
+				if( ( longsleeveSwitcherIndex != -1 ) && EquipmentSystemPlayerData.HasLongSleeves( this ) )
+				{
+					switcherIndex = ( ( Uint32 )( longsleeveSwitcherIndex ) );
+				}
+				else
+				{
+					switcherIndex = ( ( Uint32 )( CyberwareCustomizationHelper.GetCustomizationIndexFromCustomizationItem( savedData.customizationItemID ) ) );
+				}
+				request = new SaveAndApplyCyberWareSwitcherIndexRequest;
+				request.switcherIndex = switcherIndex;
+				cyberwareCustomizationSystem.QueueRequest( request );
+			}
 		}
 		super.OnItemRemovedFromSlot( evt );
 	}
@@ -2348,13 +2587,32 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 	}
 
+	private static function RemoveItemGameplayPackageOfInstigator( objectToRemoveFrom : GameObject, instigator : GameObject, itemID : ItemID )
+	{
+		var i : Int32;
+		var itemRecord : Item_Record;
+		var packages : array< weak< GameplayLogicPackage_Record > >;
+		itemRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( itemID ) );
+		if( itemRecord )
+		{
+			itemRecord.OnAttach( packages );
+		}
+		for( i = 0; i < packages.Size(); i += 1 )
+		{
+			RPGManager.RemoveGLP( objectToRemoveFrom, instigator, packages[ i ] );
+		}
+	}
+
 	protected event OnPartRemovedFromSlotEvent( evt : PartRemovedFromSlotEvent )
 	{
 		var transactionSystem : TransactionSystem;
 		transactionSystem = GameInstance.GetTransactionSystem( this.GetGame() );
-		if( !( transactionSystem.HasItemInAnySlot( this, evt.itemID ) ) )
+		if( !( transactionSystem.HasItemInSlot( this, evt.slotID, evt.item.GetItemID() ) ) )
 		{
-			RemoveItemGameplayPackage( this, evt.removedPartID );
+			RemoveItemGameplayPackageOfInstigator( this, evt.item, evt.removedPartID );
+		}
+		else
+		{
 		}
 	}
 
@@ -4339,9 +4597,12 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 		timeSystem = GameInstance.GetTimeSystem( this.GetGame() );
 		timeSystem.UnsetTimeDilation( evt.reason, '' );
-		timeSystem.SetTimeDilationOnLocalPlayerZero( reason, 1.0, 0.1, '', '' );
+		if( GetPlayerStateMachineBlackboard().GetInt( GetAllBlackboardDefs().PlayerStateMachine.TimeDilation ) != ( ( Int32 )( gamePSMTimeDilation.Photomode ) ) )
+		{
+			timeSystem.SetTimeDilationOnLocalPlayerZero( reason, 1.0, 0.1, '', '' );
+			timeSystem.UnsetTimeDilationOnLocalPlayerZero( reason, '' );
+		}
 		timeSystem.SetIgnoreTimeDilationOnLocalPlayerZero( false );
-		timeSystem.UnsetTimeDilationOnLocalPlayerZero( reason, '' );
 	}
 
 	protected event OnHealthUpdateEvent( evt : HealthUpdateEvent )
@@ -4668,6 +4929,37 @@ class PlayerPuppet extends ScriptedPuppet
 		UpdateAimAssist();
 	}
 
+	protected event OnChargePatternChange( isInsideOfChargePattern : Bool )
+	{
+		if( m_patternManager )
+		{
+			if( !( isInsideOfChargePattern ) )
+			{
+				m_patternManager.TurnOffLightRumbleLoop();
+			}
+		}
+		m_isInsideOfChargePattern = isInsideOfChargePattern;
+	}
+
+	public function GetIsInsideOfChargePattern() : Bool
+	{
+		return m_isInsideOfChargePattern;
+	}
+
+	protected event OnPatternMatchingMeleeEnabled( value : Bool )
+	{
+		m_isPatternMatchingMeleeEnabled = value;
+		if( !( m_isPatternMatchingMeleeEnabled ) )
+		{
+			m_patternManager.TurnOffLightRumbleLoop();
+		}
+	}
+
+	public function GetIsPatternMatchingMeleeEnabled() : Bool
+	{
+		return m_isPatternMatchingMeleeEnabled;
+	}
+
 	protected event OnLocomotionStateChanged( newState : Int32 )
 	{
 		var isCrouching : Bool;
@@ -4733,22 +5025,29 @@ class PlayerPuppet extends ScriptedPuppet
 			m_hasKiroshiOpticsFragment = total > 0.0;
 			UpdateAimAssist();
 		}
-		else if( statType == gamedataStatType.ZoomLevel )
+		else if( statType == gamedataStatType.ZoomLevel || statType == gamedataStatType.DualWieldZoomLevel )
 		{
 			UpdateAimAssist();
 		}
 	}
 
-	public function UpdateWeaponRightEquippedItemInfo()
+	public function UpdateWeaponRightEquippedItemInfo( slot : TweakDBID )
 	{
-		m_equippedRightHandWeapon = ( ( WeaponObject )( GameInstance.GetTransactionSystem( GetGame() ).GetItemInSlot( this, T"AttachmentSlots.WeaponRight" ) ) );
+		if( slot == T"AttachmentSlots.WeaponLeft" )
+		{
+			m_equippedLeftHandWeapon = ( ( WeaponObject )( GameInstance.GetTransactionSystem( GetGame() ).GetItemInSlot( this, T"AttachmentSlots.WeaponLeft" ) ) );
+		}
+		else if( slot == T"AttachmentSlots.WeaponRight" )
+		{
+			m_equippedRightHandWeapon = ( ( WeaponObject )( GameInstance.GetTransactionSystem( GetGame() ).GetItemInSlot( this, T"AttachmentSlots.WeaponRight" ) ) );
+		}
 	}
 
 	public function OnItemEquipped( slot : TweakDBID, item : ItemID )
 	{
-		if( slot == T"AttachmentSlots.WeaponRight" )
+		if( TweakDBInterface.GetItemRecord( ItemID.GetTDBID( item ) ).ItemCategory().Type() == gamedataItemCategory.Weapon )
 		{
-			UpdateWeaponRightEquippedItemInfo();
+			UpdateWeaponRightEquippedItemInfo( slot );
 			UpdateAimAssist();
 		}
 	}
@@ -4757,9 +5056,19 @@ class PlayerPuppet extends ScriptedPuppet
 	{
 		if( slot == T"AttachmentSlots.WeaponRight" )
 		{
-			m_handlingModifiers.RemoveHandlingModifiersFromWeapon( m_equippedRightHandWeapon );
+			m_weaponHandlingModifiers.RemoveHandlingModifiersFromWeapon( m_equippedRightHandWeapon );
 			m_equippedRightHandWeapon = NULL;
 			UpdateAimAssist();
+		}
+		if( slot == T"AttachmentSlots.WeaponLeft" )
+		{
+			m_weaponHandlingModifiers.RemoveHandlingModifiersFromWeapon( m_equippedLeftHandWeapon );
+			m_equippedLeftHandWeapon = NULL;
+			UpdateAimAssist();
+		}
+		if( !( m_equippedLeftHandWeapon ) && !( m_equippedRightHandWeapon ) )
+		{
+			m_weaponHandlingModifiers.UncacheHandlingModifiers();
 		}
 	}
 
@@ -4863,6 +5172,7 @@ class PlayerPuppet extends ScriptedPuppet
 		{
 			m_vehicleState = ( ( gamePSMVehicle )( newState ) );
 			UpdateAimAssist();
+			SetValue_GyroAimingIsShootingWithRangedWeapon( false, GetGame() );
 			if( VehicleComponent.GetVehicle( GetGame(), GetEntityID(), vehicle ) )
 			{
 				recordID = vehicle.GetRecordID();
@@ -4942,6 +5252,50 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 		m_numberOfCombatants = ( ( Int32 )( value ) );
 		GameInstance.GetTelemetrySystem( GetGame() ).LogNumberOfCombatants( m_numberOfCombatants );
+	}
+
+	protected event OnJoyconDualStyleChanged( value : Bool )
+	{
+		var questsSystem : QuestsSystem;
+		var bb : IBlackboard;
+		var isInMenu : Bool;
+		m_isJoyConStyleDual = value;
+		if( !( m_isJoyConStyleDual ) )
+		{
+			m_patternManager.TurnOffLightRumbleLoop();
+		}
+		if( !( IsInGyroTutorial() ) )
+		{
+			return true;
+		}
+		bb = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UIGameData );
+		questsSystem = GameInstance.GetQuestsSystem( GetGame() );
+		if( !( questsSystem ) || ( bb && bb.GetBool( GetAllBlackboardDefs().UIGameData.Popup_IsShown ) ) )
+		{
+			isInMenu = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_System ).GetBool( GetAllBlackboardDefs().UI_System.IsInMenu );
+			if( isInMenu )
+			{
+				bb.SetBool( GetAllBlackboardDefs().UIGameData.DetachTutorialPopup_IsShown, !( value ) );
+			}
+			return true;
+		}
+		if( !( value ) )
+		{
+			questsSystem.SetFact( 'gyro_tutorial_enable_time_dilation', 1 );
+			questsSystem.SetFact( 'gyro_tutorial_show_counter', 0 );
+			questsSystem.SetFact( 'gyro_detach_tutorial_seen', 0 );
+			questsSystem.SetFact( 'gyro_detach_tutorial', 1 );
+		}
+	}
+
+	public function GetIsJoyConStyleDual() : Bool
+	{
+		return m_isJoyConStyleDual;
+	}
+
+	protected event OnInputStyleChanged( value : CName )
+	{
+		PatternManager.SetupMotionControlsSettings( GetGame() );
 	}
 
 	public function ApplyNoMovementStatGroupModifiers()
@@ -5623,7 +5977,11 @@ class PlayerPuppet extends ScriptedPuppet
 				GameInstance.GetTimeSystem( GetGame() ).UnsetTimeDilation( 'focusedStatePerkDilation', 'MeleeHitEaseOut' );
 			}
 			GameObject.PlaySoundEvent( this, 'time_dilation_focused_exit' );
-			GameObjectEffectHelper.BreakEffectLoopEvent( this, 'cool_perk_focused_state_fullscreen' );
+			if( GetPlayerStateMachineBlackboard().GetInt( GetAllBlackboardDefs().PlayerStateMachine.Combat ) != ( ( Int32 )( gamePSMCombat.Stealth ) ) )
+			{
+				GameObjectEffectHelper.BreakEffectLoopEvent( this, 'cool_perk_focused_state_fullscreen' );
+				GameObjectEffectHelper.BreakEffectLoopEvent( this, 'stealth_mode' );
+			}
 			focusEventUI = new FocusPerkTriggerd;
 			focusEventUI.isActive = false;
 			QueueEvent( focusEventUI );
@@ -5687,9 +6045,9 @@ class PlayerPuppet extends ScriptedPuppet
 
 	protected event OnUpdateEquippedWeaponsHandling( evt : UpdateEquippedWeaponsHandlingEvent )
 	{
-		if( m_equippedRightHandWeapon )
+		if( m_equippedRightHandWeapon || m_equippedLeftHandWeapon )
 		{
-			m_handlingModifiers.UpdateEquippedWeaponsHandling( evt, m_equippedRightHandWeapon );
+			m_weaponHandlingModifiers.UpdateEquippedWeaponsHandling( evt, m_equippedRightHandWeapon, m_equippedLeftHandWeapon );
 		}
 	}
 
@@ -5989,7 +6347,6 @@ class PlayerPuppet extends ScriptedPuppet
 		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q000_vr_tutorial_gyro_started' ) );
 		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q000_vr_course_02_early_exit_mode' ) );
 		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'q000_vr_course_04_early_exit_mode' ) );
-		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'disable_gyro_tutorials' ) );
 		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'start_vr_tutorial_level' ) );
 		m_registeredFactListeners.PushBack( CreateFactCallbackData( 'vr_gyro_pattern_matching_tutorial_completed' ) );
 	}
@@ -6024,7 +6381,8 @@ class PlayerPuppet extends ScriptedPuppet
 			;
 			break;
 			case 'q000_vr_tutorial_gyro_started':
-				break;
+				PatternManager.SetupMotionControlsSettings( GetGame() );
+			break;
 			case 'q000_vr_course_02_early_exit_mode':
 			case 'q000_vr_course_04_early_exit_mode':
 				if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( evt.GetFactName() ) > 0 )
@@ -6036,16 +6394,11 @@ class PlayerPuppet extends ScriptedPuppet
 				}
 			;
 			break;
-			case 'disable_gyro_tutorials':
-				if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( evt.GetFactName() ) > 0 )
-				{
-					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_gyro_tutorials', 0 );
-				}
-			break;
 			case 'start_vr_tutorial_level':
 				if( GameInstance.GetQuestsSystem( GetGame() ).GetFact( evt.GetFactName() ) > 0 )
 				{
 					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_gyro_tutorials', 1 );
+					GameInstance.GetDelaySystem( GetGame() ).DelayEvent( this, new EnableGyroTutorialsEvent, 1.0 );
 					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'q000_vr_tutorial_gyro_started', 0 );
 					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'tutorials_were_disabled', GameInstance.GetQuestsSystem( GetGame() ).GetFact( 'disable_tutorials' ) );
 					GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_tutorials', 0 );
@@ -6066,10 +6419,16 @@ class PlayerPuppet extends ScriptedPuppet
 				}
 			break;
 			case 'vr_gyro_pattern_matching_tutorial_completed':
-				break;
+				EmporiumSettingsManager.SetPatternMatchingUnlocked( true );
+			break;
 			default:
 				break;
 		}
+	}
+
+	protected event OnEnableGyroTutorialsEvent( evt : EnableGyroTutorialsEvent )
+	{
+		GameInstance.GetQuestsSystem( GetGame() ).SetFact( 'disable_gyro_tutorials', 0 );
 	}
 
 	protected event OnSysDebuggerEvent( evt : SysDebuggerEvent )
@@ -6395,7 +6754,9 @@ class PlayerPuppet extends ScriptedPuppet
 	protected event OnDeath( evt : gameDeathEvent )
 	{
 		ForceCloseRadialWheel();
+		ForceClosePhone();
 		StatusEffectHelper.ApplyStatusEffect( this, T"GameplayRestriction.BlockAllMenu" );
+		StatusEffectHelper.ApplyStatusEffect( this, T"GameplayRestriction.NoPhone" );
 		super.OnDeath( evt );
 		GameInstance.GetTelemetrySystem( GetGame() ).LogPlayerDeathEvent( evt );
 		GameInstance.GetAutoSaveSystem( GetGame() ).InvalidateAutoSaveRequests();
@@ -6406,6 +6767,13 @@ class PlayerPuppet extends ScriptedPuppet
 		var closeEvt : ForceRadialWheelShutdown;
 		closeEvt = new ForceRadialWheelShutdown;
 		QueueEvent( closeEvt );
+	}
+
+	private function ForceClosePhone()
+	{
+		var bb : IBlackboard;
+		bb = GameInstance.GetBlackboardSystem( GetGame() ).Get( GetAllBlackboardDefs().UI_ComDevice );
+		bb.SetVariant( GetAllBlackboardDefs().UI_ComDevice.PhoneVisibility, worlduiEntryVisibility.ForceHide, true );
 	}
 
 	private function Revive( percAmount : Float )
@@ -7174,7 +7542,14 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 		if( m_isAiming )
 		{
-			m_weaponZoomLevel = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.ZoomLevel );
+			if( m_equippedRightHandWeapon && m_equippedLeftHandWeapon )
+			{
+				m_weaponZoomLevel = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.DualWieldZoomLevel );
+			}
+			else
+			{
+				m_weaponZoomLevel = GameInstance.GetStatsSystem( GetGame() ).GetStatValue( GetEntityID(), gamedataStatType.ZoomLevel );
+			}
 			if( m_weaponZoomLevel <= 1.29999995 )
 			{
 				ApplyAimAssistSettings( ( ( m_hasKiroshiOpticsFragment ) ? ( AimAssistSettingConfig.AimingLimbCyber ) : ( AimAssistSettingConfig.Aiming ) ) );
@@ -7777,6 +8152,20 @@ class PlayerPuppet extends ScriptedPuppet
 		}
 	}
 
+	protected event OnCreateAIQuickHackActionEvent( evt : CreateAIQuickHackActionEvent )
+	{
+		var action : AIQuickHackAction;
+		action = new AIQuickHackAction;
+		action.RegisterAsRequester( evt.m_requester );
+		action.SetExecutor( this );
+		action.SetObjectActionID( evt.m_objectActionID );
+		action.SetUp( evt.m_puppetPS );
+		if( action.CanPayCost( NULL, true ) )
+		{
+			action.ProcessRPGAction( GetGame() );
+		}
+	}
+
 }
 
 struct DismembermentInstigatedInfo
@@ -7804,5 +8193,9 @@ struct FactCallbackData
 {
 	var m_factName : CName;
 	var m_callbackID : Uint32;
+}
+
+class EnableGyroTutorialsEvent extends Event
+{
 }
 

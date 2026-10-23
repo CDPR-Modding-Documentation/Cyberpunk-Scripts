@@ -3,12 +3,16 @@ import class TutorialPopupGameController extends inkGameController
 	editable var m_actionHint : inkWidgetRef;
 	editable var m_popupPanel : inkWidgetRef;
 	editable var m_popupFullscreenPanel : inkWidgetRef;
+	editable var m_fullscreenButtonContainerWidgetPath : CName;
 	editable var m_popupBlockingPanel : inkWidgetRef;
 	editable var m_popupFullscreenRightPanel : inkWidgetRef;
 	private var m_data : weak< TutorialPopupData >;
+	private var m_prevData : TutorialPopupData;
 	private var m_inputBlocked : Bool;
 	private var m_gamePaused : Bool;
 	private var m_isShownBbId : CallbackHandle;
+	private var m_isHoldAction : Bool;
+	private var m_isJoyconDetachPatternTutorial : Bool;
 	private var m_animIntroPopup : CName;
 	default m_animIntroPopup = 'into_popup';
 	private var m_animIntroPopupModal : CName;
@@ -31,6 +35,8 @@ import class TutorialPopupGameController extends inkGameController
 	private var m_animationProxy : inkAnimProxy;
 	private var m_targetPosition : PopupPosition;
 	private var m_onInputDeviceChangedCallbackID : CallbackHandle;
+	private var m_joyconDualStyleChangedListener : CallbackHandle;
+	private var m_uiContextIsActive : Bool;
 
 	private import function RequestVisualState();
 	private import function RestorePreviousVisualState();
@@ -40,6 +46,7 @@ import class TutorialPopupGameController extends inkGameController
 	{
 		RequestVisualState();
 		m_data = ( ( TutorialPopupData )( GetRootWidget().GetUserData( 'TutorialPopupData' ) ) );
+		m_data.gyroTutorialProgress = 0;
 		m_targetPosition = m_data.position;
 		if( m_data.closeAtInput )
 		{
@@ -50,7 +57,14 @@ import class TutorialPopupGameController extends inkGameController
 			PauseGame( true );
 			PlaySound( 'GameMenu', 'OnOpen' );
 		}
-		SetupView();
+		if( !( GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).GetBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle ) ) && GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData ).GetBool( GetAllBlackboardDefs().UIGameData.DetachTutorialPopup_IsShown ) )
+		{
+			ShowDetachTutorialPopup();
+		}
+		else
+		{
+			SetupView();
+		}
 	}
 
 	protected event OnUninitialize()
@@ -66,32 +80,23 @@ import class TutorialPopupGameController extends inkGameController
 		}
 	}
 
-	protected event OnRelease( e : inkPointerEvent )
-	{
-		if( e.IsAction( 'close_tutorial' ) )
-		{
-			if( m_animationProxy != NULL )
-			{
-				m_animationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
-				m_animationProxy.Stop();
-				m_animationProxy = NULL;
-			}
-			m_animationProxy = PlayLibraryAnimationOnAutoSelectedTargets( m_animOutro, inkWidgetRef.Get( m_targetPopup ) );
-			m_animationProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnOutro' );
-			PlaySound( 'GameMenu', 'OnClose' );
-		}
-	}
-
 	protected event OnPlayerAttach( playerPuppet : GameObject )
 	{
-		var owner : GameObject;
 		m_onInputDeviceChangedCallbackID = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).RegisterListenerUint( GetAllBlackboardDefs().InputSchemes.Device, this, 'OnInputDeviceChanged' );
+		if( ( ( PlayerPuppet )( playerPuppet ) ).IsInGyroTutorial() )
+		{
+			m_joyconDualStyleChangedListener = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).RegisterListenerBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle, this, 'OnJoyconDualStyleChanged' );
+		}
 		if( m_inputBlocked )
 		{
-			owner = GetPlayerControlledObject();
-			owner.RegisterInputListener( this, 'UI_Apply' );
-			owner.RegisterInputListener( this, 'UI_Cancel' );
-			owner.RegisterInputListener( this, 'ChoiceApply' );
+			playerPuppet.RegisterInputListener( this, 'UI_Apply' );
+			playerPuppet.RegisterInputListener( this, 'UI_Cancel' );
+			playerPuppet.RegisterInputListener( this, 'ChoiceApply' );
+		}
+		RegisterGyroInputListeners( playerPuppet );
+		if( ( m_data.gyroTutorialProgress > 0 ) && ( m_data.gyroTutorialProgress <= m_data.gyroTutorialProgressMax ) )
+		{
+			UpdateTutorialUiText();
 		}
 	}
 
@@ -101,9 +106,17 @@ import class TutorialPopupGameController extends inkGameController
 		{
 			GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).UnregisterListenerUint( GetAllBlackboardDefs().InputSchemes.Device, m_onInputDeviceChangedCallbackID );
 		}
+		if( m_joyconDualStyleChangedListener )
+		{
+			GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).UnregisterListenerBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle, m_joyconDualStyleChangedListener );
+		}
 		if( m_inputBlocked )
 		{
 			GetPlayerControlledObject().UnregisterInputListener( this );
+		}
+		if( m_uiContextIsActive )
+		{
+			ChangeUIContext( false );
 		}
 	}
 
@@ -121,6 +134,326 @@ import class TutorialPopupGameController extends inkGameController
 		}
 	}
 
+	public function CloseTutorial()
+	{
+		var bb : IBlackboard;
+		if( m_animationProxy != NULL )
+		{
+			m_animationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
+			m_animationProxy.Stop();
+			m_animationProxy = NULL;
+		}
+		m_animationProxy = PlayLibraryAnimationOnAutoSelectedTargets( m_animOutro, inkWidgetRef.Get( m_targetPopup ) );
+		m_animationProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnOutro' );
+		PlaySound( 'GameMenu', 'OnClose' );
+		bb = GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData );
+		if( bb.GetBool( GetAllBlackboardDefs().UIGameData.DetachTutorialPopup_IsShown ) )
+		{
+			bb.SetBool( GetAllBlackboardDefs().UIGameData.DetachTutorialPopup_IsShown, false );
+		}
+	}
+
+	protected event OnRelease( e : inkPointerEvent )
+	{
+		var menuEvent : inkMenuInstance_SpawnEvent;
+		if( ( !( m_isJoyconDetachPatternTutorial ) && !( m_isHoldAction ) ) && e.IsAction( 'close_tutorial' ) )
+		{
+			CloseTutorial();
+		}
+		else if( m_isJoyconDetachPatternTutorial && e.IsAction( 'OpenPauseMenu_Tutorial' ) )
+		{
+			menuEvent = new inkMenuInstance_SpawnEvent;
+			menuEvent.Init( 'OnOpenPauseMenu' );
+			GameInstance.GetUISystem( GetPlayerControlledObject().GetGame() ).QueueEvent( menuEvent );
+		}
+	}
+
+	protected event OnHold( e : inkPointerEvent )
+	{
+		var progress : Float;
+		progress = e.GetHoldProgress();
+		if( ( ( !( m_isJoyconDetachPatternTutorial ) && m_isHoldAction ) && ( progress >= 1.0 ) ) && e.IsAction( 'close_tutorial' ) )
+		{
+			CloseTutorial();
+		}
+	}
+
+	protected event OnAction( action : ListenerAction, consumer : ListenerActionConsumer )
+	{
+		var actionName : String;
+		var actionPatternTutorialName : String;
+		actionName = NameToString( ListenerAction.GetName( action ) );
+		actionPatternTutorialName = NameToString( ListenerAction.GetPatternTutorialName( action ) );
+		if( actionName != "" )
+		{
+			if( m_data.gyroTutorialProgress < 0 )
+			{
+				m_data.gyroTutorialProgress = 0;
+			}
+			else if( m_data.gyroTutorialProgress <= m_data.gyroTutorialProgressMax )
+			{
+				SetGyroTutorialFact( actionName, actionPatternTutorialName );
+				UpdateTutorialUiText();
+			}
+			else
+			{
+				PauseGame( false );
+			}
+		}
+	}
+
+	public function ChangeUIContext( value : Bool )
+	{
+		var psmEvent : PSMPostponedParameterBool;
+		m_uiContextIsActive = value;
+		if( value )
+		{
+			psmEvent = new PSMPostponedParameterBool;
+			psmEvent.id = 'OnUIContextActive';
+		}
+		else
+		{
+			psmEvent = new PSMPostponedParameterBool;
+			psmEvent.id = 'OnUIContextInactive';
+		}
+		psmEvent.value = true;
+		GetPlayerControlledObject().QueueEvent( psmEvent );
+	}
+
+	public function SetupTutorialPopupView()
+	{
+		BlockInput( m_data.closeAtInput );
+		PauseGame( m_data.pauseGame );
+		ContinueButtonSetState( !( m_isJoyconDetachPatternTutorial ), m_data.gyroTutorialProgress > 0 );
+		SetupView();
+		ChangeUIContext( m_data.pauseGame );
+		GetBlackboardSystem().Get( GetAllBlackboardDefs().UIGameData ).SetBool( GetAllBlackboardDefs().UIGameData.DetachTutorialPopup_IsShown, m_isJoyconDetachPatternTutorial );
+	}
+
+	public function ShowDetachTutorialPopup()
+	{
+		m_prevData = new TutorialPopupData;
+		CopyPopupData( m_data, m_prevData );
+		CopyPopupData( new DetachTutorialPopupData, m_data );
+		m_isJoyconDetachPatternTutorial = true;
+		SetupTutorialPopupView();
+	}
+
+	public function CopyPopupData( from : TutorialPopupData, to : TutorialPopupData )
+	{
+		to.title = from.title;
+		to.message = from.message;
+		to.videoType = from.videoType;
+		to.video = from.video;
+		to.pauseGame = from.pauseGame;
+		to.isModal = from.isModal;
+		to.closeAtInput = from.closeAtInput;
+		to.position = from.position;
+		to.gyroTutorialProgress = from.gyroTutorialProgress;
+	}
+
+	protected event OnJoyconDualStyleChanged( value : Bool )
+	{
+		if( m_isJoyconDetachPatternTutorial && value )
+		{
+			if( m_prevData != NULL )
+			{
+				CopyPopupData( m_prevData, m_data );
+				m_prevData = NULL;
+				m_isJoyconDetachPatternTutorial = false;
+				SetupTutorialPopupView();
+			}
+			else
+			{
+				CloseTutorial();
+			}
+		}
+		else if( !( value ) )
+		{
+			ShowDetachTutorialPopup();
+		}
+	}
+
+	protected event OnGyroTutorialUIEvent( evt : GyroTutorialUIEvent )
+	{
+		var actionName : String;
+		var actionPatternTutorialName : String;
+		actionName = NameToString( evt.actionName );
+		actionPatternTutorialName = NameToString( evt.actionPatternTutorialName );
+		SetGyroTutorialFact( actionName, actionPatternTutorialName );
+		if( ( m_data.gyroTutorialProgress > 0 ) && ( m_data.gyroTutorialProgress <= m_data.gyroTutorialProgressMax ) )
+		{
+			UpdateTutorialUiText();
+		}
+	}
+
+	private function ContinueButtonSetState( isEnabled : Bool, isHoldAction : Bool )
+	{
+		var widget : weak< inkWidget >;
+		var widgetPath : CName;
+		var inputDisplayController : inkInputDisplayController;
+		widgetPath = m_fullscreenButtonContainerWidgetPath + '/inputDisplayController';
+		widget = GetWidget( widgetPath );
+		if( widget )
+		{
+			inputDisplayController = ( ( inkInputDisplayController )( widget.GetController() ) );
+			if( inputDisplayController )
+			{
+				m_isHoldAction = isHoldAction;
+				inputDisplayController.SetInputAction( 'close_tutorial' );
+				inputDisplayController.SetHoldIndicatorType( ( ( isEnabled && isHoldAction ) ? ( inkInputHintHoldIndicationType.Hold ) : ( inkInputHintHoldIndicationType.Press ) ) );
+			}
+		}
+		widgetPath = m_fullscreenButtonContainerWidgetPath + '/inputDisplayController/container/inputRoot/inputIcon';
+		widget = GetWidget( widgetPath );
+		if( widget )
+		{
+			widget.BindProperty( 'tintColor', ( ( isEnabled ) ? ( 'MainColors.Blue' ) : ( 'MainColors.Grey' ) ) );
+		}
+		widgetPath = m_fullscreenButtonContainerWidgetPath + '/inputDisplayController/container/inputRoot/inputText';
+		widget = GetWidget( widgetPath );
+		if( widget )
+		{
+			widget.BindProperty( 'tintColor', ( ( isEnabled ) ? ( 'MainColors.Blue' ) : ( 'MainColors.Grey' ) ) );
+		}
+		widgetPath = m_fullscreenButtonContainerWidgetPath + '/action';
+		widget = GetWidget( widgetPath );
+		if( widget )
+		{
+			widget.BindProperty( 'tintColor', ( ( isEnabled ) ? ( 'MainColors.Red' ) : ( 'MainColors.Grey' ) ) );
+		}
+	}
+
+	private function RegisterGyroInputListeners( owner : GameObject )
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( owner.GetGame() );
+		m_data.hasGyroTutorialCounter = questSystem.GetFact( 'gyro_tutorial_show_counter' ) == 1;
+		if( ( questSystem.GetFact( 'gyro_light_attack_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_light_attack_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'MeleeAttack_Tutorial' ) : ( 'MeleeAttack' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_light_attack_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_strong_attack_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_strong_attack_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'MeleeAttack_Tutorial' ) : ( 'MeleeAttack' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_strong_attack_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_charged_attack_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_charged_attack_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'MeleeAttack_Tutorial' ) : ( 'MeleeAttack' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_charged_attack_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_reload_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_reload_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'Reload_Tutorial' ) : ( 'Reload' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_reload_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_dodge_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_dodge_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'Dodge_Tutorial' ) : ( 'Dodge' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_dodge_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_dodge_left_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_dodge_left_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'Dodge_Tutorial' ) : ( 'Dodge' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_dodge_left_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_dodge_right_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_dodge_right_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'Dodge_Tutorial' ) : ( 'Dodge' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_dodge_right_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_inhaler_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_inhaler_tutorial_seen' ) == 0 ) )
+		{
+			owner.RegisterInputListener( this, ( ( m_inputBlocked ) ? ( 'UseConsumable_Tutorial' ) : ( 'UseConsumable' ) ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_inhaler_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_detach_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_detach_tutorial_seen' ) == 0 ) )
+		{
+			m_isJoyconDetachPatternTutorial = !( GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).GetBool( GetAllBlackboardDefs().InputSchemes.IsJoyconDualStyle ) );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_detach_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_settings_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_settings_tutorial_seen' ) == 0 ) )
+		{
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_settings_tutorial' );
+		}
+		else if( ( questSystem.GetFact( 'gyro_sensor_reset_tutorial' ) > 0 ) && ( questSystem.GetFact( 'gyro_sensor_reset_tutorial_seen' ) == 0 ) )
+		{
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_sensor_reset_tutorial' );
+		}
+		if( ( m_data.gyroTutorialProgress > 0 ) || m_data.title == "LocKey#97281" )
+		{
+			ContinueButtonSetState( !( m_isJoyconDetachPatternTutorial ), true );
+		}
+	}
+
+	public function SetGyroTutorialFact( actionName : String, actionPatternTutorialName : String )
+	{
+		var questSystem : QuestsSystem;
+		questSystem = GameInstance.GetQuestsSystem( GetPlayerControlledObject().GetGame() );
+		if( ( questSystem.GetFact( 'gyro_tutorial_show_counter' ) == 0 ) && ( ( m_data.gyroTutorialProgress + 1 ) > m_data.gyroTutorialProgressMax ) )
+		{
+			m_data.gyroTutorialProgress = m_data.gyroTutorialProgressMax - 1;
+		}
+		if( StrContains( actionName, "MeleeAttack" ) )
+		{
+			if( ( StrContains( actionPatternTutorialName, "MeleeAttack_Normal" ) && ( questSystem.GetFact( 'gyro_light_attack_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_light_attack_tutorial_seen' ) == 0 ) )
+			{
+				questSystem.SetFact( 'gyro_light_attack_tutorial', m_data.gyroTutorialProgress + 1 );
+				m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_light_attack_tutorial' );
+			}
+			else if( ( StrContains( actionPatternTutorialName, "MeleeAttack_Heavy" ) && ( questSystem.GetFact( 'gyro_strong_attack_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_strong_attack_tutorial_seen' ) == 0 ) )
+			{
+				questSystem.SetFact( 'gyro_strong_attack_tutorial', m_data.gyroTutorialProgress + 1 );
+				m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_strong_attack_tutorial' );
+			}
+			else if( ( StrContains( actionPatternTutorialName, "MeleeAttack_Charge" ) && ( questSystem.GetFact( 'gyro_charged_attack_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_charged_attack_tutorial_seen' ) == 0 ) )
+			{
+				questSystem.SetFact( 'gyro_charged_attack_tutorial', m_data.gyroTutorialProgress + 1 );
+				m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_charged_attack_tutorial' );
+			}
+		}
+		else if( ( actionName == "Reload_Tutorial" && ( questSystem.GetFact( 'gyro_reload_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_reload_tutorial_seen' ) == 0 ) )
+		{
+			questSystem.SetFact( 'gyro_reload_tutorial', m_data.gyroTutorialProgress + 1 );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_reload_tutorial' );
+		}
+		else if( ( ( actionName == "Dodge_Tutorial" || StrContains( actionPatternTutorialName, "Dodge" ) ) && ( questSystem.GetFact( 'gyro_dodge_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_dodge_tutorial_seen' ) == 0 ) )
+		{
+			questSystem.SetFact( 'gyro_dodge_tutorial', m_data.gyroTutorialProgress + 1 );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_dodge_tutorial' );
+		}
+		else if( ( ( actionName == "Dodge_Tutorial" || StrContains( actionPatternTutorialName, "Dodge" ) ) && ( questSystem.GetFact( 'gyro_dodge_left_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_dodge_left_tutorial_seen' ) == 0 ) )
+		{
+			questSystem.SetFact( 'gyro_dodge_left_tutorial', m_data.gyroTutorialProgress + 1 );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_dodge_left_tutorial' );
+		}
+		else if( ( ( actionName == "Dodge_Tutorial" || StrContains( actionPatternTutorialName, "Dodge" ) ) && ( questSystem.GetFact( 'gyro_dodge_right_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_dodge_right_tutorial_seen' ) == 0 ) )
+		{
+			questSystem.SetFact( 'gyro_dodge_right_tutorial', m_data.gyroTutorialProgress + 1 );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_dodge_right_tutorial' );
+		}
+		else if( ( actionName == "UseConsumable_Tutorial" && ( questSystem.GetFact( 'gyro_inhaler_tutorial' ) > 0 ) ) && ( questSystem.GetFact( 'gyro_inhaler_tutorial_seen' ) == 0 ) )
+		{
+			questSystem.SetFact( 'gyro_inhaler_tutorial', m_data.gyroTutorialProgress + 1 );
+			m_data.gyroTutorialProgress = questSystem.GetFact( 'gyro_inhaler_tutorial' );
+		}
+	}
+
+	public function UpdateTutorialUiText()
+	{
+		var displayController : TutorialPopupDisplayController;
+		var inputBB : IBlackboard;
+		var inputDevice : InputDevice;
+		var inputScheme : InputScheme;
+		inputBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes );
+		inputDevice = ( ( InputDevice )( ( ( Uint8 )( inputBB.GetUint( GetAllBlackboardDefs().InputSchemes.Device ) ) ) ) );
+		inputScheme = ( ( InputScheme )( ( ( Uint8 )( inputBB.GetUint( GetAllBlackboardDefs().InputSchemes.Scheme ) ) ) ) );
+		displayController = ( ( TutorialPopupDisplayController )( inkWidgetRef.GetController( m_targetPopup ) ) );
+		displayController.SetData( m_data, inputDevice, inputScheme );
+	}
+
 	private function BlockInput( value : Bool )
 	{
 		if( m_inputBlocked != value )
@@ -129,10 +462,12 @@ import class TutorialPopupGameController extends inkGameController
 			if( m_inputBlocked )
 			{
 				RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnRelease' );
+				RegisterToGlobalInputCallback( 'OnPostOnHold', this, 'OnHold' );
 			}
 			else
 			{
 				UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnRelease' );
+				UnregisterFromGlobalInputCallback( 'OnPostOnHold', this, 'OnHold' );
 			}
 		}
 	}
@@ -158,19 +493,21 @@ import class TutorialPopupGameController extends inkGameController
 
 	private function SetupView()
 	{
-		var displayController : TutorialPopupDisplayController;
-		var inputBB : IBlackboard;
-		var inputDevice : InputDevice;
-		var inputScheme : InputScheme;
 		var targetMargin : inkMargin;
-		inputBB = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes );
-		inputDevice = ( ( InputDevice )( ( ( Uint8 )( inputBB.GetUint( GetAllBlackboardDefs().InputSchemes.Device ) ) ) ) );
-		inputScheme = ( ( InputScheme )( ( ( Uint8 )( inputBB.GetUint( GetAllBlackboardDefs().InputSchemes.Scheme ) ) ) ) );
+		var isMouserActive : Bool;
 		GetRootWidget().SetVisible( true );
 		inkWidgetRef.SetVisible( m_popupPanel, false );
 		inkWidgetRef.SetVisible( m_popupFullscreenPanel, false );
 		inkWidgetRef.SetVisible( m_popupBlockingPanel, false );
 		inkWidgetRef.SetVisible( m_popupFullscreenRightPanel, false );
+		if( m_data.title == "LocKey#19637" && m_data.message == "LocKey#19639" )
+		{
+			isMouserActive = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).GetBool( GetAllBlackboardDefs().InputSchemes.IsMouserActive );
+			if( isMouserActive )
+			{
+				return;
+			}
+		}
 		if( m_animationProxy != NULL )
 		{
 			m_animationProxy.UnregisterFromAllCallbacks( inkanimEventType.OnFinish );
@@ -247,8 +584,7 @@ import class TutorialPopupGameController extends inkGameController
 				break;
 			}
 		}
-		displayController = ( ( TutorialPopupDisplayController )( inkWidgetRef.GetController( m_targetPopup ) ) );
-		displayController.SetData( m_data, inputDevice, inputScheme );
+		UpdateTutorialUiText();
 		AdaptToScreenComposition();
 		m_animationProxy = PlayLibraryAnimationOnAutoSelectedTargets( m_animIntro, inkWidgetRef.Get( m_targetPopup ) );
 		m_animationProxy.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnIntro' );
@@ -334,5 +670,11 @@ import class TutorialPopupGameController extends inkGameController
 		m_data.token.TriggerCallback( m_data );
 	}
 
+}
+
+class GyroTutorialUIEvent extends Event
+{
+	var actionName : CName;
+	var actionPatternTutorialName : CName;
 }
 
