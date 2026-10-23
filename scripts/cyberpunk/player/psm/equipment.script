@@ -213,12 +213,10 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 	protected const function GetWeaponUnEquipDuration( const scriptInterface : StateGameScriptInterface, stateContext : StateContext, stateMachineInstanceData : StateMachineInstanceData ) : Float
 	{
 		var weapon : weak< WeaponObject >;
-		var otherWeapon : weak< WeaponObject >;
 		var statSystem : StatsSystem;
 		var duration : Float;
 		var instantEquipRequested : Bool;
 		var request : EquipmentManipulationRequest;
-		var otherHandDuration : Float;
 		statSystem = scriptInterface.GetStatsSystem();
 		request = GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext );
 		weapon = ( ( WeaponObject )( GetSlotAttachedItemObject( scriptInterface, stateMachineInstanceData ) ) );
@@ -230,15 +228,6 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		else
 		{
 			duration = statSystem.GetStatValue( weapon.GetEntityID(), gamedataStatType.UnequipDuration );
-			if( request.requestType == EquipmentManipulationRequestType.DualEquip )
-			{
-				otherWeapon = ( ( WeaponObject )( scriptInterface.GetTransactionSystem().GetItemInSlot( scriptInterface.executionOwner, ( ( IsLeftHandLogic( stateMachineInstanceData ) ) ? ( T"AttachmentSlots.WeaponRight" ) : ( T"AttachmentSlots.WeaponLeft" ) ) ) ) );
-				if( otherWeapon )
-				{
-					otherHandDuration = statSystem.GetStatValue( otherWeapon.GetEntityID(), gamedataStatType.UnequipDuration );
-					duration = MaxF( duration, otherHandDuration );
-				}
-			}
 		}
 		stateContext.SetPermanentFloatParameter( 'rhUnequipDuration', duration, true );
 		return duration;
@@ -254,6 +243,51 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		{
 			return 0.2;
 		}
+	}
+
+	protected const function CanEquipRequestedWeapon( scriptInterface : StateGameScriptInterface, stateContext : StateContext, stateMachineInstanceData : StateMachineInstanceData ) : Bool
+	{
+		var slotActiveItem : ItemID;
+		var isLeftHand : Bool;
+		var itemCategory : gamedataItemCategory;
+		var otherWeapon : weak< WeaponObject >;
+		var otherWeaponID : ItemID;
+		slotActiveItem = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
+		if( !( ItemID.IsValid( slotActiveItem ) ) )
+		{
+			return true;
+		}
+		isLeftHand = IsLeftHandLogic( stateMachineInstanceData );
+		itemCategory = GetItemCategoryFromItemID( GetSlotActiveItem( scriptInterface, stateMachineInstanceData ) );
+		if( ( itemCategory == gamedataItemCategory.Gadget || itemCategory == gamedataItemCategory.Consumable ) || ( isLeftHand && itemCategory == gamedataItemCategory.Cyberware ) )
+		{
+			return CheckGenericEquipItemConditions( stateContext, scriptInterface ) && ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody ) != ( ( Int32 )( gamePSMUpperBodyStates.ForceEmptyHands ) ) );
+		}
+		else if( itemCategory == gamedataItemCategory.Weapon )
+		{
+			if( !( CanProcessEquip( stateContext, scriptInterface ) ) )
+			{
+				return false;
+			}
+			otherWeapon = ( ( isLeftHand ) ? ( ScriptedPuppet.GetRightActiveWeapon( scriptInterface.executionOwner ) ) : ( ScriptedPuppet.GetLeftActiveWeapon( scriptInterface.executionOwner ) ) );
+			if( otherWeapon )
+			{
+				if( isLeftHand && ( otherWeapon.GetItemID() != EquipmentSystem.GetSlotActiveItem( scriptInterface.executionOwner, EquipmentManipulationRequestSlot.Right ) ) )
+				{
+					return false;
+				}
+				otherWeaponID = otherWeapon.GetItemID();
+				if( WeaponObject.IsFists( otherWeaponID ) || EquipmentSystem.GetEquipAreaType( otherWeaponID ) == gamedataEquipmentArea.ArmsCW )
+				{
+					return false;
+				}
+			}
+			if( isLeftHand && IsRightHandInUnequippedState( stateContext, true ) )
+			{
+				return false;
+			}
+		}
+		return otherWeapon.GetItemID() != slotActiveItem;
 	}
 
 	protected const function HandleWeaponEquip( scriptInterface : StateGameScriptInterface, stateContext : StateContext, stateMachineInstanceData : StateMachineInstanceData, item : ItemID, isLeftWeapon : Bool )
@@ -383,12 +417,12 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		var unequipStartEvent : UnequipStart;
 		var animFeature : AnimFeature_EquipUnequipItem;
 		var animFeatureName : CName;
-		var leftHandAnimFeature : AnimFeature_LeftHandAnimation;
 		var transactionSystem : TransactionSystem;
 		var placementSlot : TweakDBID;
 		var gunzerkerLevel : Int32;
 		var playerDevelopmentData : PlayerDevelopmentData;
 		var tempEquip : StateResultBool;
+		var dualWieldLoadoutEdit : StateResultBool;
 		mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
 		unequipStartEvent = new UnequipStart;
 		animFeature = new AnimFeature_EquipUnequipItem;
@@ -408,19 +442,14 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 			otherItem = ScriptedPuppet.GetLeftActiveWeapon( scriptInterface.executionOwner );
 		}
 		tempEquip = stateContext.GetPermanentBoolParameter( GetTempEquipOverWeapon( stateMachineInstanceData ) );
-		animFeature.itemState = 3;
+		dualWieldLoadoutEdit = stateContext.GetPermanentBoolParameter( GetDualWieldLoadoutEdit( stateMachineInstanceData ) );
+		animFeature.itemState = ( ( dualWieldLoadoutEdit.valid && dualWieldLoadoutEdit.value ) ? ( 1 ) : ( 3 ) );
 		animFeature.itemType = ( ( Int32 )( TDB.GetItemRecord( ItemID.GetTDBID( item ) ).ItemType().AnimFeatureIndex() ) );
 		animFeature.stateTransitionDuration = GetWeaponUnEquipDuration( scriptInterface, stateContext, stateMachineInstanceData );
 		animFeature.tempEquipOverWeapon = tempEquip.valid && tempEquip.value;
 		if( !( isLeftWeapon ) )
 		{
 			BlockAimingForTime( stateContext, scriptInterface, animFeature.stateTransitionDuration + 0.1 );
-		}
-		else
-		{
-			leftHandAnimFeature = new AnimFeature_LeftHandAnimation;
-			leftHandAnimFeature.lockLeftHandAnimation = false;
-			scriptInterface.SetAnimationParameterFeature( 'LeftHandAnimation', leftHandAnimFeature, scriptInterface.executionOwner );
 		}
 		scriptInterface.SetAnimationParameterFeature( mappedInstanceData.itemHandlingFeatureName, animFeature, scriptInterface.executionOwner );
 		scriptInterface.SetAnimationParameterFeature( animFeatureName, animFeature, itemObject );
@@ -765,6 +794,11 @@ abstract class EquipmentBaseTransition extends DefaultTransition
 		return ( ( IsRightHandLogic( stateMachineInstanceData ) ) ? ( 'rightTempEquipOverWeapon' ) : ( 'leftTempEquipOverWeapon' ) );
 	}
 
+	protected const function GetDualWieldLoadoutEdit( stateMachineInstanceData : StateMachineInstanceData ) : CName
+	{
+		return ( ( IsRightHandLogic( stateMachineInstanceData ) ) ? ( 'rightDualWieldLoadoutEdit' ) : ( 'leftDualWieldLoadoutEdit' ) );
+	}
+
 	protected const function GetBlackboardID( stateMachineInstanceData : StateMachineInstanceData ) : BlackboardID_Int
 	{
 		return ( ( IsLeftHandLogic( stateMachineInstanceData ) ) ? ( GetAllBlackboardDefs().PlayerStateMachine.EquipmentLeft ) : ( GetAllBlackboardDefs().PlayerStateMachine.EquipmentRight ) );
@@ -881,13 +915,18 @@ class UnequippedEvents extends EquipmentBaseEvents
 
 	protected export function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
+		var weaponManipulationRequest : EquipmentManipulationRequest;
 		var tempEquipOverWeapon : Bool;
-		tempEquipOverWeapon = GetWeaponManipulationRequest( stateContext, stateMachineInitData ).tempEquipOverWeapon;
+		var dualWieldLoadoutEdit : Bool;
+		weaponManipulationRequest = GetWeaponManipulationRequest( stateContext, stateMachineInitData );
+		tempEquipOverWeapon = weaponManipulationRequest.tempEquipOverWeapon;
+		dualWieldLoadoutEdit = weaponManipulationRequest.dualWieldLoadoutEdit;
 		if( IsLeftHandLogic( stateMachineInstanceData ) )
 		{
 			scriptInterface.localBlackboard.SetBool( GetAllBlackboardDefs().PlayerStateMachine.IsDualWielding, tempEquipOverWeapon );
 		}
 		stateContext.SetPermanentBoolParameter( GetTempEquipOverWeapon( stateMachineInstanceData ), tempEquipOverWeapon, true );
+		stateContext.SetPermanentBoolParameter( GetDualWieldLoadoutEdit( stateMachineInstanceData ), dualWieldLoadoutEdit, true );
 		stateContext.RemovePermanentScriptableParameter( stateMachineInitData.eqManipulationVarName );
 	}
 
@@ -900,32 +939,7 @@ class UnequippedWaitingForExternalFactorsDecisions extends EquipmentBaseDecision
 
 	protected export const function ExitCondition( stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		var rightStateMachineId : StateMachineIdentifier;
-		var processedRequest : EquipmentManipulationRequest;
-		var rightReady : Bool;
-		if( IsRightHandLogic( stateMachineInstanceData ) )
-		{
-			if( !( CanProcessEquip( stateContext, scriptInterface ) ) )
-			{
-				return false;
-			}
-		}
-		else if( IsLeftHandLogic( stateMachineInstanceData ) )
-		{
-			if( !( CheckGenericEquipItemConditions( stateContext, scriptInterface ) ) || ( scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody ) == ( ( Int32 )( gamePSMUpperBodyStates.ForceEmptyHands ) ) ) )
-			{
-				return false;
-			}
-			processedRequest = GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext );
-			rightStateMachineId.definitionName = 'Equipment';
-			rightStateMachineId.referenceName = 'RightHand';
-			rightReady = stateContext.IsStateActiveWithIdentifier( rightStateMachineId, 'equipCycleInit' ) || stateContext.IsStateActiveWithIdentifier( rightStateMachineId, 'equipped' );
-			if( processedRequest.requestType == EquipmentManipulationRequestType.DualEquip && !( rightReady ) )
-			{
-				return false;
-			}
-		}
-		return true;
+		return CanEquipRequestedWeapon( scriptInterface, stateContext, stateMachineInstanceData );
 	}
 
 }
@@ -1010,6 +1024,10 @@ class EquippedDecisions extends EquipmentBaseDecisions
 				return false;
 			}
 		}
+		if( IsLeftHandLogic( stateMachineInstanceData ) && stateContext.IsStateMachineActive( 'Consumable' ) )
+		{
+			return false;
+		}
 		if( equipRequestOccuredThisFrame || hasEquipProcessedPrevFrame )
 		{
 			return true;
@@ -1073,7 +1091,14 @@ class EquippedEvents extends EquipmentBaseEvents
 
 	protected export function OnExit( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
-		stateContext.SetPermanentBoolParameter( GetTempEquipOverWeapon( stateMachineInstanceData ), GetWeaponManipulationRequest( stateContext, stateMachineInitData ).tempEquipOverWeapon, true );
+		var weaponManipulationRequest : EquipmentManipulationRequest;
+		var tempEquipOverWeapon : Bool;
+		var dualWieldLoadoutEdit : Bool;
+		weaponManipulationRequest = GetWeaponManipulationRequest( stateContext, stateMachineInitData );
+		tempEquipOverWeapon = weaponManipulationRequest.tempEquipOverWeapon;
+		dualWieldLoadoutEdit = weaponManipulationRequest.dualWieldLoadoutEdit;
+		stateContext.SetPermanentBoolParameter( GetTempEquipOverWeapon( stateMachineInstanceData ), tempEquipOverWeapon, true );
+		stateContext.SetPermanentBoolParameter( GetDualWieldLoadoutEdit( stateMachineInstanceData ), dualWieldLoadoutEdit, true );
 		stateContext.RemovePermanentScriptableParameter( stateMachineInitData.eqManipulationVarName );
 	}
 
@@ -1127,9 +1152,7 @@ class EquipCycleInitDecisions extends EquipmentBaseDecisions
 
 	protected export const function ToUnequippedWaitingForExternalFactors( stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		var processedRequest : EquipmentManipulationRequest;
-		processedRequest = GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext );
-		return processedRequest.requestType == EquipmentManipulationRequestType.DualEquip && IsLeftHandLogic( stateMachineInstanceData );
+		return !( CanEquipRequestedWeapon( scriptInterface, stateContext, stateMachineInstanceData ) );
 	}
 
 	protected export const function ToUnequipped( const stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
@@ -1303,11 +1326,15 @@ class EquipCycleEvents extends EquipmentBaseEvents
 			}
 			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Consumable )
 			{
+				stateContext.RemovePermanentBoolParameter( 'UnequipToGadgetOrConsumable' );
 				AddConsumableStateMachine( scriptInterface );
+				AnimationControllerComponent.SetInputBool( GetPlayerPuppet( scriptInterface ), 'ignore_other_firstequip', true );
 				return;
 			}
 			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Gadget )
 			{
+				stateContext.RemovePermanentBoolParameter( 'UnequipToGadgetOrConsumable' );
+				AnimationControllerComponent.SetInputBool( GetPlayerPuppet( scriptInterface ), 'ignore_other_firstequip', true );
 				AddGrenadesStateMachine( scriptInterface );
 				return;
 			}
@@ -1390,7 +1417,7 @@ class FirstEquipDecisions extends EquipmentBaseDecisions
 		}
 		upperBodyState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody );
 		locomotionDetailedState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.LocomotionDetailed );
-		if( ( ( ( ( ( ( ( ( ( ( ( ( ( stateContext.IsStateMachineActive( 'CombatGadget' ) || stateContext.IsStateMachineActive( 'LocomotionSwimming' ) ) || stateContext.IsStateMachineActive( 'Vehicle' ) ) || stateContext.IsStateMachineActive( 'CarriedObject' ) ) || stateContext.IsStateMachineActive( 'Consumable' ) ) || stateContext.IsStateMachineActive( 'LocomotionTakedown' ) ) || ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.TemporaryUnequip ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Climb ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Ladder ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.LadderSprint ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.LadderSlide ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Vault ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.SuperheroFall ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Slide ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.SlideFall ) ) ) )
+		if( ( ( ( ( ( ( ( ( ( ( ( ( ( ( stateContext.IsStateMachineActive( 'CombatGadget' ) || stateContext.IsStateMachineActive( 'LocomotionSwimming' ) ) || stateContext.IsStateMachineActive( 'Vehicle' ) ) || stateContext.IsStateMachineActive( 'CarriedObject' ) ) || stateContext.IsStateMachineActive( 'Consumable' ) ) || stateContext.GetBoolParameter( 'UnequipToGadgetOrConsumable', true ) ) || stateContext.IsStateMachineActive( 'LocomotionTakedown' ) ) || ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.TemporaryUnequip ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Climb ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Ladder ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.LadderSprint ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.LadderSlide ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Vault ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.SuperheroFall ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.Slide ) ) ) ) || ( locomotionDetailedState == ( ( Int32 )( gamePSMDetailedLocomotionStates.SlideFall ) ) ) )
 		{
 			return true;
 		}
@@ -1467,25 +1494,11 @@ class UnequipCycleDecisions extends EquipmentBaseDecisions
 
 	protected export const function ToUnequippedWaitingForExternalFactors( stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
 	{
-		var processedRequest : EquipmentManipulationRequest;
-		var rightStateMachineId : StateMachineIdentifier;
-		var rightReady : Bool;
-		var threshold : Float;
-		var itemId : ItemID;
-		var smConditions : Bool;
-		var upperBodyState : Int32;
-		processedRequest = GetProcessedEquipmentManipulationRequest( stateMachineInstanceData, stateContext );
-		rightStateMachineId.definitionName = 'Equipment';
-		rightStateMachineId.referenceName = 'RightHand';
-		rightReady = stateContext.IsStateActiveWithIdentifier( rightStateMachineId, 'equipCycleInit' ) || stateContext.IsStateActiveWithIdentifier( rightStateMachineId, 'equipped' );
-		if( ( processedRequest.requestSlot == EquipmentManipulationRequestSlot.Left && processedRequest.requestType == EquipmentManipulationRequestType.DualEquip ) && !( rightReady ) )
+		if( CanEquipRequestedWeapon( scriptInterface, stateContext, stateMachineInstanceData ) )
 		{
-			threshold = GetUnequipDuration( scriptInterface, stateContext, stateMachineInstanceData );
-			itemId = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
-			smConditions = ( ( ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.TemporaryUnequip ) ) ) || ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.ForceEmptyHands ) ) ) ) || stateContext.GetStateMachineCurrentState( 'Vehicle' ) == 'entering' ) || stateContext.GetStateMachineCurrentState( 'Vehicle' ) == 'switchSeats';
-			return ( ( GetInStateTime() >= threshold ) && ( itemId != ItemID.None() ) ) && !( smConditions );
+			return false;
 		}
-		return false;
+		return ToEquipCycleInit( stateContext, scriptInterface );
 	}
 
 	protected export const function ToEquipCycleInit( stateContext : StateContext, const scriptInterface : StateGameScriptInterface ) : Bool
@@ -1511,14 +1524,14 @@ class UnequipCycleDecisions extends EquipmentBaseDecisions
 		{
 			if( IsLeftHandLogic( stateMachineInstanceData ) )
 			{
-				return !( stateContext.IsStateMachineActive( 'Consumable' ) ) && !( stateContext.IsStateMachineActive( 'CombatGadget' ) );
+				return ( !( stateContext.IsStateMachineActive( 'Consumable' ) ) && !( stateContext.GetBoolParameter( 'UnequipToGadgetOrConsumable', true ) ) ) && !( stateContext.IsStateMachineActive( 'CombatGadget' ) );
 			}
 			else if( IsRightHandLogic( stateMachineInstanceData ) )
 			{
 				return true;
 			}
 		}
-		else if( ( ( ( ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.TemporaryUnequip ) ) ) || ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.ForceEmptyHands ) ) ) ) || stateContext.GetStateMachineCurrentState( 'Vehicle' ) == 'entering' ) || stateContext.GetStateMachineCurrentState( 'Vehicle' ) == 'switchSeats' ) && ( IsRightHandLogic( stateMachineInstanceData ) || ( ( IsLeftHandLogic( stateMachineInstanceData ) && !( stateContext.IsStateMachineActive( 'Consumable' ) ) ) && !( stateContext.IsStateMachineActive( 'CombatGadget' ) ) ) ) )
+		else if( ( ( ( ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.TemporaryUnequip ) ) ) || ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.ForceEmptyHands ) ) ) ) || stateContext.GetStateMachineCurrentState( 'Vehicle' ) == 'entering' ) || stateContext.GetStateMachineCurrentState( 'Vehicle' ) == 'switchSeats' ) && ( IsRightHandLogic( stateMachineInstanceData ) || ( ( ( IsLeftHandLogic( stateMachineInstanceData ) && !( stateContext.IsStateMachineActive( 'Consumable' ) ) ) && !( stateContext.GetBoolParameter( 'UnequipToGadgetOrConsumable', true ) ) ) && !( stateContext.IsStateMachineActive( 'CombatGadget' ) ) ) ) )
 		{
 			return true;
 		}
@@ -1534,6 +1547,7 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 	protected export virtual function OnEnter( stateContext : StateContext, scriptInterface : StateGameScriptInterface )
 	{
 		var item : ItemID;
+		var nextItem : ItemID;
 		item = GetItemIDFromParam( stateMachineInstanceData, stateContext );
 		if( !( ItemID.IsValid( item ) ) )
 		{
@@ -1550,16 +1564,18 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		}
 		if( IsLeftHandLogic( stateMachineInstanceData ) )
 		{
+			nextItem = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
+			if( GetItemCategoryFromItemID( nextItem ) == gamedataItemCategory.Gadget || GetItemCategoryFromItemID( nextItem ) == gamedataItemCategory.Consumable )
+			{
+				stateContext.SetPermanentBoolParameter( 'UnequipToGadgetOrConsumable', true, true );
+			}
 			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Weapon )
 			{
 				HandleWeaponUnequip( scriptInterface, stateContext, stateMachineInstanceData, item, true );
+				AnimationControllerComponent.SetInputBool( GetPlayerPuppet( scriptInterface ), 'ignore_other_firstequip', false );
 				return;
 			}
-			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Consumable )
-			{
-				return;
-			}
-			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Gadget )
+			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Consumable || GetItemCategoryFromItemID( item ) == gamedataItemCategory.Gadget )
 			{
 				return;
 			}
@@ -1578,11 +1594,13 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		var mappedInstanceData : InstanceDataMappedToReferenceName;
 		var unequipEndEvent : UnequipEnd;
 		var animFeature : AnimFeature_EquipUnequipItem;
+		var leftHandAnimFeature : AnimFeature_LeftHandAnimation;
 		var statSystem : StatsSystem;
 		var placementSlot : TweakDBID;
 		var itemId : ItemID;
 		var upperBodyState : Int32;
 		var tempEquip : StateResultBool;
+		var dualWieldLoadoutEdit : StateResultBool;
 		item = GetItemIDFromParam( stateMachineInstanceData, stateContext );
 		mappedInstanceData = GetMappedInstanceData( stateMachineInstanceData.referenceName );
 		unequipEndEvent = new UnequipEnd;
@@ -1591,6 +1609,7 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		itemId = GetSlotActiveItem( scriptInterface, stateMachineInstanceData );
 		upperBodyState = 0;
 		tempEquip = stateContext.GetPermanentBoolParameter( GetTempEquipOverWeapon( stateMachineInstanceData ) );
+		dualWieldLoadoutEdit = stateContext.GetPermanentBoolParameter( GetDualWieldLoadoutEdit( stateMachineInstanceData ) );
 		if( !( ItemID.IsValid( item ) ) )
 		{
 			return;
@@ -1603,7 +1622,7 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Weapon )
 			{
 				animFeature.stateTransitionDuration = statSystem.GetStatValue( scriptInterface.executionOwnerEntityID, gamedataStatType.UnequipDuration );
-				animFeature.itemState = 4;
+				animFeature.itemState = ( ( dualWieldLoadoutEdit.valid && dualWieldLoadoutEdit.value ) ? ( 1 ) : ( 4 ) );
 				animFeature.itemType = ( ( Int32 )( TDB.GetItemRecord( ItemID.GetTDBID( item ) ).ItemType().AnimFeatureIndex() ) );
 				animFeature.tempEquipOverWeapon = tempEquip.valid && tempEquip.value;
 				if( itemId != ItemID.None() )
@@ -1627,13 +1646,20 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 		}
 		else if( IsLeftHandLogic( stateMachineInstanceData ) )
 		{
+			upperBodyState = scriptInterface.localBlackboard.GetInt( GetAllBlackboardDefs().PlayerStateMachine.UpperBody );
+			if( !( ItemID.IsValid( itemId ) ) || ( upperBodyState == ( ( Int32 )( gamePSMUpperBodyStates.TemporaryUnequip ) ) ) )
+			{
+				leftHandAnimFeature = new AnimFeature_LeftHandAnimation;
+				leftHandAnimFeature.lockLeftHandAnimation = false;
+				scriptInterface.SetAnimationParameterFeature( 'LeftHandAnimation', leftHandAnimFeature, scriptInterface.executionOwner );
+			}
 			if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Weapon )
 			{
 				placementSlot = EquipmentSystem.GetPlacementSlot( item, true );
 				unequipEndEvent.SetSlotID( placementSlot );
 				scriptInterface.executionOwner.QueueEvent( unequipEndEvent );
 				animFeature.stateTransitionDuration = statSystem.GetStatValue( scriptInterface.executionOwnerEntityID, gamedataStatType.UnequipDuration );
-				animFeature.itemState = 4;
+				animFeature.itemState = ( ( dualWieldLoadoutEdit.valid && dualWieldLoadoutEdit.value ) ? ( 1 ) : ( 4 ) );
 				animFeature.itemType = ( ( Int32 )( TDB.GetItemRecord( ItemID.GetTDBID( item ) ).ItemType().AnimFeatureIndex() ) );
 				animFeature.tempEquipOverWeapon = tempEquip.valid && tempEquip.value;
 				if( itemId != ItemID.None() )
@@ -1653,6 +1679,16 @@ class UnequipCycleEvents extends EquipmentBaseEvents
 				{
 					RemoveLeftWeaponStateMachine( scriptInterface );
 				}
+			}
+			else if( GetItemCategoryFromItemID( item ) == gamedataItemCategory.Consumable || GetItemCategoryFromItemID( item ) == gamedataItemCategory.Gadget )
+			{
+				leftHandAnimFeature = new AnimFeature_LeftHandAnimation;
+				leftHandAnimFeature.lockLeftHandAnimation = ItemID.IsValid( GetSlotActiveItem( scriptInterface, stateMachineInstanceData ) );
+				scriptInterface.SetAnimationParameterFeature( 'LeftHandAnimation', leftHandAnimFeature, scriptInterface.executionOwner );
+				placementSlot = EquipmentSystem.GetPlacementSlot( item );
+				unequipEndEvent.SetSlotID( placementSlot );
+				scriptInterface.executionOwner.QueueEvent( unequipEndEvent );
+				return;
 			}
 			else
 			{

@@ -1,0 +1,1304 @@
+import struct inkModFilterDrawerInput
+{
+	import var folderNameTextLocKey : String;
+	import var bIsLanguageFilter : Bool;
+	import var bAllowMultipleSelection : Bool;
+	import var listOfFilterItemNames : array< String >;
+	import var listOfFilterItemLocKeys : array< String >;
+}
+
+struct ModFilterDrawerOutput
+{
+	var m_activeFilterName : String;
+	var m_localizedFilterName : String;
+	var m_bIsLanguageFilter : Bool;
+	var m_bIsExceptionFilter : Bool;
+}
+
+class ModMenuFilterDrawer extends inkLogicController
+{
+	private editable var m_resetFilterButton : inkWidgetRef;
+	private editable var m_closeAreaCanvas : inkWidgetRef;
+	private editable var m_folderSpawnerWidget : inkWidgetRef;
+	private editable var m_scrollAreaRef : inkScrollAreaRef;
+	private editable var m_sliderRef : inkWidgetRef;
+	private editable var m_contentWindowRef : inkWidgetRef;
+	private editable var m_scrollCanvas : inkCompoundRef;
+	private editable var m_endOfScrollArea : inkWidgetRef;
+	private editable var m_currentNumberOfFiltersAppliedText : inkTextRef;
+	private var m_ownerMenu : weak< BrowserModsMenuGameController >;
+	private var m_filterFolderList : array< weak< ModFilterCategoryFolder > >;
+	private var m_activeFiltersList : array< weak< ModFilterCategoryItem > >;
+	private var m_activeExceptionFiltersList : array< weak< ModFilterExceptionItem > >;
+	private var m_bVisible : Bool;
+	private var m_openAnim : inkAnimProxy;
+	private var m_closeAnim : inkAnimProxy;
+	private var m_scrollPosition : Float;
+	private var m_UpperHiddenContentSize : Float;
+	private var m_cWindowSize : Float;
+	private var m_ContentSize : Float;
+	private var m_currentlyNavigatedItem : weak< DrawerNavigableItem >;
+	var m_lastFoldedOrUnfoldedFolder : weak< ModFilterCategoryFolder >;
+	var m_endOfScrollAreaPos : Vector2;
+	var m_cursorPos : Vector2;
+	private var m_sliderController : weak< inkSliderController >;
+	private var m_maximumNumberOfFiltersActivatedAtOnce : Int32;
+	default m_maximumNumberOfFiltersActivatedAtOnce = 10;
+
+	protected event OnInitialize()
+	{
+		m_bVisible = false;
+		inkWidgetRef.RegisterToCallback( m_closeAreaCanvas, 'OnRelease', this, 'OnCloseAreaClicked' );
+		GetRootWidget().SetVisible( false );
+		m_sliderController = ( ( inkSliderController )( inkWidgetRef.GetController( m_sliderRef ) ) );
+		inkTextRef.SetText( m_currentNumberOfFiltersAppliedText, "0 / " + IntToString( m_maximumNumberOfFiltersActivatedAtOnce ) );
+	}
+
+	protected event OnUninitialize()
+	{
+		inkWidgetRef.UnregisterFromCallback( m_closeAreaCanvas, 'OnRelease', this, 'OnCloseAreaClicked' );
+	}
+
+	public function SetNavigatedItem( inNavigable : DrawerNavigableItem )
+	{
+		m_currentlyNavigatedItem = inNavigable;
+	}
+
+	public function Setup( ownerMenu : weak< BrowserModsMenuGameController >, folderSetupInfo : array< inkModFilterDrawerInput > )
+	{
+		var i : Int32;
+		var currentFilterFolderInitInfo : inkModFilterDrawerInput;
+		var currentFilterFolder : ModFilterCategoryFolder;
+		m_ownerMenu = ownerMenu;
+		for( i = 0; i < folderSetupInfo.Size(); i += 1 )
+		{
+			currentFilterFolderInitInfo = folderSetupInfo[ i ];
+			currentFilterFolder = ( ( ModFilterCategoryFolder )( SpawnFromLocal( inkWidgetRef.Get( m_folderSpawnerWidget ), 'ModFilterCategoryFolder' ).GetController() ) );
+			currentFilterFolder.Setup( this, currentFilterFolderInitInfo );
+			m_filterFolderList.PushBack( currentFilterFolder );
+		}
+		m_currentlyNavigatedItem = m_filterFolderList[ 0 ];
+		UpdateNavigables();
+	}
+
+	protected event OnCloseAreaClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
+		{
+			m_ownerMenu.HideFilterDrawer();
+		}
+	}
+
+	public function Hide()
+	{
+		m_closeAnim = PlayLibraryAnimation( 'Out' );
+		m_closeAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnCloseAnimFinished' );
+	}
+
+	protected event OnOpenAnimFinished( anim : inkAnimProxy )
+	{
+		if( m_openAnim != NULL )
+		{
+			m_openAnim.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnOpenAnimFinished' );
+			m_openAnim = NULL;
+		}
+		m_endOfScrollAreaPos = inkCompoundRef.GetChildPosition( m_scrollCanvas, inkWidgetRef.Get( m_endOfScrollArea ) );
+	}
+
+	protected event OnCloseAnimFinished( anim : inkAnimProxy )
+	{
+		var i : Int32;
+		var currentFolder : ModFilterCategoryFolder;
+		GetRootWidget().SetVisible( false );
+		m_bVisible = false;
+		for( i = 0; i < m_filterFolderList.Size(); i += 1 )
+		{
+			currentFolder = m_filterFolderList[ i ];
+			currentFolder.Fold( true );
+		}
+		if( m_closeAnim != NULL )
+		{
+			m_closeAnim.UnregisterFromCallback( inkanimEventType.OnFinish, this, 'OnCloseAnimFinished' );
+			m_closeAnim = NULL;
+		}
+		m_ownerMenu.RequestButtonHintUpdateNextFrame();
+	}
+
+	public function Show()
+	{
+		GetRootWidget().SetVisible( true );
+		m_bVisible = true;
+		m_openAnim = PlayLibraryAnimation( 'In' );
+		m_openAnim.RegisterToCallback( inkanimEventType.OnFinish, this, 'OnOpenAnimFinished' );
+	}
+
+	public function IsOpen() : Bool
+	{
+		return m_bVisible;
+	}
+
+	public function RemoveActiveFilterByName( filterNameToRemove : String, bisExceptionFilter : Bool ) : Bool
+	{
+		var i : Int32;
+		var currentFilterItem : ModFilterCategoryItem;
+		for( i = 0; i < m_activeFiltersList.Size(); i += 1 )
+		{
+			currentFilterItem = m_activeFiltersList[ i ];
+			if( currentFilterItem.GetFilterName() == filterNameToRemove )
+			{
+				currentFilterItem.ChangeFilterState();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function OnUpdatedFilters()
+	{
+		var i, j : Int32;
+		var currentFolder : ModFilterCategoryFolder;
+		var activeFiltersFromFolder : array< weak< ModFilterCategoryItem > >;
+		var currentFilter : ModFilterCategoryItem;
+		var filterListOutput : array< ModFilterDrawerOutput >;
+		var currentOutput : ModFilterDrawerOutput;
+		var numberOfActiveFilters : Int32;
+		m_activeFiltersList.Clear();
+		numberOfActiveFilters = 0;
+		for( i = 0; i < m_filterFolderList.Size(); i += 1 )
+		{
+			currentFolder = m_filterFolderList[ i ];
+			currentOutput.m_bIsExceptionFilter = currentFolder.IsA( 'ModFilterExceptionFolder' );
+			currentOutput.m_bIsLanguageFilter = currentFolder.GetIsLanguageFolder();
+			activeFiltersFromFolder = currentFolder.GetActiveFilters();
+			for( j = 0; j < activeFiltersFromFolder.Size(); j += 1 )
+			{
+				if( numberOfActiveFilters < m_maximumNumberOfFiltersActivatedAtOnce )
+				{
+					currentFilter = activeFiltersFromFolder[ j ];
+					currentOutput.m_activeFilterName = currentFilter.GetFilterName();
+					currentOutput.m_localizedFilterName = currentFilter.GetLocalizedFilterName();
+					filterListOutput.PushBack( currentOutput );
+					m_activeFiltersList.PushBack( currentFilter );
+					numberOfActiveFilters += 1;
+				}
+			}
+		}
+		PlaySound( 'Button', 'OnPress' );
+		inkTextRef.SetText( m_currentNumberOfFiltersAppliedText, ( IntToString( numberOfActiveFilters ) + " / " ) + IntToString( m_maximumNumberOfFiltersActivatedAtOnce ) );
+		UpdateFolderItemAvailableState( numberOfActiveFilters >= m_maximumNumberOfFiltersActivatedAtOnce );
+		m_ownerMenu.UpdateFiltersFromDrawer( filterListOutput );
+	}
+
+	public function UpdateFolderItemAvailableState( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce : Bool )
+	{
+		var i : Int32;
+		var currentFolder : ModFilterCategoryFolder;
+		for( i = 0; i < m_filterFolderList.Size(); i += 1 )
+		{
+			currentFolder = m_filterFolderList[ i ];
+			currentFolder.UpdateFilterItemAvailableState( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce );
+		}
+	}
+
+	public function ResetAll()
+	{
+		var i : Int32;
+		var currentFolder : ModFilterCategoryFolder;
+		PlaySound( 'Button', 'OnPress' );
+		for( i = 0; i < m_filterFolderList.Size(); i += 1 )
+		{
+			currentFolder = m_filterFolderList[ i ];
+			currentFolder.UnselectAllFilters();
+		}
+		OnUpdatedFilters();
+	}
+
+	public function likeFilterStateChanged( bInActivated : Bool )
+	{
+		m_ownerMenu.ChangeLikeFilterStateFromDrawer( bInActivated );
+	}
+
+	public function UpdateScrollPosition()
+	{
+		m_scrollPosition = inkScrollAreaRef.GetVerticalScrollPosition( m_scrollAreaRef );
+	}
+
+	public function ComputeSizeOfUpperHiddenContentInScrollArea()
+	{
+		m_scrollPosition = inkScrollAreaRef.GetVerticalScrollPosition( m_scrollAreaRef );
+		m_ContentSize = inkWidgetRef.GetDesiredHeight( m_folderSpawnerWidget );
+		m_cWindowSize = inkWidgetRef.GetDesiredHeight( m_contentWindowRef );
+		if( m_cWindowSize > m_ContentSize )
+		{
+			m_UpperHiddenContentSize = 0.0;
+		}
+		else
+		{
+			m_UpperHiddenContentSize = ( m_ContentSize - m_cWindowSize ) * m_scrollPosition;
+		}
+	}
+
+	public function GetUpperHiddenContentSize() : Float
+	{
+		return m_UpperHiddenContentSize;
+	}
+
+	public function RequestDelayedAdjustSliderForDrawer()
+	{
+		m_ownerMenu.RequestDelayedAdjustSliderForDrawer();
+	}
+
+	public function AdjustScrollbarAfterFolderManipulation()
+	{
+		var previousContentSize : Float;
+		var newContentSize : Float;
+		var previousScrollPosition : Float;
+		var newScrollPosition : Float;
+		previousContentSize = m_ContentSize;
+		previousScrollPosition = m_scrollPosition;
+		newContentSize = inkWidgetRef.GetDesiredHeight( m_folderSpawnerWidget );
+		if( newContentSize < m_cWindowSize )
+		{
+			newScrollPosition = 0.0;
+		}
+		else
+		{
+			newScrollPosition = ( previousScrollPosition * previousContentSize ) / newContentSize;
+		}
+		inkScrollAreaRef.ScrollVertical( m_scrollAreaRef, newScrollPosition );
+		m_sliderController.ChangeProgress( newScrollPosition );
+		if( m_ownerMenu.IsUsingDPad() )
+		{
+			m_ownerMenu.SetCursorOverWidget( m_lastFoldedOrUnfoldedFolder.GetWidgetToNavigateTo(), 0.0, true );
+		}
+	}
+
+	public function ReadjustScrollPositionDependingOnTargetPos( targetPosY : Float, widgetHeight : Float )
+	{
+		var bIsTooHigh : Bool;
+		var newScrollPos : Float;
+		var bIsTooLow : Bool;
+		bIsTooHigh = m_UpperHiddenContentSize > targetPosY;
+		bIsTooLow = ( ( targetPosY + ( widgetHeight * 2.5 ) ) - m_UpperHiddenContentSize ) > m_cWindowSize;
+		if( bIsTooHigh )
+		{
+			newScrollPos = ( ( ( targetPosY - widgetHeight ) < 0.0 ) ? ( 0.0 ) : ( ( targetPosY - widgetHeight ) / m_ContentSize ) );
+		}
+		else if( bIsTooLow )
+		{
+			newScrollPos = ( targetPosY + ( widgetHeight * 2.5 ) ) / m_ContentSize;
+		}
+		if( bIsTooLow || bIsTooHigh )
+		{
+			inkScrollAreaRef.ScrollVertical( m_scrollAreaRef, newScrollPos );
+			m_sliderController.ChangeProgress( newScrollPos );
+		}
+	}
+
+	public function UpdateNavigables()
+	{
+		var i : Int32;
+		var currentFolder : ModFilterCategoryFolder;
+		for( i = 0; i < m_filterFolderList.Size(); i += 1 )
+		{
+			currentFolder = m_filterFolderList[ i ];
+			currentFolder.SetPreviousFolderRef( ( ( i > 0 ) ? ( m_filterFolderList[ i - 1 ] ) : ( ( ( ModFilterCategoryFolder )( NULL ) ) ) ) );
+			currentFolder.SetNextFolderRef( ( ( i == ( m_filterFolderList.Size() - 1 ) ) ? ( ( ( ModFilterCategoryFolder )( NULL ) ) ) : ( m_filterFolderList[ i + 1 ] ) ) );
+			currentFolder.UpdateNavigablesForFolderAndItsFilters();
+		}
+	}
+
+	public function NavigateUp()
+	{
+		if( m_currentlyNavigatedItem != NULL )
+		{
+			m_currentlyNavigatedItem = m_currentlyNavigatedItem.NavigateUp( m_ownerMenu );
+		}
+		else
+		{
+			m_ownerMenu.SetCursorOverWidget( m_filterFolderList[ 0 ].GetRootWidget(), 0.0, false );
+			m_currentlyNavigatedItem = m_filterFolderList[ 0 ];
+		}
+	}
+
+	public function NavigateDown()
+	{
+		if( m_currentlyNavigatedItem != NULL )
+		{
+			m_currentlyNavigatedItem = m_currentlyNavigatedItem.NavigateDown( m_ownerMenu );
+		}
+		else
+		{
+			m_ownerMenu.SetCursorOverWidget( m_filterFolderList[ 0 ].GetRootWidget(), 0.0, false );
+			m_currentlyNavigatedItem = m_filterFolderList[ 0 ];
+		}
+	}
+
+	public function GetFolderSpawnerRef() : inkCompoundWidget
+	{
+		return ( ( inkCompoundWidget )( inkWidgetRef.Get( m_folderSpawnerWidget ) ) );
+	}
+
+}
+
+class ModFilterCategoryFolder extends DrawerNavigableItem
+{
+	protected editable var m_folderNameText : inkTextRef;
+	protected editable var m_filterItemSpawner : inkCompoundRef;
+	protected editable var m_interactableWidget : inkWidgetRef;
+	protected editable var m_arrowWidget : inkWidgetRef;
+	protected editable var m_numberOfModsText : inkTextRef;
+	protected editable var m_panelOutline : inkWidgetRef;
+	protected editable var m_panelBackground : inkWidgetRef;
+	protected editable var m_fluffOutline : inkWidgetRef;
+	protected editable var m_fluffBackground : inkWidgetRef;
+	protected editable var m_arrowOutline : inkWidgetRef;
+	protected editable var m_arrowFill : inkWidgetRef;
+	protected var m_bAllowMultipleSelection : Bool;
+	protected var m_bIsLanguageFolder : Bool;
+	protected var m_filterItems : array< weak< ModFilterCategoryItem > >;
+	private var m_selectedActiveFilters : array< weak< ModFilterCategoryItem > >;
+	protected var m_isFolded : Bool;
+	protected var m_colorNames : ModsMenuColorsNames;
+	protected var m_ownerDrawer : weak< ModMenuFilterDrawer >;
+	protected var m_previousFolderRef : weak< ModFilterCategoryFolder >;
+	protected var m_nextFolderRef : weak< ModFilterCategoryFolder >;
+
+	protected event OnInitialize()
+	{
+		inkWidgetRef.RegisterToCallback( m_interactableWidget, 'OnRelease', this, 'OnFolderClicked' );
+		m_isFolded = false;
+		inkWidgetRef.RegisterToCallback( m_interactableWidget, 'OnHoverOver', this, 'OnHoverOver' );
+		inkWidgetRef.RegisterToCallback( m_interactableWidget, 'OnHoverOut', this, 'OnHoverOut' );
+		SetUnhoveredColor();
+	}
+
+	protected event OnUninitialize()
+	{
+		inkWidgetRef.UnregisterFromCallback( m_interactableWidget, 'OnRelease', this, 'OnFolderClicked' );
+		inkWidgetRef.UnregisterFromCallback( m_interactableWidget, 'OnHoverOver', this, 'OnHoverOver' );
+		inkWidgetRef.UnregisterFromCallback( m_interactableWidget, 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	public function GetOwnerDrawer() : ModMenuFilterDrawer
+	{
+		return m_ownerDrawer;
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		SetHoveredColor();
+		m_ownerDrawer.SetNavigatedItem( this );
+		PlaySound( 'Button', 'OnHover' );
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		SetUnhoveredColor();
+	}
+
+	private function SetHoveredColor()
+	{
+		inkTextRef.Get( m_folderNameText ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkTextRef.Get( m_numberOfModsText ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_fluffOutline ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_arrowOutline ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_arrowFill ).BindProperty( 'tintColor', m_colorNames.mildBlueName );
+		inkWidgetRef.Get( m_fluffBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenPrimaryBackgroundDarkName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenPrimaryBackgroundDarkName );
+	}
+
+	private function SetUnhoveredColor()
+	{
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_fluffOutline ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_arrowOutline ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+		inkWidgetRef.Get( m_arrowFill ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_fluffBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenRedDarkBackgroundName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenRedDarkBackgroundName );
+		if( m_selectedActiveFilters.Size() > 0 )
+		{
+			inkTextRef.Get( m_folderNameText ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+			inkTextRef.Get( m_numberOfModsText ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		}
+		else
+		{
+			inkTextRef.Get( m_folderNameText ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+			inkTextRef.Get( m_numberOfModsText ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+		}
+	}
+
+	public function Setup( ownerDrawer : ModMenuFilterDrawer, folderInfo : inkModFilterDrawerInput )
+	{
+		var i : Int32;
+		var currentFilterItem : ModFilterCategoryItem;
+		m_ownerDrawer = ownerDrawer;
+		m_bAllowMultipleSelection = folderInfo.bAllowMultipleSelection;
+		m_bIsLanguageFolder = folderInfo.bIsLanguageFilter;
+		inkTextRef.SetText( m_folderNameText, GetLocalizedText( folderInfo.folderNameTextLocKey ) );
+		m_filterItems.Clear();
+		for( i = 0; i < folderInfo.listOfFilterItemNames.Size(); i += 1 )
+		{
+			currentFilterItem = ( ( ModFilterCategoryItem )( SpawnFromLocal( inkCompoundRef.Get( m_filterItemSpawner ), 'ModFilterCategoryItem' ).GetController() ) );
+			currentFilterItem.Setup( this, folderInfo.listOfFilterItemNames[ i ], folderInfo.listOfFilterItemLocKeys[ i ], folderInfo.bAllowMultipleSelection );
+			m_filterItems.PushBack( currentFilterItem );
+		}
+		Fold( true );
+		UpdateNumberOfFilterText();
+	}
+
+	public function UpdateFilterItemAvailableState( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce : Bool )
+	{
+		var i : Int32;
+		var currentFilter : ModFilterCategoryItem;
+		for( i = 0; i < m_filterItems.Size(); i += 1 )
+		{
+			currentFilter = m_filterItems[ i ];
+			currentFilter.UpdateAvailableStateAndColor( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce );
+		}
+	}
+
+	protected event OnFolderClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
+		{
+			if( !( m_isFolded ) )
+			{
+				Fold( false );
+			}
+			else
+			{
+				Unfold();
+			}
+			PlaySound( 'Button', 'OnPress' );
+		}
+	}
+
+	public function OnFilterItemChange( filterItem : weak< ModFilterCategoryItem >, bNewSelectedState : Bool )
+	{
+		if( !( m_bAllowMultipleSelection ) )
+		{
+			UnselectAllFilters();
+		}
+		UpdateFilterState( filterItem, bNewSelectedState );
+		m_ownerDrawer.OnUpdatedFilters();
+		UpdateNumberOfFilterText();
+		SetUnhoveredColor();
+	}
+
+	public virtual function Fold( bIsClosingDrawer : Bool )
+	{
+		var i : Int32;
+		var currentFilterItem : ModFilterCategoryItem;
+		if( !( m_isFolded ) )
+		{
+			for( i = 0; i < m_filterItems.Size(); i += 1 )
+			{
+				currentFilterItem = m_filterItems[ i ];
+				currentFilterItem.Hide();
+			}
+			inkWidgetRef.SetRotation( m_arrowWidget, 0.0 );
+			m_isFolded = true;
+		}
+		m_ownerDrawer.SetNavigatedItem( this );
+		m_ownerDrawer.ComputeSizeOfUpperHiddenContentInScrollArea();
+		UpdateFolderNavigablesAndNeighbors();
+		if( !( bIsClosingDrawer ) )
+		{
+			m_ownerDrawer.RequestDelayedAdjustSliderForDrawer();
+			m_ownerDrawer.m_lastFoldedOrUnfoldedFolder = this;
+		}
+	}
+
+	public function Unfold()
+	{
+		var i : Int32;
+		var currentFilterItem : ModFilterCategoryItem;
+		m_ownerDrawer.UpdateScrollPosition();
+		m_ownerDrawer.ComputeSizeOfUpperHiddenContentInScrollArea();
+		if( m_isFolded )
+		{
+			for( i = 0; i < m_filterItems.Size(); i += 1 )
+			{
+				currentFilterItem = m_filterItems[ i ];
+				currentFilterItem.Show();
+			}
+			m_ownerDrawer.UpdateScrollPosition();
+			inkWidgetRef.SetRotation( m_arrowWidget, 180.0 );
+			m_isFolded = false;
+		}
+		m_ownerDrawer.SetNavigatedItem( this );
+		UpdateFolderNavigablesAndNeighbors();
+		m_ownerDrawer.RequestDelayedAdjustSliderForDrawer();
+		m_ownerDrawer.m_lastFoldedOrUnfoldedFolder = this;
+	}
+
+	public function GetSpawnerRef() : inkCompoundWidget
+	{
+		return ( ( inkCompoundWidget )( inkCompoundRef.Get( m_filterItemSpawner ) ) );
+	}
+
+	public function SetPreviousFolderRef( previousFolder : ModFilterCategoryFolder )
+	{
+		m_previousFolderRef = previousFolder;
+	}
+
+	public function SetNextFolderRef( nextFolder : ModFilterCategoryFolder )
+	{
+		m_nextFolderRef = nextFolder;
+	}
+
+	public function SetupNavigables( upTargetForFolder : DrawerNavigableItem, downTargetForFolder : DrawerNavigableItem )
+	{
+		var i : Int32;
+		var upTargetForItem : DrawerNavigableItem;
+		var downTargetForItem : DrawerNavigableItem;
+		var currentItem : ModFilterCategoryItem;
+		SetNavigateTargets( upTargetForFolder, downTargetForFolder );
+		for( i = 1; i < m_filterItems.Size(); i += 1 )
+		{
+			upTargetForItem = ( ( i == 0 ) ? ( ( ( DrawerNavigableItem )( NULL ) ) ) : ( m_filterItems[ i - 1 ] ) );
+			downTargetForItem = ( ( i == ( m_filterItems.Size() - 1 ) ) ? ( m_nextFolderRef ) : ( ( ( DrawerNavigableItem )( NULL ) ) ) );
+			currentItem = m_filterItems[ i ];
+			currentItem.SetNavigateTargets( upTargetForItem, downTargetForItem );
+		}
+	}
+
+	public virtual function UpdateNavigablesForFolderAndItsFilters()
+	{
+		var i : Int32;
+		var currentFilterItem : ModFilterCategoryItem;
+		var upTarget : DrawerNavigableItem;
+		var downTarget : DrawerNavigableItem;
+		UpdateFolderNavigables();
+		for( i = 0; i < m_filterItems.Size(); i += 1 )
+		{
+			currentFilterItem = m_filterItems[ i ];
+			upTarget = ( ( i == 0 ) ? ( ( ( DrawerNavigableItem )( this ) ) ) : ( ( ( DrawerNavigableItem )( m_filterItems[ i - 1 ] ) ) ) );
+			downTarget = ( ( i == ( m_filterItems.Size() - 1 ) ) ? ( ( ( DrawerNavigableItem )( m_nextFolderRef ) ) ) : ( ( ( DrawerNavigableItem )( m_filterItems[ i + 1 ] ) ) ) );
+			currentFilterItem.SetNavigateTargets( upTarget, downTarget );
+		}
+	}
+
+	public function UpdateFolderNavigables()
+	{
+		var upTarget : DrawerNavigableItem;
+		var downTarget : DrawerNavigableItem;
+		if( m_previousFolderRef == NULL )
+		{
+			upTarget = NULL;
+		}
+		else
+		{
+			upTarget = ( ( m_previousFolderRef.GetIsFolded() ) ? ( ( ( DrawerNavigableItem )( m_previousFolderRef ) ) ) : ( m_previousFolderRef.GetLastFilterItem() ) );
+		}
+		if( m_isFolded )
+		{
+			downTarget = m_nextFolderRef;
+		}
+		else
+		{
+			downTarget = GetFirstFilterItem();
+		}
+		SetNavigateTargets( upTarget, downTarget );
+	}
+
+	public function UpdateNeighborFolderNavigables()
+	{
+		m_previousFolderRef.UpdateFolderNavigables();
+		m_nextFolderRef.UpdateFolderNavigables();
+	}
+
+	public function UpdateFolderNavigablesAndNeighbors()
+	{
+		UpdateFolderNavigables();
+		UpdateNeighborFolderNavigables();
+	}
+
+	public function UpdateFilterState( filterItem : weak< ModFilterCategoryItem >, bNewSelectedState : Bool )
+	{
+		if( bNewSelectedState )
+		{
+			SelectFilter( filterItem );
+		}
+		else
+		{
+			UnselectFilter( filterItem );
+		}
+	}
+
+	private function SelectFilter( filterItem : weak< ModFilterCategoryItem > )
+	{
+		filterItem.Select();
+		m_selectedActiveFilters.PushBack( filterItem );
+	}
+
+	private function UnselectFilter( filterItem : weak< ModFilterCategoryItem > )
+	{
+		m_selectedActiveFilters.Remove( filterItem );
+		filterItem.Unselect();
+	}
+
+	public function UnselectAllFilters()
+	{
+		var i : Int32;
+		var item : ModFilterCategoryItem;
+		for( i = 0; i < m_selectedActiveFilters.Size(); i += 1 )
+		{
+			item = m_selectedActiveFilters[ i ];
+			item.Unselect();
+		}
+		m_selectedActiveFilters.Clear();
+		UpdateNumberOfFilterText();
+		SetUnhoveredColor();
+	}
+
+	protected override function EvaluateWidgetPositionAndAdjustIfNecessary()
+	{
+		var drawer : ModMenuFilterDrawer;
+		var folderPos : Vector2;
+		drawer = GetOwnerDrawer();
+		drawer.ComputeSizeOfUpperHiddenContentInScrollArea();
+		folderPos = drawer.GetFolderSpawnerRef().GetChildPosition( GetRootWidget() );
+		drawer.ReadjustScrollPositionDependingOnTargetPos( folderPos.Y, inkWidgetRef.GetHeight( m_widgetToFocusTo ) );
+	}
+
+	public virtual function GetActiveFilters() : array< weak< ModFilterCategoryItem > >
+	{
+		return m_selectedActiveFilters;
+	}
+
+	public function GetIsLanguageFolder() : Bool
+	{
+		return m_bIsLanguageFolder;
+	}
+
+	public function GetIsFolded() : Bool
+	{
+		return m_isFolded;
+	}
+
+	public function GetFirstFilterItem() : ModFilterCategoryItem
+	{
+		return m_filterItems[ 0 ];
+	}
+
+	public function GetLastFilterItem() : ModFilterCategoryItem
+	{
+		return m_filterItems[ m_filterItems.Size() - 1 ];
+	}
+
+	protected function UpdateNumberOfFilterText()
+	{
+		inkTextRef.SetText( m_numberOfModsText, ( IntToString( m_selectedActiveFilters.Size() ) + "/" ) + IntToString( m_filterItems.Size() ) );
+	}
+
+	public function GetFolderPosition() : Vector2
+	{
+		return m_ownerDrawer.GetFolderSpawnerRef().GetChildPosition( GetRootWidget() );
+	}
+
+}
+
+class ModFilterExceptionFolder extends ModFilterCategoryFolder
+{
+	private var m_likeFilterItem : weak< ModFilterExceptionItem >;
+
+	protected event OnInitialize()
+	{
+		super.OnInitialize();
+		inkWidgetRef.SetVisible( m_widgetToFocusTo, false );
+	}
+
+	protected event OnUninitialize()
+	{
+		super.OnUninitialize();
+	}
+
+	public function Setup( ownerDrawer : ModMenuFilterDrawer )
+	{
+		m_ownerDrawer = ownerDrawer;
+		m_bAllowMultipleSelection = true;
+		m_bIsLanguageFolder = false;
+		inkTextRef.SetText( m_folderNameText, GetLocalizedText( "UI-Shards-Others" ) );
+		m_filterItems.Clear();
+		m_likeFilterItem = ( ( ModFilterExceptionItem )( SpawnFromLocal( inkCompoundRef.Get( m_filterItemSpawner ), 'ModFilterExceptionItem' ).GetController() ) );
+		m_likeFilterItem.Setup( this, m_ownerDrawer, "Liked", "UI-Modio-MenuContent-Liked" );
+		m_filterItems.PushBack( m_likeFilterItem );
+		Unfold();
+		UpdateNumberOfFilterText();
+	}
+
+	public override function Fold( bIsClosingDrawer : Bool ) {}
+
+	public override function GetWidgetToNavigateTo() : inkWidget
+	{
+		if( m_filterItems.Size() > 0 )
+		{
+			return m_filterItems[ 0 ].GetWidgetToNavigateTo();
+		}
+		return NULL;
+	}
+
+	public override function UpdateNavigablesForFolderAndItsFilters()
+	{
+		var i : Int32;
+		var currentFilterItem : ModFilterCategoryItem;
+		var upTarget : DrawerNavigableItem;
+		var downTarget : DrawerNavigableItem;
+		UpdateFolderNavigables();
+		for( i = 0; i < m_filterItems.Size(); i += 1 )
+		{
+			currentFilterItem = m_filterItems[ i ];
+			upTarget = ( ( i == 0 ) ? ( ( ( DrawerNavigableItem )( m_nextNavigateUpTarget ) ) ) : ( ( ( DrawerNavigableItem )( m_filterItems[ i - 1 ] ) ) ) );
+			downTarget = ( ( i == ( m_filterItems.Size() - 1 ) ) ? ( ( ( DrawerNavigableItem )( m_nextFolderRef ) ) ) : ( ( ( DrawerNavigableItem )( m_filterItems[ i + 1 ] ) ) ) );
+			currentFilterItem.SetNavigateTargets( upTarget, downTarget );
+		}
+	}
+
+	public override function SetNavigateTargets( upTarget : DrawerNavigableItem, downTarget : DrawerNavigableItem )
+	{
+		var firstFilterItem : ModFilterCategoryItem;
+		super.SetNavigateTargets( upTarget, downTarget );
+		if( m_filterItems.Size() > 0 )
+		{
+			firstFilterItem = m_filterItems[ 0 ];
+			firstFilterItem.SetNavigateTargets( upTarget, firstFilterItem.m_nextNavigateDownTarget );
+		}
+	}
+
+}
+
+class ModFilterCategoryItem extends DrawerNavigableItem
+{
+	protected editable var m_filterNameText : inkTextRef;
+	protected editable var m_selectorCanvas : inkWidgetRef;
+	protected editable var m_checkboxFill : inkImageRef;
+	protected editable var m_checkboxOutline : inkImageRef;
+	protected editable var m_panelBackground : inkWidgetRef;
+	protected editable var m_panelOutline : inkWidgetRef;
+	protected var m_filterName : String;
+	protected var m_localizedFilterName : String;
+	protected var m_isSelected : Bool;
+	protected var m_isAvailable : Bool;
+	private var m_isCurrentlyHovered : Bool;
+	protected var m_ownerFolder : weak< ModFilterCategoryFolder >;
+	private var m_colorNames : ModsMenuColorsNames;
+
+	protected event OnInitialize()
+	{
+		inkWidgetRef.RegisterToCallback( m_selectorCanvas, 'OnRelease', this, 'OnFilterClicked' );
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+		m_isSelected = false;
+		m_isCurrentlyHovered = false;
+		m_isAvailable = true;
+		inkImageRef.SetVisible( m_checkboxFill, false );
+		SetDefaultColor();
+	}
+
+	protected event OnUninitialize()
+	{
+		inkWidgetRef.UnregisterFromCallback( m_selectorCanvas, 'OnRelease', this, 'OnFilterClicked' );
+		UnregisterFromCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		UnregisterFromCallback( 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		SetHoveredColor();
+		m_isCurrentlyHovered = true;
+		m_ownerFolder.GetOwnerDrawer().SetNavigatedItem( this );
+		PlaySound( 'Button', 'OnHover' );
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		if( m_isSelected )
+		{
+			SetSelectedColor();
+		}
+		else
+		{
+			SetDefaultColor();
+		}
+		m_isCurrentlyHovered = false;
+	}
+
+	private function SetHoveredColor()
+	{
+		if( m_isAvailable )
+		{
+			inkTextRef.Get( m_filterNameText ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		}
+		else
+		{
+			inkTextRef.Get( m_filterNameText ).BindProperty( 'tintColor', m_colorNames.greyName );
+		}
+		inkImageRef.Get( m_checkboxOutline ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenPrimaryBackgroundDarkName );
+	}
+
+	private function SetSelectedColor()
+	{
+		inkTextRef.Get( m_filterNameText ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+		inkImageRef.Get( m_checkboxOutline ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.fullScreenSecondaryBackground3Name );
+	}
+
+	private function SetDefaultColor()
+	{
+		if( m_isAvailable )
+		{
+			inkTextRef.Get( m_filterNameText ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+		}
+		else
+		{
+			inkTextRef.Get( m_filterNameText ).BindProperty( 'tintColor', m_colorNames.greyName );
+		}
+		inkImageRef.Get( m_checkboxOutline ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.faintRedName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenRedDarkBackgroundName );
+	}
+
+	private function SetCorrectColor()
+	{
+		if( !( m_isCurrentlyHovered ) )
+		{
+			if( m_isSelected )
+			{
+				SetSelectedColor();
+			}
+			else
+			{
+				SetDefaultColor();
+			}
+		}
+		else
+		{
+			SetHoveredColor();
+		}
+	}
+
+	public function Setup( ownerFolder : weak< ModFilterCategoryFolder >, filterName : String, filterTextLocKey : String, allowMultipleSelection : Bool )
+	{
+		m_ownerFolder = ownerFolder;
+		m_filterName = filterName;
+		m_localizedFilterName = filterTextLocKey;
+		inkTextRef.SetText( m_filterNameText, filterTextLocKey );
+		if( !( allowMultipleSelection ) )
+		{
+			inkImageRef.SetTexturePart( m_checkboxFill, 'checkbox_round_tick' );
+			inkImageRef.SetTexturePart( m_checkboxOutline, 'checkbox_round_stroke' );
+		}
+	}
+
+	public function UpdateState( bNewState : Bool )
+	{
+		m_isSelected = bNewState;
+		inkImageRef.SetVisible( m_checkboxFill, bNewState );
+		SetCorrectColor();
+	}
+
+	public function UpdateAvailableStateAndColor( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce : Bool )
+	{
+		if( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce && !( m_isSelected ) )
+		{
+			m_isAvailable = false;
+		}
+		else if( !( bhasReachedMaximumAmmountOfActivatedFiltersAtOnce ) )
+		{
+			m_isAvailable = true;
+		}
+		SetCorrectColor();
+	}
+
+	public function GetIsSelected() : Bool
+	{
+		return m_isSelected;
+	}
+
+	public virtual function Select()
+	{
+		UpdateState( true );
+	}
+
+	public virtual function Unselect()
+	{
+		UpdateState( false );
+	}
+
+	public function Hide()
+	{
+		GetRootWidget().SetVisible( false );
+	}
+
+	public function Show()
+	{
+		GetRootWidget().SetVisible( true );
+	}
+
+	public virtual function ChangeFilterState()
+	{
+		m_ownerFolder.OnFilterItemChange( this, !( m_isSelected ) );
+	}
+
+	protected event OnFilterClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
+		{
+			if( m_isAvailable )
+			{
+				ChangeFilterState();
+			}
+		}
+	}
+
+	public function GetFilterName() : String
+	{
+		return m_filterName;
+	}
+
+	public function GetLocalizedFilterName() : String
+	{
+		return m_localizedFilterName;
+	}
+
+	protected override function EvaluateWidgetPositionAndAdjustIfNecessary()
+	{
+		var drawer : ModMenuFilterDrawer;
+		var folderPos : Vector2;
+		var pos : Vector2;
+		var posY : Float;
+		drawer = m_ownerFolder.GetOwnerDrawer();
+		drawer.ComputeSizeOfUpperHiddenContentInScrollArea();
+		pos = m_ownerFolder.GetSpawnerRef().GetChildPosition( GetRootWidget() );
+		folderPos = m_ownerFolder.GetFolderPosition();
+		posY = folderPos.Y + pos.Y;
+		posY = posY;
+		drawer.ReadjustScrollPositionDependingOnTargetPos( posY, inkWidgetRef.GetHeight( m_widgetToFocusTo ) );
+	}
+
+}
+
+class ModFilterExceptionItem extends ModFilterCategoryItem
+{
+	private var m_ownerDrawer : weak< ModMenuFilterDrawer >;
+
+	public virtual function Setup( ownerFolder : weak< ModFilterCategoryFolder >, ownerDrawer : weak< ModMenuFilterDrawer >, filterName : String, filterTextLocKey : String )
+	{
+		m_ownerFolder = ownerFolder;
+		m_ownerDrawer = ownerDrawer;
+		m_filterName = GetLocalizedText( filterTextLocKey );
+		m_localizedFilterName = m_filterName;
+		inkTextRef.SetText( m_filterNameText, m_filterName );
+	}
+
+	public override function Select()
+	{
+		var bWasSelected : Bool;
+		bWasSelected = GetIsSelected();
+		super.Select();
+		if( !( bWasSelected ) )
+		{
+			m_ownerDrawer.likeFilterStateChanged( true );
+		}
+	}
+
+	public override function Unselect()
+	{
+		var bWasSelected : Bool;
+		bWasSelected = GetIsSelected();
+		super.Unselect();
+		if( bWasSelected )
+		{
+			m_ownerDrawer.likeFilterStateChanged( false );
+		}
+	}
+
+	protected event OnFilterClicked( evt : inkPointerEvent )
+	{
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
+		{
+			ChangeFilterState();
+		}
+	}
+
+}
+
+class SelectedFilterItem extends inkButtonController
+{
+	private editable var m_crossButton : inkWidgetRef;
+	private editable var m_filterName : inkTextRef;
+	private editable var m_widgetForSize : inkWidgetRef;
+	private editable var m_fluffBackground : inkWidgetRef;
+	private editable var m_fluffOutline : inkWidgetRef;
+	private editable var m_panelOutline : inkWidgetRef;
+	private editable var m_panelBackground : inkWidgetRef;
+	private var m_owner : weak< SelectedFilterGroup >;
+	private var m_name : String;
+	private var m_localizedName : String;
+	private var m_bisExceptionFilter : Bool;
+	private var m_markAsDelete : Bool;
+	private var m_colorNames : ModsMenuColorsNames;
+
+	protected event OnInitialize()
+	{
+		m_markAsDelete = false;
+		RegisterToCallback( 'OnRelease', this, 'OnSelectedFilterClicked' );
+		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
+		SetDefaultColor();
+	}
+
+	protected event OnUninitialize()
+	{
+		UnregisterCallbacks();
+	}
+
+	public function UnregisterCallbacks()
+	{
+		UnregisterFromCallback( 'OnRelease', this, 'OnSelectedFilterClicked' );
+		UnregisterFromCallback( 'OnHoverOver', this, 'OnHoverOver' );
+		UnregisterFromCallback( 'OnHoverOut', this, 'OnHoverOut' );
+	}
+
+	public function MarkAsDelete()
+	{
+		m_markAsDelete = true;
+	}
+
+	public function GetMarkedAsDelete() : Bool
+	{
+		return m_markAsDelete;
+	}
+
+	public function Setup( owner : SelectedFilterGroup, filterName : String, localizedFilterName : String, bIsExceptionFilter : Bool )
+	{
+		m_owner = owner;
+		m_bisExceptionFilter = bIsExceptionFilter;
+		inkTextRef.SetText( m_filterName, localizedFilterName );
+		m_name = filterName;
+		m_localizedName = localizedFilterName;
+	}
+
+	public function GetFilterName() : String
+	{
+		return m_name;
+	}
+
+	public function GetLocalizedFilterName() : String
+	{
+		return m_localizedName;
+	}
+
+	public function GetIsExceptionFilter() : Bool
+	{
+		return m_bisExceptionFilter;
+	}
+
+	public function IsFilterName( name : String ) : Bool
+	{
+		return m_name == name;
+	}
+
+	protected event OnSelectedFilterClicked( e : inkPointerEvent )
+	{
+		if( e.IsAction( 'click' ) || e.IsAction( 'tap' ) )
+		{
+			m_owner.OnSelectedFilterClicked( this );
+		}
+	}
+
+	public function GetDesiredWidth() : Float
+	{
+		return inkWidgetRef.GetDesiredWidth( m_widgetForSize );
+	}
+
+	protected event OnHoverOver( e : inkPointerEvent )
+	{
+		if( m_owner.GetOwnerMenu().IsFilterDrawerOpen() )
+		{
+			return true;
+		}
+		SetHoveredColor();
+	}
+
+	protected event OnHoverOut( e : inkPointerEvent )
+	{
+		SetDefaultColor();
+	}
+
+	private function SetHoveredColor()
+	{
+		inkTextRef.Get( m_filterName ).BindProperty( 'tintColor', m_colorNames.activeBlueName );
+		inkWidgetRef.Get( m_crossButton ).BindProperty( 'tintColor', m_colorNames.mildBlueName );
+		inkWidgetRef.Get( m_fluffBackground ).BindProperty( 'tintColor', m_colorNames.faintBlueName );
+		inkWidgetRef.Get( m_fluffOutline ).BindProperty( 'tintColor', m_colorNames.mildBlueName );
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.mildBlueName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.faintBlueName );
+	}
+
+	private function SetDefaultColor()
+	{
+		inkWidgetRef.Get( m_crossButton ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkTextRef.Get( m_filterName ).BindProperty( 'tintColor', m_colorNames.activeRedName );
+		inkWidgetRef.Get( m_fluffBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenRedDarkBackgroundName );
+		inkWidgetRef.Get( m_fluffOutline ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_panelOutline ).BindProperty( 'tintColor', m_colorNames.mildRedName );
+		inkWidgetRef.Get( m_panelBackground ).BindProperty( 'tintColor', m_colorNames.fullscreenRedDarkBackgroundName );
+	}
+
+	public function SetAsExceptionFilterItem()
+	{
+		SetNavigable( false );
+		GetRootWidget().SetInteractive( false );
+		inkWidgetRef.SetInteractive( m_widgetForSize, false );
+		GetRootWidget().SetVisible( true );
+		UnregisterCallbacks();
+		inkWidgetRef.SetVisible( m_crossButton, false );
+		SetDefaultColor();
+	}
+
+}
+
+class SelectedFilterGroup extends inkLogicController
+{
+	private editable var m_filterItemSpawner : inkCompoundRef;
+	private var m_listOfFilters : array< weak< SelectedFilterItem > >;
+	private var m_owner : weak< BrowserModsMenuGameController >;
+	private var m_filterDrawerRef : weak< ModMenuFilterDrawer >;
+
+	protected event OnInitialize() {}
+
+	public function Setup( owner : BrowserModsMenuGameController, filterDrawer : ModMenuFilterDrawer )
+	{
+		m_owner = owner;
+		m_filterDrawerRef = filterDrawer;
+	}
+
+	public function AddFilter( filterName : String, m_localizedFilterName : String, bIsExceptionFilter : Bool ) : SelectedFilterItem
+	{
+		var currentFilter : inkWidget;
+		var currentFilterController : SelectedFilterItem;
+		currentFilter = SpawnFromLocal( inkCompoundRef.Get( m_filterItemSpawner ), 'SelectedFilterItem' );
+		currentFilterController = ( ( SelectedFilterItem )( currentFilter.GetController() ) );
+		currentFilterController.Setup( this, filterName, m_localizedFilterName, bIsExceptionFilter );
+		m_owner.AddToListOfNavigables( currentFilterController );
+		m_listOfFilters.PushBack( currentFilterController );
+		currentFilter.SetVisible( false );
+		return currentFilterController;
+	}
+
+	public function AddExceptionMoreFilter( numberOfHiddenMods : Int32 ) : SelectedFilterItem
+	{
+		var exceptionFilter : SelectedFilterItem;
+		var exceptionFilterName : String;
+		exceptionFilterName = "+" + IntToString( numberOfHiddenMods );
+		exceptionFilter = AddFilter( exceptionFilterName, exceptionFilterName, false );
+		exceptionFilter.SetAsExceptionFilterItem();
+		return exceptionFilter;
+	}
+
+	public function MarkFilterAsDelete( filter : SelectedFilterItem )
+	{
+		if( m_listOfFilters.Contains( filter ) )
+		{
+			filter.MarkAsDelete();
+		}
+	}
+
+	public function MarkAllFiltersAsDelete()
+	{
+		var i : Int32;
+		var currentFilter : SelectedFilterItem;
+		for( i = 0; i < m_listOfFilters.Size(); i += 1 )
+		{
+			currentFilter = m_listOfFilters[ i ];
+			MarkFilterAsDelete( currentFilter );
+		}
+	}
+
+	public function DeleteMarkedFilters()
+	{
+		var i : Int32;
+		var currentFilter : SelectedFilterItem;
+		var listOfFilterItemsToRemove : array< SelectedFilterItem >;
+		for( i = 0; i < m_listOfFilters.Size(); i += 1 )
+		{
+			currentFilter = m_listOfFilters[ i ];
+			if( currentFilter.GetMarkedAsDelete() )
+			{
+				inkCompoundRef.RemoveChild( m_filterItemSpawner, currentFilter.GetRootWidget() );
+				listOfFilterItemsToRemove.PushBack( currentFilter );
+			}
+		}
+		for( i = 0; i < listOfFilterItemsToRemove.Size(); i += 1 )
+		{
+			m_listOfFilters.Remove( listOfFilterItemsToRemove[ i ] );
+			m_owner.RemoveFromListOfNavigables( listOfFilterItemsToRemove[ i ] );
+		}
+	}
+
+	public function GetListOfFilters() : array< weak< SelectedFilterItem > >
+	{
+		return m_listOfFilters;
+	}
+
+	public function OnSelectedFilterClicked( filter : SelectedFilterItem )
+	{
+		m_filterDrawerRef.RemoveActiveFilterByName( filter.GetFilterName(), filter.GetIsExceptionFilter() );
+	}
+
+	public function GetOwnerMenu() : weak< BrowserModsMenuGameController >
+	{
+		return m_owner;
+	}
+
+}
+
+class DrawerNavigableItem extends inkButtonController
+{
+	protected editable var m_widgetToFocusTo : inkWidgetRef;
+	protected var m_nextNavigateUpTarget : weak< DrawerNavigableItem >;
+	protected var m_nextNavigateDownTarget : weak< DrawerNavigableItem >;
+
+	public virtual function GetWidgetToNavigateTo() : inkWidget
+	{
+		return inkWidgetRef.Get( m_widgetToFocusTo );
+	}
+
+	public virtual function SetNavigateTargets( upTarget : DrawerNavigableItem, downTarget : DrawerNavigableItem )
+	{
+		m_nextNavigateUpTarget = upTarget;
+		m_nextNavigateDownTarget = downTarget;
+	}
+
+	public function NavigateUp( gameController : inkGameController ) : DrawerNavigableItem
+	{
+		if( m_nextNavigateUpTarget == NULL )
+		{
+			return this;
+		}
+		gameController.SetCursorOverWidget( m_nextNavigateUpTarget.GetWidgetToNavigateTo(), 0.0, true );
+		m_nextNavigateUpTarget.EvaluateWidgetPositionAndAdjustIfNecessary();
+		return m_nextNavigateUpTarget;
+	}
+
+	public function NavigateDown( gameController : inkGameController ) : DrawerNavigableItem
+	{
+		if( m_nextNavigateDownTarget == NULL )
+		{
+			return this;
+		}
+		gameController.SetCursorOverWidget( m_nextNavigateDownTarget.GetWidgetToNavigateTo(), 0.0, true );
+		m_nextNavigateDownTarget.EvaluateWidgetPositionAndAdjustIfNecessary();
+		return m_nextNavigateDownTarget;
+	}
+
+	protected virtual function EvaluateWidgetPositionAndAdjustIfNecessary() {}
+}
+

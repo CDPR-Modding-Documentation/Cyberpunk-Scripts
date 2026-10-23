@@ -83,6 +83,16 @@ class SaveGroupInfo extends IScriptable
 		return additionalContentIds.Contains( 'EP1' );
 	}
 
+	public function CopySaveMetaData( info : SaveMetadataInfo )
+	{
+		timestamp = info.timestamp;
+		playthroughID = info.playthroughID;
+		playthroughTime = info.playthroughTime;
+		playTime = info.playTime;
+		level = info.level;
+		lifePath = info.lifePath;
+	}
+
 }
 
 class LoadGameMenuGameController extends gameuiSaveHandlingController
@@ -101,6 +111,7 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private editable var m_loadingSpinner : inkWidgetRef;
 	private editable var m_scrollbar : inkWidgetRef;
 	private editable var m_tooltipManagerRef : inkWidgetRef;
+	private editable var m_disableModVerificationLabel : inkWidgetRef;
 	private var m_tooltipManager : weak< gameuiTooltipsManager >;
 	private var m_eventDispatcher : weak< inkMenuEventDispatcher >;
 	private var m_loadComplete : Bool;
@@ -120,15 +131,18 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private var m_animProxy : inkAnimProxy;
 	private var m_sourceIndex : Int32;
 	private var m_playthroughIDs : array< String >;
-	private var m_playthroughGroupHeaders : array< weak< inkWidget > >;
-	private var m_loadGroupInfos : array< SaveGroupInfo >;
-	private var m_saveItemMap : array< array< weak< inkWidget > > >;
+	private var m_saveWidgetsMap : array< array< weak< inkWidget > > >;
+	private var m_saveGroupHeaderWidgets : array< weak< inkWidget > >;
+	private var m_saveGroupInfos : array< SaveGroupInfo >;
 	private var m_buttonList : array< weak< LoadListItem > >;
+	private var m_buttonListFinalized : Bool;
 	private var m_gogContainerController : weak< GogContainerController >;
-	private var m_groupCount : Int32;
+	private var m_isUserUGCRestricted : Bool;
+	default m_isUserUGCRestricted = false;
 
 	protected event OnInitialize()
 	{
+		var platformName : String;
 		m_onlineSystem = GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() );
 		m_systemHandler = GetSystemRequestsHandler();
 		m_systemHandler.RegisterToCallback( 'OnSavesForLoadReady', this, 'OnSavesForLoadReady' );
@@ -149,6 +163,25 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		m_isEp1Enabled = IsEP1();
 		m_tooltipManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_tooltipManagerRef, 'gameuiTooltipsManager' ) ) );
 		m_tooltipManager.Setup( ETooltipsStyle.Menus );
+		inkWidgetRef.SetVisible( m_disableModVerificationLabel, !( IsEnableModVerification() ) );
+		platformName = GetPlatformShortName();
+		if( ( ( ( ( platformName == "ps5" || platformName == "ps5pro" ) || platformName == "xseriesx" ) || platformName == "xseriess" ) || platformName == "emporium" ) || platformName == "windowsGDK" )
+		{
+			Modio.RequestRestrictionStatus( this, 'OnRequestRestrictionStatusCallBack', false );
+		}
+	}
+
+	protected event OnRequestRestrictionStatusCallBack( status : Int32 )
+	{
+		if( status == 0 )
+		{
+			m_isUserUGCRestricted = false;
+		}
+		else
+		{
+			m_isUserUGCRestricted = true;
+			RefreshUGCRestrictedThumbnails();
+		}
 	}
 
 	protected event OnUninitialize()
@@ -193,15 +226,18 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		m_tooltipManager.HideTooltips();
 	}
 
-	private function OpenUpdateModsPopup( modInfoList : array< ModToUpdateInfo >, bHaveDeletedModsBeenRemoved : Bool, bShouldDisplayThumbnail : Bool, bShouldDisplayModConfirm : Bool )
+	private function OpenUpdateModsPopup( modInfoList : array< ModToUpdateInfo >, deprecatedCount : Int32, bDoesNumberExceedModLimit : Bool, bHaveDeletedModsBeenRemoved : Bool, bShouldDisplayThumbnail : Bool, bShouldDisplayModName : Bool, bModsDefaultSelected : Bool )
 	{
 		var updateModRequestEvt : UpdateModsPopupEvent;
 		updateModRequestEvt = new UpdateModsPopupEvent;
 		updateModRequestEvt.modInfoList = modInfoList;
 		updateModRequestEvt.bHaveModsBeenDeleted = bHaveDeletedModsBeenRemoved;
 		updateModRequestEvt.bShouldShowThumbnail = bShouldDisplayThumbnail;
-		updateModRequestEvt.bShouldShowModNames = true;
-		updateModRequestEvt.bShouldShowConfirmButton = bShouldDisplayModConfirm;
+		updateModRequestEvt.bShouldShowModNames = bShouldDisplayModName;
+		updateModRequestEvt.bDoesNumberExceedModLimit = bDoesNumberExceedModLimit;
+		updateModRequestEvt.bDefaultModsSelected = bModsDefaultSelected;
+		updateModRequestEvt.bShouldShowConfirmButton = false;
+		updateModRequestEvt.deprecatedModsCount = deprecatedCount;
 		QueueBroadcastEvent( updateModRequestEvt );
 	}
 
@@ -281,6 +317,37 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 			GogLogin( false );
 			evt.Handle();
 		}
+		else if( evt.IsAction( 'thumb_press_right' ) )
+		{
+			SetAllGroupsExpandedState( true );
+		}
+		else if( evt.IsAction( 'thumb_press_left' ) )
+		{
+			SetAllGroupsExpandedState( false );
+		}
+	}
+
+	private function SetAllGroupsExpandedState( expandedState : Bool )
+	{
+		var groupController : weak< LoadListGroup >;
+		var playthroughIndex : Int32;
+		for( playthroughIndex = 0; playthroughIndex < m_saveGroupHeaderWidgets.Size(); playthroughIndex += 1 )
+		{
+			groupController = ( ( LoadListGroup )( m_saveGroupHeaderWidgets[ playthroughIndex ].GetController() ) );
+			groupController.SetExpandedState( expandedState );
+			SetVisibilityOfSavesInGroup( playthroughIndex, expandedState );
+		}
+	}
+
+	private function SetVisibilityOfSavesInGroup( playthroughIndex : Int32, newVisibility : Bool )
+	{
+		var buttonList : array< weak< inkWidget > >;
+		var index : Int32;
+		buttonList = m_saveWidgetsMap[ playthroughIndex ];
+		for( index = 0; index < buttonList.Size(); index += 1 )
+		{
+			buttonList[ index ].SetVisible( newVisibility );
+		}
 	}
 
 	private function UpdateButtonHints( savesCount : Int32 )
@@ -295,6 +362,8 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		{
 			m_buttonHintsController.AddButtonHint( 'delete_save', GetLocalizedText( "UI-Menus-DeleteSave" ) );
 			m_buttonHintsController.AddButtonHint( 'select', GetLocalizedText( "UI-UserActions-Select" ) );
+			m_buttonHintsController.AddButtonHint( 'thumb_press_right', GetLocalizedText( "UI-Menus-Saving-SaveFilesGroup-ExpandAll" ) );
+			m_buttonHintsController.AddButtonHint( 'thumb_press_left', GetLocalizedText( "UI-Menus-Saving-SaveFilesGroup-CollapseAll" ) );
 		}
 	}
 
@@ -307,6 +376,24 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		}
 	}
 
+	private function RefreshUGCRestrictedThumbnails()
+	{
+		var i : Int32;
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		var characterCustomizationSystem : gameuiICharacterCustomizationSystem;
+		characterCustomizationSystem = GameInstance.GetCharacterCustomizationSystem( GetPlayerControlledObject().GetGame() );
+		for( i = 0; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+		{
+			button = inkCompoundRef.GetWidgetByIndex( m_list, i );
+			controller = ( ( LoadListItem )( button.GetController() ) );
+			if( controller && controller.IsModded() )
+			{
+				controller.CheckThumbnailCensorship( !( characterCustomizationSystem.IsNudityAllowed() ), m_isUserUGCRestricted );
+			}
+		}
+	}
+
 	private function RefreshUnfinishedItemLoads()
 	{
 		var i : Int32;
@@ -316,9 +403,9 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		{
 			button = inkCompoundRef.GetWidgetByIndex( m_list, i );
 			controller = ( ( LoadListItem )( button.GetController() ) );
-			if( controller && !( controller.IsVisible() ) )
+			if( controller && !( controller.IsMetadataSet() ) )
 			{
-				GetSystemRequestsHandler().RequestGameScreenshot( controller.SaveIndex(), controller.GetPreviewImageWidget() );
+				GetSystemRequestsHandler().RequestSavedGameScreenshot( controller.SaveIndex(), controller.GetPreviewImageWidget() );
 			}
 		}
 	}
@@ -338,34 +425,21 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	{
 		var button : weak< inkWidget >;
 		var controller : weak< LoadListGroup >;
-		var index : Int32;
-		var buttonList : array< weak< inkWidget > >;
+		var playthroughIndex : Int32;
+		var isExpanded : Bool;
 		if( !( m_isInputDisabled ) )
 		{
 			button = ( ( inkWidget )( e.GetCurrentTarget() ) );
 			controller = ( ( LoadListGroup )( button.GetController() ) );
 			if( ( e.IsAction( 'click' ) || e.IsAction( 'tap' ) ) && m_loadComplete == true )
 			{
-				index = m_playthroughIDs.FindFirst( controller.GetPlaythroughID() );
-				if( index == -1 )
+				playthroughIndex = m_playthroughIDs.FindFirst( controller.GetPlaythroughID() );
+				if( playthroughIndex == -1 )
 				{
 					return false;
 				}
-				buttonList = m_saveItemMap[ index ];
-				if( controller.SwitchExpandedState() )
-				{
-					for( index = 0; index < buttonList.Size(); index += 1 )
-					{
-						buttonList[ index ].SetVisible( true );
-					}
-				}
-				else
-				{
-					for( index = 0; index < buttonList.Size(); index += 1 )
-					{
-						buttonList[ index ].SetVisible( false );
-					}
-				}
+				isExpanded = controller.SwitchExpandedState();
+				SetVisibilityOfSavesInGroup( playthroughIndex, isExpanded );
 				controller.Refocus( button );
 			}
 		}
@@ -412,7 +486,12 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		var animOptions : inkAnimOptions;
 		if( controller.IsModded() )
 		{
+			m_animProxy = PlayLibraryAnimation( m_transitToLoadingAnimName, animOptions );
 			LoadModdedSave( controller.SaveIndex() );
+			if( m_enableLoadingTransition )
+			{
+				PlayTransitionAnimOnButtons( controller.ButtonIndex(), false );
+			}
 		}
 		else if( GetSystemRequestsHandler().IsPreGame() )
 		{
@@ -562,15 +641,15 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 				if( controller && ( controller.SaveIndex() == idx ) )
 				{
 					index = m_playthroughIDs.FindFirst( controller.GetPlaythroughID() );
+					inkCompoundRef.RemoveChild( m_list, button );
 					if( index != -1 )
 					{
-						m_saveItemMap[ index ].Remove( button );
-						if( m_saveItemMap[ index ].Size() == 0 )
+						m_saveWidgetsMap[ index ].Remove( button );
+						if( m_saveWidgetsMap[ index ].Size() == 0 )
 						{
-							m_playthroughGroupHeaders[ index ].SetVisible( false );
+							inkCompoundRef.RemoveChild( m_list, m_saveGroupHeaderWidgets[ index ] );
 						}
 					}
-					button.SetVisible( false );
 					break;
 				}
 			}
@@ -625,6 +704,10 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 			ResetSaveMetaData();
 			SetupLoadItems( m_saves );
 			savesCount = m_saves.Size();
+			if( savesCount > 0 )
+			{
+				inkWidgetRef.SetVisible( m_loadingSpinner, true );
+			}
 			inkWidgetRef.SetVisible( m_noSavedGamesLabel, savesCount == 0 );
 			UpdateButtonHints( savesCount );
 			m_loadComplete = true;
@@ -634,76 +717,87 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 	private function ResetSaveMetaData()
 	{
 		m_playthroughIDs.Clear();
-		m_loadGroupInfos.Clear();
-		m_saveItemMap.Clear();
-		m_groupCount = 0;
+		m_saveGroupInfos.Clear();
+		m_saveWidgetsMap.Clear();
+		m_saveGroupHeaderWidgets.Clear();
+		m_saveWidgetsMap.Clear();
+		m_buttonList.Clear();
+		m_buttonListFinalized = false;
 	}
 
 	protected event OnSaveMetadataReady( info : SaveMetadataInfo )
 	{
-		var groupHeader : weak< inkWidget >;
 		var groupController : weak< LoadListGroup >;
-		var item : weak< inkWidget >;
+		var saveWidget : weak< inkWidget >;
 		var controller : weak< LoadListItem >;
 		var characterCustomizationSystem : gameuiICharacterCustomizationSystem;
-		var saveGroupInfo : SaveGroupInfo;
 		var saveWidgets : array< weak< inkWidget > >;
 		var playthroughIndex : Int32;
-		item = FindSavedItem( info.saveIndex );
-		if( item == NULL )
+		saveWidget = FindSaveWidget( info.saveIndex );
+		if( saveWidget == NULL )
 		{
 			return false;
 		}
 		characterCustomizationSystem = GameInstance.GetCharacterCustomizationSystem( GetPlayerControlledObject().GetGame() );
 		playthroughIndex = m_playthroughIDs.FindFirst( info.playthroughID );
-		if( playthroughIndex != -1 )
+		if( playthroughIndex == -1 )
 		{
-			saveWidgets = m_saveItemMap[ playthroughIndex ];
-			saveWidgets.PushBack( item );
-			m_saveItemMap[ playthroughIndex ] = saveWidgets;
+			playthroughIndex = CreateNewSaveGroup( info );
 		}
-		else
-		{
-			saveWidgets.PushBack( item );
-			m_saveItemMap.PushBack( saveWidgets );
-			m_playthroughIDs.PushBack( info.playthroughID );
-			groupHeader = SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListExpandableGroup' );
-			groupHeader.RegisterToCallback( 'OnRelease', this, 'OnReleaseLoadListGroup' );
-			m_playthroughGroupHeaders.PushBack( groupHeader );
-			groupController = ( ( LoadListGroup )( groupHeader.GetController() ) );
-			groupController.SetPlaythroughID( info.playthroughID );
-			groupController.SetGameController( this );
-			saveGroupInfo = new SaveGroupInfo;
-			saveGroupInfo.timestamp = info.timestamp;
-			saveGroupInfo.playthroughID = info.playthroughID;
-			saveGroupInfo.playthroughTime = info.playthroughTime;
-			saveGroupInfo.playTime = info.playTime;
-			saveGroupInfo.level = info.level;
-			saveGroupInfo.lifePath = info.lifePath;
-			groupController.SetMetadata( saveGroupInfo );
-			playthroughIndex = m_groupCount;
-			ReorderListItem( groupHeader, playthroughIndex, true );
-			m_groupCount += 1;
-			if( m_groupCount == 1 )
-			{
-				groupController.SwitchExpandedState();
-			}
-		}
-		ReorderListItem( item, playthroughIndex, false );
-		controller = ( ( LoadListItem )( item.GetController() ) );
+		groupController = ( ( LoadListGroup )( m_saveGroupHeaderWidgets[ playthroughIndex ].GetController() ) );
+		saveWidgets = m_saveWidgetsMap[ playthroughIndex ];
+		saveWidgets.PushBack( saveWidget );
+		m_saveWidgetsMap[ playthroughIndex ] = saveWidgets;
+		ReorderListItem( saveWidget, playthroughIndex, false );
+		controller = ( ( LoadListItem )( saveWidget.GetController() ) );
 		if( info.isValid )
 		{
-			controller.SetData( info.saveIndex );
-			controller.SetButtonIndex( m_buttonList.Size() );
-			m_buttonList.PushBack( controller );
 			controller.SetOwnerMenuCallbacks( this );
-			controller.SetMetadata( info, playthroughIndex == 0, m_isEp1Enabled );
-			controller.CheckThumbnailCensorship( !( characterCustomizationSystem.IsNudityAllowed() ) );
+			controller.SetMetadata( info, groupController.GetExpandedState(), m_isEp1Enabled );
+			controller.CheckThumbnailCensorship( !( characterCustomizationSystem.IsNudityAllowed() ), m_isUserUGCRestricted );
 		}
 		else
 		{
-			controller.SetInvalid( info.internalName );
+			controller.SetInvalid( info.internalName, groupController.GetExpandedState() );
 		}
+		if( !( m_buttonListFinalized ) )
+		{
+			PopulateButtonList();
+			if( CountSaveWidgetsInGroups() == m_saves.Size() )
+			{
+				m_buttonListFinalized = true;
+				inkWidgetRef.SetVisible( m_loadingSpinner, false );
+			}
+		}
+	}
+
+	private function CreateNewSaveGroup( info : SaveMetadataInfo ) : Int32
+	{
+		var saveGroupInfo : SaveGroupInfo;
+		var saveWidgets : array< weak< inkWidget > >;
+		var groupHeader : weak< inkWidget >;
+		var groupController : weak< LoadListGroup >;
+		var playthroughIndex : Int32;
+		playthroughIndex = m_playthroughIDs.Size();
+		m_playthroughIDs.PushBack( info.playthroughID );
+		saveWidgets.Clear();
+		m_saveWidgetsMap.PushBack( saveWidgets );
+		saveGroupInfo = new SaveGroupInfo;
+		saveGroupInfo.CopySaveMetaData( info );
+		m_saveGroupInfos.PushBack( saveGroupInfo );
+		groupHeader = SpawnFromLocal( inkCompoundRef.Get( m_list ), 'LoadListExpandableGroup' );
+		groupHeader.RegisterToCallback( 'OnRelease', this, 'OnReleaseLoadListGroup' );
+		m_saveGroupHeaderWidgets.PushBack( groupHeader );
+		groupController = ( ( LoadListGroup )( groupHeader.GetController() ) );
+		groupController.SetPlaythroughID( info.playthroughID );
+		groupController.SetGameController( this );
+		groupController.SetMetadata( saveGroupInfo );
+		ReorderListItem( groupHeader, playthroughIndex, true );
+		if( playthroughIndex == 0 )
+		{
+			groupController.SwitchExpandedState();
+		}
+		return playthroughIndex;
 	}
 
 	private function ReorderListItem( item : weak< inkWidget >, playthroughIndex : Int32, isHeader : Bool )
@@ -716,13 +810,13 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 		}
 		for( i = 0; i < playthroughIndex; i += 1 )
 		{
-			count += m_saveItemMap[ i ].Size();
+			count += m_saveWidgetsMap[ i ].Size();
 			count += 1;
 		}
 		inkCompoundRef.ReorderChild( m_list, item, count );
 	}
 
-	private function FindSavedItem( index : Int32 ) : weak< inkWidget >
+	private function FindSaveWidget( index : Int32 ) : weak< inkWidget >
 	{
 		var i : Int32;
 		var button : weak< inkWidget >;
@@ -737,6 +831,33 @@ class LoadGameMenuGameController extends gameuiSaveHandlingController
 			}
 		}
 		return NULL;
+	}
+
+	public function CountSaveWidgetsInGroups() : Int32
+	{
+		var i, count : Int32;
+		count = 0;
+		for( i = 0; i < m_saveWidgetsMap.Size(); i += 1 )
+		{
+			count += m_saveWidgetsMap[ i ].Size();
+		}
+		return count;
+	}
+
+	public function PopulateButtonList()
+	{
+		var index : Int32;
+		var itemController : weak< LoadListItem >;
+		m_buttonList.Clear();
+		for( index = 0; index < inkCompoundRef.GetNumChildren( m_list ); index += 1 )
+		{
+			itemController = ( ( LoadListItem )( inkCompoundRef.GetWidgetByIndex( m_list, index ).GetController() ) );
+			if( itemController )
+			{
+				itemController.SetButtonIndex( m_buttonList.Size() );
+				m_buttonList.PushBack( itemController );
+			}
+		}
 	}
 
 	protected event OnGogPressed( evt : inkPointerEvent )
@@ -796,6 +917,8 @@ class LoadListItem extends AnimatedListItemController
 	private var m_validSlot : Bool;
 	private var m_initialLoadingID : Uint64;
 	private var m_metadata : SaveMetadataInfo;
+	private var m_isMetadataSet : Bool;
+	default m_isMetadataSet = false;
 	private const var m_defaultAtlasPath : ResRef;
 	default m_defaultAtlasPath = R"base\gameplay\gui\fullscreen\load_game\save_game.inkatlas";
 	private var m_tranistionAnimProxy : inkAnimProxy;
@@ -866,6 +989,7 @@ class LoadListItem extends AnimatedListItemController
 		var playthroughTime : Float;
 		var fileSizeMB : String;
 		m_metadata = metadata;
+		m_isMetadataSet = true;
 		inkWidgetRef.SetVisible( m_wrapper, isVisible );
 		inkTextRef.SetVisible( m_label, true );
 		inkTextRef.SetVisible( m_labelDate, true );
@@ -973,14 +1097,20 @@ class LoadListItem extends AnimatedListItemController
 		if( metadata.isModded )
 		{
 			inkImageRef.SetVisible( m_modIcon, true );
-			inkImageRef.SetVisible( m_trophyIcon, true );
+			inkImageRef.SetVisible( m_trophyIcon, isAbleToDisplayBrokenTrophyIconAndTooltip() );
 		}
 	}
 
-	public function SetInvalid( const label : ref< String > )
+	private function isAbleToDisplayBrokenTrophyIconAndTooltip() : Bool
+	{
+		return ( ( GetPlatformShortName() == "ps5" || GetPlatformShortName() == "ps5pro" ) || GetPlatformShortName() == "xseriesx" ) || GetPlatformShortName() == "xseriess";
+	}
+
+	public function SetInvalid( const label : ref< String >, isVisible : Bool )
 	{
 		m_validSlot = false;
-		inkWidgetRef.SetVisible( m_wrapper, true );
+		m_isMetadataSet = true;
+		inkWidgetRef.SetVisible( m_wrapper, isVisible );
 		inkTextRef.SetVisible( m_label, true );
 		inkTextRef.SetVisible( m_quest, true );
 		inkTextRef.SetText( m_label, "UI-Menus-Saving-CorruptedSaveTitle" );
@@ -1001,6 +1131,7 @@ class LoadListItem extends AnimatedListItemController
 		{
 			inkWidgetRef.SetVisible( m_emptySlotWrapper, false );
 		}
+		m_isMetadataSet = false;
 	}
 
 	public function SetButtonIndex( index : Int32 )
@@ -1059,6 +1190,11 @@ class LoadListItem extends AnimatedListItemController
 		return m_validSlot;
 	}
 
+	public function IsMetadataSet() : Bool
+	{
+		return m_isMetadataSet;
+	}
+
 	public function GetInitialLoadingID() : Uint64
 	{
 		return m_initialLoadingID;
@@ -1074,8 +1210,14 @@ class LoadListItem extends AnimatedListItemController
 		return inkWidgetRef.IsVisible( m_wrapper );
 	}
 
-	public function CheckThumbnailCensorship( IsBuildCensored : Bool )
+	public function CheckThumbnailCensorship( IsBuildCensored : Bool, isUserUGCRestricted : Bool )
 	{
+		if( isUserUGCRestricted && IsModded() )
+		{
+			inkImageRef.SetAtlasResource( m_imageReplacement, m_defaultAtlasPath );
+			inkImageRef.SetActiveTextureType( m_imageReplacement, inkTextureType.StaticTexture );
+			inkImageRef.SetTexturePart( m_imageReplacement, 'save_img' );
+		}
 		if( IsBuildCensored && IsCloud() )
 		{
 			inkImageRef.SetAtlasResource( m_imageReplacement, m_defaultAtlasPath );
@@ -1108,8 +1250,6 @@ class LoadListGroup extends AnimatedListItemController
 	private editable var m_sep1 : inkWidgetRef;
 	private editable var m_sep2 : inkWidgetRef;
 	private editable var m_background : inkImageRef;
-	private var m_index : Int32;
-	private var m_validSlot : Bool;
 	private var m_metadata : SaveGroupInfo;
 	private const var m_defaultAtlasPath : ResRef;
 	default m_defaultAtlasPath = R"base\gameplay\gui\fullscreen\load_game\save_game.inkatlas";
@@ -1127,7 +1267,6 @@ class LoadListGroup extends AnimatedListItemController
 		RegisterToCallback( 'OnHoverOver', this, 'OnHoverOver' );
 		RegisterToCallback( 'OnHoverOut', this, 'OnHoverOut' );
 		super.OnInitialize();
-		m_validSlot = true;
 		inkWidgetRef.SetVisible( m_wrapper, false );
 		inkTextRef.SetVisible( m_playTime, false );
 		inkTextRef.SetVisible( m_playTimeLabel, false );
@@ -1255,18 +1394,6 @@ class LoadListGroup extends AnimatedListItemController
 		return m_metadata;
 	}
 
-	public function SetInvalid( const label : ref< String > )
-	{
-		m_validSlot = false;
-		inkWidgetRef.SetVisible( m_wrapper, true );
-	}
-
-	public function SetData( index : Int32 )
-	{
-		m_index = index;
-		inkWidgetRef.SetVisible( m_wrapper, false );
-	}
-
 	public function Refocus( widgetToFocus : weak< inkWidget > )
 	{
 		m_refocus = true;
@@ -1297,16 +1424,6 @@ class LoadListGroup extends AnimatedListItemController
 		PlayLibraryAnimation( 'pause_button_hover_out_anim' );
 	}
 
-	public function Index() : Int32
-	{
-		return m_index;
-	}
-
-	public function ValidSlot() : Bool
-	{
-		return m_validSlot;
-	}
-
 	public function IsVisible() : Bool
 	{
 		return inkWidgetRef.IsVisible( m_wrapper );
@@ -1331,6 +1448,21 @@ class LoadListGroup extends AnimatedListItemController
 			inkImageRef.SetTexturePart( m_expandIconBackground, 'arrow_down_bg' );
 		}
 		return m_isExpanded;
+	}
+
+	public function GetExpandedState() : Bool
+	{
+		return m_isExpanded;
+	}
+
+	public function SetExpandedState( newExpandedState : Bool ) : Bool
+	{
+		if( m_isExpanded != newExpandedState )
+		{
+			SwitchExpandedState();
+			return true;
+		}
+		return false;
 	}
 
 	public function SetPlaythroughID( playthroughID : String )

@@ -18,6 +18,11 @@ class SaveAndApplyCyberwareCustomizationDataRequest extends ScriptableSystemRequ
 	var secondaryColorIndex : Uint8;
 }
 
+class SaveAndApplyCyberWareSwitcherIndexRequest extends ScriptableSystemRequest
+{
+	var switcherIndex : Uint32;
+}
+
 class SaveAndApplyCyberWareCustomColorRequest extends ScriptableSystemRequest
 {
 	var enabled : Bool;
@@ -38,6 +43,7 @@ struct CyberwareCustomizationPersistentData
 	persistent var brandDataID : TweakDBID;
 	persistent var primaryColorIndex : Uint8;
 	persistent var secondaryColorIndex : Uint8;
+	persistent var hasMaxTacApperanceEquipped : Bool;
 
 	public static function GetBrandDataID( data : CyberwareCustomizationPersistentData ) : UIGlamdocBrandData_Record
 	{
@@ -58,17 +64,93 @@ struct CyberwareCustomizationPersistentData
 
 importonly class NativeCyberwareCustomizationSystem extends ScriptableSystem
 {
-	protected import function SetIndexForCustomizationSwitcher( switcherName : CName, index : Uint32 );
+	protected import function SetIndexForCustomizationSwitcher( switcherName : CName, index : Uint32, forcePlayerCustomization : Bool );
+	protected import function SetIndexForCustomizationSwitcherWithMaxTacAppearance( switcherName : CName, index : Uint32, forcePlayerCustomization : Bool );
 	protected import function SetCustomizationParameters( enabled : Bool, primaryColor : Color, secondaryColor : Color );
+	protected import function SetCustomizationAppearance( apperanceOptionName : CName, apperanceDefinitionName : CName );
+	protected import function ResetCustomizationAppearance( apperanceOptionName : CName );
+}
+
+class PotentiallyRefreshMaxTacApperanceRequest extends ScriptableSystemRequest
+{
+}
+
+class CyberwareCustomizationAttachmentSlotsScriptCallback extends AttachmentSlotsScriptCallback
+{
+	var m_cyberwareCustomizationSystem : weak< CyberwareCustomizationSystem >;
+
+	public override function OnItemEquippedVisual( slot : TweakDBID, item : ItemID )
+	{
+		var requestRefresh : PotentiallyRefreshMaxTacApperanceRequest;
+		if( ( slot == T"AttachmentSlots.RightArm" ) && ( ItemID.GetTDBID( item ) == T"Items.MantisBladeHolsteredFists" ) )
+		{
+			requestRefresh = new PotentiallyRefreshMaxTacApperanceRequest;
+			m_cyberwareCustomizationSystem.QueueRequest( requestRefresh );
+		}
+	}
+
 }
 
 class CyberwareCustomizationSystem extends NativeCyberwareCustomizationSystem
 {
 	private persistent var savedData : CyberwareCustomizationPersistentData;
+	private var m_transactionSystem : weak< TransactionSystem >;
+	private var m_attachmentSlotCallback : AttachmentSlotsScriptListener;
+	private var m_playerAttachedCallbackID : Uint32;
+	private var m_playerPuppet : weak< GameObject >;
 
 	public const function GetSavedData() : CyberwareCustomizationPersistentData
 	{
 		return savedData;
+	}
+
+	private function OnPotentiallyRefreshMaxTacApperance( requestRefresh : PotentiallyRefreshMaxTacApperanceRequest )
+	{
+		var shouldApplyMaxTacApperance : Bool;
+		var hasMaxTacApperanceEquipped : Bool;
+		shouldApplyMaxTacApperance = ShouldApplyMaxTacApperance();
+		hasMaxTacApperanceEquipped = savedData.hasMaxTacApperanceEquipped;
+		if( shouldApplyMaxTacApperance && !( hasMaxTacApperanceEquipped ) )
+		{
+			SetMaxTacApperance();
+		}
+		else if( !( shouldApplyMaxTacApperance ) && hasMaxTacApperanceEquipped )
+		{
+			RemoveMaxTacApperance();
+		}
+	}
+
+	private function SetMaxTacApperance()
+	{
+		SetCustomizationAppearance( 'u_mantis_edge_base', 'max_tac' );
+		savedData.hasMaxTacApperanceEquipped = true;
+	}
+
+	private function RemoveMaxTacApperance()
+	{
+		ResetCustomizationAppearance( 'u_mantis_edge_base' );
+		savedData.hasMaxTacApperanceEquipped = false;
+	}
+
+	private function ShouldApplyMaxTacApperance() : Bool
+	{
+		var equipData : EquipmentSystemPlayerData;
+		var cwEquipArea : ItemID;
+		var armsCWRecord : Item_Record;
+		var i : Int32;
+		var tags : array< CName >;
+		equipData = EquipmentSystem.GetData( m_playerPuppet );
+		cwEquipArea = equipData.GetActiveItem( gamedataEquipmentArea.ArmsCW );
+		armsCWRecord = TweakDBInterface.GetItemRecord( ItemID.GetTDBID( cwEquipArea ) );
+		tags = armsCWRecord.Tags();
+		for( i = 0; i < tags.Size(); i += 1 )
+		{
+			if( tags[ i ] == 'SetMaxTacApperance' )
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private function OnApplyCyberwareCustomizationDataRequest( request : ApplyCyberwareCustomizationDataRequest )
@@ -83,7 +165,7 @@ class CyberwareCustomizationSystem extends NativeCyberwareCustomizationSystem
 		brandData = CyberwareCustomizationHelper.GetBrandDataFromCustomizationItem( request.customizationItem );
 		primaryColor = CyberwareCustomizationHelper.GetColorFromBrandData( brandData, request.primaryColorIndex );
 		secondaryColor = CyberwareCustomizationHelper.GetColorFromBrandData( brandData, request.secondaryColorIndex );
-		SetIndexForCustomizationSwitcher( switcherName, switcherIndex );
+		SetIndexForCustomizationSwitcher( switcherName, switcherIndex, true );
 		SetCustomizationParameters( request.enabled, Color.ToLinear( primaryColor ), Color.ToLinear( secondaryColor ) );
 	}
 
@@ -96,7 +178,13 @@ class CyberwareCustomizationSystem extends NativeCyberwareCustomizationSystem
 		savedData.brandDataID = CyberwareCustomizationHelper.GetBrandDataFromCustomizationItem( request.customizationItem ).GetRecordID();
 		savedData.primaryColorIndex = request.primaryColorIndex;
 		savedData.secondaryColorIndex = request.secondaryColorIndex;
-		RestoreCyberwareCustomization();
+		RestoreCyberwareCustomization( true );
+	}
+
+	private function OnSaveAndApplyCyberwareSwitcherIndexRequest( request : SaveAndApplyCyberWareSwitcherIndexRequest )
+	{
+		savedData.switcherIndex = request.switcherIndex;
+		RestoreCyberwareCustomization( true );
 	}
 
 	private function OnSaveAndApplyCyberwareCustomizationColorRequest( request : SaveAndApplyCyberWareCustomColorRequest )
@@ -109,17 +197,40 @@ class CyberwareCustomizationSystem extends NativeCyberwareCustomizationSystem
 
 	private function OnRestoreCyberwareCustomizationDataRequest( request : RestoreCyberwareCustomizationDataRequest )
 	{
-		RestoreCyberwareCustomization();
+		RestoreCyberwareCustomization( false );
+	}
+
+	private export override function OnAttach()
+	{
+		GameInstance.GetPlayerSystem( GetGameInstance() ).UnregisterPlayerPuppetAttachedCallback( m_playerAttachedCallbackID );
+		m_playerAttachedCallbackID = GameInstance.GetPlayerSystem( GetGameInstance() ).RegisterPlayerPuppetAttachedCallback( this, 'PlayerAttachedCallback' );
+	}
+
+	private export function PlayerAttachedCallback( playerPuppet : GameObject )
+	{
+		var attachmentCallback : CyberwareCustomizationAttachmentSlotsScriptCallback;
+		m_playerPuppet = playerPuppet;
+		m_transactionSystem = GameInstance.GetTransactionSystem( GetGameInstance() );
+		attachmentCallback = new CyberwareCustomizationAttachmentSlotsScriptCallback;
+		attachmentCallback.m_cyberwareCustomizationSystem = this;
+		m_attachmentSlotCallback = m_transactionSystem.RegisterAttachmentSlotListener( playerPuppet, attachmentCallback );
 	}
 
 	private export override function OnRestored( saveVersion : Int32, gameVersion : Int32 )
 	{
-		RestoreCyberwareCustomization();
+		RestoreCyberwareCustomization( false );
 	}
 
-	private function RestoreCyberwareCustomization()
+	public function RestoreCyberwareCustomization( forcePlayerCustomization : Bool )
 	{
-		SetIndexForCustomizationSwitcher( savedData.switcherName, savedData.switcherIndex );
+		if( savedData.hasMaxTacApperanceEquipped || ShouldApplyMaxTacApperance() )
+		{
+			SetIndexForCustomizationSwitcherWithMaxTacAppearance( savedData.switcherName, savedData.switcherIndex, forcePlayerCustomization );
+		}
+		else
+		{
+			SetIndexForCustomizationSwitcher( savedData.switcherName, savedData.switcherIndex, forcePlayerCustomization );
+		}
 		SetCustomizationParameters( savedData.enabled, Color.ToLinear( CyberwareCustomizationPersistentData.GetPrimaryColor( savedData ) ), Color.ToLinear( CyberwareCustomizationPersistentData.GetSecondaryColor( savedData ) ) );
 	}
 
@@ -142,11 +253,25 @@ class CyberwareCustomizationHelper
 		return customizationItemRecord.CustomizationIndex();
 	}
 
-	public static function GetPreviewCustomizationIndexFromCustomizationItem( item : gameItemData ) : Int32
+	public static function GetCustomizationIndexFromCustomizationItem( itemID : ItemID ) : Int32
+	{
+		var customizationItemRecord : UIGlamdocCustomizationItem_Record;
+		customizationItemRecord = TweakDBInterface.GetUIGlamdocCustomizationItemRecord( ItemID.GetTDBID( itemID ) );
+		return customizationItemRecord.CustomizationIndex();
+	}
+
+	public static function GetLongSleevesCustomizationIndexFromCustomizationItem( item : gameItemData ) : Int32
 	{
 		var customizationItemRecord : UIGlamdocCustomizationItem_Record;
 		customizationItemRecord = TweakDBInterface.GetUIGlamdocCustomizationItemRecord( ItemID.GetTDBID( item.GetID() ) );
-		return customizationItemRecord.PreviewCustomizationIndex();
+		return customizationItemRecord.LongSleevesCustomizationIndex();
+	}
+
+	public static function GetLongSleevesCustomizationIndexFromCustomizationItem( itemID : ItemID ) : Int32
+	{
+		var customizationItemRecord : UIGlamdocCustomizationItem_Record;
+		customizationItemRecord = TweakDBInterface.GetUIGlamdocCustomizationItemRecord( ItemID.GetTDBID( itemID ) );
+		return customizationItemRecord.LongSleevesCustomizationIndex();
 	}
 
 	public static function GetBrandDataFromCustomizationItem( item : gameItemData ) : UIGlamdocBrandData_Record

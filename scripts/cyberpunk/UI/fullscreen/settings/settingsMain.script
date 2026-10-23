@@ -7,6 +7,8 @@ import class gameuiSettingsMenuGameController extends gameuiMenuGameController
 	protected virtual function SetLanguagePackageInstallProgress( progress : Float ) {}
 
 	protected virtual function SetLanguagePackageInstallProgressBar( progress : Float, completed : Bool, started : Bool ) {}
+
+	protected virtual function RefreshLanguagePackageInstallProgressBar( progress : Float, visible : Bool, installingLanguage : CName ) {}
 }
 
 struct SettingsCategory
@@ -140,6 +142,8 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 	private editable var m_controlsStyleWidget : inkWidgetRef;
 	[ category = "Other" ]
 	private editable var m_descriptionWarningRichColor : String;
+	[ category = "Other" ]
+	private editable var m_globalPreloaderContainer : inkWidgetRef;
 	private var m_languageInstallProgressBar : weak< SettingsLanguageInstallProgressBar >;
 	private var m_menuEventDispatcher : weak< inkMenuEventDispatcher >;
 	private var m_settingsElements : array< weak< SettingsSelectorController > >;
@@ -167,6 +171,13 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 	private var m_showControlsStyle : Bool;
 	private var m_controlsStyleCtrl : weak< ListController >;
 	private var m_controlsStyleConfigVar : ConfigVarListString;
+	private var m_requestHandler : weak< inkISystemRequestsHandler >;
+	private var m_globalPreloader : weak< inkWidget >;
+	private var m_interactionsBlocked : Bool;
+	private var m_telemetryUpdatePopupToken : inkGameNotificationToken;
+	private var m_delayPopupProxy : inkAnimProxy;
+	private var m_preventNextTelemetryLog : Bool;
+	private var m_currentSelectLanguage : CName;
 
 	protected event OnInitialize()
 	{
@@ -180,8 +191,9 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		{
 			isInPatternMatchingTutorial = playerPuppet.IsInGyroTutorial();
 		}
-		m_settings = GetSystemRequestsHandler().GetUserSettings();
-		m_isPreGame = GetSystemRequestsHandler().IsPreGame();
+		m_requestHandler = GetSystemRequestsHandler();
+		m_settings = m_requestHandler.GetUserSettings();
+		m_isPreGame = m_requestHandler.IsPreGame();
 		m_settingsListener = new SettingsVarListener;
 		m_settingsListener.RegisterController( this );
 		m_settingsNotificationListener = new SettingsNotificationListener;
@@ -238,10 +250,6 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		m_closeSettingsRequest = false;
 		m_resetSettingsRequest = false;
 		m_useRightAligned = UseRightAligned();
-		if( m_isPreGame )
-		{
-			GetSystemRequestsHandler().RequestTelemetryConsent( true );
-		}
 		if( m_showControlsStyle && isInPatternMatchingTutorial )
 		{
 			for( idx = 0; idx < m_controlsStyleCtrl.Size(); idx += 1 )
@@ -254,6 +262,12 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 				}
 			}
 		}
+		m_requestHandler.RegisterToCallback( 'OnTelemetryDataRemovalCallback', this, 'OnTelemetryDataRemovalResult_Settings' );
+		m_globalPreloader = SpawnFromExternal( inkWidgetRef.Get( m_globalPreloaderContainer ), R"base\gameplay\gui\common\preloader\preloader.inkwidget", 'Root' );
+		m_globalPreloader.SetAnchor( inkEAnchor.Fill );
+		m_globalPreloader.SetAnchorPoint( Vector2( 0.5, 0.5 ) );
+		m_globalPreloader.SetVisible( false );
+		CheckTakeoutTelemetryVisibility();
 	}
 
 	protected event OnSetUserData( userData : IScriptable )
@@ -288,6 +302,7 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		{
 			GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).UnregisterListenerName( GetAllBlackboardDefs().InputSchemes.ActiveStyle, m_onInputStyleChangedCallbackID );
 		}
+		m_requestHandler.UnregisterFromCallback( 'OnConsentUpdateReceivedCallback', this, 'OnConsentUpdateReceivedResult_Settings' );
 	}
 
 	protected event OnInputStyleChanged( value : CName )
@@ -358,6 +373,9 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		var i : Int32;
 		var size : Int32;
 		var item : SettingsSelectorController;
+		var gameplayMiscsettingsGroup : ConfigGroup;
+		var configVarTelemetry : ConfigVarBool;
+		var settings : UserSettings;
 		size = m_settingsElements.Size();
 		CheckButtons();
 		for( i = 0; i < size; i += 1 )
@@ -385,6 +403,103 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		{
 			CheckHDRSettingVisibility();
 		}
+		if( varName == 'EnableTelemetry' )
+		{
+			settings = m_requestHandler.GetUserSettings();
+			if( settings.HasGroup( '/gameplay/misc' ) )
+			{
+				gameplayMiscsettingsGroup = settings.GetGroup( '/gameplay/misc' );
+				if( gameplayMiscsettingsGroup.HasVar( 'EnableTelemetry' ) )
+				{
+					configVarTelemetry = ( ( ConfigVarBool )( gameplayMiscsettingsGroup.GetVar( 'EnableTelemetry' ) ) );
+					if( !( configVarTelemetry.GetValue() ) )
+					{
+						DisplayRequestBuffer();
+						m_requestHandler.RequestTelemetryDataRemoval();
+					}
+					else
+					{
+						if( m_preventNextTelemetryLog )
+						{
+							m_preventNextTelemetryLog = false;
+						}
+						else
+						{
+							GameInstance.GetTelemetrySystem( GetPlayerControlledObject().GetGame() ).LogTelemetryConsentChanged();
+						}
+					}
+					CheckTakeoutTelemetryVisibility();
+					RefreshSettings();
+				}
+			}
+		}
+		if( varName == 'EnableMarketing' )
+		{
+			GameInstance.GetTelemetrySystem( GetPlayerControlledObject().GetGame() ).LogMarketingConsentChanged();
+		}
+	}
+
+	private function DisplayRequestBuffer()
+	{
+		var playbackOptions : inkAnimOptions;
+		var i : Int32;
+		playbackOptions.loopType = inkanimLoopType.Cycle;
+		playbackOptions.loopInfinite = true;
+		m_interactionsBlocked = true;
+		m_globalPreloader.SetVisible( true );
+		m_groupsSelectorCtrl.SetInteractionBlocked( true );
+		m_globalPreloader.GetController().PlayLibraryAnimation( 'loop', playbackOptions );
+		for( i = 0; i < m_settingsElements.Size(); i += 1 )
+		{
+			m_settingsElements[ i ].SetInteractionBlocked( m_interactionsBlocked );
+		}
+	}
+
+	protected event OnTelemetryDataRemovalResult_Settings( result : inkTelemetryDataRemovalResult )
+	{
+		var i : Int32;
+		var gameplayMiscsettingsGroup : ConfigGroup;
+		var configVarTelemetry : ConfigVarBool;
+		var settings : UserSettings;
+		m_interactionsBlocked = false;
+		m_globalPreloader.SetVisible( false );
+		m_groupsSelectorCtrl.SetInteractionBlocked( false );
+		for( i = 0; i < m_settingsElements.Size(); i += 1 )
+		{
+			m_settingsElements[ i ].SetInteractionBlocked( m_interactionsBlocked );
+		}
+		if( result == inkTelemetryDataRemovalResult.Succeed )
+		{
+			GameInstance.GetTelemetrySystem( GetPlayerControlledObject().GetGame() ).LogTelemetryConsentChanged();
+		}
+		else if( result == inkTelemetryDataRemovalResult.Failed )
+		{
+			ShowTelemetryConsentFailedPopup();
+			settings = m_requestHandler.GetUserSettings();
+			if( settings.HasGroup( '/gameplay/misc' ) )
+			{
+				gameplayMiscsettingsGroup = settings.GetGroup( '/gameplay/misc' );
+				if( gameplayMiscsettingsGroup.HasVar( 'EnableTelemetry' ) )
+				{
+					configVarTelemetry = ( ( ConfigVarBool )( gameplayMiscsettingsGroup.GetVar( 'EnableTelemetry' ) ) );
+				}
+				m_preventNextTelemetryLog = true;
+				configVarTelemetry.SetValue( true );
+			}
+		}
+	}
+
+	private function ShowTelemetryConsentFailedPopup()
+	{
+		m_telemetryUpdatePopupToken = GenericMessageNotification.Show( this, "UI-Settings-Gameplay-Misc-TelemetryDisabledErrorPopupTitle", "UI-Settings-Gameplay-Misc-TelemetryDisabledErrorPopupDesc", GenericMessageNotificationType.OK );
+		m_telemetryUpdatePopupToken.RegisterListener( this, 'OnCloseTelemetryConsentFailedPopup' );
+		m_interactionsBlocked = true;
+	}
+
+	protected event OnCloseTelemetryConsentFailedPopup( data : inkGameNotificationData )
+	{
+		m_telemetryUpdatePopupToken = NULL;
+		m_interactionsBlocked = false;
 	}
 
 	private function SetLanguageDisclaimerVisiblity( i : Int32 )
@@ -491,7 +606,7 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		var triggerEnabledVar : ConfigVarBool;
 		var triggerIntensityVar : ConfigVarFloat;
 		var isUsingDualSense : Bool;
-		if( GetPlatformShortName() == "windows" )
+		if( ( GetPlatformShortName() == "windows" || GetPlatformShortName() == "windowsGDK" ) || GetPlatformShortName() == "mac" )
 		{
 			triggerEnabledVar = ( ( ConfigVarBool )( m_settings.GetVar( '/accessibility/controls', 'EnableAdaptiveTriggerEffects' ) ) );
 			triggerIntensityVar = ( ( ConfigVarFloat )( m_settings.GetVar( '/accessibility/controls', 'AdaptiveTriggersIntensity' ) ) );
@@ -518,7 +633,7 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		{
 			m_currentHDRindex = option.GetIndex();
 			m_showBrightnessButton = m_currentHDRindex == 0;
-			m_showHdrButton = !( m_showBrightnessButton );
+			m_showHdrButton = !( m_showBrightnessButton ) && !( GetSystemRequestsHandler().HasAltDisplay() );
 			if( option.IsDynamic() )
 			{
 				isEnabled = values.Size() > 1;
@@ -546,6 +661,25 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		}
 	}
 
+	private function CheckTakeoutTelemetryVisibility()
+	{
+		var gameplayMiscsettingsGroup : ConfigGroup;
+		var configVarTelemetry : ConfigVarBool;
+		var configVarTakeoutTelemetry : ConfigVarButton;
+		var settings : UserSettings;
+		settings = m_requestHandler.GetUserSettings();
+		if( settings.HasGroup( '/gameplay/misc' ) )
+		{
+			gameplayMiscsettingsGroup = settings.GetGroup( '/gameplay/misc' );
+			if( gameplayMiscsettingsGroup.HasVar( 'EnableTelemetry' ) )
+			{
+				configVarTelemetry = ( ( ConfigVarBool )( gameplayMiscsettingsGroup.GetVar( 'EnableTelemetry' ) ) );
+				configVarTakeoutTelemetry = ( ( ConfigVarButton )( gameplayMiscsettingsGroup.GetVar( 'TakeoutTelemetry' ) ) );
+				configVarTakeoutTelemetry.SetVisible( configVarTelemetry.GetValue() );
+			}
+		}
+	}
+
 	protected override function SetLanguagePackageInstallProgress( progress : Float )
 	{
 		m_languageInstallProgressBar.SetProgress( progress );
@@ -554,6 +688,12 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 	protected override function SetLanguagePackageInstallProgressBar( progress : Float, completed : Bool, started : Bool )
 	{
 		m_languageInstallProgressBar.SetProgressBarVisiblity( !( completed ) && started );
+		m_languageInstallProgressBar.SetProgress( progress );
+	}
+
+	protected override function RefreshLanguagePackageInstallProgressBar( progress : Float, visible : Bool, installingLanguage : CName )
+	{
+		m_languageInstallProgressBar.SetProgressBarVisiblity( visible && m_currentSelectLanguage == installingLanguage );
 		m_languageInstallProgressBar.SetProgress( progress );
 	}
 
@@ -682,7 +822,7 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	protected event OnBack( userData : IScriptable )
 	{
-		if( !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) )
+		if( !( m_interactionsBlocked ) && !( StatusEffectSystem.ObjectHasStatusEffectWithTag( GetPlayerControlledObject(), 'LockInHubMenu' ) ) )
 		{
 			m_closeSettingsRequest = true;
 			CheckSettings();
@@ -691,6 +831,10 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	private function RequestClose()
 	{
+		if( m_interactionsBlocked )
+		{
+			return;
+		}
 		m_menuEventDispatcher.SpawnEvent( 'OnCloseSettingsScreen' );
 		m_closeSettingsRequest = false;
 	}
@@ -782,7 +926,7 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 	private function SetSideButtonsVisiblity( i : Int32 )
 	{
 		inkWidgetRef.SetVisible( m_benchmarkButton, IsBenchmarkPossible() && ( m_menusList[ i ] == m_settingGroupName_Graphics || m_menusList[ i ] == m_settingGroupName_Video ) );
-		inkWidgetRef.SetVisible( m_hdrButton, ( !( m_isBenchmarkSettings ) && m_showHdrButton ) && m_menusList[ i ] == m_settingGroupName_Video );
+		inkWidgetRef.SetVisible( m_hdrButton, ( ( !( m_isBenchmarkSettings ) && m_showHdrButton ) && m_menusList[ i ] == m_settingGroupName_Video ) && !( GetSystemRequestsHandler().HasAltDisplay() ) );
 		inkWidgetRef.SetVisible( m_brightnessButton, ( !( m_isBenchmarkSettings ) && m_showBrightnessButton ) && m_menusList[ i ] == m_settingGroupName_Video );
 		inkWidgetRef.SetVisible( m_controllerButton, m_menusList[ i ] == m_settingGroupName_Controls );
 		inkWidgetRef.SetVisible( m_replayTutorialButton, m_menusList[ i ] == m_settingGroupName_Controls && !( GetSystemRequestsHandler().IsPreGame() ) );
@@ -929,6 +1073,10 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	protected event OnMenuChanged( index : Int32, target : ListItemController )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		PlaySound( 'Button', 'OnPress' );
 		PopulateCategorySettingsOptions( index );
 		( ( inkScrollController )( inkWidgetRef.GetController( m_scrollPanel ) ) ).SetScrollPosition( 0.0 );
@@ -944,11 +1092,19 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	protected event OnSubMenuChanged( index : Int32, target : ListItemController )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		m_controlsStyleConfigVar.SetIndex( index );
 	}
 
 	protected event OnApplyButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		m_closeSettingsRequest = false;
 		OnApplyButton();
 		CheckHDRSettingVisibility();
@@ -956,27 +1112,47 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	protected event OnResetButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		m_closeSettingsRequest = false;
 		OnResetButton();
 	}
 
 	protected event OnBrightnessButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		ShowBrightnessScreen();
 	}
 
 	protected event OnHDRButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		ShowHDRScreen();
 	}
 
 	protected event OnControllerButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		ShowControllerScreen();
 	}
 
 	protected event OnPressReplayTutorial( evt : inkPointerEvent )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
 		{
 			m_settings.RequestStartReplayTutorialDialog( this );
@@ -985,6 +1161,10 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	protected event OnBenchmarkButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		if( IsBenchmarkPossible() )
 		{
 			CheckSettings();
@@ -1018,6 +1198,10 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 
 	protected event OnDefaultButtonReleased( controller : weak< inkButtonController > )
 	{
+		if( m_interactionsBlocked )
+		{
+			return false;
+		}
 		m_closeSettingsRequest = false;
 		RequestRestoreDefaults();
 	}
@@ -1117,6 +1301,10 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		if( playerPuppet )
 		{
 			isInPatternMatchingTutorial = playerPuppet.IsInGyroTutorial();
+		}
+		if( m_interactionsBlocked )
+		{
+			return false;
 		}
 		CheckDualSenseSettingsVisibility();
 		listSize = m_groupsSelectorCtrl.Size();
@@ -1262,6 +1450,7 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 		var currentSettingsItemType : ConfigVarType;
 		var currentItem : weak< SettingsSelectorController >;
 		var currentVoItem : weak< SettingsSelectorControllerLanguagesList >;
+		var currentButtonItem : weak< SettingsSelectorControllerButton >;
 		var isVoiceOver : Bool;
 		var isKeyBinding : Bool;
 		size = options.Size();
@@ -1321,6 +1510,9 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 						currentItem = ( ( SettingsSelectorController )( SpawnFromLocal( inkCompoundRef.Get( m_settingsOptionsList ), 'settingsSelectorLanguagesList' ).GetController() ) );
 					}
 				break;
+				case ConfigVarType.Button:
+					currentItem = ( ( SettingsSelectorController )( SpawnFromLocal( inkCompoundRef.Get( m_settingsOptionsList ), 'settingsSelectorButton' ).GetController() ) );
+				break;
 				default:
 					break;
 			}
@@ -1338,10 +1530,16 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 				{
 					currentItem.AddLabelIndent( m_useRightAligned );
 				}
+				if( currentSettingsItemType == ConfigVarType.Button )
+				{
+					currentButtonItem = ( ( SettingsSelectorControllerButton )( currentItem ) );
+					currentButtonItem.SetUserSettings( m_settings );
+				}
 				if( isVoiceOver )
 				{
 					currentVoItem = ( ( SettingsSelectorControllerLanguagesList )( currentItem ) );
 					currentVoItem.RegisterDownloadButtonHovers( m_descriptionText );
+					currentVoItem.SetMainController( this );
 				}
 				m_settingsElements.PushBack( currentItem );
 			}
@@ -1375,6 +1573,11 @@ class SettingsMainGameController extends gameuiSettingsMenuGameController
 			PopulateOptions( settingsSubCategory.options );
 		}
 		m_groupsSelectorCtrl.SetSelectedIndex( idx );
+	}
+
+	public function SetCurrentSelectLanguage( voName : CName )
+	{
+		m_currentSelectLanguage = voName;
 	}
 
 }

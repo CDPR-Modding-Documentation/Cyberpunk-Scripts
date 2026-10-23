@@ -9,7 +9,7 @@ class EventInventorySlotSelectDelayedInventoryEvent extends Event
 	var target : weak< inkWidget >;
 }
 
-class gameuiInventoryGameController extends gameuiMenuGameController
+import class gameuiInventoryGameController extends gameuiMenuGameController
 {
 	private editable var m_TooltipsManagerRef : inkWidgetRef;
 	private editable var m_buttonHintsManagerRef : inkWidgetRef;
@@ -56,6 +56,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 	private var m_uiScriptableSystem : weak< UIScriptableSystem >;
 	private var m_comparisonResolver : ItemPreferredComparisonResolver;
 	private var m_equipmentSystem : weak< EquipmentSystem >;
+	private var m_transactionSystem : weak< TransactionSystem >;
 	private var m_EquipAreas : array< gamedataEquipmentArea >;
 	private var m_ConsumablesAreas : array< gamedataEquipmentArea >;
 	protected var m_UIBBEquipment : UI_EquipmentDef;
@@ -80,9 +81,15 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 	private var m_wardrobeOutfitAreas : array< gamedataEquipmentArea >;
 	private var m_lastClothingSetIndex : Int32;
 	default m_lastClothingSetIndex = -1;
+	private var m_registeredAttachmentSlotListener : AttachmentSlotsScriptListener;
+	private var m_attachmentSlotListener : InventoryAttachmentSlotsScriptCallback;
+	private var m_previewPuppet : weak< gamePuppet >;
 	private var telemetrySystem : weak< TelemetrySystem >;
 	private var m_CyberwareScreenUserData : CyberwareDisplayWrapper;
 	private var m_openItemMode : Bool;
+
+	protected import function HidePuppetPreview();
+	public import function ShowPuppetPreview();
 
 	protected event OnInitialize()
 	{
@@ -106,6 +113,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 		m_comparisonResolver = ItemPreferredComparisonResolver.Make( m_InventoryManager );
 		m_uiScriptableSystem = UIScriptableSystem.GetInstance( m_player.GetGame() );
 		m_equipmentSystem = ( ( EquipmentSystem )( GameInstance.GetScriptableSystemsContainer( m_player.GetGame() ).Get( 'EquipmentSystem' ) ) );
+		m_transactionSystem = ( ( TransactionSystem )( GameInstance.GetTransactionSystem( m_player.GetGame() ) ) );
 		m_EquipAreas = InventoryDataManagerV2.GetInventoryEquipmentAreas();
 		m_TooltipsManager = ( ( gameuiTooltipsManager )( inkWidgetRef.GetControllerByType( m_TooltipsManagerRef, 'gameuiTooltipsManager' ) ) );
 		m_TooltipsManager.Setup( ETooltipsStyle.Menus );
@@ -1245,6 +1253,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 
 	private function UnequipItem( controller : InventoryItemDisplayController, const itemData : ref< InventoryItemData > )
 	{
+		HandleCyberwareStyleUpdate( InventoryItemData.GetEquipmentArea( itemData ), itemData.SlotID, true );
 		m_InventoryManager.UnequipItem( controller.GetEquipmentArea(), controller.GetSlotIndex() );
 		m_InventoryManager.RemoveInventoryItemFromCache( controller.GetItemID() );
 		m_itemModeLogicController.SetInventoryItemButtonHintsHoverOut();
@@ -1258,6 +1267,7 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 			{
 				return;
 			}
+			HandleCyberwareStyleUpdate( InventoryItemData.GetEquipmentArea( itemData ), itemData.SlotID, false );
 			if( InventoryItemData.GetEquipmentArea( itemData ) == gamedataEquipmentArea.Weapon )
 			{
 				m_InventoryManager.EquipItem( InventoryItemData.GetID( itemData ), GetFirstAvailableWeaponSlot(), true );
@@ -1267,6 +1277,65 @@ class gameuiInventoryGameController extends gameuiMenuGameController
 				m_InventoryManager.EquipItem( InventoryItemData.GetID( itemData ), 0, true );
 			}
 		}
+	}
+
+	protected event OnInventoryPuppetReceived( puppet : gamePuppet )
+	{
+		m_previewPuppet = puppet;
+		m_registeredAttachmentSlotListener = m_transactionSystem.RegisterAttachmentSlotListener( m_previewPuppet, m_attachmentSlotListener );
+	}
+
+	public function HandleCyberwareStyleUpdate( const changedItemEquipmentArea : gamedataEquipmentArea, const slotID : TweakDBID, isUnequipping : Bool )
+	{
+		var cyberwareStyleEquipped : ItemID;
+		if( ( changedItemEquipmentArea == gamedataEquipmentArea.Outfit || changedItemEquipmentArea == gamedataEquipmentArea.OuterChest ) || changedItemEquipmentArea == gamedataEquipmentArea.InnerChest )
+		{
+			cyberwareStyleEquipped = EquipmentSystem.GetData( GetPlayerControlledObject() ).GetItemInEquipSlot( gamedataEquipmentArea.ArmsCWStyle, 0 );
+			if( ItemID.IsValid( cyberwareStyleEquipped ) )
+			{
+				HidePuppetPreview();
+				m_attachmentSlotListener = new InventoryAttachmentSlotsScriptCallback;
+				m_attachmentSlotListener.m_player = m_player;
+				m_attachmentSlotListener.m_transactionSystem = m_transactionSystem;
+				m_attachmentSlotListener.m_isUnequipping = isUnequipping;
+				m_attachmentSlotListener.m_showDelay = ( ( isUnequipping ) ? ( 0.40000001 ) : ( 0.1 ) );
+				m_attachmentSlotListener.m_controller = this;
+				m_attachmentSlotListener.m_slotToWaitFor = slotID;
+			}
+		}
+	}
+
+	public function ClothVisualsReady()
+	{
+		ShowPuppetPreview();
+		m_transactionSystem.UnregisterAttachmentSlotListener( m_previewPuppet, m_registeredAttachmentSlotListener );
+	}
+
+	public function IsSpawningCloth() : Bool
+	{
+		var equipData : EquipmentSystemPlayerData;
+		var clothingInfos : array< SSlotInfo >;
+		var i : Int32;
+		var item : ItemID;
+		equipData = EquipmentSystem.GetData( GetPlayerControlledObject() );
+		clothingInfos = equipData.GetClothingSlotsInfo();
+		for( i = 0; i < clothingInfos.Size(); i += 1 )
+		{
+			item = equipData.GetVisualItemInSlot( clothingInfos[ i ].areaType, clothingInfos[ i ].equipSlot );
+			if( ItemID.IsValid( item ) )
+			{
+				if( m_transactionSystem.IsSlotSpawningAnyItem( m_player, clothingInfos[ i ].equipSlot ) )
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	protected event OnVisualSlotsUpdatedEvent( evt : VisualSlotsUpdatedEvent )
+	{
+		ClothVisualsReady();
 	}
 
 	private function OnInventoryItemHoverOver( const itemData : ref< InventoryItemData >, target : weak< inkWidget > )
@@ -2389,5 +2458,47 @@ enum InventoryPaperdollZoomArea
 class CyberwareSlotSpawnData
 {
 	var index : Int32;
+}
+
+class InventoryAttachmentSlotsScriptCallback extends AttachmentSlotsScriptCallback
+{
+	var m_player : weak< PlayerPuppet >;
+	var m_transactionSystem : weak< TransactionSystem >;
+	var m_controller : weak< gameuiInventoryGameController >;
+	var m_isUnequipping : Bool;
+	var m_showDelay : Float;
+	var m_slotToWaitFor : TweakDBID;
+
+	public override function OnItemEquippedVisual( slot : TweakDBID, item : ItemID )
+	{
+		ShowPuppetPreviewOnceItemsVisualsAreUpdated( slot, item );
+	}
+
+	public override function OnItemUnequippedComplete( slot : TweakDBID, item : ItemID )
+	{
+		ShowPuppetPreviewOnceItemsVisualsAreUpdated( slot, item );
+	}
+
+	private function ShowPuppetPreviewOnceItemsVisualsAreUpdated( slot : TweakDBID, item : ItemID )
+	{
+		var delayEvent : VisualSlotsUpdatedEvent;
+		if( m_isUnequipping )
+		{
+			if( slot == T"AttachmentSlots.TppHead" )
+			{
+				delayEvent = new VisualSlotsUpdatedEvent;
+				GameInstance.GetDelaySystem( m_player.GetGame() ).DelayEvent( m_player, delayEvent, m_showDelay, false );
+			}
+		}
+		else
+		{
+			if( slot == m_slotToWaitFor )
+			{
+				delayEvent = new VisualSlotsUpdatedEvent;
+				GameInstance.GetDelaySystem( m_player.GetGame() ).DelayEvent( m_player, delayEvent, m_showDelay, false );
+			}
+		}
+	}
+
 }
 
