@@ -8,6 +8,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 	private var m_eventDispatcher : weak< inkMenuEventDispatcher >;
 	private var m_handler : weak< inkISystemRequestsHandler >;
 	private var m_buttonHintsController : weak< ButtonHints >;
+	private var m_gogContainerController : weak< GogContainerController >;
 	private var m_saveInfo : SaveMetadataInfo;
 	private var m_saves : array< String >;
 	private var m_pendingRegistration : Bool;
@@ -18,9 +19,11 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 	private var m_cloudSynced : Bool;
 	private var m_emptySlotController : weak< LoadListItem >;
 	private var m_isEp1Enabled : Bool;
+	private var m_isUserUGCRestricted : Bool;
 
 	protected event OnInitialize()
 	{
+		var platformName : String;
 		m_handler = GetSystemRequestsHandler();
 		m_handler.RegisterToCallback( 'OnSavesForSaveReady', this, 'OnSavesForSaveReady' );
 		m_handler.RegisterToCallback( 'OnSaveMetadataReady', this, 'OnSaveMetadataReady' );
@@ -47,6 +50,12 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
 		ShowCompatibilityLimitationPopup();
 		m_isEp1Enabled = IsEP1();
+		m_isUserUGCRestricted = false;
+		platformName = GetPlatformShortName();
+		if( ( ( ( ( platformName == "ps5" || platformName == "ps5pro" ) || platformName == "xseriesx" ) || platformName == "xseriess" ) || platformName == "emporium" ) || platformName == "windowsGDK" )
+		{
+			Modio.RequestRestrictionStatus( this, 'OnRequestRestrictionStatusCallBack', false );
+		}
 	}
 
 	protected event OnUninitialize()
@@ -54,6 +63,10 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		if( GameInstance.GetOnlineSystem( GetPlayerControlledObject().GetGame() ) )
 		{
 			inkWidgetRef.UnregisterFromCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
+		}
+		if( m_gogContainerController )
+		{
+			m_gogContainerController.UnregisterFromCallback( 'GogReloadEmporium', this, 'OnGogReloadEmporium' );
 		}
 		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnButtonRelease' );
 	}
@@ -63,7 +76,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		if( evt.IsAction( 'next_menu' ) && inkWidgetRef.IsVisible( m_gogButtonWidgetRef ) )
 		{
 			PlaySound( 'Button', 'OnPress' );
-			GogLogin();
+			GogLogin( false );
 			evt.Handle();
 		}
 	}
@@ -84,6 +97,32 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		}
 	}
 
+	protected event OnRequestRestrictionStatusCallBack( status : Int32 )
+	{
+		if( status == 0 )
+		{
+			m_isUserUGCRestricted = false;
+		}
+		else
+		{
+			m_isUserUGCRestricted = true;
+			RefreshUGCRestrictedThumbnails();
+		}
+	}
+
+	private function RefreshUGCRestrictedThumbnails()
+	{
+		var i : Int32;
+		var button : weak< inkWidget >;
+		var controller : weak< LoadListItem >;
+		for( i = 0; i < inkCompoundRef.GetNumChildren( m_list ); i += 1 )
+		{
+			button = inkCompoundRef.GetWidgetByIndex( m_list, i );
+			controller = ( ( LoadListItem )( button.GetController() ) );
+			controller.CheckThumbnailCensorship( false, m_isUserUGCRestricted );
+		}
+	}
+
 	private function InitCrossProgression()
 	{
 		var hudGroup : ConfigGroup;
@@ -97,6 +136,11 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 			inkWidgetRef.RegisterToCallback( m_gogButtonWidgetRef, 'OnRelease', this, 'OnGogPressed' );
 			inkWidgetRef.SetVisible( m_gogButtonWidgetRef, true );
 			inkWidgetRef.SetInteractive( m_gogButtonWidgetRef, true );
+			m_gogContainerController = ( ( GogContainerController )( inkWidgetRef.GetController( m_gogContainer ) ) );
+			if( m_gogContainerController )
+			{
+				m_gogContainerController.RegisterToCallback( 'GogReloadEmporium', this, 'OnGogReloadEmporium' );
+			}
 		}
 		else
 		{
@@ -156,7 +200,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		}
 		button = ( ( inkWidget )( e.GetCurrentTarget() ) );
 		controller = ( ( LoadListItem )( button.GetController() ) );
-		if( e.IsAction( 'click' ) )
+		if( e.IsAction( 'click' ) || e.IsAction( 'tap' ) )
 		{
 			PlaySound( 'Button', 'OnPress' );
 			if( controller.EmptySlot() && m_handler.HasFreeSaveSlot( "ManualSave-" ) )
@@ -174,7 +218,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 						showXbCompatWarning = true;
 					}
 				}
-				OverrideSavedGame( controller.Index(), showXbCompatWarning );
+				OverrideSavedGame( controller.SaveIndex(), showXbCompatWarning );
 			}
 			return true;
 		}
@@ -183,7 +227,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 			if( !( controller.EmptySlot() ) )
 			{
 				transferSaveData = new TransferSaveData;
-				transferSaveData.saveIndex = controller.Index();
+				transferSaveData.saveIndex = controller.SaveIndex();
 				transferSaveData.action = TransferSaveAction.Export;
 				TransferSavedGame( transferSaveData );
 			}
@@ -199,7 +243,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 				}
 				else
 				{
-					DeleteSavedGame( controller.Index() );
+					DeleteSavedGame( controller.SaveIndex() );
 				}
 			}
 			else
@@ -210,26 +254,39 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		}
 	}
 
-	private function GogLogin()
+	private function GogLogin( isReload : Bool )
 	{
 		var container : weak< inkCompoundWidget >;
-		var gogPopupWidget : inkWidget;
-		var gogPopupController : weak< GOGProfileLogicController >;
 		container = ( ( inkCompoundWidget )( inkWidgetRef.Get( m_gogContainer ) ) );
+		if( isReload )
+		{
+			container.RemoveAllChildren();
+			SpawnGogPopupWidget( container );
+			return;
+		}
+		PlaySound( 'Button', 'OnPress' );
 		if( container.GetNumChildren() )
 		{
 			container.RemoveAllChildren();
 		}
 		else
 		{
-			gogPopupWidget = SpawnFromExternal( container, R"base\gameplay\gui\fullscreen\main_menu\gog_popup.inkwidget", 'Root' );
-			if( gogPopupWidget != NULL )
+			SpawnGogPopupWidget( container );
+		}
+	}
+
+	private function SpawnGogPopupWidget( gogContainer : weak< inkCompoundWidget > )
+	{
+		var gogPopupController : weak< GOGProfileLogicController >;
+		var gogPopupWidget : inkWidget;
+		gogPopupWidget = SpawnFromExternal( gogContainer, R"base\gameplay\gui\fullscreen\main_menu\gog_popup.inkwidget", 'Root' );
+		if( gogPopupWidget != NULL )
+		{
+			gogPopupController = ( ( GOGProfileLogicController )( gogPopupWidget.GetController() ) );
+			if( gogPopupController != NULL )
 			{
-				gogPopupController = ( ( GOGProfileLogicController )( gogPopupWidget.GetController() ) );
-				if( gogPopupController != NULL )
-				{
-					gogPopupController.SetMenuState( EGOGMenuState.LoadGame );
-				}
+				gogPopupController.SetMenuState( EGOGMenuState.LoadGame );
+				gogPopupController.SetGogContainer( gogContainer );
 			}
 		}
 	}
@@ -245,7 +302,7 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 			{
 				button = inkCompoundRef.GetWidgetByIndex( m_list, i );
 				controller = ( ( LoadListItem )( button.GetController() ) );
-				if( controller.Index() == idx )
+				if( controller.SaveIndex() == idx )
 				{
 					inkCompoundRef.RemoveChild( m_list, button );
 					break;
@@ -263,6 +320,11 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		{
 			handler.RequestSavesForSave();
 		}
+	}
+
+	protected event OnGogReloadEmporium( evt : GogReloadEmporium )
+	{
+		GogLogin( true );
 	}
 
 	protected event OnOverrideSaveAccepted()
@@ -328,15 +390,16 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 		{
 			button = inkCompoundRef.GetWidgetByIndex( m_list, i );
 			controller = ( ( LoadListItem )( button.GetController() ) );
-			if( controller.Index() == info.saveIndex )
+			if( controller.SaveIndex() == info.saveIndex )
 			{
 				if( info.isValid )
 				{
-					controller.SetMetadata( info, m_isEp1Enabled );
+					controller.SetMetadata( info, true, m_isEp1Enabled );
+					controller.CheckThumbnailCensorship( false, m_isUserUGCRestricted );
 				}
 				else
 				{
-					controller.SetInvalid( info.internalName );
+					controller.SetInvalid( info.internalName, true );
 				}
 				break;
 			}
@@ -345,10 +408,10 @@ class SaveGameMenuGameController extends gameuiSaveHandlingController
 
 	protected event OnGogPressed( evt : inkPointerEvent )
 	{
-		if( evt.IsAction( 'click' ) )
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
 		{
 			PlaySound( 'Button', 'OnPress' );
-			GogLogin();
+			GogLogin( false );
 			evt.Handle();
 		}
 	}

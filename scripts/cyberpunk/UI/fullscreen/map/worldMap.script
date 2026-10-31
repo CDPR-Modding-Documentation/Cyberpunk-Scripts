@@ -167,6 +167,8 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private var m_isZooming : Bool;
 	private var m_pressedRMB : Bool;
 	private var m_startedFastTraveling : Bool;
+	private var m_inputMouserLayoutBBID : CallbackHandle;
+	private var m_isMouserActive : Bool;
 
 	protected event OnInitialize()
 	{
@@ -203,6 +205,11 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		evt.Init( 'world_map' );
 		QueueEvent( evt );
 		inkWidgetRef.SetVisible( m_locationAndGangsContainer, false );
+		if( GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ) )
+		{
+			m_inputMouserLayoutBBID = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).RegisterListenerBool( GetAllBlackboardDefs().InputSchemes.IsMouserActive, this, 'OnMouserActiveChanged' );
+			m_isMouserActive = GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).GetBool( GetAllBlackboardDefs().InputSchemes.IsMouserActive );
+		}
 	}
 
 	protected event OnUninitialize()
@@ -227,6 +234,16 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		evt.Init( 'default' );
 		QueueEvent( evt );
 		CancelDelamainTaxiMappinPosition();
+		if( GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ) )
+		{
+			GetBlackboardSystem().Get( GetAllBlackboardDefs().InputSchemes ).UnregisterDelayedListener( GetAllBlackboardDefs().InputSchemes.IsMouserActive, m_inputMouserLayoutBBID );
+		}
+	}
+
+	protected event OnMouserActiveChanged( value : Bool )
+	{
+		m_isMouserActive = value;
+		RefreshInputHints();
 	}
 
 	private function InitializeQuickFiltersList()
@@ -266,7 +283,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 
 	protected event OnFilterLeftArrowClicked( evt : inkPointerEvent )
 	{
-		if( evt.IsAction( 'click' ) )
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
 		{
 			evt.Consume();
 			CycleQuickFilterPrev();
@@ -275,7 +292,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 
 	protected event OnFilterRightArrowClicked( evt : inkPointerEvent )
 	{
-		if( evt.IsAction( 'click' ) )
+		if( evt.IsAction( 'click' ) || evt.IsAction( 'tap' ) )
 		{
 			evt.Consume();
 			CycleQuickFilterNext();
@@ -376,10 +393,13 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	protected event OnFilterSwitched( evt : inkPointerEvent )
 	{
 		var filterLogic : weak< WorldMapFiltersListItem >;
-		if( evt.IsAction( 'click' ) && canChangeCustomFilter )
+		if( canChangeCustomFilter )
 		{
 			filterLogic = ( ( WorldMapFiltersListItem )( evt.GetTarget().GetController() ) );
-			UpdateCustomFilter( filterLogic.GetFilterType(), filterLogic.SwitchFilter() );
+			if( evt.IsAction( 'click' ) || ( evt.IsAction( 'tap' ) && filterLogic.IsFilterHovered() ) )
+			{
+				UpdateCustomFilter( filterLogic.GetFilterType(), filterLogic.SwitchFilter() );
+			}
 		}
 	}
 
@@ -415,10 +435,6 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		var isQuestType : Bool;
 		var questType : gameJournalQuestType;
 		m_mappinsPositions.Clear();
-		if( IsFastTravelEnabled() || IsDelamainTaxiEnabled() )
-		{
-			return;
-		}
 		m_trackedObjective = ( ( JournalQuestObjectiveBase )( m_journalManager.GetTrackedEntry() ) );
 		if( m_trackedObjective != NULL )
 		{
@@ -461,6 +477,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		GetRootCompoundWidget().RemoveChild( widget );
 		m_readyToZoom = true;
 		inkWidgetRef.SetVisible( m_locationAndGangsContainer, true );
+		RefreshInputHints();
 	}
 
 	protected event OnShowSpinner()
@@ -484,6 +501,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		RegisterToGlobalInputCallback( 'OnPostOnPress', this, 'OnPressInput' );
 		RegisterToGlobalInputCallback( 'OnPostOnRelease', this, 'OnReleaseInput' );
 		RegisterToGlobalInputCallback( 'OnPostOnHold', this, 'OnHoldInput' );
+		RegisterToGlobalInputCallback( 'OnPostOnRelative', this, 'OnRelativeInput' );
 		m_cameraMode = GetEntityPreview().GetCameraMode();
 		fastTravelEnabled = IsFastTravelEnabled();
 		UpdateFastTravelVisiblity( fastTravelEnabled );
@@ -501,7 +519,6 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		m_mapBlackboard.SetString( m_mapDefinition.currentState, "EntityAttached" );
 		preloaderController = ( ( WorldMapPreloader )( inkWidgetRef.GetController( m_preloaderWidget ) ) );
 		preloaderController.SetMapLoaded();
-		RefreshInputHints();
 		m_entityAttached = true;
 	}
 
@@ -530,6 +547,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		UnregisterFromGlobalInputCallback( 'OnPostOnPress', this, 'OnPressInput' );
 		UnregisterFromGlobalInputCallback( 'OnPostOnHold', this, 'OnHoldInput' );
 		UnregisterFromGlobalInputCallback( 'OnPostOnRelease', this, 'OnReleaseInput' );
+		UnregisterFromGlobalInputCallback( 'OnPostOnRelative', this, 'OnRelativeInput' );
 	}
 
 	protected event OnZoomLevelChanged( oldLevel : Int32, newLevel : Int32 )
@@ -590,16 +608,34 @@ import class WorldMapMenuGameController extends MappinsContainerController
 
 	protected event OnHoverOverMappin( e : inkPointerEvent )
 	{
+		var targetedWidget : inkWidget;
+		var scaleUp : Vector2;
 		var hoveredController : BaseWorldMapMappinController;
+		scaleUp.X = 1.75;
+		scaleUp.Y = 1.75;
 		hoveredController = ( ( BaseWorldMapMappinController )( e.GetTarget().GetController() ) );
 		if( hoveredController && hoveredController.CanSelectMappin() )
 		{
+			if( GetPlayerControlledObject().PlayerLastUsedTouch() )
+			{
+				targetedWidget = e.GetTarget();
+				targetedWidget.SetScale( scaleUp );
+			}
 			SetSelectedMappin( hoveredController );
 		}
 	}
 
 	protected event OnHoverOutMappin( e : inkPointerEvent )
 	{
+		var targetedWidget : inkWidget;
+		var normalScale : Vector2;
+		normalScale.X = 1.0;
+		normalScale.Y = 1.0;
+		if( GetPlayerControlledObject().PlayerLastUsedTouch() )
+		{
+			targetedWidget = e.GetTarget();
+			targetedWidget.SetScale( normalScale );
+		}
 		SetSelectedMappin( NULL );
 	}
 
@@ -713,28 +749,31 @@ import class WorldMapMenuGameController extends MappinsContainerController
 	private function NavigateCustomFilters( option : ECustomFilterDPadNavigationOption )
 	{
 		var filtersAmount : Int32;
-		if( m_customFiltersList[ m_currentCustomFilterIndex ].IsFilterEnabled() )
+		if( !( GetPlayerControlledObject().PlayerLastUsedTouch() ) )
 		{
-			m_customFiltersList[ m_currentCustomFilterIndex ].SetFilterState( 'Selected' );
+			if( m_customFiltersList[ m_currentCustomFilterIndex ].IsFilterEnabled() )
+			{
+				m_customFiltersList[ m_currentCustomFilterIndex ].SetFilterState( 'Selected' );
+			}
+			else
+			{
+				m_customFiltersList[ m_currentCustomFilterIndex ].SetFilterState( 'Default' );
+			}
+			filtersAmount = m_customFiltersList.Size();
+			switch( option )
+			{
+				case ECustomFilterDPadNavigationOption.SelectNext:
+					m_currentCustomFilterIndex = ( ( m_currentCustomFilterIndex < ( filtersAmount - 1 ) ) ? ( m_currentCustomFilterIndex + 1 ) : ( 0 ) );
+				break;
+				case ECustomFilterDPadNavigationOption.SelectPrev:
+					m_currentCustomFilterIndex = ( ( m_currentCustomFilterIndex > 0 ) ? ( m_currentCustomFilterIndex - 1 ) : ( filtersAmount - 1 ) );
+				break;
+				case ECustomFilterDPadNavigationOption.Toggle:
+					UpdateCustomFilter( m_customFiltersList[ m_currentCustomFilterIndex ].GetFilterType(), m_customFiltersList[ m_currentCustomFilterIndex ].SwitchFilter() );
+				break;
+			}
+			m_customFiltersList[ m_currentCustomFilterIndex ].SetFilterState( 'Hover' );
 		}
-		else
-		{
-			m_customFiltersList[ m_currentCustomFilterIndex ].SetFilterState( 'Default' );
-		}
-		filtersAmount = m_customFiltersList.Size();
-		switch( option )
-		{
-			case ECustomFilterDPadNavigationOption.SelectNext:
-				m_currentCustomFilterIndex = ( ( m_currentCustomFilterIndex < ( filtersAmount - 1 ) ) ? ( m_currentCustomFilterIndex + 1 ) : ( 0 ) );
-			break;
-			case ECustomFilterDPadNavigationOption.SelectPrev:
-				m_currentCustomFilterIndex = ( ( m_currentCustomFilterIndex > 0 ) ? ( m_currentCustomFilterIndex - 1 ) : ( filtersAmount - 1 ) );
-			break;
-			case ECustomFilterDPadNavigationOption.Toggle:
-				UpdateCustomFilter( m_customFiltersList[ m_currentCustomFilterIndex ].GetFilterType(), m_customFiltersList[ m_currentCustomFilterIndex ].SwitchFilter() );
-			break;
-		}
-		m_customFiltersList[ m_currentCustomFilterIndex ].SetFilterState( 'Hover' );
 	}
 
 	private function CycleWorldMapFilter( cycleNext : Bool )
@@ -1123,6 +1162,31 @@ import class WorldMapMenuGameController extends MappinsContainerController
 			}
 			entityPreview.ZoomIn( amount );
 		}
+		else if( m_isMouserActive && e.IsAction( 'world_map_menu_zoom_Jcms' ) )
+		{
+			if( amount == 0.0 )
+			{
+				if( m_isZooming )
+				{
+					m_audioSystem.Play( 'ui_menu_scrolling_stop' );
+					m_isZooming = false;
+				}
+				return;
+			}
+			if( !( m_isZooming ) )
+			{
+				m_audioSystem.Play( 'ui_menu_scrolling_start' );
+				m_isZooming = true;
+			}
+			if( amount > 0.0 )
+			{
+				entityPreview.ZoomIn( amount );
+			}
+			else
+			{
+				entityPreview.ZoomOut( -( amount ) );
+			}
+		}
 	}
 
 	private function HandlePressInput( e : inkPointerEvent )
@@ -1192,6 +1256,7 @@ import class WorldMapMenuGameController extends MappinsContainerController
 
 	private function HandleReleaseInput( e : inkPointerEvent )
 	{
+		var menuEvent : inkMenuInstance_SpawnEvent;
 		if( inkWidgetRef.IsVisible( m_customFilters ) )
 		{
 			if( e.IsAction( 'world_map_filter_navigation_down' ) )
@@ -1244,6 +1309,9 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		{
 			if( !( e.IsHandled() ) || !( e.IsConsumed() ) )
 			{
+				menuEvent = new inkMenuInstance_SpawnEvent;
+				menuEvent.Init( 'OnHotkeySwitchToJournal_FastTravel' );
+				QueueEvent( menuEvent );
 				e.Handle();
 				e.Consume();
 				PlaySound( 'Button', 'OnPress' );
@@ -1294,6 +1362,16 @@ import class WorldMapMenuGameController extends MappinsContainerController
 				PlaySound( 'Attributes', 'OnFail' );
 			}
 		}
+		else if( e.IsAction( 'world_map_menu_track_waypoint_touch' ) )
+		{
+			holdProgress = e.GetHoldProgress();
+			if( holdProgress < 1.0 )
+			{
+				return;
+			}
+			m_pressedRMB = true;
+			TryTrackQuestOrSetWaypoint();
+		}
 	}
 
 	protected event OnPressInput( e : inkPointerEvent )
@@ -1325,6 +1403,22 @@ import class WorldMapMenuGameController extends MappinsContainerController
 		if( m_readyToZoom )
 		{
 			HandleAxisInput( e );
+		}
+	}
+
+	protected event OnRelativeInput( e : inkPointerEvent )
+	{
+		var entityPreview : weak< inkWorldMapPreviewGameController >;
+		var amount : Float;
+		entityPreview = GetEntityPreview();
+		amount = e.GetAxisData();
+		if( e.IsAction( 'world_map_menu_move_horizontal_touch' ) )
+		{
+			entityPreview.Move( Vector4( -1.0, 0.0, 0.0, 0.0 ), amount );
+		}
+		else if( e.IsAction( 'world_map_menu_move_vertical_touch' ) )
+		{
+			entityPreview.Move( Vector4( 0.0, -1.0, 0.0, 0.0 ), amount );
 		}
 	}
 
@@ -1512,7 +1606,18 @@ import class WorldMapMenuGameController extends MappinsContainerController
 			{
 				AddInputHintUpdate( evt, false, 'world_map_menu_jump_to_player', "UI-UserActions-JumpToObjective", priority );
 			}
-			AddInputHintUpdate( evt, true, 'world_map_menu_zoom_in', "Gameplay-RPG-Stats-WeaponStats-ZoomLevel", priority );
+			if( m_isMouserActive )
+			{
+				AddInputHintUpdate( evt, true, 'world_map_menu_zoom_Jcms', "Gameplay-RPG-Stats-WeaponStats-ZoomLevel", priority );
+				AddInputHintUpdate( evt, false, 'world_map_menu_zoom_in', "Gameplay-RPG-Stats-WeaponStats-ZoomLevel", priority );
+				AddInputHintUpdate( evt, false, 'world_map_menu_zoom_out', "UI-ScriptExports-ZoomOut0", priority );
+			}
+			else
+			{
+				AddInputHintUpdate( evt, false, 'world_map_menu_zoom_Jcms', "Gameplay-RPG-Stats-WeaponStats-ZoomLevel", priority );
+				AddInputHintUpdate( evt, true, 'world_map_menu_zoom_in', "Gameplay-RPG-Stats-WeaponStats-ZoomLevel", priority );
+				AddInputHintUpdate( evt, true, 'world_map_menu_zoom_out', "UI-ScriptExports-ZoomOut0", priority );
+			}
 			AddInputHintUpdate( evt, true, 'world_map_fake_move', "Gameplay-Player-ButtonHelper-Move", priority );
 			canTrackWaypoint = !( isFastTravelEnabled );
 			AddInputHintUpdate( evt, canTrackWaypoint, 'world_map_menu_track_waypoint', "UI-Settings-ButtonMappings-Actions-MapTrack", priority );
@@ -2076,14 +2181,7 @@ class WorldMapFiltersList extends inkLogicController
 		UnregisterFromCallback( 'OnRelease', this, 'OnConsumeInput' );
 	}
 
-	protected event OnConsumeInput( evt : inkPointerEvent )
-	{
-		if( evt.IsAction( 'click' ) )
-		{
-			evt.Consume();
-		}
-	}
-
+	protected event OnConsumeInput( evt : inkPointerEvent ) {}
 }
 
 class WorldMapFiltersListItem extends inkLogicController
